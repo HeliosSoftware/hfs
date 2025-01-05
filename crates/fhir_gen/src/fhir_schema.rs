@@ -81,19 +81,20 @@ pub struct Extension {
 mod tests {
     use super::*;
     use std::fs::File;
-    use std::io::BufReader;
-    use ndjson::Deserializer;
+    use std::io::{BufRead, BufReader};
 
     #[test]
     fn test_ndjson_roundtrip() {
         let file = File::open("resources/1.0.0_hl7.fhir.r4.core#4.0.1_package.ndjson").unwrap();
         let reader = BufReader::new(file);
-        let deserializer = Deserializer::new(reader);
         
         // Read all schemas from the file
-        let schemas: Vec<FHIRSchema> = deserializer
-            .into_iter()
-            .map(|result| result.unwrap())
+        let schemas: Vec<FHIRSchema> = reader
+            .lines()
+            .map(|line| {
+                let line = line.unwrap();
+                serde_json::from_str(&line).unwrap()
+            })
             .collect();
         
         // Serialize back to NDJSON format
