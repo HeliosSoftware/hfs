@@ -66,14 +66,25 @@ pub enum DerivationType {
 /// Represents an element in the schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Element {
+    /// Fixed value for the element
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<String>,
+
     /// Element type
-    #[serde(rename = "type")]
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub element_type: Option<String>,
 
-    /// References to other profiles
-    pub refers: Option<Vec<String>>,
+    /// Whether the element is required
+    #[serde(rename = "required-element", skip_serializing_if = "Option::is_none")]
+    pub required_element: Option<bool>,
 
-    // Add other element properties as needed
+    /// What this element is a choice of
+    #[serde(rename = "choiceOf", skip_serializing_if = "Option::is_none")]
+    pub choice_of: Option<String>,
+
+    /// Available choices for this element
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
 }
 
 /// Represents a constraint in the schema
