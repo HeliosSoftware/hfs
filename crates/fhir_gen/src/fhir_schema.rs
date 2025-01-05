@@ -91,7 +91,7 @@ mod tests {
         // Read all schemas from the file
         let schemas: Vec<FHIRSchema> = reader
             .lines()
-            .skip(1) // Skip header line
+            .skip(2) // Skip header lines
             .map(|line| {
                 let line = line.unwrap();
                 serde_json::from_str(&line).unwrap()
