@@ -7,6 +7,10 @@ pub struct FHIRSchema {
     /// URL used to reference the profile
     pub url: String,
 
+    /// Package meta information
+    #[serde(rename = "package-meta")]
+    pub package_meta : PackageMeta,
+
     /// Resource type being constrained
     #[serde(rename = "type")]
     pub resource_type: String,
@@ -40,6 +44,15 @@ pub struct FHIRSchema {
     /// Extensions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<Vec<Extension>>,
+}
+
+/// Represents Package Metadata information
+/// Represents an element in the schema
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageMeta {
+    pub name: String,
+    pub version: String,
+    pub path: String
 }
 
 /// Type of schema derivation
