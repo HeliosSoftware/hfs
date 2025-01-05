@@ -80,7 +80,42 @@ pub struct Extension {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use std::fs::File;
+    use std::io::BufReader;
+    use ndjson::Deserializer;
+
+    #[test]
+    fn test_ndjson_roundtrip() {
+        let file = File::open("resources/1.0.0_hl7.fhir.r4.core#4.0.1_package.ndjson").unwrap();
+        let reader = BufReader::new(file);
+        let deserializer = Deserializer::new(reader);
+        
+        // Read all schemas from the file
+        let schemas: Vec<FHIRSchema> = deserializer
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect();
+        
+        // Serialize back to NDJSON format
+        let mut output = Vec::new();
+        for schema in &schemas {
+            let json = serde_json::to_string(&schema).unwrap();
+            output.push(json);
+        }
+        
+        // Read original file as string for comparison
+        let original = std::fs::read_to_string("resources/1.0.0_hl7.fhir.r4.core#4.0.1_package.ndjson").unwrap();
+        let original_lines: Vec<_> = original.lines().collect();
+        
+        // Compare line by line
+        assert_eq!(output.len(), original_lines.len(), "Number of records should match");
+        
+        for (i, (orig, processed)) in original_lines.iter().zip(output.iter()).enumerate() {
+            let orig_value: serde_json::Value = serde_json::from_str(orig).unwrap();
+            let processed_value: serde_json::Value = serde_json::from_str(processed).unwrap();
+            assert_eq!(orig_value, processed_value, "Record {} should match", i);
+        }
+    }
 
     #[test]
     fn test_schema_serialization() {
