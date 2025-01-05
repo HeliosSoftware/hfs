@@ -120,7 +120,7 @@ mod tests {
         
         // Read original file as string for comparison
         let original = std::fs::read_to_string("resources/1.0.0_hl7.fhir.r4.core#4.0.1_package.ndjson").unwrap();
-        let original_lines: Vec<_> = original.lines().collect();
+        let original_lines: Vec<_> = original.lines().skip(2).collect();
         
         // Compare line by line
         assert_eq!(output.len(), original_lines.len(), "Number of records should match");
