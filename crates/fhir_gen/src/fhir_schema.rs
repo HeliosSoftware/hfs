@@ -136,6 +136,11 @@ mod tests {
     fn test_schema_serialization() {
         let schema = FHIRSchema {
             url: "http://example.com/patient".to_string(),
+            package_meta: PackageMeta {
+                name: "hl7.fhir.r4.core".to_string(),
+                version: "4.0.1".to_string(),
+                path: "hl7.fhir.r4.core#4.0.1".to_string(),
+            },
             base: Some("http://hl7.org/fhir/us/core/StructureDefinition/us-core-patient|6.0.0".to_string()),
             resource_type: "Patient".to_string(),
             name: "ExamplePatient".to_string(),
