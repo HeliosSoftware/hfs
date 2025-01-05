@@ -1,0 +1,13 @@
+[package]
+name = "hfs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["R4"]
+R4 = []
+R4B = []
+R5 = []
+R6 = []
+
+[dependencies]
