@@ -66,17 +66,21 @@ pub enum DerivationType {
 /// Represents an element in the schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Element {
-    /// Fixed value for the element
+    /// Whether this is an array type
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fixed: Option<String>,
+    pub array: Option<bool>,
 
-    /// Element type
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub element_type: Option<String>,
+    /// Whether this is a scalar type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scalar: Option<bool>,
 
-    /// Whether the element is required
-    #[serde(rename = "required-element", skip_serializing_if = "Option::is_none")]
-    pub required_element: Option<bool>,
+    /// Minimum number of items (for arrays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<i32>,
+
+    /// Maximum number of items (for arrays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<i32>,
 
     /// What this element is a choice of
     #[serde(rename = "choiceOf", skip_serializing_if = "Option::is_none")]
@@ -85,6 +89,69 @@ pub struct Element {
     /// Available choices for this element
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choices: Option<Vec<String>>,
+
+    /// Elements that must be present
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+
+    /// Elements that must be absent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<Vec<String>>,
+
+    /// References to other elements
+    #[serde(rename = "elementReference", skip_serializing_if = "Option::is_none")]
+    pub element_reference: Option<Vec<String>>,
+
+    /// Element type
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub element_type: Option<String>,
+
+    /// Nested elements definitions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elements: Option<HashMap<String, Element>>,
+
+    /// Fixed value that must match exactly
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<serde_json::Value>,
+
+    /// Pattern value that must be contained
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<serde_json::Value>,
+
+    /// Allowed reference targets
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refers: Option<Vec<String>>,
+
+    /// Whether this element changes resource interpretation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<bool>,
+
+    /// Whether this element must be supported by implementations
+    #[serde(rename = "mustSupport", skip_serializing_if = "Option::is_none")]
+    pub must_support: Option<bool>,
+
+    /// Whether this element should be included in search summaries
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<bool>,
+
+    /// Value set binding information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Binding>,
+}
+
+/// Represents a terminology binding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Binding {
+    /// URL of the value set
+    #[serde(rename = "valueSet")]
+    pub value_set: String,
+
+    /// Binding strength (required, extensible, preferred, example)
+    pub strength: String,
+
+    /// Code systems included in the value set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codesystems: Option<Vec<String>>,
 }
 
 /// Represents a constraint in the schema
