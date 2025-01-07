@@ -18,8 +18,22 @@ fn main() {
     println!("Downloading FHIR definitions...");
 
     // Download the file
-    let mut response = reqwest::blocking::get(url)
+    let response = reqwest::blocking::get(url)
         .expect("Failed to GET from url");
+        
+    // Check if request was successful
+    if !response.status().is_success() {
+        panic!("Download failed with status: {}", response.status());
+    }
+    
+    // Verify content type
+    if let Some(content_type) = response.headers().get("content-type") {
+        if !content_type.to_str().unwrap_or("").contains("application/zip") {
+            panic!("Expected ZIP file but got content-type: {}", content_type.to_str().unwrap_or("unknown"));
+        }
+    }
+    
+    let mut response = response;
     
     // Create the file
     let mut downloaded_file = File::create(output_path.clone())
