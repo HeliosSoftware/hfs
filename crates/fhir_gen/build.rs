@@ -12,7 +12,7 @@ fn main() {
     let resources_dir = Path::new("resources/R4");
     fs::create_dir_all(resources_dir).expect("Failed to create resources directory");
 
-    let url = "https://github.com/HL7/fhir/raw/R4/definitions.json.zip";
+    let url = "https://hl7.org/fhir/R4/definitions.json.zip";
     let output_path = resources_dir.join("definitions.json.zip");
 
     println!("Downloading FHIR definitions...");
