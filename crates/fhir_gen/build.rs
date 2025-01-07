@@ -12,18 +12,25 @@ fn main() {
     let resources_dir = Path::new("resources/R4");
     fs::create_dir_all(resources_dir).expect("Failed to create resources directory");
 
-    let url = "https://hl7.org/fhir/R4/definitions.json.zip";
+    let url = "https://github.com/HL7/fhir/raw/R4/definitions.json.zip";
     let output_path = resources_dir.join("definitions.json.zip");
 
     println!("Downloading FHIR definitions...");
 
+    // Create a client with custom headers
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)")
+        .build()
+        .expect("Failed to create HTTP client");
+
     // Download the file
-    let response = reqwest::blocking::get(url)
+    let response = client.get(url)
+        .send()
         .expect("Failed to GET from url");
         
     // Check if request was successful
     if !response.status().is_success() {
-        panic!("Download failed with status: {}", response.status());
+        panic!("Download failed with status: {} for URL: {}", response.status(), url);
     }
     
     // Verify content type
