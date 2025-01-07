@@ -1,8 +1,12 @@
 use std::fs;
+use std::fs::File;
 use std::path::Path;
+use std::io::copy;
+use zip::ZipArchive;
 
-async fn main() {
-    println!("Start!");
+fn main() {
+
+    println!("Start");
 
     // Create resources directory if it doesn't exist
     let resources_dir = Path::new("resources/R4");
@@ -11,26 +15,39 @@ async fn main() {
     let url = "https://hl7.org/fhir/R4/definitions.json.zip";
     let output_path = resources_dir.join("definitions.json.zip");
 
-    // Only download if file doesn't exist
-    if !output_path.exists() {
-        println!("Downloading FHIR definitions...");
+    println!("Downloading FHIR definitions...");
 
-        // Download the file
-        let response = reqwest::get(url)
-            .await
-            .expect("Failed to GET from url");
+    // Download the file
+    let mut response = reqwest::blocking::get(url)
+        .expect("Failed to GET from url");
+    
+    // Create the file
+    let mut downloaded_file = File::create(output_path.clone())
+        .expect("Failed to create the file");
 
-        let bytes = response.bytes()
-            .await
-            .expect("Failed to get response bytes");
+    copy(&mut response, &mut downloaded_file)
+        .expect("Failed to copy the file");
 
-        // Write to file
-        fs::write(&output_path, bytes)
-            .expect("Failed to write zip file");
-            
-        println!("FHIR definitions downloaded successfully");
+    let file = fs::File::open(output_path).unwrap();
+
+    let mut archive = ZipArchive::new(file).unwrap();
+
+    // Extract everything
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).unwrap();
+        let outpath = resources_dir.join(file.mangled_name());
+        
+        if file.name().ends_with('/') {
+            fs::create_dir_all(&outpath).unwrap();
+        } else {
+            if let Some(p) = outpath.parent() {
+                fs::create_dir_all(p).unwrap();
+            }
+            let mut outfile = fs::File::create(&outpath).unwrap();
+            std::io::copy(&mut file, &mut outfile).unwrap();
+        }
     }
 
-    // Tell Cargo to rerun if the downloaded file changes or is deleted
-    println!("cargo:rerun-if-changed=crates/fhir_gen/resources/R4/definitions.json.zip");
+    println!("FHIR definitions downloaded successfully");
+
 }
