@@ -1,10 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-#[tokio::main]
 async fn main() {
+    println!("Start!");
+
     // Create resources directory if it doesn't exist
-    let resources_dir = Path::new("crates/fhir_gen/resources/R4");
+    let resources_dir = Path::new("resources/R4");
     fs::create_dir_all(resources_dir).expect("Failed to create resources directory");
 
     let url = "https://hl7.org/fhir/R4/definitions.json.zip";
@@ -13,7 +14,7 @@ async fn main() {
     // Only download if file doesn't exist
     if !output_path.exists() {
         println!("Downloading FHIR definitions...");
-        
+
         // Download the file
         let response = reqwest::get(url)
             .await
