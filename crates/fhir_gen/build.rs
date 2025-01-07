@@ -35,8 +35,9 @@ fn main() {
     
     // Verify content type
     if let Some(content_type) = response.headers().get("content-type") {
-        if !content_type.to_str().unwrap_or("").contains("application/zip") {
-            panic!("Expected ZIP file but got content-type: {}", content_type.to_str().unwrap_or("unknown"));
+        let content_type_str = content_type.to_str().unwrap_or("");
+        if !content_type_str.contains("zip") {
+            panic!("Expected ZIP file but got content-type: {}", content_type_str);
         }
     }
     
