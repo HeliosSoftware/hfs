@@ -25,10 +25,22 @@ fn main() {
     let mut downloaded_file = File::create(output_path.clone())
         .expect("Failed to create the file");
 
-    copy(&mut response, &mut downloaded_file)
+    let bytes_copied = copy(&mut response, &mut downloaded_file)
         .expect("Failed to copy the file");
-
-    let file = fs::File::open(output_path).unwrap();
+    
+    // Ensure file is written to disk
+    downloaded_file.sync_all().expect("Failed to flush file to disk");
+    
+    println!("Downloaded {} bytes", bytes_copied);
+    
+    // Verify file exists and has content
+    let file = fs::File::open(&output_path).expect("Failed to open downloaded file");
+    let metadata = file.metadata().expect("Failed to get file metadata");
+    println!("File size on disk: {} bytes", metadata.len());
+    
+    if metadata.len() == 0 {
+        panic!("Downloaded file is empty!");
+    }
 
     let mut archive = ZipArchive::new(file).unwrap();
 
