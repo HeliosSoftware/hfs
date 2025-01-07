@@ -10,18 +10,26 @@ async fn main() {
     let url = "https://hl7.org/fhir/R4/definitions.json.zip";
     let output_path = resources_dir.join("definitions.json.zip");
 
-    // Download the file
-    let response = reqwest::get(url)
-        .await
-        .expect("Failed to GET from url");
+    // Only download if file doesn't exist
+    if !output_path.exists() {
+        println!("Downloading FHIR definitions...");
+        
+        // Download the file
+        let response = reqwest::get(url)
+            .await
+            .expect("Failed to GET from url");
 
-    let bytes = response.bytes()
-        .await
-        .expect("Failed to get response bytes");
+        let bytes = response.bytes()
+            .await
+            .expect("Failed to get response bytes");
 
-    // Write to file
-    fs::write(&output_path, bytes)
-        .expect("Failed to write zip file");
+        // Write to file
+        fs::write(&output_path, bytes)
+            .expect("Failed to write zip file");
+            
+        println!("FHIR definitions downloaded successfully");
+    }
 
-    println!("cargo:rerun-if-changed=build.rs");
+    // Tell Cargo to rerun if the downloaded file changes or is deleted
+    println!("cargo:rerun-if-changed=crates/fhir_gen/resources/R4/definitions.json.zip");
 }
