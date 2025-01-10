@@ -5,6 +5,17 @@ use std::io::copy;
 use zip::ZipArchive;
 
 fn main() {
+    // Check if R6 feature is enabled
+    if !cfg!(feature = "r6") {
+        return;
+    }
+
+    // Check if resources/build already exists
+    let resources_dir = Path::new("resources/build");
+    if resources_dir.exists() {
+        println!("Resources directory already exists, skipping download");
+        return;
+    }
 
     // Create resources directory if it doesn't exist
     let resources_dir = Path::new("resources/build");
