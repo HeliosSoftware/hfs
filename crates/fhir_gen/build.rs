@@ -6,13 +6,11 @@ use zip::ZipArchive;
 
 fn main() {
 
-    println!("Start");
-
     // Create resources directory if it doesn't exist
-    let resources_dir = Path::new("resources/R4");
+    let resources_dir = Path::new("resources/build");
     fs::create_dir_all(resources_dir).expect("Failed to create resources directory");
 
-    let url = "https://hl7.org/fhir/R4/definitions.json.zip";
+    let url = "https://build.fhir.org/definitions.json.zip";
     let output_path = resources_dir.join("definitions.json.zip");
 
     println!("Downloading FHIR definitions...");
@@ -85,3 +83,4 @@ fn main() {
     println!("FHIR definitions downloaded successfully");
 
 }
+
