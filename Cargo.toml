@@ -2,7 +2,4 @@
 members = ["crates/*"]
 resolver = "2"
 
-[features]
-r6 = []
-
 

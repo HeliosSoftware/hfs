@@ -5,8 +5,9 @@ use std::io::copy;
 use zip::ZipArchive;
 
 fn main() {
+
     // Check if R6 feature is enabled
-    if !cfg!(feature = "r6") {
+    if !cfg!(feature = "R6") {
         return;
     }
 
