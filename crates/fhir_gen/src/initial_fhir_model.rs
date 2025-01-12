@@ -107,6 +107,7 @@ pub struct Range {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "resourceType")]
 pub enum Resource {
     StructureDefinition(StructureDefinition),
 }
