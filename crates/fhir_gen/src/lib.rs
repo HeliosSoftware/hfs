@@ -1,3 +1,5 @@
+pub mod initial_fhir_model;
+
 use serde_json::Result;
 use std::fs::File;
 use std::io::BufReader;

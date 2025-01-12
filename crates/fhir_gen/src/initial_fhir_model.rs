@@ -977,3 +977,11 @@ pub struct Bundle {
     pub entry: Vec<BundleEntry>,
     pub signature: Option<Signature>,
 }
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Extension {
+    // TODO
+}
+
+// ... rest of the model code ...
