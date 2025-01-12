@@ -26,18 +26,23 @@ mod tests {
             .join("R4")
             .join("profiles-types.json");
 
-        let bundle = parse_structure_definitions(test_file).unwrap();
+        match parse_structure_definitions(&test_file) {
+            Ok(bundle) => {
+                // Verify that we have something
+                assert!(!bundle.entry.is_none());
 
-        // Verify that we have something
-        assert!(!bundle.entry.is_none());
-
-        // Verify we have the expected type definitions
-        assert!(bundle.entry.unwrap().iter().any(|e| {
-            if let Some(resource) = &e.resource {
-                matches!(resource, Resource::StructureDefinition(_))
-            } else {
-                false
+                // Verify we have the expected type definitions
+                assert!(bundle.entry.unwrap().iter().any(|e| {
+                    if let Some(resource) = &e.resource {
+                        matches!(resource, Resource::StructureDefinition(_))
+                    } else {
+                        false
+                    }
+                }));
             }
-        }));
+            Err(e) => {
+                panic!("Failed to parse bundle: {:?}", e);
+            }
+        }
     }
 }

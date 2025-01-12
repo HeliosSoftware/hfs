@@ -819,6 +819,8 @@ pub struct BundleEntryResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Bundle {
+    #[serde(rename = "resourceType")]
+    pub resource_type: String,
     pub id: Option<String>,
     pub meta: Option<Meta>,
     #[serde(rename = "implicitRules")]
