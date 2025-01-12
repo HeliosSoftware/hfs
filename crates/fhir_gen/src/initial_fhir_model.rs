@@ -204,7 +204,7 @@ pub struct ElementDefinitionSlicing {
 pub struct ElementDefinitionBase {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
-    pub string: String,
+    pub path: String,
     pub min: u32,
     pub max: String,
 }
