@@ -1125,3 +1125,52 @@ pub struct Bundle {
     pub entry: Option<Vec<BundleEntry>>,
     pub signature: Option<Signature>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompartmentDefinition {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<String>,
+    pub language: Option<String>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: String,
+    pub version: Option<String>,
+    #[serde(rename = "versionAlgorithmString")]
+    pub version_algorithm_string: Option<String>,
+    #[serde(rename = "versionAlgorithmCoding")]
+    pub version_algorithm_coding: Option<Coding>,
+    pub name: String,
+    pub title: Option<String>,
+    pub status: String,
+    pub experimental: Option<bool>,
+    pub date: Option<String>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<String>,
+    #[serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    pub purpose: Option<String>,
+    pub code: String,
+    pub search: bool,
+    pub resource: Option<Vec<CompartmentDefinitionResource>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompartmentDefinitionResource {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: String,
+    pub param: Option<Vec<String>>,
+    pub documentation: Option<String>,
+    #[serde(rename = "startParam")]
+    pub start_param: Option<String>,
+    #[serde(rename = "endParam")]
+    pub end_param: Option<String>,
+}
