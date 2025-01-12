@@ -908,6 +908,11 @@ pub struct CapabilityStatement {
     #[serde(rename = "implicitRules")]
     pub implicit_rules: Option<String>,
     pub language: Option<String>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub url: Option<String>,
     pub identifier: Option<Vec<Identifier>>,
     pub version: Option<String>,
@@ -923,6 +928,7 @@ pub struct CapabilityStatement {
     pub publisher: Option<String>,
     pub contact: Option<Vec<ContactDetail>>,
     pub description: Option<String>,
+    #[serde(rename = "useContext")]
     pub use_context: Option<Vec<UsageContext>>,
     pub jurisdiction: Option<Vec<CodeableConcept>>,
     pub purpose: Option<String>,
@@ -1016,6 +1022,7 @@ pub struct CapabilityStatementResource {
     #[serde(rename = "searchParam")]
     pub search_param: Option<Vec<CapabilityStatementSearchParam>>,
     pub operation: Option<Vec<CapabilityStatementOperation>>,
+    pub compartment: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
