@@ -195,6 +195,7 @@ pub enum Resource {
     CapabilityStatement(CapabilityStatement),
     CompartmentDefinition(CompartmentDefinition),
     Bundle(Bundle),
+    OperationDefinition(OperationDefinition),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
