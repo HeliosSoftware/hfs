@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Extension {}
+pub struct Extension {
+    // TODO
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Id {
@@ -210,7 +212,9 @@ pub struct Range {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Resource {}
+pub enum Resource {
+    // TODO
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UsageContext {
@@ -254,7 +258,7 @@ pub struct StructureDefinitionMapping {
     pub id: Option<std::string::String>,
     pub extension: Vec<Extension>,
     #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Extension>,
+    pub modifier_extension: Vec<Extension>,
     pub identity: Id,
     pub uri: Option<Uri>,
     pub name: Option<String>,
@@ -266,7 +270,7 @@ pub struct StructureDefinitionContext {
     pub id: Option<std::string::String>,
     pub extension: Vec<Extension>,
     #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Extension>,
+    pub modifier_extension: Vec<Extension>,
     #[serde(rename = "type")]
     pub r#type: Code,
     pub expression: String,
@@ -277,7 +281,7 @@ pub struct StructureDefinitionSnapshotOrDifferential {
     pub id: Option<std::string::String>,
     pub extension: Vec<Extension>,
     #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Extension>,
+    pub modifier_extension: Vec<Extension>,
     pub element: Vec<ElementDefinition>,
 }
 
@@ -850,7 +854,7 @@ pub struct StructureDefinition {
     pub contained: Option<Resource>,
     pub extension: Option<Extension>,
     #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Extension>,
+    pub modifier_extension: Vec<Extension>,
     pub url: Uri,
     pub identifier: Vec<Identifier>,
     pub version: Option<String>,
@@ -890,4 +894,86 @@ pub struct StructureDefinition {
     pub derivation: Option<Code>,
     pub snapshot: Vec<StructureDefinitionSnapshotOrDifferential>,
     pub differential: Vec<StructureDefinitionSnapshotOrDifferential>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleLink {
+    pub id: Option<std::string::String>,
+    pub extension: Vec<Extension>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Vec<Extension>,
+    pub relation: String,
+    pub url: Uri,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleEntry {
+    pub id: Option<std::string::String>,
+    pub extension: Vec<Extension>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Vec<Extension>,
+    pub link: Vec<BundleLink>,
+    #[serde(rename = "fullUrl")]
+    pub full_url: Option<Uri>,
+    pub resource: Option<Resource>,
+    pub search: Option<BundleEntrySearch>,
+    pub request: Option<BundleEntryRequest>,
+    pub response: Option<BundleEntryResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleEntrySearch {
+    pub id: Option<std::string::String>,
+    pub extension: Vec<Extension>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Vec<Extension>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleEntryRequest {
+    pub id: Option<std::string::String>,
+    pub extension: Vec<Extension>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Vec<Extension>,
+    pub method: Code,
+    pub url: Uri,
+    #[serde(rename = "ifNoneMatch")]
+    pub if_none_match: Option<String>,
+    #[serde(rename = "ifModifiedSince")]
+    pub if_modified_since: Option<Instant>,
+    #[serde(rename = "ifMatch")]
+    pub if_match: Option<String>,
+    #[serde(rename = "ifNoneExist")]
+    pub if_none_exist: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleEntryResponse {
+    pub id: Option<std::string::String>,
+    pub extension: Vec<Extension>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Vec<Extension>,
+    pub status: String,
+    pub location: Option<Uri>,
+    pub etag: Option<String>,
+    #[serde(rename = "lastModified")]
+    pub last_modified: Option<Instant>,
+    pub outcome: Option<Resource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Bundle {
+    pub id: Option<Id>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub timestamp: Option<Instant>,
+    pub total: Option<UnsignedInt>,
+    pub link: Vec<BundleLink>,
+    pub entry: Vec<BundleEntry>,
+    pub signature: Option<Signature>,
 }
