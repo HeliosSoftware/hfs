@@ -96,7 +96,7 @@ pub struct Coding {
     pub code: Option<String>,
     pub display: Option<String>,
     #[serde(rename = "userSelected")]
-    pub user_selected: bool,
+    pub user_selected: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,7 +115,7 @@ pub struct Meta {
 pub struct CodeableConcept {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
-    pub coding: Option<Coding>,
+    pub coding: Option<Vec<Coding>>,
     pub text: Option<String>,
 }
 
@@ -192,7 +192,7 @@ pub struct Range {
 #[serde(tag = "resourceType")]
 pub enum Resource {
     StructureDefinition(StructureDefinition),
-    CapabilityStatement(CapabilityStatement), 
+    CapabilityStatement(CapabilityStatement),
     Bundle(Bundle),
 }
 
@@ -982,7 +982,6 @@ pub struct CapabilityStatementRest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSecurity {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -993,7 +992,6 @@ pub struct CapabilityStatementSecurity {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementResource {
     pub id: Option<String>,
@@ -1035,7 +1033,6 @@ pub struct CapabilityStatementResource {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementInteraction {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -1045,7 +1042,6 @@ pub struct CapabilityStatementInteraction {
     pub documentation: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSearchParam {
     pub id: Option<String>,
@@ -1059,7 +1055,6 @@ pub struct CapabilityStatementSearchParam {
     pub documentation: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementOperation {
     pub id: Option<String>,
@@ -1082,7 +1077,6 @@ pub struct CapabilityStatementMessaging {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementEndpoint {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -1093,7 +1087,6 @@ pub struct CapabilityStatementEndpoint {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSupportedMessage {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -1103,7 +1096,6 @@ pub struct CapabilityStatementSupportedMessage {
     pub definition: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementDocument {
     pub id: Option<String>,
