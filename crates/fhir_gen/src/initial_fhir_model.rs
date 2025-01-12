@@ -698,9 +698,8 @@ pub struct ElementDefinitionConstraint {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "resourceType")]
 pub struct StructureDefinition {
-    #[serde(rename = "resourceType")]
-    pub resource_type: String,
     pub id: Option<String>,
     pub meta: Option<Meta>,
     #[serde(rename = "implicitRules")]
