@@ -3,6 +3,63 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Extension {
     pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub url: String,
+    pub valueBase64Binary: Option<String>,
+    pub valueBoolean: Option<bool>,
+    pub valueCanonical: Option<String>,
+    pub valueCode: Option<String>,
+    pub valueDate: Option<String>,
+    pub valueDateTime: Option<String>,
+    pub valueDecimal: Option<String>,
+    pub valueId: Option<String>,
+    pub valueInstant: Option<String>,
+    pub valueInteger: Option<i32>,
+    pub valueInteger64: Option<i64>,
+    pub valueMarkdown: Option<String>,
+    pub valueOid: Option<String>,
+    pub valuePositiveInt: Option<u32>,
+    pub valueString: Option<String>,
+    pub valueTime: Option<String>,
+    pub valueUnsignedInt: Option<u32>,
+    pub valueUri: Option<String>,
+    pub valueUrl: Option<String>,
+    pub valueUuid: Option<String>,
+    pub valueAddress: Option<Address>,
+    pub valueAge: Option<Age>,
+    pub valueAnnotation: Option<Annotation>,
+    pub valueAttachment: Option<Attachment>,
+    pub valueCodeableConcept: Option<CodeableConcept>,
+    /*    pub valueCodeableReference: Option<CodeableReference>,
+        pub valueCoding: Option<Coding>,
+    valueContactPoint: ContactPoint
+    valueCount: Count
+    valueDistance: Distance
+    valueDuration: Duration
+    valueHumanName: HumanName
+    valueIdentifier: Identifier
+    valueMoney: Money
+    valuePeriod: Period
+    valueQuantity: Quantity
+    valueRange: Range
+    valueRatio: Ratio
+    valueRatioRange: RatioRange
+    valueReference: Reference - a reference to another resource
+    valueSampledData: SampledData
+    valueSignature: Signature
+    valueTiming: Timing
+    valueContactDetail: ContactDetail
+    valueDataRequirement: DataRequirement
+    valueExpression: Expression
+    valueParameterDefinition: ParameterDefinition
+    valueRelatedArtifact: RelatedArtifact
+    valueTriggerDefinition: TriggerDefinition
+    valueUsageContext: UsageContext
+    valueAvailability: Availability
+    valueExtendedContactDetail: ExtendedContactDetail
+    valueDosage: Dosage
+    valueMeta: Meta
+    */
 }
 
 #[derive(Debug, Serialize, Deserialize)]
