@@ -193,6 +193,7 @@ pub struct Range {
 pub enum Resource {
     StructureDefinition(StructureDefinition),
     CapabilityStatement(CapabilityStatement),
+    CompartmentDefinition(CompartmentDefinition),
     Bundle(Bundle),
 }
 
@@ -1128,6 +1129,8 @@ pub struct Bundle {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompartmentDefinition {
+    #[serde(rename = "resourceType")]
+    pub resource_type: String,
     pub id: Option<String>,
     pub meta: Option<Meta>,
     #[serde(rename = "implicitRules")]
