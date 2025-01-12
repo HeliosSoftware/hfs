@@ -24,7 +24,7 @@ mod tests {
         let test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
             .join("R4")
-            .join("profiles-types.json");
+            .join("profiles-resources.json");
 
         match parse_structure_definitions(&test_file) {
             Ok(bundle) => {
