@@ -708,7 +708,7 @@ pub struct StructureDefinition {
     pub language: Option<String>,
     pub text: Option<Narrative>,
     pub contained: Option<Box<Resource>>,
-    pub extension: Option<Extension>,
+    pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub url: String,
