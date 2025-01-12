@@ -214,10 +214,10 @@ pub struct ElementDefinitionType {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub code: String,
-    pub profile: Option<String>,
+    pub profile: Option<Vec<String>>,
     #[serde(rename = "targetProfile")]
-    pub target_profile: Option<String>,
-    pub aggregation: Option<String>,
+    pub target_profile: Option<Vec<String>>,
+    pub aggregation: Option<Vec<String>>,
     pub versioning: Option<String>,
 }
 
@@ -607,7 +607,7 @@ pub struct ElementDefinition {
     #[serde(rename = "contentReference")]
     pub content_reference: Option<String>,
     #[serde(rename = "type")]
-    pub r#type: Option<ElementDefinitionType>,
+    pub r#type: Option<Vec<ElementDefinitionType>>,
     #[serde(rename = "defaultValue")]
     pub default_value: Option<ElementDefinitionDefaultValue>,
     #[serde(rename = "meaningWhenMissing")]
@@ -731,8 +731,8 @@ pub struct StructureDefinition {
     pub jurisdiction: Option<Vec<CodeableConcept>>,
     pub purpose: Option<String>,
     pub copyright: Option<String>,
-    #[serde(rename = "copyrightedLabel")]
-    pub copyrighted_label: Option<String>,
+    #[serde(rename = "copyrightLabel")]
+    pub copyright_label: Option<String>,
     pub keyword: Option<Vec<Coding>>,
     #[serde(rename = "fhirVersion")]
     pub fhir_version: Option<String>,
@@ -748,8 +748,8 @@ pub struct StructureDefinition {
     #[serde(rename = "baseDefinition")]
     pub base_definition: Option<String>,
     pub derivation: Option<String>,
-    pub snapshot: Option<Vec<StructureDefinitionSnapshotOrDifferential>>,
-    pub differential: Option<Vec<StructureDefinitionSnapshotOrDifferential>>,
+    pub snapshot: Option<StructureDefinitionSnapshotOrDifferential>,
+    pub differential: Option<StructureDefinitionSnapshotOrDifferential>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
