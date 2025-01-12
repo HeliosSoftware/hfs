@@ -790,7 +790,7 @@ pub struct StructureDefinition {
     pub implicit_rules: Option<String>,
     pub language: Option<String>,
     pub text: Option<Narrative>,
-    pub contained: Option<Box<Resource>>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
