@@ -982,14 +982,24 @@ pub struct CapabilityStatementRest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSecurity {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub cors: Option<bool>,
     pub service: Option<Vec<CodeableConcept>>,
     pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementResource {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
     pub r#type: String,
     pub profile: Option<String>,
@@ -1025,13 +1035,23 @@ pub struct CapabilityStatementResource {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementInteraction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub code: String,
     pub documentation: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSearchParam {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
     pub definition: Option<String>,
     #[serde(rename = "type")]
@@ -1040,7 +1060,12 @@ pub struct CapabilityStatementSearchParam {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementOperation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
     pub definition: String,
     pub documentation: Option<String>,
@@ -1057,19 +1082,34 @@ pub struct CapabilityStatementMessaging {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementEndpoint {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub protocol: Coding,
     pub address: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementSupportedMessage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub mode: String,
     pub definition: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatementDocument {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
     pub mode: String,
     pub documentation: Option<String>,
     pub profile: String,
