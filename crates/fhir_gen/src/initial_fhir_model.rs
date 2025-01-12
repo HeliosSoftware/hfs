@@ -738,7 +738,7 @@ pub struct ElementDefinitionExample {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub label: String,
-    pub value: ElementDefinitionDefaultValue,
+    pub value: Option<ElementDefinitionDefaultValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
