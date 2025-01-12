@@ -189,12 +189,10 @@ pub struct Range {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "resourceType")]
 pub enum Resource {
-    #[serde(rename = "StructureDefinition")]
     StructureDefinition(StructureDefinition),
-    #[serde(rename = "CapabilityStatement")] 
-    CapabilityStatement(CapabilityStatement),
-    #[serde(rename = "Bundle")]
+    CapabilityStatement(CapabilityStatement), 
     Bundle(Bundle),
 }
 
