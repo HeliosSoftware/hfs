@@ -193,6 +193,7 @@ pub struct Range {
 pub enum Resource {
     StructureDefinition(StructureDefinition),
     CapabilityStatement(CapabilityStatement),
+    Bundle(Bundle),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
