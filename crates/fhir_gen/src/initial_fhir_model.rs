@@ -900,7 +900,6 @@ pub struct BundleEntryResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CapabilityStatement {
     #[serde(rename = "resourceType")]
     pub resource_type: String,
@@ -1070,6 +1069,7 @@ pub struct CapabilityStatementDocument {
     pub profile: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Bundle {
     #[serde(rename = "resourceType")]
     pub resource_type: String,
