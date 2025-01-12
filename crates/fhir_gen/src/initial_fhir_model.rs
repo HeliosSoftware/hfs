@@ -213,7 +213,7 @@ pub struct Range {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Resource {
-    // TODO
+    StructureDefinition(StructureDefinition),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
