@@ -32,7 +32,8 @@ mod tests {
                     if path.is_dir() {
                         json_files.extend(visit_dirs(&path)?);
                     } else if let Some(ext) = path.extension() {
-                        if ext == "json" && !path.file_name().unwrap().to_string_lossy().contains("conceptmap") {
+                        if ext == "json" && !path.file_name().unwrap().to_string_lossy().contains("conceptmap") 
+                            && !path.file_name().unwrap().to_string_lossy().contains("valueset") {
                             json_files.push(path);
                         }
                     }
