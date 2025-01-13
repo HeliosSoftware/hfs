@@ -34,7 +34,11 @@ mod tests {
                 // Verify we have the expected type definitions
                 assert!(bundle.entry.unwrap().iter().any(|e| {
                     if let Some(resource) = &e.resource {
-                        matches!(resource, Resource::StructureDefinition(_))
+                        matches!(resource, 
+                            Resource::StructureDefinition(_) |
+                            Resource::SearchParameter(_) |
+                            Resource::OperationDefinition(_)
+                        )
                     } else {
                         false
                     }
