@@ -1237,7 +1237,8 @@ pub struct OperationDefinitionParameter {
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
-    pub use_: String,
+    #[serde(rename = "use")]
+    pub r#use_: String,
     pub scope: Option<Vec<String>>,
     pub min: i32,
     pub max: String,
