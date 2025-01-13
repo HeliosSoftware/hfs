@@ -196,6 +196,7 @@ pub enum Resource {
     CompartmentDefinition(CompartmentDefinition),
     Bundle(Bundle),
     OperationDefinition(OperationDefinition),
+    SearchParameter(SearchParameter),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1288,4 +1289,69 @@ pub struct OperationDefinitionOverload {
     #[serde(rename = "parameterName")]
     pub parameter_name: Option<Vec<String>>,
     pub comment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchParameter {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<String>,
+    pub language: Option<String>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: String,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    #[serde(rename = "versionAlgorithmString")]
+    pub version_algorithm_string: Option<String>,
+    #[serde(rename = "versionAlgorithmCoding")]
+    pub version_algorithm_coding: Option<Coding>,
+    pub name: String,
+    pub title: Option<String>,
+    #[serde(rename = "derivedFrom")]
+    pub derived_from: Option<String>,
+    pub status: String,
+    pub experimental: Option<bool>,
+    pub date: Option<String>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: String,
+    #[serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<String>,
+    pub copyright: Option<String>,
+    #[serde(rename = "copyrightLabel")]
+    pub copyright_label: Option<String>,
+    pub code: String,
+    pub base: Vec<String>,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub expression: Option<String>,
+    #[serde(rename = "processingMode")]
+    pub processing_mode: Option<String>,
+    pub constraint: Option<String>,
+    pub target: Option<Vec<String>>,
+    #[serde(rename = "multipleOr")]
+    pub multiple_or: Option<bool>,
+    #[serde(rename = "multipleAnd")]
+    pub multiple_and: Option<bool>,
+    pub comparator: Option<Vec<String>>,
+    pub modifier: Option<Vec<String>>,
+    pub chain: Option<Vec<String>>,
+    pub component: Option<Vec<SearchParameterComponent>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchParameterComponent {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub definition: String,
+    pub expression: String,
 }
