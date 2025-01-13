@@ -23,8 +23,8 @@ mod tests {
     fn test_parse_structure_definitions() {
         let test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
-            .join("R4")
-            .join("search-parameters.json");
+            .join("R5")
+            .join("profiles-resources.json");
 
         match parse_structure_definitions(&test_file) {
             Ok(bundle) => {
@@ -34,10 +34,11 @@ mod tests {
                 // Verify we have the expected type definitions
                 assert!(bundle.entry.unwrap().iter().any(|e| {
                     if let Some(resource) = &e.resource {
-                        matches!(resource, 
-                            Resource::StructureDefinition(_) |
-                            Resource::SearchParameter(_) |
-                            Resource::OperationDefinition(_)
+                        matches!(
+                            resource,
+                            Resource::StructureDefinition(_)
+                                | Resource::SearchParameter(_)
+                                | Resource::OperationDefinition(_)
                         )
                     } else {
                         false
