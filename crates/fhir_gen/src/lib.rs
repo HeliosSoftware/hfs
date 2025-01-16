@@ -14,7 +14,7 @@ pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-pub fn generate_code(bundle: Bundle) -> io::Result<()> {
+pub fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     Ok(())
 }
 
