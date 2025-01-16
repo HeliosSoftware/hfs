@@ -25,7 +25,7 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    
+
     match args.version {
         FhirVersion::R4 => println!("Processing R4"),
         FhirVersion::R4B => println!("Processing R4B"),
@@ -33,4 +33,6 @@ fn main() {
         FhirVersion::R6 => println!("Processing R6"),
         FhirVersion::All => println!("Processing all versions"),
     }
+
+    // Output hello world AI!
 }
