@@ -34,5 +34,5 @@ fn main() {
         FhirVersion::All => println!("Processing all versions"),
     }
 
-    // Output hello world AI!
+    println!("Hello world!");
 }
