@@ -33,6 +33,4 @@ fn main() {
         FhirVersion::R6 => println!("Processing R6"),
         FhirVersion::All => println!("Processing all versions"),
     }
-
-    println!("Hello world!");
 }
