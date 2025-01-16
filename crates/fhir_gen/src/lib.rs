@@ -6,11 +6,16 @@ use std::io::BufReader;
 use std::path::Path;
 
 use crate::initial_fhir_model::Bundle;
+use std::io;
 
 pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).expect("File not found");
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
+}
+
+pub fn generate_code(bundle: Bundle) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
