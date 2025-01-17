@@ -70,7 +70,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
         })
 }
 
-fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut json_files = Vec::new();
     if dir.is_dir() {
         for entry in std::fs::read_dir(dir)? {
