@@ -12,12 +12,9 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    // Instead of println below, we should be calling
-    match args.version {
-        FhirVersion::R4 => println!("Processing R4"),
-        FhirVersion::R4B => println!("Processing R4B"),
-        FhirVersion::R5 => println!("Processing R5"),
-        FhirVersion::R6 => println!("Processing R6"),
-        FhirVersion::All => println!("Processing all versions"),
+    let output_dir = std::path::PathBuf::from("generated");
+    if let Err(e) = fhir_gen::process_fhir_version(args.version, &output_dir) {
+        eprintln!("Error processing FHIR version: {}", e);
+        std::process::exit(1);
     }
 }

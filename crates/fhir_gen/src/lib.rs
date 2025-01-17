@@ -24,7 +24,66 @@ use std::path::Path;
 use crate::initial_fhir_model::Bundle;
 use std::io;
 
-// Add a function that takes a FhirVersion and an output path AI!
+pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    
+    let version_dir = match version {
+        FhirVersion::R4 => resources_dir.join("R4"),
+        FhirVersion::R4B => resources_dir.join("R4B"),
+        FhirVersion::R5 => resources_dir.join("R5"),
+        FhirVersion::R6 => resources_dir.join("R6"),
+        FhirVersion::All => resources_dir,
+    };
+
+    if !version_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("FHIR version directory not found: {}", version_dir.display())
+        ));
+    }
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(&output_path)?;
+
+    // Process all JSON files in the version directory
+    visit_dirs(&version_dir)?
+        .into_iter()
+        .try_for_each(|file_path| {
+            if let Ok(bundle) = parse_structure_definitions(&file_path) {
+                generate_code(bundle, &output_path)?;
+            }
+            Ok(())
+        })
+}
+
+fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut json_files = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                json_files.extend(visit_dirs(&path)?);
+            } else if let Some(ext) = path.extension() {
+                if ext == "json"
+                    && !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains("conceptmap")
+                    && !path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains("valueset")
+                {
+                    json_files.push(path);
+                }
+            }
+        }
+    }
+    Ok(json_files)
+}
 
 pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).expect("File not found");
