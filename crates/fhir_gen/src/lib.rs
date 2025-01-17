@@ -52,8 +52,11 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
             };
 
             if !version_dir.exists() {
-                // Return an error that indicates the directory is not available. AI!
-            };
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("FHIR resources directory not found for version {:?}: {}", specific_version, version_dir.display())
+                ));
+            }
 
             // Create output directory if it doesn't exist
             std::fs::create_dir_all(&output_path)?;
