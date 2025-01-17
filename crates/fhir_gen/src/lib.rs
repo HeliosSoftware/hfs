@@ -24,6 +24,8 @@ use std::path::Path;
 use crate::initial_fhir_model::Bundle;
 use std::io;
 
+// Add a function that takes a FhirVersion and an output path AI!
+
 pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).expect("File not found");
     let reader = BufReader::new(file);
