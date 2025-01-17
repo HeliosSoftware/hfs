@@ -130,7 +130,22 @@ mod tests {
     use initial_fhir_model::Resource;
     use std::path::PathBuf;
 
-    // Add a test for process_fhir_version AI!
+    #[test]
+    fn test_process_fhir_version() {
+        // Create a temporary directory for test output
+        let temp_dir = std::env::temp_dir().join("fhir_gen_test");
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
+
+        // Test processing R4 version
+        assert!(process_fhir_version(FhirVersion::R4, &temp_dir).is_ok());
+
+        // Verify placeholder file was created
+        let placeholder_path = temp_dir.join("placeholder.rs");
+        assert!(placeholder_path.exists());
+
+        // Clean up
+        std::fs::remove_dir_all(&temp_dir).expect("Failed to clean up temp directory");
+    }
 
     #[test]
     fn test_parse_structure_definitions() {
