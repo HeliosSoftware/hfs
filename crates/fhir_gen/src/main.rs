@@ -8,9 +8,23 @@ struct Args {
     #[arg(value_enum, default_value_t = FhirVersion::default())]
     version: FhirVersion,
 }
-// If no arguments are passed, display a message indicating the valid parameters. AI!
+
 fn main() {
-    let args = Args::parse();
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) => {
+            println!("FHIR Generator - Process FHIR definitions\n");
+            println!("Available versions:");
+            println!("  R4   - FHIR Release 4 (default)");
+            println!("  R4B  - FHIR Release 4B");
+            println!("  R5   - FHIR Release 5");
+            println!("  R6   - FHIR Release 6");
+            println!("  all  - Process all versions\n");
+            println!("Usage example:");
+            println!("  fhir_gen R5\n");
+            e.exit();
+        }
+    };
 
     let output_dir = std::path::PathBuf::from("generated");
     if let Err(e) = fhir_gen::process_fhir_version(args.version, &output_dir) {
