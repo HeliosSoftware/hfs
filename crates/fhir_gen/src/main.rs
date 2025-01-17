@@ -2,6 +2,7 @@ mod initial_fhir_model;
 
 use clap::{Parser, ValueEnum};
 
+// Move FhirVersion to lib.rs AI!
 #[derive(Debug, Clone, ValueEnum)]
 enum FhirVersion {
     R4,
@@ -28,6 +29,7 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    // Instead of println below, we should be calling
     match args.version {
         FhirVersion::R4 => println!("Processing R4"),
         FhirVersion::R4B => println!("Processing R4B"),
