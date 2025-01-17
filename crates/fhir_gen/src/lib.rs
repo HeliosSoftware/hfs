@@ -1,6 +1,22 @@
 pub mod initial_fhir_model;
 
+use clap::ValueEnum;
 use serde_json::Result;
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum FhirVersion {
+    R4,
+    R4B,
+    R5,
+    R6,
+    All,
+}
+
+impl Default for FhirVersion {
+    fn default() -> Self {
+        FhirVersion::R4
+    }
+}
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;

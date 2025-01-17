@@ -1,22 +1,5 @@
-mod initial_fhir_model;
-
-use clap::{Parser, ValueEnum};
-
-// Move FhirVersion to lib.rs AI!
-#[derive(Debug, Clone, ValueEnum)]
-enum FhirVersion {
-    R4,
-    R4B,
-    R5,
-    R6,
-    All,
-}
-
-impl Default for FhirVersion {
-    fn default() -> Self {
-        FhirVersion::R4
-    }
-}
+use clap::Parser;
+use fhir_gen::FhirVersion;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
