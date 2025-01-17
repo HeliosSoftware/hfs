@@ -30,7 +30,12 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
     match version {
         FhirVersion::All => {
             // Process each version separately
-            for ver in [FhirVersion::R4, FhirVersion::R4B, FhirVersion::R5, FhirVersion::R6] {
+            for ver in [
+                FhirVersion::R4,
+                FhirVersion::R4B,
+                FhirVersion::R5,
+                FhirVersion::R6,
+            ] {
                 if let Err(e) = process_fhir_version(ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
@@ -47,12 +52,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
             };
 
             if !version_dir.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "FHIR version directory not found: {}",
-                    version_dir.display()
-                    ));
+                // Return an error that indicates the directory is not available. AI!
             };
 
             // Create output directory if it doesn't exist
@@ -64,7 +64,9 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
                 .try_for_each(|file_path| {
                     match parse_structure_definitions(&file_path) {
                         Ok(bundle) => generate_code(bundle, &output_path)?,
-                        Err(e) => eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e),
+                        Err(e) => {
+                            eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
+                        }
                     }
                     Ok(())
                 });
@@ -103,7 +105,8 @@ pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
-    let file = File::open(path).map_err(|e| serde_json::Error::custom(format!("Failed to open file: {}", e)))?;
+    let file = File::open(path)
+        .map_err(|e| serde_json::Error::custom(format!("Failed to open file: {}", e)))?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
 }
@@ -117,7 +120,7 @@ pub fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Resul
     // For now just write a placeholder file to verify the path works
     let placeholder_path = output_path.join("placeholder.rs");
     std::fs::write(placeholder_path, "// TODO: Generated code will go here\n")?;
-    
+
     Ok(())
 }
 
