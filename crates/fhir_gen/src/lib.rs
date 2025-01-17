@@ -47,27 +47,29 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
             };
 
             if !version_dir.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "FHIR version directory not found: {}",
-                version_dir.display()
-            ),
-        ));
-    }
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "FHIR version directory not found: {}",
+                    version_dir.display()
+                    ));
+            };
 
-    // Create output directory if it doesn't exist
-    std::fs::create_dir_all(&output_path)?;
+            // Create output directory if it doesn't exist
+            std::fs::create_dir_all(&output_path)?;
 
-    // Process all JSON files in the version directory
-    visit_dirs(&version_dir)?
-        .into_iter()
-        .try_for_each(|file_path| {
-            if let Ok(bundle) = parse_structure_definitions(&file_path) {
-                generate_code(bundle, &output_path)?;
-            }
+            // Process all JSON files in the version directory
+            visit_dirs(&version_dir)?
+                .into_iter()
+                .try_for_each(|file_path| {
+                    if let Ok(bundle) = parse_structure_definitions(&file_path) {
+                        generate_code(bundle, &output_path)?;
+                    }
+                    Ok(())
+                });
             Ok(())
-        })
+        }
+    }
 }
 
 pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
