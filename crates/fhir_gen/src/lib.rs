@@ -1,7 +1,13 @@
 pub mod initial_fhir_model;
 
+use crate::initial_fhir_model::Bundle;
 use clap::ValueEnum;
 use serde_json::Result;
+use std::fs::File;
+use std::io;
+use std::io::BufReader;
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum FhirVersion {
@@ -17,28 +23,28 @@ impl Default for FhirVersion {
         FhirVersion::R4
     }
 }
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-
-use crate::initial_fhir_model::Bundle;
-use std::io;
 
 pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    
+
     let version_dir = match version {
         FhirVersion::R4 => resources_dir.join("R4"),
         FhirVersion::R4B => resources_dir.join("R4B"),
         FhirVersion::R5 => resources_dir.join("R5"),
-        FhirVersion::R6 => resources_dir.join("R6"),
+        FhirVersion::R6 => resources_dir.join("build"),
         FhirVersion::All => resources_dir,
     };
+
+    // If FhirVersion::All is selected, the below code should run for each of the R4, R4B, R5 and
+    // R6 AI!
 
     if !version_dir.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("FHIR version directory not found: {}", version_dir.display())
+            format!(
+                "FHIR version directory not found: {}",
+                version_dir.display()
+            ),
         ));
     }
 
