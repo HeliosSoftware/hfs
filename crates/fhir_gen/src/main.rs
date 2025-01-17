@@ -8,7 +8,7 @@ struct Args {
     #[arg(value_enum, default_value_t = FhirVersion::default())]
     version: FhirVersion,
 }
-
+// If no arguments are passed, display a message indicating the valid parameters. AI!
 fn main() {
     let args = Args::parse();
 
