@@ -26,7 +26,7 @@ impl Default for FhirVersion {
 
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    
+
     let version_dir = match version {
         FhirVersion::R4 => resources_dir.join("R4"),
         FhirVersion::R4B => resources_dir.join("R4B"),
@@ -68,7 +68,12 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
     match version {
         FhirVersion::All => {
             // Process each version separately
-            for ver in [FhirVersion::R4, FhirVersion::R4B, FhirVersion::R5, FhirVersion::R6] {
+            for ver in [
+                FhirVersion::R4,
+                FhirVersion::R4B,
+                FhirVersion::R5,
+                FhirVersion::R6,
+            ] {
                 if let Err(e) = process_single_version(&ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
@@ -108,10 +113,12 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
+
+    // Iterate over the bundle entries AI!
 
     // TODO: Generate actual code from the bundle
     // For now just write a placeholder file to verify the path works
