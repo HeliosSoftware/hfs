@@ -125,12 +125,10 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                 match resource {
                     Resource::StructureDefinition(def) => {
                         // Only process complex-type and primitive-type definitions
-                        if let Some(kind) = &def.kind {
-                            if kind == "complex-type" || kind == "primitive-type" {
-                                let file_name = format!("{}.rs", def.id.unwrap_or_default());
-                                let file_path = output_path.join(file_name);
-                                std::fs::write(file_path, "// TODO: Generated structure code\n")?;
-                            }
+                        if def.kind == "complex-type" || def.kind == "primitive-type" {
+                            let file_name = format!("{}.rs", def.id.unwrap_or_default());
+                            let file_path = output_path.join(file_name);
+                            std::fs::write(file_path, "// TODO: Generated structure code\n")?;
                         }
                     }
                     Resource::SearchParameter(param) => {
