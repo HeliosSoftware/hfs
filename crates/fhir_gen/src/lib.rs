@@ -27,18 +27,26 @@ impl Default for FhirVersion {
 pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
 
-    let version_dir = match version {
-        FhirVersion::R4 => resources_dir.join("R4"),
-        FhirVersion::R4B => resources_dir.join("R4B"),
-        FhirVersion::R5 => resources_dir.join("R5"),
-        FhirVersion::R6 => resources_dir.join("build"),
-        FhirVersion::All => resources_dir,
-    };
+    match version {
+        FhirVersion::All => {
+            // Process each version separately
+            for ver in [FhirVersion::R4, FhirVersion::R4B, FhirVersion::R5, FhirVersion::R6] {
+                if let Err(e) = process_fhir_version(ver, &output_path) {
+                    eprintln!("Warning: Failed to process {:?}: {}", ver, e);
+                }
+            }
+            Ok(())
+        }
+        specific_version => {
+            let version_dir = match specific_version {
+                FhirVersion::R4 => resources_dir.join("R4"),
+                FhirVersion::R4B => resources_dir.join("R4B"),
+                FhirVersion::R5 => resources_dir.join("R5"),
+                FhirVersion::R6 => resources_dir.join("build"),
+                FhirVersion::All => unreachable!(),
+            };
 
-    // If FhirVersion::All is selected, the below code should run for each of the R4, R4B, R5 and
-    // R6 AI!
-
-    if !version_dir.exists() {
+            if !version_dir.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
