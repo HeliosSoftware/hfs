@@ -24,61 +24,58 @@ impl Default for FhirVersion {
     }
 }
 
-pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    
+    let version_dir = match version {
+        FhirVersion::R4 => resources_dir.join("R4"),
+        FhirVersion::R4B => resources_dir.join("R4B"),
+        FhirVersion::R5 => resources_dir.join("R5"),
+        FhirVersion::R6 => resources_dir.join("build"),
+        FhirVersion::All => return Ok(()), // Skip All variant
+    };
 
+    if !version_dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "FHIR resources directory not found for version {:?}: {}",
+                version,
+                version_dir.display()
+            ),
+        ));
+    }
+
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(&output_path)?;
+
+    // Process all JSON files in the version directory
+    visit_dirs(&version_dir)?
+        .into_iter()
+        .try_for_each::<_, io::Result<()>>(|file_path| {
+            match parse_structure_definitions(&file_path) {
+                Ok(bundle) => generate_code(bundle, &output_path)?,
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
+                }
+            }
+            Ok(())
+        })?;
+    Ok(())
+}
+
+pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     match version {
         FhirVersion::All => {
             // Process each version separately
-            for ver in [
-                FhirVersion::R4,
-                FhirVersion::R4B,
-                FhirVersion::R5,
-                FhirVersion::R6,
-            ] {
-                if let Err(e) = process_fhir_version(ver.clone(), &output_path) {
+            for ver in [FhirVersion::R4, FhirVersion::R4B, FhirVersion::R5, FhirVersion::R6] {
+                if let Err(e) = process_single_version(&ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
             }
             Ok(())
         }
-        specific_version => {
-            let version_dir = match specific_version {
-                FhirVersion::R4 => resources_dir.join("R4"),
-                FhirVersion::R4B => resources_dir.join("R4B"),
-                FhirVersion::R5 => resources_dir.join("R5"),
-                FhirVersion::R6 => resources_dir.join("build"),
-                FhirVersion::All => unreachable!(),
-            };
-
-            if !version_dir.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "FHIR resources directory not found for version {:?}: {}",
-                        specific_version,
-                        version_dir.display()
-                    ),
-                ));
-            }
-
-            // Create output directory if it doesn't exist
-            std::fs::create_dir_all(&output_path)?;
-
-            // Process all JSON files in the version directory
-            visit_dirs(&version_dir)?
-                .into_iter()
-                .try_for_each::<_, io::Result<()>>(|file_path| {
-                    match parse_structure_definitions(&file_path) {
-                        Ok(bundle) => generate_code(bundle, &output_path)?,
-                        Err(e) => {
-                            eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
-                        }
-                    }
-                    Ok(())
-                })?;
-            Ok(())
-        }
+        specific_version => process_single_version(&specific_version, output_path),
     }
 }
 
