@@ -87,19 +87,13 @@ pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
             if path.is_dir() {
                 json_files.extend(visit_dirs(&path)?);
             } else if let Some(ext) = path.extension() {
-                if ext == "json"
-                    && !path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .contains("conceptmap")
-                    && !path
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .contains("valueset")
-                {
-                    json_files.push(path);
+                if ext == "json" {
+                    if let Some(filename) = path.file_name() {
+                        let filename = filename.to_string_lossy();
+                        if !filename.contains("conceptmap") && !filename.contains("valueset") {
+                            json_files.push(path);
+                        }
+                    }
                 }
             }
         }
