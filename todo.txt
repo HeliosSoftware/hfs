@@ -1,1 +1,1 @@
-Create a StructureDefinition.rs file that can be used to parse the spec
+Export all of the types

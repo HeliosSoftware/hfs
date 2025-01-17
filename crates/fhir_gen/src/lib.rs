@@ -131,17 +131,17 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                             std::fs::write(file_path, "// TODO: Generated structure code\n")?;
                         }
                     }
-                    Resource::SearchParameter(param) => {
+                    Resource::SearchParameter(_param) => {
                         // TODO: Generate code for search parameter
-                        let file_name = format!("search_{}.rs", param.id.unwrap_or_default());
-                        let file_path = output_path.join(file_name);
-                        std::fs::write(file_path, "// TODO: Generated search code\n")?;
+                        //let file_name = format!("search_{}.rs", param.id.unwrap_or_default());
+                        //let file_path = output_path.join(file_name);
+                        //std::fs::write(file_path, "// TODO: Generated search code\n")?;
                     }
-                    Resource::OperationDefinition(op) => {
+                    Resource::OperationDefinition(_op) => {
                         // TODO: Generate code for operation definition
-                        let file_name = format!("op_{}.rs", op.id.unwrap_or_default());
-                        let file_path = output_path.join(file_name);
-                        std::fs::write(file_path, "// TODO: Generated operation code\n")?;
+                        //let file_name = format!("op_{}.rs", op.id.unwrap_or_default());
+                        //let file_path = output_path.join(file_name);
+                        //std::fs::write(file_path, "// TODO: Generated operation code\n")?;
                     }
                     _ => {} // Skip other resource types for now
                 }
