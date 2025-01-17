@@ -64,7 +64,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
             // Process all JSON files in the version directory
             visit_dirs(&version_dir)?
                 .into_iter()
-                .try_for_each(|file_path| {
+                .try_for_each::<_, io::Result<()>>(|file_path| {
                     match parse_structure_definitions(&file_path) {
                         Ok(bundle) => generate_code(bundle, &output_path)?,
                         Err(e) => {
@@ -103,12 +103,12 @@ pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path)
-        .map_err(|e| serde_json::Error::custom(format!("Failed to open file: {}", e)))?;
+        .map_err(|e| serde_json::Error::io(e))?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
 }
 
-pub fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+pub fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
