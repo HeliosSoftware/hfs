@@ -36,7 +36,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
                 FhirVersion::R5,
                 FhirVersion::R6,
             ] {
-                if let Err(e) = process_fhir_version(ver, &output_path) {
+                if let Err(e) = process_fhir_version(ver.clone(), &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
             }
