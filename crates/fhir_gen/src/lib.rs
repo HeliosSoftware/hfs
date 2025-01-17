@@ -1,6 +1,6 @@
 pub mod initial_fhir_model;
 
-use crate::initial_fhir_model::Bundle;
+use crate::initial_fhir_model::{Bundle, Resource};
 use clap::ValueEnum;
 use serde_json::Result;
 use std::fs::File;
@@ -113,13 +113,13 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
 
     // Process each entry in the bundle
-    if let Some(entries) = bundle.entry {
+    if let Some(entries) = _bundle.entry {
         for entry in entries {
             if let Some(resource) = entry.resource {
                 match resource {
