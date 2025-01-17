@@ -15,13 +15,13 @@ fn main() {
         Err(e) => {
             println!("FHIR Generator - Process FHIR definitions\n");
             println!("Available versions:");
-            println!("  R4   - FHIR Release 4 (default)");
-            println!("  R4B  - FHIR Release 4B");
-            println!("  R5   - FHIR Release 5");
-            println!("  R6   - FHIR Release 6");
+            println!("  r4   - FHIR Release 4 (default)");
+            println!("  r4b  - FHIR Release 4B");
+            println!("  r5   - FHIR Release 5");
+            println!("  r6   - FHIR Release 6");
             println!("  all  - Process all versions\n");
             println!("Usage example:");
-            println!("  fhir_gen R5\n");
+            println!("  fhir_gen r5\n");
             e.exit();
         }
     };
