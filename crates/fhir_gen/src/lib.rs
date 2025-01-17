@@ -72,7 +72,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
                         }
                     }
                     Ok(())
-                });
+                })?;
             Ok(())
         }
     }
