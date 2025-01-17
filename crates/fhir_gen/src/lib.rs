@@ -118,10 +118,36 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
 
-    // Iterate over the bundle entries AI!
+    // Process each entry in the bundle
+    if let Some(entries) = bundle.entry {
+        for entry in entries {
+            if let Some(resource) = entry.resource {
+                match resource {
+                    Resource::StructureDefinition(def) => {
+                        // TODO: Generate code for structure definition
+                        let file_name = format!("{}.rs", def.id.unwrap_or_default());
+                        let file_path = output_path.join(file_name);
+                        std::fs::write(file_path, "// TODO: Generated structure code\n")?;
+                    }
+                    Resource::SearchParameter(param) => {
+                        // TODO: Generate code for search parameter
+                        let file_name = format!("search_{}.rs", param.id.unwrap_or_default());
+                        let file_path = output_path.join(file_name);
+                        std::fs::write(file_path, "// TODO: Generated search code\n")?;
+                    }
+                    Resource::OperationDefinition(op) => {
+                        // TODO: Generate code for operation definition
+                        let file_name = format!("op_{}.rs", op.id.unwrap_or_default());
+                        let file_path = output_path.join(file_name);
+                        std::fs::write(file_path, "// TODO: Generated operation code\n")?;
+                    }
+                    _ => {} // Skip other resource types for now
+                }
+            }
+        }
+    }
 
-    // TODO: Generate actual code from the bundle
-    // For now just write a placeholder file to verify the path works
+    // Write a placeholder file to verify the path works
     let placeholder_path = output_path.join("placeholder.rs");
     std::fs::write(placeholder_path, "// TODO: Generated code will go here\n")?;
 
