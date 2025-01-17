@@ -54,7 +54,11 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
             if !version_dir.exists() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("FHIR resources directory not found for version {:?}: {}", specific_version, version_dir.display())
+                    format!(
+                        "FHIR resources directory not found for version {:?}: {}",
+                        specific_version,
+                        version_dir.display()
+                    ),
                 ));
             }
 
@@ -78,7 +82,7 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
     }
 }
 
-pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut json_files = Vec::new();
     if dir.is_dir() {
         for entry in std::fs::read_dir(dir)? {
@@ -101,14 +105,13 @@ pub fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(json_files)
 }
 
-pub fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
-    let file = File::open(path)
-        .map_err(|e| serde_json::Error::io(e))?;
+fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
+    let file = File::open(path).map_err(|e| serde_json::Error::io(e))?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
 }
 
-pub fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
@@ -126,6 +129,8 @@ mod tests {
     use super::*;
     use initial_fhir_model::Resource;
     use std::path::PathBuf;
+
+    // Add a test for process_fhir_version AI!
 
     #[test]
     fn test_parse_structure_definitions() {
