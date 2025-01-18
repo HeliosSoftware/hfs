@@ -157,6 +157,13 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
     Ok(())
 }
 
+fn rust_safe_literal(input: &str) -> String {
+    match input {
+        "type" | "use" | "abstract" => format!("r#{}", input),
+        _ => input.to_string(),
+    }
+}
+
 fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     let mut output = String::new();
 
@@ -184,7 +191,7 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
             for element in elements.iter().skip(1) { // Skip first element as it's the root
                 if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                     let field_name = element.path.split('.').last().unwrap_or("unknown");
-                    let rust_field_name = if field_name == "type" { "r#type" } else { field_name };
+                    let rust_field_name = rust_safe_literal(field_name);
                     
                     // Handle array types
                     let is_array = element.max.as_deref() == Some("*");
