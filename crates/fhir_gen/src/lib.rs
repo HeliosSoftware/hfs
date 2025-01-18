@@ -1,6 +1,5 @@
 pub mod initial_fhir_model;
 
-use serde::{Deserialize, Serialize};
 use crate::initial_fhir_model::{Bundle, Resource};
 use clap::ValueEnum;
 use initial_fhir_model::StructureDefinition;
