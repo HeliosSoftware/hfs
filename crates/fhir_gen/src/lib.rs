@@ -129,7 +129,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             let file_name = format!("{}.rs", def.id.unwrap_or_default());
                             let file_path = output_path.join(file_name);
-                            std::fs::write(file_path, structure_definition_to_rust_file(def);)?;
+                            std::fs::write(file_path, structure_definition_to_rust_file(def))?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
