@@ -157,7 +157,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
     Ok(())
 }
 
-fn rust_safe_literal(input: &str) -> String {
+fn make_rust_safe(input: &str) -> String {
     match input {
         "type" | "use" | "abstract" => format!("r#{}", input),
         _ => input.to_string(),
@@ -168,53 +168,37 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     let mut output = String::new();
 
     // Add module documentation
-    if let Some(description) = sd.description {
-        output.push_str(&format!("//! {}\n\n", description));
-    }
+    //if let Some(description) = sd.description {
+    //    output.push_str(&format!("//! {}\n\n", description));
+    //}
 
     // Add imports
-    output.push_str("use serde::{Serialize, Deserialize};\n");
-    output.push_str("use crate::initial_fhir_model::{Extension, Meta};\n\n");
+    output.push_str("use serde::{Serialize, Deserialize};\n\n");
 
     // Add struct definition
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str(&format!("pub struct {} {{\n", sd.name));
-    output.push_str("    pub id: Option<String>,\n");
-    output.push_str("    pub meta: Option<Meta>,\n");
-    output.push_str("    pub extension: Option<Vec<Extension>>,\n");
-    output.push_str("    #[serde(rename = \"modifierExtension\")]\n");
-    output.push_str("    pub modifier_extension: Option<Vec<Extension>>,\n");
 
     // Add fields from snapshot or differential
     if let Some(snapshot) = sd.snapshot {
         if let Some(elements) = snapshot.element {
-            for element in elements.iter().skip(1) { // Skip first element as it's the root
+            for element in elements.iter().skip(1) {
+                // Skip first element as it's the root
                 if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                     let field_name = element.path.split('.').last().unwrap_or("unknown");
-                    let rust_field_name = rust_safe_literal(field_name);
-                    
+                    let rust_field_name = make_rust_safe(field_name);
+
                     // Handle array types
                     let is_array = element.max.as_deref() == Some("*");
                     let base_type = match ty.code.as_str() {
-                        "string" => "String",
-                        "boolean" => "bool",
-                        "integer" => "i32",
-                        "decimal" => "String", // Using String for decimal to match model
-                        "dateTime" => "String",
-                        "instant" => "String",
-                        "date" => "String",
-                        "time" => "String",
-                        "code" => "String",
-                        "oid" => "String",
-                        "id" => "String",
-                        "uri" => "String",
-                        "url" => "String",
-                        "canonical" => "String",
-                        "uuid" => "String",
-                        "markdown" => "String",
-                        "positiveInt" => "u32",
-                        "unsignedInt" => "u32",
-                        "integer64" => "i64",
+                        "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                        "http://hl7.org/fhirpath/System.String" => "String",
+                        "http://hl7.org/fhirpath/System.Integer" => "i32",
+                        "http://hl7.org/fhirpath/System.Long" => "i64",
+                        "http://hl7.org/fhirpath/System.Decimal" => "f64",
+                        "http://hl7.org/fhirpath/System.DateTime" => "String",
+                        "http://hl7.org/fhirpath/System.Time" => "String",
+                        "http://hl7.org/fhirpath/System.Quantity" => "String",
                         _ => ty.code.as_str(), // Use the type name directly for complex types
                     };
 
@@ -224,7 +208,7 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                         output.push_str(field_name);
                         output.push_str("\")]\n");
                     }
-                    
+
                     let type_str = if is_array {
                         format!("Option<Vec<{}>>", base_type)
                     } else if element.min.unwrap_or(0) == 0 {
