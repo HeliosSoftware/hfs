@@ -202,22 +202,69 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                         _ => ty.code.as_str(), // Use the type name directly for complex types
                     };
 
-                    // Add field with proper optionality and array handling
-                    if field_name != rust_field_name {
-                        output.push_str("    #[serde(rename = \"");
-                        output.push_str(field_name);
-                        output.push_str("\")]\n");
-                    }
+                    // Check if this is a choice type field
+                    if element.path.ends_with("[x]") {
+                        // Generate enum name from base path
+                        let base_path = element.path.trim_end_matches("[x]");
+                        let enum_name = base_path.split('.').last()
+                            .unwrap_or("Unknown")
+                            .chars()
+                            .next()
+                            .unwrap()
+                            .to_uppercase()
+                            .chain(base_path.split('.').last().unwrap_or("Unknown").chars().skip(1))
+                            .collect::<String>();
+                        
+                        // Create enum with all possible types
+                        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+                        output.push_str("#[serde(rename_all = \"camelCase\")]\n");
+                        output.push_str(&format!("pub enum {} {{\n", enum_name));
+                        
+                        if let Some(types) = &element.r#type {
+                            for ty in types {
+                                let variant_name = ty.code.chars().next().unwrap().to_uppercase()
+                                    .chain(ty.code.chars().skip(1))
+                                    .collect::<String>();
+                                let type_str = match ty.code.as_str() {
+                                    "string" => "String",
+                                    "boolean" => "bool",
+                                    "integer" => "i32",
+                                    "decimal" => "String",
+                                    "Reference" => "Reference",
+                                    _ => &ty.code,
+                                };
+                                output.push_str(&format!("    {}({}),\n", variant_name, type_str));
+                            }
+                        }
+                        output.push_str("}\n\n");
 
-                    let type_str = if is_array {
-                        format!("Option<Vec<{}>>", base_type)
-                    } else if element.min.unwrap_or(0) == 0 {
-                        format!("Option<{}>", base_type)
+                        // Add the field using the enum type
+                        let field_name = base_path.split('.').last().unwrap_or("unknown");
+                        let rust_field_name = make_rust_safe(field_name);
+                        let type_str = if element.min.unwrap_or(0) == 0 {
+                            format!("Option<{}>", enum_name)
+                        } else {
+                            enum_name
+                        };
+                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     } else {
-                        base_type.to_string()
-                    };
+                        // Add field with proper optionality and array handling
+                        if field_name != rust_field_name {
+                            output.push_str("    #[serde(rename = \"");
+                            output.push_str(field_name);
+                            output.push_str("\")]\n");
+                        }
 
-                    output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                        let type_str = if is_array {
+                            format!("Option<Vec<{}>>", base_type)
+                        } else if element.min.unwrap_or(0) == 0 {
+                            format!("Option<{}>", base_type)
+                        } else {
+                            base_type.to_string()
+                        };
+
+                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                    }
                 }
             }
         }
