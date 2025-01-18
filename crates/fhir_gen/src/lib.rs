@@ -2,6 +2,7 @@ pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, Resource};
 use clap::ValueEnum;
+use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
 use std::fs::File;
 use std::io;
@@ -128,7 +129,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             let file_name = format!("{}.rs", def.id.unwrap_or_default());
                             let file_path = output_path.join(file_name);
-                            std::fs::write(file_path, "// TODO: Generated structure code\n")?;
+                            std::fs::write(file_path, structure_definition_to_rust_file(def);)?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
@@ -155,6 +156,16 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
 
     Ok(())
 }
+
+fn structure_definition_to_rust_file(sd: StructureDefinition) => String {
+
+    // Return a TODO comment AI!
+    ret: String = "// TODO";
+
+
+
+}
+
 
 #[cfg(test)]
 mod tests {
