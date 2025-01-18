@@ -207,16 +207,8 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                     if element.path.ends_with("[x]") {
                         // Generate enum name from base path
                         let base_path = element.path.trim_end_matches("[x]");
-                        let enum_name = base_path.split('.').last()
-                            .unwrap_or("Unknown")
-                            .chars()
-                            .next()
-                            .unwrap()
-                            .to_uppercase()
-                            .chain(base_path.split('.').last().unwrap_or("Unknown").chars().skip(1))
-                            .collect::<String>();
                         
-                        // Store enum definition for later
+                        // Generate enum name from struct name and field
                         let enum_name = format!("{}{}", sd.name, base_path.split('.')
                             .last()
                             .unwrap_or("Unknown")
