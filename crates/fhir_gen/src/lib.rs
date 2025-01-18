@@ -129,6 +129,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             let file_name = format!("{}.rs", def.id.unwrap_or_default());
                             let file_path = output_path.join(file_name);
+                            // AI! Can you fix this compiler error?
                             std::fs::write(file_path, structure_definition_to_rust_file(def))?;
                         }
                     }
@@ -159,7 +160,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
 
 fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     let mut output = String::new();
-    
+
     // Add module documentation
     if let Some(description) = sd.description {
         output.push_str(&format!("//! {}\n\n", description));
@@ -172,16 +173,18 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     // Add fields from snapshot or differential
     if let Some(snapshot) = sd.snapshot {
         if let Some(elements) = snapshot.element {
-            for element in elements.iter().skip(1) { // Skip first element as it's the root
+            for element in elements.iter().skip(1) {
+                // Skip first element as it's the root
                 if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-                    output.push_str(&format!("    pub {}: {},\n", 
+                    output.push_str(&format!(
+                        "    pub {}: {},\n",
                         element.path.split('.').last().unwrap_or("unknown"),
                         match ty.code.as_str() {
                             "string" => "String",
                             "boolean" => "bool",
                             "integer" => "i32",
                             "decimal" => "f64",
-                            _ => "String" // Default to String for now
+                            _ => "String", // Default to String for now
                         }
                     ));
                 }
@@ -191,10 +194,7 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
 
     output.push_str("}\n");
     output
-
-
 }
-
 
 #[cfg(test)]
 mod tests {
