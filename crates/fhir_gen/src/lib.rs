@@ -167,7 +167,7 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
 
     // Add imports
     output.push_str("use serde::{Serialize, Deserialize};\n\n");
-    
+
     // Add struct definition
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str(&format!("pub struct {} {{\n", sd.name));
