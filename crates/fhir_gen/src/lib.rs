@@ -166,6 +166,7 @@ fn make_rust_safe(input: &str) -> String {
 
 fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     let mut output = String::new();
+    let mut enums_to_add = Vec::new();
 
     // Add module documentation
     //if let Some(description) = sd.description {
@@ -215,10 +216,21 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                             .chain(base_path.split('.').last().unwrap_or("Unknown").chars().skip(1))
                             .collect::<String>();
                         
-                        // Create enum with all possible types
-                        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-                        output.push_str("#[serde(rename_all = \"camelCase\")]\n");
-                        output.push_str(&format!("pub enum {} {{\n", enum_name));
+                        // Store enum definition for later
+                        let enum_name = format!("{}{}", sd.name, base_path.split('.')
+                            .last()
+                            .unwrap_or("Unknown")
+                            .chars()
+                            .next()
+                            .unwrap()
+                            .to_uppercase()
+                            .chain(base_path.split('.').last().unwrap_or("Unknown").chars().skip(1))
+                            .collect::<String>());
+
+                        let mut enum_def = String::new();
+                        enum_def.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+                        enum_def.push_str("#[serde(rename_all = \"camelCase\")]\n");
+                        enum_def.push_str(&format!("pub enum {} {{\n", enum_name));
                         
                         if let Some(types) = &element.r#type {
                             for ty in types {
@@ -233,10 +245,13 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                                     "Reference" => "Reference",
                                     _ => &ty.code,
                                 };
-                                output.push_str(&format!("    {}({}),\n", variant_name, type_str));
+                                enum_def.push_str(&format!("    {}({}),\n", variant_name, type_str));
                             }
                         }
-                        output.push_str("}\n\n");
+                        enum_def.push_str("}\n\n");
+
+                        // Store enum definition to be added after struct
+                        enums_to_add.push(enum_def);
 
                         // Add the field using the enum type
                         let field_name = base_path.split('.').last().unwrap_or("unknown");
@@ -270,7 +285,13 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
         }
     }
 
-    output.push_str("}\n");
+    output.push_str("}\n\n");
+    
+    // Add all the enums after the struct definition
+    for enum_def in enums_to_add {
+        output.push_str(&enum_def);
+    }
+    
     output
 }
 
