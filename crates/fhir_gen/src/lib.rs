@@ -176,7 +176,7 @@ fn generate_code(
                                 let file_name = format!("{}.rs", id);
                                 let file_path = output_path.join(&file_name);
                                 std::fs::write(file_path, structure_definition_to_rust_file(def))?;
-                                generated_modules.push(id);
+                                generated_modules.push(id.to_string());
                             }
                         }
                     }
