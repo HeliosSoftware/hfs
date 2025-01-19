@@ -21,8 +21,6 @@ pub enum FhirVersion {
 
 impl ToString for FhirVersion {
     fn to_string(&self) -> String {
-        // Can't this be simplified using version.to_string().to_uppercase() AI!
-
         match self {
             FhirVersion::R4 => "R4".to_string(),
             FhirVersion::R4B => "R4B".to_string(),
