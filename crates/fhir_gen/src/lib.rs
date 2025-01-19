@@ -45,22 +45,10 @@ fn process_single_version(
 
     let generated_path = base_output_path.as_ref().join("generated");
     let (version_dir, output_path) = match version {
-        FhirVersion::R4 => (
-            resources_dir.join("R4"),
-            generated_path.join("R4"),
-        ),
-        FhirVersion::R4B => (
-            resources_dir.join("R4B"),
-            generated_path.join("R4B"),
-        ),
-        FhirVersion::R5 => (
-            resources_dir.join("R5"),
-            generated_path.join("R5"),
-        ),
-        FhirVersion::R6 => (
-            resources_dir.join("build"),
-            generated_path.join("R6"),
-        ),
+        FhirVersion::R4 => (resources_dir.join("R4"), generated_path.join("R4")),
+        FhirVersion::R4B => (resources_dir.join("R4B"), generated_path.join("R4B")),
+        FhirVersion::R5 => (resources_dir.join("R5"), generated_path.join("R5")),
+        FhirVersion::R6 => (resources_dir.join("build"), generated_path.join("R6")),
         FhirVersion::All => return Ok(()), // Skip All variant
     };
 
@@ -164,10 +152,7 @@ fn generate_code(
                             if let Some(id) = &def.id {
                                 let file_name = format!("{}.rs", id);
                                 let file_path = output_path.join(&file_name);
-                                std::fs::write(
-                                    file_path,
-                                    structure_definition_to_rust_file(def, version),
-                                )?;
+                                std::fs::write(file_path, structure_definition_to_rust_file(def))?;
                                 generated_modules.push(id.clone());
                             }
                         }
@@ -186,18 +171,9 @@ fn generate_code(
 
     // Generate lib.rs with module declarations and use statements
     let mut lib_content = String::new();
-    lib_content.push_str(&format!("//! FHIR {} types\n\n", version.to_string()));
-    
-    // Sort modules for consistent output
-    generated_modules.sort();
-    
-    // Add module declarations
-    for module in &generated_modules {
-        lib_content.push_str(&format!("pub mod {};\n", module));
-    }
+    lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
 
     // Add use statements
-    lib_content.push_str("\n// Re-export all types\n");
     for module in generated_modules {
         lib_content.push_str(&format!("pub use {}::*;\n", module));
     }
@@ -215,14 +191,9 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust_file(sd: &StructureDefinition, version: &FhirVersion) -> String {
+fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
     let mut enums_to_add = Vec::new();
-
-    // Add module documentation
-    //if let Some(description) = sd.description {
-    //    output.push_str(&format!("//! {}\n\n", description));
-    //}
 
     // Add imports
     output.push_str("use serde::{Serialize, Deserialize};\n\n");
