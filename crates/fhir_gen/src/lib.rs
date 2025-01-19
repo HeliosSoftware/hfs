@@ -191,7 +191,7 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
+fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
     let mut enums_to_add = Vec::new();
 
@@ -208,8 +208,8 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     output.push_str(&format!("pub struct {} {{\n", sd.name));
 
     // Add fields from snapshot or differential
-    if let Some(snapshot) = sd.snapshot {
-        if let Some(elements) = snapshot.element {
+    if let Some(snapshot) = &sd.snapshot {
+        if let Some(elements) = &snapshot.element {
             for element in elements.iter().skip(1) {
                 // Skip first element as it's the root
                 if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
