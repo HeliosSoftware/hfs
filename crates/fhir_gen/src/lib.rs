@@ -175,13 +175,22 @@ fn generate_code(
 
     println!("Generated modules size: {}", generated_modules.len());
     if !generated_modules.is_empty() {
-        println!("First few modules: {:?}", &generated_modules[..generated_modules.len().min(3)]);
+        println!(
+            "First few modules: {:?}",
+            &generated_modules[..generated_modules.len().min(3)]
+        );
     }
+
+    // generated_modules has a non zero length, but lib_content.push_str("hi"); is not getting
+    // called AI!
 
     // Add use statements
     for module in generated_modules {
-        lib_content.push_str(&format!("pub use {}::*;\n", module));
+        let use_statement = format!("pub use {}::*;\n", module);
+        lib_content.push_str(&use_statement);
+        lib_content.push_str("hi");
     }
+    lib_content.push_str("hi2");
 
     // Write lib.rs
     std::fs::write(output_path.join("lib.rs"), lib_content)?;
