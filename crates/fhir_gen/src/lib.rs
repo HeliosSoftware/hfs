@@ -67,17 +67,40 @@ fn process_single_version(
     std::fs::create_dir_all(&output_path)?;
 
     // Process all JSON files in the version directory
+    let mut all_generated_modules = Vec::new();
+    
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_path, version)?,
+                Ok(bundle) => generate_code(bundle, &output_path, version, &mut all_generated_modules)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
             }
             Ok(())
         })?;
+
+    // Write final lib.rs with all accumulated modules
+    let mut lib_content = String::new();
+    lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
+
+    println!("Total generated modules: {}", all_generated_modules.len());
+    if !all_generated_modules.is_empty() {
+        println!(
+            "First few modules: {:?}",
+            &all_generated_modules[..all_generated_modules.len().min(3)]
+        );
+    }
+
+    // Add use statements for all modules
+    for module in all_generated_modules {
+        println!("Adding module to lib.rs: {}", module);
+        let use_statement = format!("pub use {}::*;\n", module);
+        lib_content.push_str(&use_statement);
+    }
+    
+    std::fs::write(output_path.join("lib.rs"), lib_content)?;
     Ok(())
 }
 
@@ -130,16 +153,16 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
+// Track all generated modules across files
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
     version: &FhirVersion,
+    generated_modules: &mut Vec<String>,
 ) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
-
-    let mut generated_modules = Vec::new();
 
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
