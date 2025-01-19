@@ -43,22 +43,23 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
 
+    let generated_path = base_output_path.as_ref().join("generated");
     let (version_dir, output_path) = match version {
         FhirVersion::R4 => (
             resources_dir.join("R4"),
-            base_output_path.as_ref().join("generated").join("R4"),
+            generated_path.join("R4"),
         ),
         FhirVersion::R4B => (
             resources_dir.join("R4B"),
-            base_output_path.as_ref().join("generated").join("R4B"),
+            generated_path.join("R4B"),
         ),
         FhirVersion::R5 => (
             resources_dir.join("R5"),
-            base_output_path.as_ref().join("generated").join("R5"),
+            generated_path.join("R5"),
         ),
         FhirVersion::R6 => (
             resources_dir.join("build"),
-            base_output_path.as_ref().join("generated").join("R6"),
+            generated_path.join("R6"),
         ),
         FhirVersion::All => return Ok(()), // Skip All variant
     };
