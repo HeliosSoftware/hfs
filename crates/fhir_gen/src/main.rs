@@ -26,8 +26,7 @@ fn main() {
         }
     };
 
-    let output_dir = std::path::PathBuf::from("crates/fhir/src")
-        .join(args.version.to_string().to_lowercase());
+    let output_dir = std::path::PathBuf::from("crates/fhir/src");
 
     if let Err(e) = fhir_gen::process_fhir_version(args.version, &output_dir) {
         eprintln!("Error processing FHIR version: {}", e);
