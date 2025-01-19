@@ -22,11 +22,11 @@ pub enum FhirVersion {
 impl ToString for FhirVersion {
     fn to_string(&self) -> String {
         match self {
-            FhirVersion::R4 => "r4".to_string(),
-            FhirVersion::R4B => "r4b".to_string(),
-            FhirVersion::R5 => "r5".to_string(),
-            FhirVersion::R6 => "r6".to_string(),
-            FhirVersion::All => "all".to_string(),
+            FhirVersion::R4 => "R4".to_string(),
+            FhirVersion::R4B => "R4B".to_string(),
+            FhirVersion::R5 => "R5".to_string(),
+            FhirVersion::R6 => "R6".to_string(),
+            FhirVersion::All => "ALL".to_string(),
         }
     }
 }
@@ -46,19 +46,19 @@ fn process_single_version(
     let (version_dir, output_path) = match version {
         FhirVersion::R4 => (
             resources_dir.join("R4"),
-            base_output_path.as_ref().join("r4"),
+            base_output_path.as_ref().join("R4"),
         ),
         FhirVersion::R4B => (
             resources_dir.join("R4B"),
-            base_output_path.as_ref().join("r4b"),
+            base_output_path.as_ref().join("R4B"),
         ),
         FhirVersion::R5 => (
             resources_dir.join("R5"),
-            base_output_path.as_ref().join("r5"),
+            base_output_path.as_ref().join("R5"),
         ),
         FhirVersion::R6 => (
             resources_dir.join("build"),
-            base_output_path.as_ref().join("r6"),
+            base_output_path.as_ref().join("R6"),
         ),
         FhirVersion::All => return Ok(()), // Skip All variant
     };
@@ -196,7 +196,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition, version: &FhirVer
     let mut enums_to_add = Vec::new();
 
     // Add module declaration
-    output.push_str(&format!("pub mod {};\n\n", version.to_string()));
+    output.push_str(&format!("pub mod {};\n\n", version.to_string().to_uppercase()));
 
     // Add module documentation
     //if let Some(description) = sd.description {
