@@ -151,6 +151,8 @@ fn generate_code(
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
 
+    let mut generated_modules = Vec::new();
+
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
         for entry in entries {
@@ -159,25 +161,22 @@ fn generate_code(
                     Resource::StructureDefinition(def) => {
                         // Only process complex-type and primitive-type definitions
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
-                            let file_name = format!("{}.rs", def.id.clone().unwrap_or_default());
-                            let file_path = output_path.join(file_name);
-                            std::fs::write(
-                                file_path,
-                                structure_definition_to_rust_file(def, version),
-                            )?;
+                            if let Some(id) = &def.id {
+                                let file_name = format!("{}.rs", id);
+                                let file_path = output_path.join(&file_name);
+                                std::fs::write(
+                                    file_path,
+                                    structure_definition_to_rust_file(def, version),
+                                )?;
+                                generated_modules.push(id.clone());
+                            }
                         }
                     }
                     Resource::SearchParameter(_param) => {
                         // TODO: Generate code for search parameter
-                        //let file_name = format!("search_{}.rs", param.id.unwrap_or_default());
-                        //let file_path = output_path.join(file_name);
-                        //std::fs::write(file_path, "// TODO: Generated search code\n")?;
                     }
                     Resource::OperationDefinition(_op) => {
                         // TODO: Generate code for operation definition
-                        //let file_name = format!("op_{}.rs", op.id.unwrap_or_default());
-                        //let file_path = output_path.join(file_name);
-                        //std::fs::write(file_path, "// TODO: Generated operation code\n")?;
                     }
                     _ => {} // Skip other resource types for now
                 }
@@ -185,9 +184,20 @@ fn generate_code(
         }
     }
 
-    // Write a placeholder file to verify the path works
-    let placeholder_path = output_path.join("placeholder.rs");
-    std::fs::write(placeholder_path, "// TODO: Generated code will go here\n")?;
+    // Generate lib.rs with module declarations
+    let mut lib_content = String::new();
+    lib_content.push_str(&format!("//! FHIR {} types\n\n", version.to_string()));
+    
+    // Sort modules for consistent output
+    generated_modules.sort();
+    
+    // Add module declarations
+    for module in generated_modules {
+        lib_content.push_str(&format!("pub mod {};\n", module));
+    }
+
+    // Write lib.rs
+    std::fs::write(output_path.join("lib.rs"), lib_content)?;
 
     Ok(())
 }
