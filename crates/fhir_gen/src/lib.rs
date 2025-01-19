@@ -173,7 +173,10 @@ fn generate_code(
     let mut lib_content = String::new();
     lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
 
-    // print the size of generated_modules and the first 3 values AI!
+    println!("Generated modules size: {}", generated_modules.len());
+    if !generated_modules.is_empty() {
+        println!("First few modules: {:?}", &generated_modules[..generated_modules.len().min(3)]);
+    }
 
     // Add use statements
     for module in generated_modules {
