@@ -26,8 +26,10 @@ fn main() {
         }
     };
 
-    let output_dir = std::path::PathBuf::from("crates/fhir/src")
-        .join(args.version.to_string().to_lowercase());
+    // This path needs to be relative to the root of the project, and not this module AI!
+    let output_dir =
+        std::path::PathBuf::from("crates/fhir/src").join(args.version.to_string().to_lowercase());
+
     if let Err(e) = fhir_gen::process_fhir_version(args.version, &output_dir) {
         eprintln!("Error processing FHIR version: {}", e);
         std::process::exit(1);
