@@ -181,16 +181,14 @@ fn generate_code(
         );
     }
 
-    // generated_modules has a non zero length, but lib_content.push_str("hi"); is not getting
-    // called AI!
-
+    println!("About to process use statements...");
     // Add use statements
     for module in generated_modules {
+        println!("Processing module: {}", module);
         let use_statement = format!("pub use {}::*;\n", module);
         lib_content.push_str(&use_statement);
-        lib_content.push_str("hi");
     }
-    lib_content.push_str("hi2");
+    println!("Final lib_content length: {}", lib_content.len());
 
     // Write lib.rs
     std::fs::write(output_path.join("lib.rs"), lib_content)?;
