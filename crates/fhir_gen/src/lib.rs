@@ -37,14 +37,29 @@ impl Default for FhirVersion {
     }
 }
 
-fn process_single_version(version: &FhirVersion, base_output_path: impl AsRef<Path>) -> io::Result<()> {
+fn process_single_version(
+    version: &FhirVersion,
+    base_output_path: impl AsRef<Path>,
+) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
 
     let (version_dir, output_path) = match version {
-        FhirVersion::R4 => (resources_dir.join("R4"), base_output_path.as_ref().join("r4")),
-        FhirVersion::R4B => (resources_dir.join("R4B"), base_output_path.as_ref().join("r4b")),
-        FhirVersion::R5 => (resources_dir.join("R5"), base_output_path.as_ref().join("r5")),
-        FhirVersion::R6 => (resources_dir.join("build"), base_output_path.as_ref().join("r6")),
+        FhirVersion::R4 => (
+            resources_dir.join("R4"),
+            base_output_path.as_ref().join("r4"),
+        ),
+        FhirVersion::R4B => (
+            resources_dir.join("R4B"),
+            base_output_path.as_ref().join("r4b"),
+        ),
+        FhirVersion::R5 => (
+            resources_dir.join("R5"),
+            base_output_path.as_ref().join("r5"),
+        ),
+        FhirVersion::R6 => (
+            resources_dir.join("build"),
+            base_output_path.as_ref().join("r6"),
+        ),
         FhirVersion::All => return Ok(()), // Skip All variant
     };
 
@@ -141,7 +156,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             let file_name = format!("{}.rs", def.id.clone().unwrap_or_default());
                             let file_path = output_path.join(file_name);
-                            std::fs::write(file_path, structure_definition_to_rust_file(def.clone()))?;
+                            std::fs::write(file_path, structure_definition_to_rust_file(def))?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
@@ -219,26 +234,43 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                     if element.path.ends_with("[x]") {
                         // Generate enum name from base path
                         let base_path = element.path.trim_end_matches("[x]");
-                        
+
                         // Generate enum name from struct name and field
-                        let enum_name = format!("{}{}", sd.name, base_path.split('.')
-                            .last()
-                            .unwrap_or("Unknown")
-                            .chars()
-                            .next()
-                            .unwrap()
-                            .to_uppercase()
-                            .chain(base_path.split('.').last().unwrap_or("Unknown").chars().skip(1))
-                            .collect::<String>());
+                        let enum_name = format!(
+                            "{}{}",
+                            sd.name,
+                            base_path
+                                .split('.')
+                                .last()
+                                .unwrap_or("Unknown")
+                                .chars()
+                                .next()
+                                .unwrap()
+                                .to_uppercase()
+                                .chain(
+                                    base_path
+                                        .split('.')
+                                        .last()
+                                        .unwrap_or("Unknown")
+                                        .chars()
+                                        .skip(1)
+                                )
+                                .collect::<String>()
+                        );
 
                         let mut enum_def = String::new();
                         enum_def.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
                         enum_def.push_str("#[serde(rename_all = \"camelCase\")]\n");
                         enum_def.push_str(&format!("pub enum {} {{\n", enum_name));
-                        
+
                         if let Some(types) = &element.r#type {
                             for ty in types {
-                                let variant_name = ty.code.chars().next().unwrap().to_uppercase()
+                                let variant_name = ty
+                                    .code
+                                    .chars()
+                                    .next()
+                                    .unwrap()
+                                    .to_uppercase()
                                     .chain(ty.code.chars().skip(1))
                                     .collect::<String>();
                                 let type_str = match ty.code.as_str() {
@@ -249,7 +281,8 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
                                     "Reference" => "Reference",
                                     _ => &ty.code,
                                 };
-                                enum_def.push_str(&format!("    {}({}),\n", variant_name, type_str));
+                                enum_def
+                                    .push_str(&format!("    {}({}),\n", variant_name, type_str));
                             }
                         }
                         enum_def.push_str("}\n\n");
@@ -290,12 +323,12 @@ fn structure_definition_to_rust_file(sd: StructureDefinition) -> String {
     }
 
     output.push_str("}\n\n");
-    
+
     // Add all the enums after the struct definition
     for enum_def in enums_to_add {
         output.push_str(&enum_def);
     }
-    
+
     output
 }
 
@@ -336,7 +369,10 @@ mod tests {
                 Ok(bundle) => {
                     // Verify that we have something
                     if bundle.entry.is_none() {
-                        println!("Warning: Bundle entry is None for file: {}", file_path.display());
+                        println!(
+                            "Warning: Bundle entry is None for file: {}",
+                            file_path.display()
+                        );
                         continue;
                     }
 
