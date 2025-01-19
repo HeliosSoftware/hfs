@@ -153,7 +153,7 @@ fn generate_code(
                                 let file_name = format!("{}.rs", id);
                                 let file_path = output_path.join(&file_name);
                                 std::fs::write(file_path, structure_definition_to_rust_file(def))?;
-                                generated_modules.push(id.clone());
+                                generated_modules.push(id);
                             }
                         }
                     }
@@ -172,6 +172,8 @@ fn generate_code(
     // Generate lib.rs with module declarations and use statements
     let mut lib_content = String::new();
     lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
+
+    // print the size of generated_modules and the first 3 values AI!
 
     // Add use statements
     for module in generated_modules {
