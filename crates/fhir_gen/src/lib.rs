@@ -82,7 +82,7 @@ fn process_single_version(
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_path)?,
+                Ok(bundle) => generate_code(bundle, &output_path, version)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -141,7 +141,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirVersion) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
