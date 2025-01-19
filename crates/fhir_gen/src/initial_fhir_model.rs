@@ -784,7 +784,7 @@ pub struct ElementDefinitionConstraint {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "resourceType")]
 pub struct StructureDefinition {
     pub id: Option<String>,
