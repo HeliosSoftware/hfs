@@ -21,6 +21,8 @@ pub enum FhirVersion {
 
 impl ToString for FhirVersion {
     fn to_string(&self) -> String {
+        // Can't this be simplified using version.to_string().to_uppercase() AI!
+
         match self {
             FhirVersion::R4 => "R4".to_string(),
             FhirVersion::R4B => "R4B".to_string(),
@@ -141,7 +143,11 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirVersion) -> io::Result<()> {
+fn generate_code(
+    _bundle: Bundle,
+    output_path: impl AsRef<Path>,
+    version: &FhirVersion,
+) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
@@ -156,7 +162,10 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirV
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             let file_name = format!("{}.rs", def.id.clone().unwrap_or_default());
                             let file_path = output_path.join(file_name);
-                            std::fs::write(file_path, structure_definition_to_rust_file(def, version))?;
+                            std::fs::write(
+                                file_path,
+                                structure_definition_to_rust_file(def, version),
+                            )?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
