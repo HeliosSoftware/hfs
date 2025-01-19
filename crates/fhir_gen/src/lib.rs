@@ -191,9 +191,12 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
+fn structure_definition_to_rust_file(sd: &StructureDefinition, version: &FhirVersion) -> String {
     let mut output = String::new();
     let mut enums_to_add = Vec::new();
+
+    // Add module declaration
+    output.push_str(&format!("pub mod {};\n\n", version.to_string()));
 
     // Add module documentation
     //if let Some(description) = sd.description {
