@@ -184,7 +184,7 @@ fn generate_code(
         }
     }
 
-    // Generate lib.rs with module declarations
+    // Generate lib.rs with module declarations and use statements
     let mut lib_content = String::new();
     lib_content.push_str(&format!("//! FHIR {} types\n\n", version.to_string()));
     
@@ -192,8 +192,14 @@ fn generate_code(
     generated_modules.sort();
     
     // Add module declarations
-    for module in generated_modules {
+    for module in &generated_modules {
         lib_content.push_str(&format!("pub mod {};\n", module));
+    }
+
+    // Add use statements
+    lib_content.push_str("\n// Re-export all types\n");
+    for module in generated_modules {
+        lib_content.push_str(&format!("pub use {}::*;\n", module));
     }
 
     // Write lib.rs
@@ -212,9 +218,6 @@ fn make_rust_safe(input: &str) -> String {
 fn structure_definition_to_rust_file(sd: &StructureDefinition, version: &FhirVersion) -> String {
     let mut output = String::new();
     let mut enums_to_add = Vec::new();
-
-    // Add module declaration
-    output.push_str(&format!("pub mod {};\n\n", version.to_string()));
 
     // Add module documentation
     //if let Some(description) = sd.description {
