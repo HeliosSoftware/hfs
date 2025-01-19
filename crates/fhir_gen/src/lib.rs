@@ -1,6 +1,6 @@
 pub mod initial_fhir_model;
 
-use crate::initial_fhir_model::{Bundle, BundleEntry, Resource};
+use crate::initial_fhir_model::{Bundle, Resource};
 use clap::ValueEnum;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
@@ -10,13 +10,25 @@ use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, ValueEnum, ToString)]
+#[derive(Debug, Clone, ValueEnum)]
 pub enum FhirVersion {
     R4,
     R4B,
     R5,
     R6,
     All,
+}
+
+impl ToString for FhirVersion {
+    fn to_string(&self) -> String {
+        match self {
+            FhirVersion::R4 => "r4".to_string(),
+            FhirVersion::R4B => "r4b".to_string(),
+            FhirVersion::R5 => "r5".to_string(),
+            FhirVersion::R6 => "r6".to_string(),
+            FhirVersion::All => "all".to_string(),
+        }
+    }
 }
 
 impl Default for FhirVersion {
@@ -122,7 +134,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
         for entry in entries {
-            if let Some(resource) = entry.resource {
+            if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
                         // Only process complex-type and primitive-type definitions
