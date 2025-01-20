@@ -25,17 +25,7 @@ impl Default for FhirVersion {
     }
 }
 
-impl AsRef<Path> for FhirVersion {
-    fn as_ref(&self) -> &Path {
-        Path::new(match self {
-            FhirVersion::R4 => "r4",
-            FhirVersion::R4B => "r4b",
-            FhirVersion::R5 => "r5",
-            FhirVersion::R6 => "r6",
-            FhirVersion::All => "all",
-        })
-    }
-}
+// AI!  Implement the trait that converts a FhirVersion to a String
 
 fn process_single_version(
     version: &FhirVersion,
