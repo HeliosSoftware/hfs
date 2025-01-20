@@ -25,7 +25,17 @@ impl Default for FhirVersion {
     }
 }
 
-// AI!  Implement the trait that converts a FhirVersion to a String
+impl ToString for FhirVersion {
+    fn to_string(&self) -> String {
+        match self {
+            FhirVersion::R4 => "r4".to_string(),
+            FhirVersion::R4B => "r4b".to_string(),
+            FhirVersion::R5 => "r5".to_string(),
+            FhirVersion::R6 => "r6".to_string(),
+            FhirVersion::All => "all".to_string(),
+        }
+    }
+}
 
 fn process_single_version(
     version: &FhirVersion,
