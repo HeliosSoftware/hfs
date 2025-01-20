@@ -154,9 +154,9 @@ fn generate_code(
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        // We want to ignore constraints which are derivations AI!
-                        // Only process complex-type and primitive-type definitions
-                        if def.kind == "complex-type" || def.kind == "primitive-type" {
+                        // Skip constraint derivations and only process base types
+                        if (def.kind == "complex-type" || def.kind == "primitive-type") 
+                            && def.derivation.as_deref() != Some("constraint") {
                             if let Some(id) = &def.id {
                                 let file_name = format!("{}.rs", id.to_lowercase());
                                 let file_path = output_path.join(&file_name);
