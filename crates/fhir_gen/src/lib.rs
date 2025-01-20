@@ -42,22 +42,20 @@ fn process_single_version(
     base_output_path: impl AsRef<Path>,
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let version_dir = resources_dir.join(version);
-    let output_path = base_output_path.as_ref().join(version);
+    let version_dir = resources_dir.join(version.to_string());
+    let output_path = base_output_path.as_ref().join(version.to_string());
 
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
 
-    // Process all JSON files in the version directory
+    // Process all JSON files in the resources/{FhirVersion} directory
     let mut all_generated_modules = Vec::new();
 
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => {
-                    generate_code(bundle, &output_path, version, &mut all_generated_modules)?
-                }
+                Ok(bundle) => generate_code(bundle, &output_path, &mut all_generated_modules)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -65,21 +63,29 @@ fn process_single_version(
             Ok(())
         })?;
 
-    // Write final lib.rs with all accumulated modules
+    // Write final {FhirVersion}.rs with all accumulated modules
     let mut lib_content = String::new();
-    lib_content.push_str(&format!("mod {};\n\n", version));
 
-    // Add use statements for all modules
+    // Add pub mod statements for all modules
     for module in all_generated_modules {
-        let use_statement = format!("pub use {}::*;\n", module);
-        lib_content.push_str(&use_statement);
+        lib_content.push_str(&format!("pub mod {};\n", module));
     }
 
-    std::fs::write(output_path.join("lib.rs"), lib_content)?;
+    std::fs::write(
+        base_output_path
+            .as_ref()
+            .join(&format!("{}.rs", version.to_string())),
+        lib_content,
+    )?;
+
     Ok(())
 }
 
 pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
+    let mut lib_content = String::new();
+
+    // In lib_content, I wish to collect 'pub mod X;' statements where X is the version.to_string()
+    // value, and then after they are all collected, we need to output this to lib.rs AI!
     match version {
         FhirVersion::All => {
             // Process each version separately
@@ -132,7 +138,6 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
-    version: &FhirVersion,
     generated_modules: &mut Vec<String>,
 ) -> io::Result<()> {
     // Create the output directory if it doesn't exist
@@ -328,9 +333,9 @@ mod tests {
         // Test processing R4 version
         assert!(process_fhir_version(FhirVersion::R4, &temp_dir).is_ok());
 
-        // Verify placeholder file was created
-        let placeholder_path = temp_dir.join("placeholder.rs");
-        assert!(placeholder_path.exists());
+        // Verify files were created
+        assert!(temp_dir.join("r4.rs").exists());
+        assert!(temp_dir.join("lib.rs").exists());
 
         // Clean up
         std::fs::remove_dir_all(&temp_dir).expect("Failed to clean up temp directory");
