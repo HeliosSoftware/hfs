@@ -25,13 +25,16 @@ impl Default for FhirVersion {
     }
 }
 
+// AI! finish this implementation
+impl AsRef<Path> for FhirVersion {}
+
 fn process_single_version(
     version: &FhirVersion,
     base_output_path: impl AsRef<Path>,
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let version_dir = resources_dir.join(version.to_string().to_lowercase());
-    let output_path = base_output_path.as_ref().join(version.to_string().to_lowercase());
+    let version_dir = resources_dir.join(version);
+    let output_path = base_output_path.as_ref().join(version);
 
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
