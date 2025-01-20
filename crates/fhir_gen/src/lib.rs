@@ -84,8 +84,6 @@ fn process_single_version(
 pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let mut lib_content = String::new();
 
-    // In lib_content, I wish to collect 'pub mod X;' statements where X is the version.to_string()
-    // value, and then after they are all collected, we need to output this to lib.rs AI!
     match version {
         FhirVersion::All => {
             // Process each version separately
@@ -98,10 +96,16 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
                 if let Err(e) = process_single_version(&ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
+                lib_content.push_str(&format!("pub mod {};\n", ver.to_string()));
             }
+            std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
             Ok(())
         }
-        specific_version => process_single_version(&specific_version, output_path),
+        specific_version => {
+            lib_content.push_str(&format!("pub mod {};\n", specific_version.to_string()));
+            std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
+            process_single_version(&specific_version, output_path)
+        }
     }
 }
 
