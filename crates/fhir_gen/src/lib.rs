@@ -154,6 +154,7 @@ fn generate_code(
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
+                        // We want to ignore constraints which are derivations AI!
                         // Only process complex-type and primitive-type definitions
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             if let Some(id) = &def.id {
