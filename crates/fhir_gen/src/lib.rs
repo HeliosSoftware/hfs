@@ -166,11 +166,10 @@ fn generate_code(
                         // Only process complex-type and primitive-type definitions
                         if def.kind == "complex-type" || def.kind == "primitive-type" {
                             if let Some(id) = &def.id {
-                                let lowercase_id = id.to_lowercase();
-                                let file_name = format!("{}.rs", lowercase_id);
+                                let file_name = format!("{}.rs", id.to_lowercase());
                                 let file_path = output_path.join(&file_name);
                                 std::fs::write(file_path, structure_definition_to_rust_file(def))?;
-                                generated_modules.push(lowercase_id);
+                                generated_modules.push(id.to_string());
                             }
                         }
                     }
