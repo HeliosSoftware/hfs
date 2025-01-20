@@ -19,18 +19,6 @@ pub enum FhirVersion {
     All,
 }
 
-impl ToString for FhirVersion {
-    fn to_string(&self) -> String {
-        match self {
-            FhirVersion::R4 => "R4".to_string(),
-            FhirVersion::R4B => "R4B".to_string(),
-            FhirVersion::R5 => "R5".to_string(),
-            FhirVersion::R6 => "R6".to_string(),
-            FhirVersion::All => "ALL".to_string(),
-        }
-    }
-}
-
 impl Default for FhirVersion {
     fn default() -> Self {
         FhirVersion::R4
@@ -43,25 +31,7 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
 
-    let generated_path = base_output_path.as_ref().join("generated");
-    let (version_dir, output_path) = match version {
-        FhirVersion::R4 => (resources_dir.join("R4"), generated_path.join("R4")),
-        FhirVersion::R4B => (resources_dir.join("R4B"), generated_path.join("R4B")),
-        FhirVersion::R5 => (resources_dir.join("R5"), generated_path.join("R5")),
-        FhirVersion::R6 => (resources_dir.join("build"), generated_path.join("R6")),
-        FhirVersion::All => return Ok(()), // Skip All variant
-    };
-
-    if !version_dir.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "FHIR resources directory not found for version {:?}: {}",
-                version,
-                version_dir.display()
-            ),
-        ));
-    }
+    // declare output_path and appeand version to it AI!
 
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
@@ -85,7 +55,7 @@ fn process_single_version(
 
     // Write final lib.rs with all accumulated modules
     let mut lib_content = String::new();
-    lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
+    lib_content.push_str(&format!("mod {};\n\n", version));
 
     // Add use statements for all modules
     for module in all_generated_modules {
@@ -184,18 +154,6 @@ fn generate_code(
             }
         }
     }
-
-    // Generate lib.rs with module declarations and use statements
-    let mut lib_content = String::new();
-    lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
-
-    // Add use statements
-    for module in generated_modules {
-        lib_content.push_str(&format!("pub use {}::*;\n", module));
-    }
-
-    // Write lib.rs
-    std::fs::write(output_path.join("lib.rs"), lib_content)?;
 
     Ok(())
 }
