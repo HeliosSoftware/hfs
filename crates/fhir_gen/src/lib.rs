@@ -30,8 +30,8 @@ fn process_single_version(
     base_output_path: impl AsRef<Path>,
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-
-    // declare output_path and appeand version to it AI!
+    let version_dir = resources_dir.join(version.to_string().to_lowercase());
+    let output_path = base_output_path.as_ref().join(version.to_string().to_lowercase());
 
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
