@@ -68,12 +68,14 @@ fn process_single_version(
 
     // Process all JSON files in the version directory
     let mut all_generated_modules = Vec::new();
-    
+
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_path, version, &mut all_generated_modules)?,
+                Ok(bundle) => {
+                    generate_code(bundle, &output_path, version, &mut all_generated_modules)?
+                }
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -85,21 +87,12 @@ fn process_single_version(
     let mut lib_content = String::new();
     lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
 
-    println!("Total generated modules: {}", all_generated_modules.len());
-    if !all_generated_modules.is_empty() {
-        println!(
-            "First few modules: {:?}",
-            &all_generated_modules[..all_generated_modules.len().min(3)]
-        );
-    }
-
     // Add use statements for all modules
     for module in all_generated_modules {
-        println!("Adding module to lib.rs: {}", module);
         let use_statement = format!("pub use {}::*;\n", module);
         lib_content.push_str(&use_statement);
     }
-    
+
     std::fs::write(output_path.join("lib.rs"), lib_content)?;
     Ok(())
 }
@@ -196,22 +189,10 @@ fn generate_code(
     let mut lib_content = String::new();
     lib_content.push_str(&format!("mod {};\n\n", version.to_string()));
 
-    println!("Generated modules size: {}", generated_modules.len());
-    if !generated_modules.is_empty() {
-        println!(
-            "First few modules: {:?}",
-            &generated_modules[..generated_modules.len().min(3)]
-        );
-    }
-
-    println!("About to process use statements...");
     // Add use statements
     for module in generated_modules {
-        println!("Processing module: {}", module);
-        let use_statement = format!("pub use {}::*;\n", module);
-        lib_content.push_str(&use_statement);
+        lib_content.push_str(&format!("pub use {}::*;\n", module));
     }
-    println!("Final lib_content length: {}", lib_content.len());
 
     // Write lib.rs
     std::fs::write(output_path.join("lib.rs"), lib_content)?;
