@@ -190,7 +190,13 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
-// AI! create a function that capitalizes the first letter of a string and returns it
+fn capitalize_first_letter(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+    }
+}
 
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
