@@ -235,8 +235,12 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
-                                // AI! Capitalize first letter of ty.code
-                                _ => &ty.code,
+                                _ => {
+                                    // Capitalize first letter of type code
+                                    &ty.code.chars().next().unwrap_or_default().to_uppercase()
+                                        .chain(ty.code.chars().skip(1))
+                                        .collect::<String>()
+                                },
                             };
 
                             let type_str = if is_array {
