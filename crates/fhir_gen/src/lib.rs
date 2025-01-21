@@ -212,6 +212,50 @@ fn process_elements(
     processed_types: &mut std::collections::HashSet<String>,
     base_name: &str,
 ) {
+    // Generate main struct first
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    output.push_str(&format!("pub struct {} {{\n", base_name));
+    
+    // Add fields for the main struct
+    if let Some(main_elements) = elements.iter().find(|e| e.path == base_name) {
+        for element in elements.iter().filter(|e| {
+            let parts: Vec<&str> = e.path.split('.').collect();
+            parts.len() == 2 && parts[0] == base_name
+        }) {
+            if let Some(field_name) = element.path.split('.').last() {
+                if !field_name.contains("[x]") {
+                    let rust_field_name = make_rust_safe(field_name);
+                    
+                    if field_name != rust_field_name {
+                        output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
+                    }
+
+                    if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+                        let is_array = element.max.as_deref() == Some("*");
+                        let base_type = match ty.code.as_str() {
+                            "http://hl7.org/fhirpath/System.String" => "String",
+                            "positiveInt" | "unsignedInt" => "u32",
+                            "decimal" => "String",
+                            "code" => "String",
+                            "time" => "String",
+                            _ => &ty.code
+                        };
+
+                        let type_str = if is_array {
+                            format!("Option<Vec<{}>>", base_type)
+                        } else if element.min.unwrap_or(0) == 0 {
+                            format!("Option<{}>", base_type)
+                        } else {
+                            base_type.to_string()
+                        };
+
+                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                    }
+                }
+            }
+        }
+    }
+    output.push_str("}\n\n");
     // Group elements by their parent path
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
