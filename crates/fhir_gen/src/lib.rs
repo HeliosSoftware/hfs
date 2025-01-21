@@ -235,6 +235,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
+                                // AI! Capitalize first letter of ty.code
                                 _ => &ty.code,
                             };
 
