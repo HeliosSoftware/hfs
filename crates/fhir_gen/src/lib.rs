@@ -2,6 +2,7 @@ pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, Resource};
 use clap::ValueEnum;
+use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
 use std::fs::File;
@@ -190,7 +191,7 @@ fn make_rust_safe(input: &str) -> String {
 
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
-    
+
     // Add imports
     output.push_str("use serde::{Serialize, Deserialize};\n\n");
 
@@ -206,18 +207,19 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
 }
 
 fn process_elements(
-    elements: &[Element],
+    elements: &[ElementDefinition],
     output: &mut String,
     processed_types: &mut std::collections::HashSet<String>,
     base_name: &str,
 ) {
     // Group elements by their parent path
-    let mut element_groups: std::collections::HashMap<String, Vec<&Element>> = std::collections::HashMap::new();
-    
+    let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
+        std::collections::HashMap::new();
+
     for element in elements {
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
-            let parent_path = path_parts[..path_parts.len()-1].join(".");
+            let parent_path = path_parts[..path_parts.len() - 1].join(".");
             element_groups.entry(parent_path).or_default().push(element);
         }
     }
@@ -237,11 +239,20 @@ fn process_elements(
         let choice_field = group.iter().find(|e| e.path.ends_with("[x]"));
         if let Some(choice) = choice_field {
             // Generate choice type enum
-            let enum_name = format!("{}{}", type_name, choice.path.split('.').last().unwrap().trim_end_matches("[x]"));
+            let enum_name = format!(
+                "{}{}",
+                type_name,
+                choice
+                    .path
+                    .split('.')
+                    .last()
+                    .unwrap()
+                    .trim_end_matches("[x]")
+            );
             output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
-            
+
             if let Some(types) = &choice.r#type {
                 for ty in types {
                     output.push_str(&format!("    {}({}),\n", ty.code, ty.code));
@@ -258,7 +269,7 @@ fn process_elements(
             if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
                     let rust_field_name = make_rust_safe(field_name);
-                    
+
                     if field_name != rust_field_name {
                         output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
                     }
@@ -271,7 +282,7 @@ fn process_elements(
                             "decimal" => "String",
                             "code" => "String",
                             "time" => "String",
-                            _ => &ty.code
+                            _ => &ty.code,
                         };
 
                         let type_str = if is_array {
@@ -298,30 +309,21 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
     if parts[0] == base_name {
         // For nested types, combine the parent type names
-        parts[1..].iter()
-            .map(|p| p.chars().next().unwrap().to_uppercase().chain(p.chars().skip(1)).collect::<String>())
+        parts[1..]
+            .iter()
+            .map(|p| {
+                p.chars()
+                    .next()
+                    .unwrap()
+                    .to_uppercase()
+                    .chain(p.chars().skip(1))
+                    .collect::<String>()
+            })
             .collect::<String>()
     } else {
         // For root type, use as is
         path.to_string()
     }
-}
-
-fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
-    let mut output = String::new();
-    
-    // Add imports
-    output.push_str("use serde::{Serialize, Deserialize};\n\n");
-
-    // Process elements recursively
-    if let Some(snapshot) = &sd.snapshot {
-        if let Some(elements) = &snapshot.element {
-            let mut processed_types = std::collections::HashSet::new();
-            process_elements(elements, &mut output, &mut processed_types, &sd.name);
-        }
-    }
-
-    output
 }
 
 #[cfg(test)]
