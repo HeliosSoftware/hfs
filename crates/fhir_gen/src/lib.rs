@@ -307,130 +307,20 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
     }
 }
 
-    // Generate main struct
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-    output.push_str(&format!("pub struct {} {{\n", sd.name));
+}
 
-    // Add fields from snapshot or differential
+fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
+    let mut output = String::new();
+    
+    // Add imports
+    output.push_str("use serde::{Serialize, Deserialize};\n\n");
+
+    // Process elements recursively
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
-            for element in elements.iter().skip(1) {
-                // Skip first element as it's the root
-                if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-                    let field_name = element.path.split('.').last().unwrap_or("unknown");
-                    let rust_field_name = make_rust_safe(field_name);
-
-                    // Handle array types
-                    let is_array = element.max.as_deref() == Some("*");
-                    let base_type = match ty.code.as_str() {
-                        "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                        "http://hl7.org/fhirpath/System.String" => "String",
-                        "http://hl7.org/fhirpath/System.Integer" => "i32",
-                        "http://hl7.org/fhirpath/System.Long" => "i64",
-                        "http://hl7.org/fhirpath/System.Decimal" => "f64",
-                        "http://hl7.org/fhirpath/System.DateTime" => "String",
-                        "http://hl7.org/fhirpath/System.Time" => "String",
-                        "http://hl7.org/fhirpath/System.Quantity" => "String",
-                        _ => ty.code.as_str(), // Use the type name directly for complex types
-                    };
-
-                    // Check if this is a choice type field
-                    if element.path.ends_with("[x]") {
-                        // Generate enum name from base path
-                        let base_path = element.path.trim_end_matches("[x]");
-
-                        // Generate enum name from struct name and field
-                        let enum_name = format!(
-                            "{}{}",
-                            sd.name,
-                            base_path
-                                .split('.')
-                                .last()
-                                .unwrap_or("Unknown")
-                                .chars()
-                                .next()
-                                .unwrap()
-                                .to_uppercase()
-                                .chain(
-                                    base_path
-                                        .split('.')
-                                        .last()
-                                        .unwrap_or("Unknown")
-                                        .chars()
-                                        .skip(1)
-                                )
-                                .collect::<String>()
-                        );
-
-                        let mut enum_def = String::new();
-                        enum_def.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-                        enum_def.push_str("#[serde(rename_all = \"camelCase\")]\n");
-                        enum_def.push_str(&format!("pub enum {} {{\n", enum_name));
-
-                        if let Some(types) = &element.r#type {
-                            for ty in types {
-                                let variant_name = ty
-                                    .code
-                                    .chars()
-                                    .next()
-                                    .unwrap()
-                                    .to_uppercase()
-                                    .chain(ty.code.chars().skip(1))
-                                    .collect::<String>();
-                                let type_str = match ty.code.as_str() {
-                                    "string" => "String",
-                                    "boolean" => "bool",
-                                    "integer" => "i32",
-                                    "decimal" => "String",
-                                    "Reference" => "Reference",
-                                    _ => &ty.code,
-                                };
-                                enum_def
-                                    .push_str(&format!("    {}({}),\n", variant_name, type_str));
-                            }
-                        }
-                        enum_def.push_str("}\n\n");
-
-                        // Store enum definition to be added after struct
-                        enums_to_add.push(enum_def);
-
-                        // Add the field using the enum type
-                        let field_name = base_path.split('.').last().unwrap_or("unknown");
-                        let rust_field_name = make_rust_safe(field_name);
-                        let type_str = if element.min.unwrap_or(0) == 0 {
-                            format!("Option<{}>", enum_name)
-                        } else {
-                            enum_name
-                        };
-                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-                    } else {
-                        // Add field with proper optionality and array handling
-                        if field_name != rust_field_name {
-                            output.push_str("    #[serde(rename = \"");
-                            output.push_str(field_name);
-                            output.push_str("\")]\n");
-                        }
-
-                        let type_str = if is_array {
-                            format!("Option<Vec<{}>>", base_type)
-                        } else if element.min.unwrap_or(0) == 0 {
-                            format!("Option<{}>", base_type)
-                        } else {
-                            base_type.to_string()
-                        };
-
-                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-                    }
-                }
-            }
+            let mut processed_types = std::collections::HashSet::new();
+            process_elements(elements, &mut output, &mut processed_types, &sd.name);
         }
-    }
-
-    output.push_str("}\n\n");
-
-    // Add all the enums after the struct definition
-    for enum_def in enums_to_add {
-        output.push_str(&enum_def);
     }
 
     output
