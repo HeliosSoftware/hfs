@@ -307,8 +307,6 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
     }
 }
 
-}
-
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
     
