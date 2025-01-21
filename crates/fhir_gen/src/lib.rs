@@ -190,78 +190,81 @@ fn make_rust_safe(input: &str) -> String {
 
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
-    let mut types_to_generate = Vec::new();
-
+    
     // Add imports
     output.push_str("use serde::{Serialize, Deserialize};\n\n");
 
-    // First pass - identify all nested types and choice types
+    // Process elements recursively
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
-            let mut current_path = String::new();
-            let mut current_fields = Vec::new();
-
-            for element in elements.iter() {
-                let path_parts: Vec<&str> = element.path.split('.').collect();
-                
-                if path_parts.len() > 2 {
-                    // This is a nested type field
-                    let type_path = path_parts[..path_parts.len()-1].join(".");
-                    if type_path != current_path {
-                        if !current_fields.is_empty() {
-                            types_to_generate.push((current_path.clone(), current_fields.clone()));
-                            current_fields.clear();
-                        }
-                        current_path = type_path;
-                    }
-                    current_fields.push(element.clone());
-                }
-            }
-            if !current_fields.is_empty() {
-                types_to_generate.push((current_path, current_fields));
-            }
+            let mut processed_types = std::collections::HashSet::new();
+            process_elements(elements, &mut output, &mut processed_types, &sd.name);
         }
     }
 
-    // Generate nested types first
-    for (type_path, fields) in &types_to_generate {
-        let type_name = format!("{}{}", sd.name, type_path.split('.').last().unwrap_or("Unknown"));
-        
-        // Check if this is a choice type that needs an enum
-        if fields.iter().any(|f| f.path.ends_with("[x]")) {
-            let enum_name = format!("{}Bounds", type_name);
+    output
+}
+
+fn process_elements(
+    elements: &[Element],
+    output: &mut String,
+    processed_types: &mut std::collections::HashSet<String>,
+    base_name: &str,
+) {
+    // Group elements by their parent path
+    let mut element_groups: std::collections::HashMap<String, Vec<&Element>> = std::collections::HashMap::new();
+    
+    for element in elements {
+        let path_parts: Vec<&str> = element.path.split('.').collect();
+        if path_parts.len() > 1 {
+            let parent_path = path_parts[..path_parts.len()-1].join(".");
+            element_groups.entry(parent_path).or_default().push(element);
+        }
+    }
+
+    // Process each group
+    for (path, group) in element_groups {
+        // Skip if we've already processed this type
+        if path == base_name || processed_types.contains(&path) {
+            continue;
+        }
+
+        // Generate type name from path
+        let type_name = generate_type_name(&path, base_name);
+        processed_types.insert(path.clone());
+
+        // Check if this group contains a choice type
+        let choice_field = group.iter().find(|e| e.path.ends_with("[x]"));
+        if let Some(choice) = choice_field {
+            // Generate choice type enum
+            let enum_name = format!("{}{}", type_name, choice.path.split('.').last().unwrap().trim_end_matches("[x]"));
             output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
             
-            // Add enum variants
-            if let Some(first_field) = fields.iter().find(|f| f.path.ends_with("[x]")) {
-                if let Some(types) = &first_field.r#type {
-                    for ty in types {
-                        output.push_str(&format!("    {}({}),\n", ty.code, ty.code));
-                    }
+            if let Some(types) = &choice.r#type {
+                for ty in types {
+                    output.push_str(&format!("    {}({}),\n", ty.code, ty.code));
                 }
             }
             output.push_str("}\n\n");
         }
 
-        // Generate the struct
+        // Generate struct
         output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
         output.push_str(&format!("pub struct {} {{\n", type_name));
 
-        for field in fields {
-            if let Some(field_name) = field.path.split('.').last() {
+        for element in &group {
+            if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
                     let rust_field_name = make_rust_safe(field_name);
                     
-                    // Add serde rename if needed
                     if field_name != rust_field_name {
                         output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
                     }
 
-                    // Determine field type
-                    if let Some(ty) = field.r#type.as_ref().and_then(|t| t.first()) {
-                        let is_array = field.max.as_deref() == Some("*");
+                    if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+                        let is_array = element.max.as_deref() == Some("*");
                         let base_type = match ty.code.as_str() {
                             "http://hl7.org/fhirpath/System.String" => "String",
                             "positiveInt" | "unsignedInt" => "u32",
@@ -273,7 +276,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
 
                         let type_str = if is_array {
                             format!("Option<Vec<{}>>", base_type)
-                        } else if field.min.unwrap_or(0) == 0 {
+                        } else if element.min.unwrap_or(0) == 0 {
                             format!("Option<{}>", base_type)
                         } else {
                             base_type.to_string()
@@ -285,7 +288,24 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
             }
         }
         output.push_str("}\n\n");
+
+        // Recursively process nested types
+        process_elements(elements, output, processed_types, base_name);
     }
+}
+
+fn generate_type_name(path: &str, base_name: &str) -> String {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts[0] == base_name {
+        // For nested types, combine the parent type names
+        parts[1..].iter()
+            .map(|p| p.chars().next().unwrap().to_uppercase().chain(p.chars().skip(1)).collect::<String>())
+            .collect::<String>()
+    } else {
+        // For root type, use as is
+        path.to_string()
+    }
+}
 
     // Generate main struct
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
