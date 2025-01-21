@@ -203,6 +203,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             for element in elements.iter().filter(|e| {
+                // println e.path AI!
                 let parts: Vec<&str> = e.path.split('.').collect();
                 parts.len() == 2 && parts[0] == sd.name
             }) {
@@ -217,8 +218,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
 
                         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                             let is_array = element.max.as_deref() == Some("*");
-                            println!("Path parts: {:?}, Type code: {}", parts, ty.code);
-
+                            println!("Type code: {}", ty.code);
                             let base_type = match ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.String" => "String",
                                 "positiveInt" | "unsignedInt" => "u32",
