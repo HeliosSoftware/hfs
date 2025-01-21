@@ -198,7 +198,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     // Generate main struct first
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str(&format!("pub struct {} {{\n", sd.name));
-    
+
     // Add fields for the main struct
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
@@ -209,20 +209,23 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                 if let Some(field_name) = element.path.split('.').last() {
                     if !field_name.contains("[x]") {
                         let rust_field_name = make_rust_safe(field_name);
-                        
+
                         if field_name != rust_field_name {
-                            output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
+                            output
+                                .push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
                         }
 
                         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                             let is_array = element.max.as_deref() == Some("*");
+                            // print all the elements of parts and the ty.code value AI!
+
                             let base_type = match ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.String" => "String",
                                 "positiveInt" | "unsignedInt" => "u32",
                                 "decimal" => "String",
                                 "code" => "String",
                                 "time" => "String",
-                                _ => &ty.code
+                                _ => &ty.code,
                             };
 
                             let type_str = if is_array {
@@ -233,7 +236,8 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 base_type.to_string()
                             };
 
-                            output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                            output
+                                .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                         }
                     }
                 }
@@ -299,14 +303,16 @@ fn process_elements(
                     .next()
                     .unwrap()
                     .to_uppercase()
-                    .chain(choice
-                        .path
-                        .split('.')
-                        .last()
-                        .unwrap()
-                        .trim_end_matches("[x]")
-                        .chars()
-                        .skip(1))
+                    .chain(
+                        choice
+                            .path
+                            .split('.')
+                            .last()
+                            .unwrap()
+                            .trim_end_matches("[x]")
+                            .chars()
+                            .skip(1)
+                    )
                     .collect::<String>()
             );
             output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
@@ -347,12 +353,17 @@ fn process_elements(
 
                         let type_str = if field_name.ends_with("[x]") {
                             let base_name = field_name.trim_end_matches("[x]");
-                            let enum_name = format!("{}{}", type_name, base_name.chars()
-                                .next()
-                                .unwrap()
-                                .to_uppercase()
-                                .chain(base_name.chars().skip(1))
-                                .collect::<String>());
+                            let enum_name = format!(
+                                "{}{}",
+                                type_name,
+                                base_name
+                                    .chars()
+                                    .next()
+                                    .unwrap()
+                                    .to_uppercase()
+                                    .chain(base_name.chars().skip(1))
+                                    .collect::<String>()
+                            );
                             format!("Option<{}>", enum_name)
                         } else if is_array {
                             format!("Option<Vec<{}>>", base_type)
@@ -380,12 +391,15 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
         // For nested types, combine all parts including the base name
         let mut result = base_name.to_string();
         for part in &parts[1..] {
-            result.push_str(&part.chars()
-                .next()
-                .unwrap()
-                .to_uppercase()
-                .chain(part.chars().skip(1))
-                .collect::<String>());
+            result.push_str(
+                &part
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .to_uppercase()
+                    .chain(part.chars().skip(1))
+                    .collect::<String>(),
+            );
         }
         result
     } else {
