@@ -248,6 +248,19 @@ fn process_elements(
                     .last()
                     .unwrap()
                     .trim_end_matches("[x]")
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .to_uppercase()
+                    .chain(choice
+                        .path
+                        .split('.')
+                        .last()
+                        .unwrap()
+                        .trim_end_matches("[x]")
+                        .chars()
+                        .skip(1))
+                    .collect::<String>()
             );
             output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
@@ -308,18 +321,17 @@ fn process_elements(
 fn generate_type_name(path: &str, base_name: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
     if parts[0] == base_name {
-        // For nested types, combine the parent type names
-        parts[1..]
-            .iter()
-            .map(|p| {
-                p.chars()
-                    .next()
-                    .unwrap()
-                    .to_uppercase()
-                    .chain(p.chars().skip(1))
-                    .collect::<String>()
-            })
-            .collect::<String>()
+        // For nested types, combine all parts including the base name
+        let mut result = base_name.to_string();
+        for part in &parts[1..] {
+            result.push_str(&part.chars()
+                .next()
+                .unwrap()
+                .to_uppercase()
+                .chain(part.chars().skip(1))
+                .collect::<String>());
+        }
+        result
     } else {
         // For root type, use as is
         path.to_string()
