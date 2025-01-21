@@ -158,6 +158,7 @@ fn generate_code(
                         // Skip constraint derivations, only work with specializations and only process base types
                         if (def.kind == "complex-type" || def.kind == "primitive-type")
                             && def.derivation.as_deref() == Some("specialization")
+                            && def.r#abstract == false
                         {
                             if let Some(id) = &def.id {
                                 let file_name = format!("{}.rs", id.to_lowercase());
@@ -219,12 +220,20 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                             let is_array = element.max.as_deref() == Some("*");
                             println!("Type code: {}", ty.code);
+                            println!(
+                                "Generated Type Name {}",
+                                &generate_type_name(&element.path, &sd.name)
+                            );
                             let base_type = match ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.String" => "String",
+                                "http://hl7.org/fhirpath/System.Boolean" => "Boolean",
                                 "positiveInt" | "unsignedInt" => "u32",
                                 "decimal" => "String",
                                 "code" => "String",
                                 "time" => "String",
+                                "Element" | "BackboneElement" => {
+                                    &generate_type_name(&element.path, &sd.name)
+                                }
                                 _ => &ty.code,
                             };
 
@@ -404,6 +413,7 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
         result
     } else {
         // For root type, use as is
+        // AI! Capitalize the first letter of the string
         path.to_string()
     }
 }
