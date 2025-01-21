@@ -190,6 +190,8 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
+// AI! create a function that capitalizes the first letter of a string and returns it
+
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
 
@@ -227,20 +229,19 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                             let base_type = match ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.String" => "String",
                                 "http://hl7.org/fhirpath/System.Boolean" => "Boolean",
-                                "positiveInt" | "unsignedInt" => "u32",
-                                "decimal" => "String",
-                                "code" => "String",
-                                "time" => "String",
-                                "uuid" => "Uuid",
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
                                 _ => {
                                     // Capitalize first letter of type code
-                                    &ty.code.chars().next().unwrap_or_default().to_uppercase()
+                                    &ty.code
+                                        .chars()
+                                        .next()
+                                        .unwrap_or_default()
+                                        .to_uppercase()
                                         .chain(ty.code.chars().skip(1))
                                         .collect::<String>()
-                                },
+                                }
                             };
 
                             let type_str = if is_array {
