@@ -154,9 +154,10 @@ fn generate_code(
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        // Skip constraint derivations and only process base types
-                        if (def.kind == "complex-type" || def.kind == "primitive-type") 
-                            && def.derivation.as_deref() != Some("constraint") {
+                        // Skip constraint derivations, only work with specializations and only process base types
+                        if (def.kind == "complex-type" || def.kind == "primitive-type")
+                            && def.derivation.as_deref() == Some("specialization")
+                        {
                             if let Some(id) = &def.id {
                                 let file_name = format!("{}.rs", id.to_lowercase());
                                 let file_path = output_path.join(&file_name);
