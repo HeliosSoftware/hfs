@@ -217,7 +217,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
 
                         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                             let is_array = element.max.as_deref() == Some("*");
-                            // print all the elements of parts and the ty.code value AI!
+                            println!("Path parts: {:?}, Type code: {}", parts, ty.code);
 
                             let base_type = match ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.String" => "String",
