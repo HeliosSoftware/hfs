@@ -345,7 +345,16 @@ fn process_elements(
                             _ => &ty.code,
                         };
 
-                        let type_str = if is_array {
+                        let type_str = if field_name.ends_with("[x]") {
+                            let base_name = field_name.trim_end_matches("[x]");
+                            let enum_name = format!("{}{}", type_name, base_name.chars()
+                                .next()
+                                .unwrap()
+                                .to_uppercase()
+                                .chain(base_name.chars().skip(1))
+                                .collect::<String>());
+                            format!("Option<{}>", enum_name)
+                        } else if is_array {
                             format!("Option<Vec<{}>>", base_type)
                         } else if element.min.unwrap_or(0) == 0 {
                             format!("Option<{}>", base_type)
