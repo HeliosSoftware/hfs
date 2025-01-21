@@ -231,6 +231,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 "decimal" => "String",
                                 "code" => "String",
                                 "time" => "String",
+                                "uuid" => "Uuid",
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
