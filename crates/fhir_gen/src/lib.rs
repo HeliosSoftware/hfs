@@ -412,9 +412,13 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
         }
         result
     } else {
-        // For root type, use as is
-        // AI! Capitalize the first letter of the string
-        path.to_string()
+        // For root type, use as is with capitalized first letter
+        path.chars()
+            .next()
+            .unwrap_or_default()
+            .to_uppercase()
+            .chain(path.chars().skip(1))
+            .collect()
     }
 }
 
