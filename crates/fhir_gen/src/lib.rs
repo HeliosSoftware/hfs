@@ -203,7 +203,7 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             for element in elements.iter().filter(|e| {
-                // println e.path AI!
+                println!("Element path: {}", e.path);
                 let parts: Vec<&str> = e.path.split('.').collect();
                 parts.len() == 2 && parts[0] == sd.name
             }) {
