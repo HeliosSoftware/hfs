@@ -391,8 +391,6 @@ fn process_elements(
         }
         output.push_str("}\n\n");
 
-        // Recursively process nested types
-        process_elements(elements, output, processed_types, base_name);
     }
 }
 
