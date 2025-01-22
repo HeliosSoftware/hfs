@@ -201,12 +201,14 @@ fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
 
 fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collections::HashSet<(String, String)> {
     let mut cycles = std::collections::HashSet::new();
-    let mut graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut graph: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
     
-    // Build dependency graph
+    // Build dependency graph with field information
     for element in elements {
         if let Some(types) = &element.r#type {
             let from_type = element.path.split('.').next().unwrap_or(base_name).to_string();
+            let field_name = element.path.split('.').last().unwrap_or("").to_string();
+            
             for ty in types {
                 if !matches!(ty.code.as_str(), 
                     "http://hl7.org/fhirpath/System.Boolean" |
@@ -220,7 +222,7 @@ fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collec
                     "http://hl7.org/fhirpath/System.Quantity") {
                     graph.entry(from_type.clone())
                         .or_default()
-                        .push(ty.code.clone());
+                        .push((ty.code.clone(), field_name.clone()));
                 }
             }
         }
@@ -232,15 +234,21 @@ fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collec
 
     fn dfs(
         current: &str,
-        graph: &std::collections::HashMap<String, Vec<String>>,
+        graph: &std::collections::HashMap<String, Vec<(String, String)>>,
         visited: &mut std::collections::HashSet<String>,
         path: &mut Vec<String>,
+        field_path: &mut Vec<String>,
         cycles: &mut std::collections::HashSet<(String, String)>,
     ) {
         if path.contains(&current.to_string()) {
             let cycle_start_idx = path.iter().position(|x| x == current).unwrap();
-            for window in path[cycle_start_idx..].windows(2) {
-                cycles.insert((window[0].clone(), window[1].clone()));
+            // Only mark as cycle if the field path creates a recursive structure
+            let field_sequence = &field_path[cycle_start_idx..];
+            if field_sequence.iter().any(|f| f == "identifier") && 
+               field_sequence.iter().any(|f| f == "reference") {
+                for window in path[cycle_start_idx..].windows(2) {
+                    cycles.insert((window[0].clone(), window[1].clone()));
+                }
             }
             return;
         }
@@ -253,8 +261,10 @@ fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collec
         path.push(current.to_string());
 
         if let Some(deps) = graph.get(current) {
-            for dep in deps {
-                dfs(dep, graph, visited, path, cycles);
+            for (dep, field) in deps {
+                field_path.push(field.clone());
+                dfs(dep, graph, visited, path, field_path, cycles);
+                field_path.pop();
             }
         }
 
@@ -262,7 +272,8 @@ fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collec
     }
 
     for node in graph.keys() {
-        dfs(node, &graph, &mut visited, &mut path, &mut cycles);
+        let mut field_path = Vec::new();
+        dfs(node, &graph, &mut visited, &mut path, &mut field_path, &mut cycles);
     }
 
     cycles
