@@ -246,10 +246,8 @@ fn detect_struct_cycles(
     // Build direct struct dependencies
     for element in elements {
         if let Some(types) = &element.r#type {
-            let from_type = element.path.split('.').next().unwrap_or("").to_string();
             let path_parts: Vec<&str> = element.path.split('.').collect();
             if path_parts.len() > 1 {
-                let field_name = path_parts.last().unwrap();
                 let from_type = path_parts[0].to_string();
                 if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
                     for ty in types {
