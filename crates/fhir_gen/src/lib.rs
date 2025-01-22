@@ -274,14 +274,13 @@ fn process_elements(
 
     // Process each group
     for (path, group) in element_groups {
-        // Only skip if we've already processed this type, but allow base_name to be processed once
-        if processed_types.contains(&path) {
+        // Skip if we've already processed this type
+        let type_name = generate_type_name(&path, base_name);
+        if processed_types.contains(&type_name) {
             continue;
         }
+        processed_types.insert(type_name.clone());
 
-        // Generate type name from path
-        let type_name = generate_type_name(&path, base_name);
-        processed_types.insert(path.clone());
 
         // Check if this group contains a choice type
         let choice_field = group.iter().find(|e| e.path.ends_with("[x]"));
