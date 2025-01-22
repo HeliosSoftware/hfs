@@ -154,6 +154,8 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         let element_refs: Vec<&ElementDefinition> = all_elements;
         let cycles = detect_struct_cycles(&element_refs);
 
+        // AI! printf all the cycles
+
         // Second pass: generate code
         for entry in entries {
             if let Some(resource) = &entry.resource {
@@ -161,7 +163,6 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                     Resource::StructureDefinition(def) => {
                         if is_valid_structure_definition(def) {
                             let content = structure_definition_to_rust(def, &cycles);
-                            // Append the content to the version-specific file
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
                                 .write(true)
@@ -246,11 +247,16 @@ fn detect_struct_cycles(
             if !from_type.is_empty() {
                 for ty in types {
                     // Only track struct-level dependencies
+                    // TODO - Unsure if that is correct - we may want them all
                     if !ty.code.contains('.') {
-                        graph
-                            .entry(from_type.clone())
-                            .or_default()
-                            .push(ty.code.clone());
+                        // For this purpose, we don't care are about self cycles like Extension has
+                        // an .extension attribute that is also an Extension - that's ok
+                        if from_type != ty.code {
+                            graph
+                                .entry(from_type.clone())
+                                .or_default()
+                                .push(ty.code.clone());
+                        }
                     }
                 }
             }
@@ -526,6 +532,30 @@ mod tests {
                 }]),
                 ..Default::default()
             },
+            ElementDefinition {
+                path: "Extension".to_string(),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Extension.extension".to_string(),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
+                    code: "Extension".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Base64Binary".to_string(),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Base64Binary.extension".to_string(),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
+                    code: "Extension".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
         ];
 
         let element_refs: Vec<&ElementDefinition> = elements.iter().collect();
@@ -540,6 +570,11 @@ mod tests {
         // Should not detect Patient -> Resource as a cycle (one-way dependency)
         assert!(!cycles.contains(&("Patient".to_string(), "Resource".to_string())));
         assert!(!cycles.contains(&("Resource".to_string(), "Patient".to_string())));
+
+        // Should also not detect self cycles - these are ok
+        assert!(!cycles.contains(&("Extension".to_string(), "Extension".to_string())));
+
+        assert!(!cycles.contains(&("Base64Binary".to_string(), "Extension".to_string())));
     }
 
     #[test]
