@@ -247,22 +247,19 @@ fn detect_struct_cycles(
     for element in elements {
         if let Some(types) = &element.r#type {
             let from_type = element.path.split('.').next().unwrap_or("").to_string();
-            if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
-                for ty in types {
-                    // Only track struct-level dependencies
-                    if !ty.code.contains('.') && from_type != ty.code {
-                        // Find the corresponding element for the target type
-                        if let Some(target_element) = elements
-                            .iter()
-                            .find(|e| e.path.split('.').next().unwrap_or("") == ty.code)
-                        {
-                            // Only add if both sides have max=1
-                            if target_element.max.as_ref().map(|m| m.as_str()) == Some("1") {
-                                graph
-                                    .entry(from_type.clone())
-                                    .or_default()
-                                    .push(ty.code.clone());
-                            }
+            let path_parts: Vec<&str> = element.path.split('.').collect();
+            if path_parts.len() > 1 {
+                let field_name = path_parts.last().unwrap();
+                let from_type = path_parts[0].to_string();
+                if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
+                    for ty in types {
+                        // Only track struct-level dependencies
+                        if !ty.code.contains('.') && from_type != ty.code {
+                            // Add the dependency if it's a field with max=1
+                            graph
+                                .entry(from_type.clone())
+                                .or_default()
+                                .push(ty.code.clone());
                         }
                     }
                 }
