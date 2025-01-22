@@ -138,7 +138,9 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         && def.r#abstract == false
                     {
                         if let Some(snapshot) = &def.snapshot {
-                            all_elements.extend(snapshot.element.iter().map(|e| e));
+                            // AI! I want all_elements to have the type of Vec<&ElementDefinition>
+                            // after the call to all_elements.extend
+                            all_elements.extend(snapshot.element.map(|e| e));
                         }
                     }
                 }
