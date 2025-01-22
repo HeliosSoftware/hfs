@@ -178,76 +178,13 @@ fn capitalize_first_letter(s: &str) -> String {
 
 fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     let mut output = String::new();
-    /*
-        // Generate main struct first
-        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-        output.push_str(&format!(
-            "pub struct {} {{\n",
-            capitalize_first_letter(&sd.name)
-        ));
-
-        // Add fields for the main struct
-        if let Some(snapshot) = &sd.snapshot {
-            if let Some(elements) = &snapshot.element {
-
-                for element in elements.iter().filter(|e| {
-                    let parts: Vec<&str> = e.path.split('.').collect();
-                    parts.len() == 2 && parts[0] == sd.name
-                }) {
-                    if let Some(field_name) = element.path.split('.').last() {
-                        if !field_name.contains("[x]") {
-                            let rust_field_name = make_rust_safe(field_name);
-
-                            if field_name != rust_field_name {
-                                output
-                                    .push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
-                            }
-
-                            if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-                                let is_array = element.max.as_deref() == Some("*");
-                                let base_type = match ty.code.as_str() {
-                                    // https://build.fhir.org/fhirpath.html#types
-                                    "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                                    "http://hl7.org/fhirpath/System.String" => "std::string::String",
-                                    "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
-                                    "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
-                                    "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
-                                    "http://hl7.org/fhirpath/System.Date" => "std::string::String",
-                                    "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
-                                    "http://hl7.org/fhirpath/System.Time" => "std::string::String",
-                                    "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                                    "Element" | "BackboneElement" => {
-                                        &generate_type_name(&element.path, &sd.name)
-                                    }
-                                    _ => &capitalize_first_letter(&ty.code),
-                                };
-
-                                let type_str = if is_array {
-                                    format!("Option<Vec<{}>>", base_type)
-                                } else if element.min.unwrap_or(0) == 0 {
-                                    format!("Option<{}>", base_type)
-                                } else {
-                                    base_type.to_string()
-                                };
-
-                                output
-                                    .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        output.push_str("}\n\n");
-    */
-    // Process elements recursively
+    // Process elements
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             let mut processed_types = std::collections::HashSet::new();
             process_elements(elements, &mut output, &mut processed_types, &sd.name);
         }
     }
-
     output
 }
 
@@ -268,6 +205,7 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
+        // AI! println parent_path and element
         element_groups.entry(parent_path).or_default().push(element);
     }
 
