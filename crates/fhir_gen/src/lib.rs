@@ -254,10 +254,13 @@ fn detect_struct_cycles(
                     for ty in types {
                         // Only track struct-level dependencies
                         if !ty.code.contains('.') && from_type != ty.code {
-                            // Add the dependency if it's a field with max=1
-                            // AI! We don't want to hard code these values - we want to check to
-                            // see if the other side's max=1
-                            if field_name == "identifier" || field_name == "assigner" {
+                            // Add the dependency if both sides have max=1
+                            let target_max = elements.iter()
+                                .find(|e| e.path == ty.code)
+                                .and_then(|e| e.max.as_ref())
+                                .map(|m| m.as_str());
+                            
+                            if target_max == Some("1") {
                                 graph
                                     .entry(from_type.clone())
                                     .or_default()
