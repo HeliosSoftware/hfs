@@ -6,7 +6,7 @@ use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
@@ -58,7 +58,7 @@ fn process_single_version(
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_path)?,
+                Ok(bundle) => generate_code(bundle, &output_dir, version)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -127,7 +127,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 }
 
 // Track all generated modules across files
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirVersion) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
@@ -145,11 +145,11 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
-                            std::fs::OpenOptions::new()
+                            let mut file = std::fs::OpenOptions::new()
                                 .write(true)
                                 .append(true)
-                                .open(output_path.join(&format!("{}.rs", version.to_string())))?
-                                .write_all(content.as_bytes())?;
+                                .open(output_path.join(&format!("{}.rs", version.to_string())))?;
+                            file.write_all(content.as_bytes())?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
