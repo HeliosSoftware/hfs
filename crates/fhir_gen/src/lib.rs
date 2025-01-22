@@ -125,27 +125,49 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 }
 
 fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
-    // Process each entry in the bundle
+    // First collect all ElementDefinitions across all StructureDefinitions
+    let mut all_elements = Vec::new();
+    
     if let Some(entries) = _bundle.entry.as_ref() {
+        // First pass: collect all elements
         for entry in entries {
             if let Some(resource) = &entry.resource {
-                match resource {
-                    Resource::StructureDefinition(def) => {
-                        // Skip constraint derivations, only work with specializations and only process base types
-                        if (def.kind == "complex-type" || def.kind == "primitive-type")
-                            && def.derivation.as_deref() == Some("specialization")
-                            && def.r#abstract == false
-                        {
-                            let content = structure_definition_to_rust(def);
-                            // Append the content to the version-specific file
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .append(true)
-                                .open(output_path.as_ref())?;
-                            writeln!(file, "{}", content)?;
+                if let Resource::StructureDefinition(def) = resource {
+                    if (def.kind == "complex-type" || def.kind == "primitive-type")
+                        && def.derivation.as_deref() == Some("specialization")
+                        && def.r#abstract == false
+                    {
+                        if let Some(snapshot) = &def.snapshot {
+                            if let Some(elements) = &snapshot.element {
+                                all_elements.extend(elements.iter().cloned());
+                            }
                         }
                     }
+                }
+            }
+        }
+        
+        // Detect cycles using all collected elements
+        let cycles = detect_struct_cycles(&all_elements);
+        
+        // Second pass: generate code
+        for entry in entries {
+            if let Some(resource) = &entry.resource {
+                if let Resource::StructureDefinition(def) = resource {
+                    if (def.kind == "complex-type" || def.kind == "primitive-type")
+                        && def.derivation.as_deref() == Some("specialization")
+                        && def.r#abstract == false
+                    {
+                        let content = structure_definition_to_rust(def, &cycles);
+                        // Append the content to the version-specific file
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .append(true)
+                            .open(output_path.as_ref())?;
+                        writeln!(file, "{}", content)?;
+                    }
+                }
                     Resource::SearchParameter(_param) => {
                         // TODO: Generate code for search parameter
                     }
@@ -187,13 +209,13 @@ fn capitalize_first_letter(s: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
+fn structure_definition_to_rust(sd: &StructureDefinition, cycles: &std::collections::HashSet<(String, String)>) -> String {
     let mut output = String::new();
     // Process elements
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             let mut processed_types = std::collections::HashSet::new();
-            process_elements(elements, &mut output, &mut processed_types, &sd.name);
+            process_elements(elements, &mut output, &mut processed_types, &sd.name, cycles);
         }
     }
     output
@@ -244,9 +266,8 @@ fn process_elements(
     output: &mut String,
     processed_types: &mut std::collections::HashSet<String>,
     base_name: &str,
+    cycles: &std::collections::HashSet<(String, String)>,
 ) {
-    // Detect cycles first
-    let cycles = detect_struct_cycles(elements);
     // Group elements by their parent path
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
