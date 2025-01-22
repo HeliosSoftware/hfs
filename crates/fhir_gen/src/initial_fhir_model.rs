@@ -296,7 +296,7 @@ pub struct ElementDefinitionBase {
     pub max: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ElementDefinitionType {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -676,7 +676,7 @@ pub struct Element {
     pub extension: Option<Vec<Extension>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
