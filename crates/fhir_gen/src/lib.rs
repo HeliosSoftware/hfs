@@ -162,14 +162,17 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
 }
 
 fn make_rust_safe(input: &str) -> String {
-    let snake_case = input.chars().enumerate().fold(String::new(), |mut acc, (i, c)| {
-        if i > 0 && c.is_uppercase() {
-            acc.push('_');
-        }
-        acc.push(c.to_lowercase().next().unwrap());
-        acc
-    });
-    
+    let snake_case = input
+        .chars()
+        .enumerate()
+        .fold(String::new(), |mut acc, (i, c)| {
+            if i > 0 && c.is_uppercase() {
+                acc.push('_');
+            }
+            acc.push(c.to_lowercase().next().unwrap());
+            acc
+        });
+
     match snake_case.as_str() {
         "type" | "use" | "abstract" => format!("r#{}", snake_case),
         _ => snake_case,
@@ -209,12 +212,10 @@ fn process_elements(
     // First pass - collect all type names that will be generated
     for element in elements {
         let path_parts: Vec<&str> = element.path.split('.').collect();
-        let parent_path = if path_parts.len() == 1 {
-            path_parts[0].to_string()
-        } else {
-            path_parts[..path_parts.len() - 1].join(".")
-        };
-        element_groups.entry(parent_path).or_default().push(element);
+        if path_parts.len() > 1 {
+            let parent_path = path_parts[..path_parts.len() - 1].join(".");
+            element_groups.entry(parent_path).or_default().push(element);
+        }
     }
 
     // Process each group
