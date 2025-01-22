@@ -244,22 +244,24 @@ fn detect_struct_cycles(
         std::collections::HashMap::new();
 
     // Build direct struct dependencies
-    // AI! We only want to add to the graph if both sides have a max value of "1"
     for element in elements {
         if let Some(types) = &element.r#type {
             let from_type = element.path.split('.').next().unwrap_or("").to_string();
-            if !from_type.is_empty() {
+            if !from_type.is_empty() && element.max.as_deref() == Some("1") {
                 for ty in types {
                     // Only track struct-level dependencies
-                    // TODO - Unsure if that is correct - we may want them all
-                    if !ty.code.contains('.') {
-                        // For this purpose, we don't care are about self cycles like Extension has
-                        // an .extension attribute that is also an Extension - that's ok
-                        if from_type != ty.code {
-                            graph
-                                .entry(from_type.clone())
-                                .or_default()
-                                .push(ty.code.clone());
+                    if !ty.code.contains('.') && from_type != ty.code {
+                        // Find the corresponding element for the target type
+                        if let Some(target_element) = elements.iter().find(|e| {
+                            e.path.split('.').next().unwrap_or("") == ty.code
+                        }) {
+                            // Only add if both sides have max=1
+                            if target_element.max.as_deref() == Some("1") {
+                                graph
+                                    .entry(from_type.clone())
+                                    .or_default()
+                                    .push(ty.code.clone());
+                            }
                         }
                     }
                 }
