@@ -61,7 +61,7 @@ fn process_single_version(
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_dir, version)?,
+                Ok(bundle) => generate_code(bundle, &version_file, version)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
