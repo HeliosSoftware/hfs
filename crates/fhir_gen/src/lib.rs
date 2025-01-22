@@ -249,15 +249,18 @@ fn detect_struct_cycles(
             let path_parts: Vec<&str> = element.path.split('.').collect();
             if path_parts.len() > 1 {
                 let from_type = path_parts[0].to_string();
+                let field_name = path_parts[path_parts.len() - 1];
                 if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
                     for ty in types {
                         // Only track struct-level dependencies
                         if !ty.code.contains('.') && from_type != ty.code {
                             // Add the dependency if it's a field with max=1
-                            graph
-                                .entry(from_type.clone())
-                                .or_default()
-                                .push(ty.code.clone());
+                            if field_name == "identifier" || field_name == "assigner" {
+                                graph
+                                    .entry(from_type.clone())
+                                    .or_default()
+                                    .push(ty.code.clone());
+                            }
                         }
                     }
                 }
