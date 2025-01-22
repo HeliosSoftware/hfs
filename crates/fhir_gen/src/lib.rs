@@ -279,6 +279,22 @@ fn process_elements(
         if processed_types.contains(&type_name) {
             continue;
         }
+
+        // Check if any field in this group has already been processed as part of another type
+        let mut should_skip = false;
+        for element in &group {
+            if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+                let field_type = capitalize_first_letter(&ty.code);
+                if processed_types.contains(&field_type) {
+                    should_skip = true;
+                    break;
+                }
+            }
+        }
+        if should_skip {
+            continue;
+        }
+
         processed_types.insert(type_name.clone());
 
 
