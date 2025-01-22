@@ -282,7 +282,17 @@ fn detect_struct_cycles(
         }
     }
 
-    // AI!  printf graph and cycles here
+    // Print the dependency graph
+    println!("\nDependency graph:");
+    for (from_type, deps) in &graph {
+        println!("  {} -> {:?}", from_type, deps);
+    }
+
+    // Print detected cycles
+    println!("\nDetected cycles:");
+    for (from_type, to_type) in &cycles {
+        println!("  {} <-> {}", from_type, to_type);
+    }
 
     cycles
 }
