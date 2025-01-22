@@ -464,6 +464,10 @@ mod tests {
         let elements = vec![
             ElementDefinition {
                 path: "Identifier".to_string(),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Identifier.assigner".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Reference".to_string(),
                     ..Default::default()
@@ -472,6 +476,10 @@ mod tests {
             },
             ElementDefinition {
                 path: "Reference".to_string(),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Reference.identifier".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Identifier".to_string(),
                     ..Default::default()
