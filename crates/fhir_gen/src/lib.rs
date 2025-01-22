@@ -199,7 +199,6 @@ fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     output
 }
 
-
 fn process_elements(
     elements: &[ElementDefinition],
     output: &mut String,
@@ -315,7 +314,7 @@ fn process_elements(
                             _ => &capitalize_first_letter(&ty.code),
                         };
 
-                        let mut type_str = if field_name.ends_with("[x]") {
+                        let type_str = if field_name.ends_with("[x]") {
                             let base_name = field_name.trim_end_matches("[x]");
                             let enum_name = format!(
                                 "{}{}",
@@ -336,7 +335,6 @@ fn process_elements(
                         } else {
                             base_type.to_string()
                         };
-
 
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
