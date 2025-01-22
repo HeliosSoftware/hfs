@@ -153,21 +153,22 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         // Second pass: generate code
         for entry in entries {
             if let Some(resource) = &entry.resource {
-                if let Resource::StructureDefinition(def) = resource {
-                    if (def.kind == "complex-type" || def.kind == "primitive-type")
-                        && def.derivation.as_deref() == Some("specialization")
-                        && def.r#abstract == false
-                    {
-                        let content = structure_definition_to_rust(def, &cycles);
-                        // Append the content to the version-specific file
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .append(true)
-                            .open(output_path.as_ref())?;
-                        writeln!(file, "{}", content)?;
+                match resource {
+                    Resource::StructureDefinition(def) => {
+                        if (def.kind == "complex-type" || def.kind == "primitive-type")
+                            && def.derivation.as_deref() == Some("specialization")
+                            && def.r#abstract == false
+                        {
+                            let content = structure_definition_to_rust(def, &cycles);
+                            // Append the content to the version-specific file
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .append(true)
+                                .open(output_path.as_ref())?;
+                            writeln!(file, "{}", content)?;
+                        }
                     }
-                }
                     Resource::SearchParameter(_param) => {
                         // TODO: Generate code for search parameter
                     }
