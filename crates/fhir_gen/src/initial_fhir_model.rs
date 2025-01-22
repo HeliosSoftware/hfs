@@ -308,7 +308,7 @@ pub struct ElementDefinitionType {
     pub versioning: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Address {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -327,7 +327,7 @@ pub struct Address {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Duration {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -338,7 +338,7 @@ pub struct Duration {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Count {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -349,7 +349,7 @@ pub struct Count {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Distance {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -360,7 +360,7 @@ pub struct Distance {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Age {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -371,7 +371,7 @@ pub struct Age {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AnnotationAuthor {
     #[serde(rename = "authorReference")]
     AuthorReference(Reference),
@@ -379,7 +379,7 @@ pub enum AnnotationAuthor {
     AuthorString(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Annotation {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -388,7 +388,7 @@ pub struct Annotation {
     pub text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Attachment {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -670,7 +670,7 @@ pub enum ElementDefinitionMinMaxValue {
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Element {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -755,7 +755,7 @@ pub struct ElementDefinitionBinding {
     pub additional: Option<Vec<ElementDefinitionBindingAdditional>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionBindingAdditional {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
