@@ -139,8 +139,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 if let Resource::StructureDefinition(def) = resource {
-                    if is_valid_structure_definition(def)
-                    {
+                    if is_valid_structure_definition(def) {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
                                 all_elements.extend(elements.iter().map(|e| e));
@@ -160,8 +159,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        if is_valid_structure_definition(def)
-                        {
+                        if is_valid_structure_definition(def) {
                             let content = structure_definition_to_rust(def, &cycles);
                             // Append the content to the version-specific file
                             let mut file = std::fs::OpenOptions::new()
@@ -496,11 +494,11 @@ mod tests {
     #[test]
     fn test_detect_struct_cycles() {
         let elements = vec![
-            &ElementDefinition {
+            ElementDefinition {
                 path: "Identifier".to_string(),
                 ..Default::default()
             },
-            &ElementDefinition {
+            ElementDefinition {
                 path: "Identifier.assigner".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Reference".to_string(),
@@ -508,11 +506,11 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            &ElementDefinition {
+            ElementDefinition {
                 path: "Reference".to_string(),
                 ..Default::default()
             },
-            &ElementDefinition {
+            ElementDefinition {
                 path: "Reference.identifier".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Identifier".to_string(),
@@ -520,7 +518,7 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            &ElementDefinition {
+            ElementDefinition {
                 path: "Patient".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Resource".to_string(),
@@ -529,6 +527,8 @@ mod tests {
                 ..Default::default()
             },
         ];
+
+        // AI! convert this Vec<ElementDefinition> to a suitable parameter to detect_struct_cycles
 
         let cycles = detect_struct_cycles(&elements);
 
