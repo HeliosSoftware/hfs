@@ -146,8 +146,8 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         }
 
         // Detect cycles using all collected elements
-        // AI! I want to pass all_elements to detect_struct_cycles
-        let cycles = detect_struct_cycles(&all_elements);
+        let element_refs: Vec<&ElementDefinition> = all_elements.iter().collect();
+        let cycles = detect_struct_cycles(&element_refs);
 
         // Second pass: generate code
         for entry in entries {
