@@ -6,8 +6,8 @@ use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
 use std::fs::File;
-use std::io::{self, Write};
 use std::io::BufReader;
+use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -44,8 +44,10 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
-    let version_file = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
-    
+    let version_file = base_output_path
+        .as_ref()
+        .join(&format!("{}.rs", version.to_string()));
+
     // Create parent directory if it doesn't exist
     if let Some(parent) = version_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -128,8 +130,14 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 }
 
 // Track all generated modules across files
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirVersion) -> io::Result<()> {
-    let version_file = output_path.as_ref().join(&format!("{}.rs", version.to_string()));
+fn generate_code(
+    _bundle: Bundle,
+    output_path: impl AsRef<Path>,
+    version: &FhirVersion,
+) -> io::Result<()> {
+    let version_file = output_path
+        .as_ref()
+        .join(&format!("{}.rs", version.to_string()));
 
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
