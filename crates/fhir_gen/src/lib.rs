@@ -274,11 +274,7 @@ fn process_elements(
     // Process each group
     for (path, group) in element_groups {
         // Generate the type name and check if we've already processed it
-        let type_name = if path.contains('.') {
-            generate_type_name(&path, base_name)
-        } else {
-            capitalize_first_letter(&path)
-        };
+        let type_name = generate_type_name(&path, base_name);
         println!("Processing type: {}", type_name);
         if processed_types.contains(&type_name) {
             continue;
