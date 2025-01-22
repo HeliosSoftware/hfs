@@ -390,15 +390,16 @@ fn process_elements(
             }
         }
         output.push_str("}\n\n");
-
-        // Recursively process nested types, but only for elements not in the current group
-        let nested_elements: Vec<&ElementDefinition> = elements
-            .iter()
-            .filter(|e| !group.contains(e))
-            .collect();
-        if !nested_elements.is_empty() {
-            process_elements(&nested_elements, output, processed_types, base_name);
-        }
+        /*
+                // Recursively process nested types, but only for elements not in the current group
+                let nested_elements: Vec<&ElementDefinition> = elements
+                    .iter()
+                    .filter(|e| !group.contains(e))
+                    .collect();
+                if !nested_elements.is_empty() {
+                    process_elements(&nested_elements, output, processed_types, base_name);
+                }
+        */
     }
 }
 
