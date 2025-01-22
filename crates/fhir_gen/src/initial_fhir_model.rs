@@ -99,7 +99,7 @@ pub struct Coding {
     pub user_selected: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Meta {
     #[serde(rename = "versionString")]
     pub version_id: Option<String>,
@@ -111,7 +111,7 @@ pub struct Meta {
     pub tag: Option<Vec<Coding>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CodeableConcept {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -119,7 +119,7 @@ pub struct CodeableConcept {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Period {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -127,7 +127,7 @@ pub struct Period {
     pub end: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Reference {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -138,7 +138,7 @@ pub struct Reference {
     pub display: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Identifier {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -152,7 +152,7 @@ pub struct Identifier {
     pub assigner: Option<Box<Reference>>, // Use of Box here for recursive type
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Narrative {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -160,7 +160,7 @@ pub struct Narrative {
     pub div: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContactDetail {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -168,7 +168,7 @@ pub struct ContactDetail {
     pub telecom: Option<Vec<ContactPoint>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContactPoint {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -180,7 +180,7 @@ pub struct ContactPoint {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Range {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
