@@ -69,7 +69,7 @@ fn process_single_version(
 
     // Add pub mod statements for all modules
     for module in all_generated_modules {
-        lib_content.push_str(&format!("pub mod {};\n", module));
+        lib_content.push_str(&format!("pub mod {};\n", capitalize_first_letter(&module)));
     }
 
     std::fs::write(
@@ -206,7 +206,10 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
 
     // Generate main struct first
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-    output.push_str(&format!("pub struct {} {{\n", sd.name));
+    output.push_str(&format!(
+        "pub struct {} {{\n",
+        capitalize_first_letter(&sd.name)
+    ));
 
     // Add fields for the main struct
     if let Some(snapshot) = &sd.snapshot {
@@ -233,21 +236,12 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 &generate_type_name(&element.path, &sd.name)
                             );
                             let base_type = match ty.code.as_str() {
-                                "http://hl7.org/fhirpath/System.String" => "String",
-                                "http://hl7.org/fhirpath/System.Boolean" => "Boolean",
+                                "http://hl7.org/fhirpath/System.String" => "string",
+                                "http://hl7.org/fhirpath/System.Boolean" => "bool",
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
-                                _ => {
-                                    // Capitalize first letter of type code
-                                    &ty.code
-                                        .chars()
-                                        .next()
-                                        .unwrap_or_default()
-                                        .to_uppercase()
-                                        .chain(ty.code.chars().skip(1))
-                                        .collect::<String>()
-                                }
+                                _ => &capitalize_first_letter(&ty.code),
                             };
 
                             let type_str = if is_array {
@@ -343,7 +337,11 @@ fn process_elements(
 
             if let Some(types) = &choice.r#type {
                 for ty in types {
-                    output.push_str(&format!("    {}({}),\n", ty.code, ty.code));
+                    output.push_str(&format!(
+                        "    {}({}),\n",
+                        capitalize_first_letter(&ty.code),
+                        capitalize_first_letter(&ty.code)
+                    ));
                 }
             }
             output.push_str("}\n\n");
@@ -351,7 +349,10 @@ fn process_elements(
 
         // Generate struct
         output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-        output.push_str(&format!("pub struct {} {{\n", type_name));
+        output.push_str(&format!(
+            "pub struct {} {{\n",
+            capitalize_first_letter(&type_name)
+        ));
 
         for element in &group {
             if let Some(field_name) = element.path.split('.').last() {
@@ -365,12 +366,12 @@ fn process_elements(
                     if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                         let is_array = element.max.as_deref() == Some("*");
                         let base_type = match ty.code.as_str() {
-                            "http://hl7.org/fhirpath/System.String" => "String",
-                            "positiveInt" | "unsignedInt" => "u32",
-                            "decimal" => "String",
-                            "code" => "String",
-                            "time" => "String",
-                            _ => &ty.code,
+                            "http://hl7.org/fhirpath/System.String" => "string",
+                            "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                            "Element" | "BackboneElement" => {
+                                &generate_type_name(&element.path, &base_name)
+                            }
+                            _ => &capitalize_first_letter(&ty.code),
                         };
 
                         let type_str = if field_name.ends_with("[x]") {
