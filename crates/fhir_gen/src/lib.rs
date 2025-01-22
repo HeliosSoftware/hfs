@@ -154,7 +154,10 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         let element_refs: Vec<&ElementDefinition> = all_elements;
         let cycles = detect_struct_cycles(&element_refs);
 
-        // AI! printf all the cycles
+        // Print detected cycles
+        for (from_type, to_type) in &cycles {
+            println!("Cycle detected between {} and {}", from_type, to_type);
+        }
 
         // Second pass: generate code
         for entry in entries {
