@@ -44,16 +44,13 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
-    let output_path = base_output_path
-        .as_ref()
-        .join(version.to_string())
-        .join(&format!("{}.rs", version.to_string()));
-
+    let output_dir = base_output_path.as_ref().join(version.to_string());
+    
     // Create output directory if it doesn't exist
-    std::fs::create_dir_all(&output_path)?;
+    std::fs::create_dir_all(&output_dir)?;
 
     // Create or truncate the version-specific output file
-    let version_file = output_path.join(&format!("{}.rs", version.to_string()));
+    let version_file = output_dir.join(&format!("{}.rs", version.to_string()));
     std::fs::write(&version_file, "use serde::{Serialize, Deserialize};\n\n")?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -148,7 +145,11 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
-                            std::fs::write(output_path, content)?;
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .append(true)
+                                .open(output_path.join(&format!("{}.rs", version.to_string())))?
+                                .write_all(content.as_bytes())?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
