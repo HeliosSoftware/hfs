@@ -47,8 +47,7 @@ fn process_single_version(
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(base_output_path.as_ref())?;
 
-    let version_file = format!("{}.rs", version.to_string());
-    let version_path = base_output_path.as_ref().join(&version_file);
+    let version_path = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
 
     // Create or truncate the version-specific output file with initial content
     let mut file = std::fs::File::create(&version_path)?;
@@ -130,9 +129,9 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
-    _version: &FhirVersion,
+    version: &FhirVersion,
 ) -> io::Result<()> {
-    let version_path = output_path.as_ref();
+    let version_path = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
 
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
@@ -151,7 +150,7 @@ fn generate_code(
                                 .create(true)
                                 .write(true)
                                 .append(true)
-                                .open(version_path)?;
+                                .open(&version_path)?;
                             writeln!(file, "{}", content)?;
                         }
                     }
