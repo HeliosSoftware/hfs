@@ -274,8 +274,8 @@ fn process_elements(
 
     // Process each group
     for (path, group) in element_groups {
-        // Skip if we've already processed this type
-        if path == base_name || processed_types.contains(&path) {
+        // Only skip if we've already processed this type, but allow base_name to be processed once
+        if processed_types.contains(&path) {
             continue;
         }
 
