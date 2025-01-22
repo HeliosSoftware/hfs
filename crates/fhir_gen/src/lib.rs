@@ -268,7 +268,6 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
-        // println parent_path and element AI!
         element_groups.entry(parent_path).or_default().push(element);
     }
 
@@ -276,12 +275,12 @@ fn process_elements(
     for (path, group) in element_groups {
         // Skip if we've already processed this type
         let type_name = generate_type_name(&path, base_name);
+        // AI! println type_name
         if processed_types.contains(&type_name) {
             continue;
         }
 
         processed_types.insert(type_name.clone());
-
 
         // Check if this group contains a choice type
         let choice_field = group.iter().find(|e| e.path.ends_with("[x]"));
