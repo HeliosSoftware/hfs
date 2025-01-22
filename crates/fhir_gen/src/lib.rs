@@ -244,6 +244,7 @@ fn detect_struct_cycles(
         std::collections::HashMap::new();
 
     // Build direct struct dependencies
+    // AI! We only want to add to the graph if both sides have a max value of "1"
     for element in elements {
         if let Some(types) = &element.r#type {
             let from_type = element.path.split('.').next().unwrap_or("").to_string();
@@ -526,6 +527,7 @@ mod tests {
                     code: "Identifier".to_string(),
                     ..Default::default()
                 }]),
+                max: Some("1".to_string()),
                 ..Default::default()
             },
             ElementDefinition {
@@ -546,6 +548,7 @@ mod tests {
                     code: "Extension".to_string(),
                     ..Default::default()
                 }]),
+                max: Some("*".to_string()),
                 ..Default::default()
             },
             ElementDefinition {
@@ -558,6 +561,7 @@ mod tests {
                     code: "Extension".to_string(),
                     ..Default::default()
                 }]),
+                max: Some("*".to_string()),
                 ..Default::default()
             },
         ];
