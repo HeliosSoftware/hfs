@@ -199,9 +199,12 @@ fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     output
 }
 
-fn detect_struct_cycles(elements: &[ElementDefinition]) -> std::collections::HashSet<(String, String)> {
+fn detect_struct_cycles(
+    elements: &[ElementDefinition],
+) -> std::collections::HashSet<(String, String)> {
     let mut cycles = std::collections::HashSet::new();
-    let mut graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut graph: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     // Build direct struct dependencies
     for element in elements {
@@ -211,7 +214,8 @@ fn detect_struct_cycles(elements: &[ElementDefinition]) -> std::collections::Has
                 for ty in types {
                     // Only track struct-level dependencies
                     if !ty.code.contains('.') {
-                        graph.entry(from_type.clone())
+                        graph
+                            .entry(from_type.clone())
                             .or_default()
                             .push(ty.code.clone());
                     }
@@ -382,7 +386,10 @@ fn process_elements(
                                     if cycle_from == from_type && cycle_to == &field_type.code {
                                         // Add Box<> around the type, preserving Option if present
                                         if type_str.starts_with("Option<") {
-                                            type_str = format!("Option<Box<{}>>", &type_str[7..type_str.len()-1]);
+                                            type_str = format!(
+                                                "Option<Box<{}>>",
+                                                &type_str[7..type_str.len() - 1]
+                                            );
                                         } else {
                                             type_str = format!("Box<{}>", type_str);
                                         }
@@ -482,11 +489,13 @@ mod tests {
         ];
 
         let cycles = detect_struct_cycles(&elements);
-        
+
         // Should detect the Identifier <-> Reference cycle
-        assert!(cycles.contains(&("Identifier".to_string(), "Reference".to_string())) ||
-                cycles.contains(&("Reference".to_string(), "Identifier".to_string())));
-        
+        assert!(
+            cycles.contains(&("Identifier".to_string(), "Reference".to_string()))
+                || cycles.contains(&("Reference".to_string(), "Identifier".to_string()))
+        );
+
         // Should not detect Patient -> Resource as a cycle (one-way dependency)
         assert!(!cycles.contains(&("Patient".to_string(), "Resource".to_string())));
         assert!(!cycles.contains(&("Resource".to_string(), "Patient".to_string())));
