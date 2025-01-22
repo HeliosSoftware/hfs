@@ -138,9 +138,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         && def.r#abstract == false
                     {
                         if let Some(snapshot) = &def.snapshot {
-                            if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().map(|e| e));
-                            }
+                            all_elements.extend(snapshot.element);
                         }
                     }
                 }
@@ -148,8 +146,8 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         }
 
         // Detect cycles using all collected elements
-        let element_refs: Vec<&ElementDefinition> = all_elements.iter().collect();
-        let cycles = detect_struct_cycles(&element_refs);
+        // AI! I want to pass all_elements to detect_struct_cycles
+        let cycles = detect_struct_cycles(&all_elements);
 
         // Second pass: generate code
         for entry in entries {
