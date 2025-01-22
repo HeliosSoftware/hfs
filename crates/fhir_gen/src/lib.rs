@@ -211,8 +211,16 @@ fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
                                 &generate_type_name(&element.path, &sd.name)
                             );
                             let base_type = match ty.code.as_str() {
-                                "http://hl7.org/fhirpath/System.String" => "string",
+                                // https://build.fhir.org/fhirpath.html#types
                                 "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                                "http://hl7.org/fhirpath/System.String" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+                                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+                                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+                                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
                                 "Element" | "BackboneElement" => {
                                     &generate_type_name(&element.path, &sd.name)
                                 }
@@ -341,8 +349,16 @@ fn process_elements(
                     if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
                         let is_array = element.max.as_deref() == Some("*");
                         let base_type = match ty.code.as_str() {
-                            "http://hl7.org/fhirpath/System.String" => "string",
+                            // https://build.fhir.org/fhirpath.html#types
                             "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                            "http://hl7.org/fhirpath/System.String" => "std::string::String",
+                            "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+                            "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+                            "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+                            "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+                            "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+                            "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+                            "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
                             "Element" | "BackboneElement" => {
                                 &generate_type_name(&element.path, &base_name)
                             }

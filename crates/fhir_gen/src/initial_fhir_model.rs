@@ -671,6 +671,12 @@ pub enum ElementDefinitionMinMaxValue {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Element {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -784,7 +790,7 @@ pub struct ElementDefinitionConstraint {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "resourceType")]
 pub struct StructureDefinition {
     pub id: Option<String>,
