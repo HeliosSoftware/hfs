@@ -513,6 +513,8 @@ mod tests {
                     code: "Reference".to_string(),
                     ..Default::default()
                 }]),
+                //AI! Add max value of 1
+                max: "1",
                 ..Default::default()
             },
             ElementDefinition {
