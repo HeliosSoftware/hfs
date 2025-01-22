@@ -44,14 +44,12 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all(base_output_path.as_ref())?;
+
     let version_file = base_output_path
         .as_ref()
         .join(&format!("{}.rs", version.to_string()));
-
-    // Create parent directory if it doesn't exist
-    if let Some(parent) = version_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
 
     // Create or truncate the version-specific output file
     std::fs::write(&version_file, "use serde::{Serialize, Deserialize};\n\n")?;
