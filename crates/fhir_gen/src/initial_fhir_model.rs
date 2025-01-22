@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Extension {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -87,7 +87,7 @@ pub struct Extension {
     */
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Coding {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -277,7 +277,7 @@ pub struct ElementDefinitionSlicingDescriminator {
     pub path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionSlicing {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -287,7 +287,7 @@ pub struct ElementDefinitionSlicing {
     pub rules: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionBase {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -603,7 +603,7 @@ pub struct TriggerDefinition {
     pub condition: Option<Expression>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ElementDefinitionDefaultValue {
     Base64Binary(String),
     Boolean(bool),
@@ -656,7 +656,7 @@ pub enum ElementDefinitionDefaultValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ElementDefinitionMinMaxValue {
     Date(String),
     DateTime(String),
@@ -734,7 +734,7 @@ pub struct ElementDefinition {
     pub mapping: Option<Vec<ElementDefinitionMapping>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionMapping {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -744,7 +744,7 @@ pub struct ElementDefinitionMapping {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionBinding {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -769,7 +769,7 @@ pub struct ElementDefinitionBindingAdditional {
     pub any: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionExample {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -777,7 +777,7 @@ pub struct ElementDefinitionExample {
     pub value: Option<ElementDefinitionDefaultValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ElementDefinitionConstraint {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
