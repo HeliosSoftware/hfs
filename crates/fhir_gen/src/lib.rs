@@ -223,7 +223,7 @@ fn structure_definition_to_rust(sd: &StructureDefinition, cycles: &std::collecti
 }
 
 fn detect_struct_cycles(
-    elements: &[ElementDefinition],
+    elements: &Vec<ElementDefinition>,
 ) -> std::collections::HashSet<(String, String)> {
     let mut cycles = std::collections::HashSet::new();
     let mut graph: std::collections::HashMap<String, Vec<String>> =
