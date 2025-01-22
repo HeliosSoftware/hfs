@@ -124,6 +124,12 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
+fn is_valid_structure_definition(def: &StructureDefinition) -> bool {
+    (def.kind == "complex-type" || def.kind == "primitive-type")
+        && def.derivation.as_deref() == Some("specialization")
+        && def.r#abstract == false
+}
+
 fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // First collect all ElementDefinitions across all StructureDefinitions
     let mut all_elements = Vec::new();
@@ -133,9 +139,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 if let Resource::StructureDefinition(def) = resource {
-                    if (def.kind == "complex-type" || def.kind == "primitive-type")
-                        && def.derivation.as_deref() == Some("specialization")
-                        && def.r#abstract == false
+                    if is_valid_structure_definition(def)
                     {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
@@ -156,9 +160,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        if (def.kind == "complex-type" || def.kind == "primitive-type")
-                            && def.derivation.as_deref() == Some("specialization")
-                            && def.r#abstract == false
+                        if is_valid_structure_definition(def)
                         {
                             let content = structure_definition_to_rust(def, &cycles);
                             // Append the content to the version-specific file
