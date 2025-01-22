@@ -220,12 +220,10 @@ fn process_elements(
         }
         
         println!("Processing type: {}", type_name);
-        processed_types.insert(type_name.clone());
-
-        // Check if this group contains a choice type
-        let choice_field = group.iter().find(|e| e.path.ends_with("[x]"));
-        if let Some(choice) = choice_field {
-            // Generate choice type enum
+        
+        // Process choice types first
+        let choice_fields: Vec<_> = group.iter().filter(|e| e.path.ends_with("[x]")).collect();
+        for choice in choice_fields {
             let enum_name = format!(
                 "{}{}",
                 type_name,
@@ -251,6 +249,12 @@ fn process_elements(
                     )
                     .collect::<String>()
             );
+            
+            // Skip if we've already processed this enum
+            if processed_types.contains(&enum_name) {
+                continue;
+            }
+            processed_types.insert(enum_name.clone());
             output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
