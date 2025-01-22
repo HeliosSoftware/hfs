@@ -138,7 +138,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                         && def.r#abstract == false
                     {
                         if let Some(snapshot) = &def.snapshot {
-                            all_elements.extend(snapshot.element);
+                            all_elements.extend(snapshot.element.iter().map(|e| e));
                         }
                     }
                 }
@@ -146,7 +146,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         }
 
         // Detect cycles using all collected elements
-        let element_refs: Vec<&ElementDefinition> = all_elements.iter().collect();
+        let element_refs: Vec<&ElementDefinition> = all_elements;
         let cycles = detect_struct_cycles(&element_refs);
 
         // Second pass: generate code
