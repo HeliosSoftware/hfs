@@ -47,12 +47,11 @@ fn process_single_version(
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(base_output_path.as_ref())?;
 
-    let version_file = base_output_path
-        .as_ref()
-        .join(&format!("{}.rs", version.to_string()));
+    let version_file = format!("{}.rs", version.to_string());
+    let version_path = base_output_path.as_ref().join(&version_file);
 
     // Create or truncate the version-specific output file with initial content
-    let mut file = std::fs::File::create(&version_file)?;
+    let mut file = std::fs::File::create(&version_path)?;
     writeln!(file, "use serde::{{Serialize, Deserialize}};\n")?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -131,11 +130,9 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
-    version: &FhirVersion,
+    _version: &FhirVersion,
 ) -> io::Result<()> {
-    let version_file = output_path
-        .as_ref()
-        .join(&format!("{}.rs", version.to_string()));
+    let version_path = output_path.as_ref();
 
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
@@ -154,7 +151,7 @@ fn generate_code(
                                 .create(true)
                                 .write(true)
                                 .append(true)
-                                .open(&version_file)?;
+                                .open(version_path)?;
                             writeln!(file, "{}", content)?;
                         }
                     }
