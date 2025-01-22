@@ -38,16 +38,15 @@ impl ToString for FhirVersion {
     }
 }
 
-fn process_single_version(
-    version: &FhirVersion,
-    base_output_path: impl AsRef<Path>,
-) -> io::Result<()> {
+fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
     // Create output directory if it doesn't exist
-    std::fs::create_dir_all(base_output_path.as_ref())?;
+    std::fs::create_dir_all(output_path.as_ref())?;
 
-    let version_path = output_path.as_ref().join(&format!("{}.rs", version.to_string()));
+    let version_path = output_path
+        .as_ref()
+        .join(&format!("{}.rs", version.to_string()));
 
     // Create or truncate the version-specific output file with initial content
     let mut file = std::fs::File::create(&version_path)?;
@@ -58,7 +57,7 @@ fn process_single_version(
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &version_path, version)?,
+                Ok(bundle) => generate_code(bundle, file)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -126,13 +125,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(
-    _bundle: Bundle,
-    output_path: impl AsRef<Path>,
-    version: &FhirVersion,
-) -> io::Result<()> {
-    let version_path = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
-
+fn generate_code(_bundle: Bundle, mut file: File) -> io::Result<()> {
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
         for entry in entries {
@@ -146,11 +139,6 @@ fn generate_code(
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .append(true)
-                                .open(&version_path)?;
                             writeln!(file, "{}", content)?;
                         }
                     }
