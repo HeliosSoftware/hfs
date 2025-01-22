@@ -205,7 +205,7 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
-        // AI! println parent_path and element
+        println!("Parent path: {}, Element path: {}", parent_path, element.path);
         element_groups.entry(parent_path).or_default().push(element);
     }
 
