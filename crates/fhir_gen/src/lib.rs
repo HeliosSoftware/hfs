@@ -127,7 +127,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // First collect all ElementDefinitions across all StructureDefinitions
     let mut all_elements = Vec::new();
-    
+
     if let Some(entries) = _bundle.entry.as_ref() {
         // First pass: collect all elements
         for entry in entries {
@@ -139,18 +139,18 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                     {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().map(|e| (*e).clone()));
+                                // AI! Add the elements to all_elements as references
                             }
                         }
                     }
                 }
             }
         }
-        
+
         // Detect cycles using all collected elements
         let element_refs: Vec<&ElementDefinition> = all_elements.iter().collect();
         let cycles = detect_struct_cycles(&element_refs);
-        
+
         // Second pass: generate code
         for entry in entries {
             if let Some(resource) = &entry.resource {
@@ -211,13 +211,22 @@ fn capitalize_first_letter(s: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust(sd: &StructureDefinition, cycles: &std::collections::HashSet<(String, String)>) -> String {
+fn structure_definition_to_rust(
+    sd: &StructureDefinition,
+    cycles: &std::collections::HashSet<(String, String)>,
+) -> String {
     let mut output = String::new();
     // Process elements
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             let mut processed_types = std::collections::HashSet::new();
-            process_elements(elements, &mut output, &mut processed_types, &sd.name, cycles);
+            process_elements(
+                elements,
+                &mut output,
+                &mut processed_types,
+                &sd.name,
+                cycles,
+            );
         }
     }
     output
