@@ -44,13 +44,14 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
-    let output_dir = base_output_path.as_ref().join(version.to_string());
+    let version_file = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
     
-    // Create output directory if it doesn't exist
-    std::fs::create_dir_all(&output_dir)?;
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = version_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     // Create or truncate the version-specific output file
-    let version_file = output_dir.join(&format!("{}.rs", version.to_string()));
     std::fs::write(&version_file, "use serde::{Serialize, Deserialize};\n\n")?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -128,9 +129,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 
 // Track all generated modules across files
 fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirVersion) -> io::Result<()> {
-    // Create the output directory if it doesn't exist
-    let output_path = output_path.as_ref();
-    std::fs::create_dir_all(output_path)?;
+    let version_file = output_path.as_ref().join(&format!("{}.rs", version.to_string()));
 
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
@@ -148,7 +147,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>, version: &FhirV
                             let mut file = std::fs::OpenOptions::new()
                                 .write(true)
                                 .append(true)
-                                .open(output_path.join(&format!("{}.rs", version.to_string())))?;
+                                .open(&version_file)?;
                             file.write_all(content.as_bytes())?;
                         }
                     }
