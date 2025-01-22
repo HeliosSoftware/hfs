@@ -199,12 +199,50 @@ fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     output
 }
 
+fn detect_struct_cycles(elements: &[ElementDefinition]) -> std::collections::HashSet<(String, String)> {
+    let mut cycles = std::collections::HashSet::new();
+    let mut graph: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+    // Build direct struct dependencies
+    for element in elements {
+        if let Some(types) = &element.r#type {
+            let from_type = element.path.split('.').next().unwrap_or("").to_string();
+            if !from_type.is_empty() {
+                for ty in types {
+                    // Only track struct-level dependencies
+                    if !ty.code.contains('.') {
+                        graph.entry(from_type.clone())
+                            .or_default()
+                            .push(ty.code.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Find cycles between exactly two structs
+    for (from_type, deps) in &graph {
+        for to_type in deps {
+            if let Some(back_deps) = graph.get(to_type) {
+                if back_deps.contains(from_type) {
+                    // We found a cycle between exactly two structs
+                    cycles.insert((from_type.clone(), to_type.clone()));
+                }
+            }
+        }
+    }
+
+    cycles
+}
+
 fn process_elements(
     elements: &[ElementDefinition],
     output: &mut String,
     processed_types: &mut std::collections::HashSet<String>,
     base_name: &str,
 ) {
+    // Detect cycles first
+    let cycles = detect_struct_cycles(elements);
     // Group elements by their parent path
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
@@ -314,7 +352,7 @@ fn process_elements(
                             _ => &capitalize_first_letter(&ty.code),
                         };
 
-                        let type_str = if field_name.ends_with("[x]") {
+                        let mut type_str = if field_name.ends_with("[x]") {
                             let base_name = field_name.trim_end_matches("[x]");
                             let enum_name = format!(
                                 "{}{}",
@@ -335,6 +373,24 @@ fn process_elements(
                         } else {
                             base_type.to_string()
                         };
+
+                        // Add Box<> to break cycles (only to the "to" type in the cycle)
+                        if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
+                            let from_type = element.path.split('.').next().unwrap_or("");
+                            if !from_type.is_empty() {
+                                for (cycle_from, cycle_to) in &cycles {
+                                    if cycle_from == from_type && cycle_to == &field_type.code {
+                                        // Add Box<> around the type, preserving Option if present
+                                        if type_str.starts_with("Option<") {
+                                            type_str = format!("Option<Box<{}>>", &type_str[7..type_str.len()-1]);
+                                        } else {
+                                            type_str = format!("Box<{}>", type_str);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
 
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
