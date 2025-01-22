@@ -139,7 +139,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                     {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().cloned());
+                                all_elements.extend(elements.iter().map(|e| e.clone()));
                             }
                         }
                     }
@@ -404,7 +404,7 @@ fn process_elements(
                         if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
                             let from_type = element.path.split('.').next().unwrap_or("");
                             if !from_type.is_empty() {
-                                for (cycle_from, cycle_to) in &cycles {
+                                for (cycle_from, cycle_to) in cycles.iter() {
                                     if cycle_from == from_type && cycle_to == &field_type.code {
                                         // Add Box<> around the type, preserving Option if present
                                         if type_str.starts_with("Option<") {

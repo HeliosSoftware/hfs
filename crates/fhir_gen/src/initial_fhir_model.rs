@@ -676,7 +676,7 @@ pub struct Element {
     pub extension: Option<Vec<Extension>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
