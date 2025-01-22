@@ -49,6 +49,10 @@ fn process_single_version(
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
 
+    // Create or truncate the version-specific output file
+    let version_file = output_path.join(&format!("{}.rs", version.to_string()));
+    std::fs::write(&version_file, "use serde::{Serialize, Deserialize};\n\n")?;
+
     // Process all JSON files in the resources/{FhirVersion} directory
     let mut all_generated_modules = Vec::new();
 
@@ -147,9 +151,12 @@ fn generate_code(
                             && def.r#abstract == false
                         {
                             if let Some(id) = &def.id {
-                                let mut content = String::new();
-                                content.push_str(&structure_definition_to_rust_file(def));
-                                std::fs::write(output_path, content)?;
+                                let content = structure_definition_to_rust_file(def);
+                                // Append the content to the version-specific file
+                                std::fs::write(
+                                    output_path.join(&format!("{}.rs", version.to_string())),
+                                    content,
+                                )?;
                                 generated_modules.push(id.to_string());
                             }
                         }
@@ -186,9 +193,6 @@ fn capitalize_first_letter(s: &str) -> String {
 
 fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
     let mut output = String::new();
-
-    // Add imports
-    output.push_str("use serde::{Serialize, Deserialize};\n\n");
 
     // Generate main struct first
     output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
