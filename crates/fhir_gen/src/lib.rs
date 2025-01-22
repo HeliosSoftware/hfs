@@ -139,7 +139,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                     {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.clone());
+                                all_elements.extend(elements.iter().map(|e| (*e).clone()));
                             }
                         }
                     }
@@ -148,7 +148,8 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         }
         
         // Detect cycles using all collected elements
-        let cycles = detect_struct_cycles(&all_elements);
+        let element_refs: Vec<&ElementDefinition> = all_elements.iter().collect();
+        let cycles = detect_struct_cycles(&element_refs);
         
         // Second pass: generate code
         for entry in entries {
@@ -223,7 +224,7 @@ fn structure_definition_to_rust(sd: &StructureDefinition, cycles: &std::collecti
 }
 
 fn detect_struct_cycles(
-    elements: &Vec<ElementDefinition>,
+    elements: &Vec<&ElementDefinition>,
 ) -> std::collections::HashSet<(String, String)> {
     let mut cycles = std::collections::HashSet::new();
     let mut graph: std::collections::HashMap<String, Vec<String>> =
