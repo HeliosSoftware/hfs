@@ -44,7 +44,10 @@ fn process_single_version(
 ) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.to_string());
-    let output_path = base_output_path.as_ref().join(version.to_string());
+    let output_path = base_output_path
+        .as_ref()
+        .join(version.to_string())
+        .join(&format!("{}.rs", version.to_string()));
 
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(&output_path)?;
@@ -65,7 +68,6 @@ fn process_single_version(
             }
             Ok(())
         })?;
-
 
     Ok(())
 }
@@ -128,10 +130,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 }
 
 // Track all generated modules across files
-fn generate_code(
-    _bundle: Bundle,
-    output_path: impl AsRef<Path>,
-) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
     std::fs::create_dir_all(output_path)?;
@@ -147,14 +146,9 @@ fn generate_code(
                             && def.derivation.as_deref() == Some("specialization")
                             && def.r#abstract == false
                         {
-                            if let Some(id) = &def.id {
-                                let content = structure_definition_to_rust_file(def);
-                                // Append the content to the version-specific file
-                                std::fs::write(
-                                    output_path.join(&format!("{}.rs", version.to_string())),
-                                    content,
-                                )?;
-                            }
+                            let content = structure_definition_to_rust_file(def);
+                            // Append the content to the version-specific file
+                            std::fs::write(output_path, content)?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
