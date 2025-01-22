@@ -268,6 +268,7 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
+        // println parent_path and element AI!
         element_groups.entry(parent_path).or_default().push(element);
     }
 
