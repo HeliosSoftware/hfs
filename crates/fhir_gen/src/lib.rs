@@ -528,9 +528,8 @@ mod tests {
             },
         ];
 
-        // AI! convert this Vec<ElementDefinition> to a suitable parameter to detect_struct_cycles
-
-        let cycles = detect_struct_cycles(&elements);
+        let element_refs: Vec<&ElementDefinition> = elements.iter().collect();
+        let cycles = detect_struct_cycles(&element_refs);
 
         // Should detect the Identifier <-> Reference cycle
         assert!(
