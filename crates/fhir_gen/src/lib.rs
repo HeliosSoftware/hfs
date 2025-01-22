@@ -199,85 +199,6 @@ fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     output
 }
 
-fn detect_cycles(elements: &[ElementDefinition], base_name: &str) -> std::collections::HashSet<(String, String)> {
-    let mut cycles = std::collections::HashSet::new();
-    let mut graph: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
-    
-    // Build dependency graph with field information
-    for element in elements {
-        if let Some(types) = &element.r#type {
-            let from_type = element.path.split('.').next().unwrap_or(base_name).to_string();
-            let field_name = element.path.split('.').last().unwrap_or("").to_string();
-            
-            for ty in types {
-                if !matches!(ty.code.as_str(), 
-                    "http://hl7.org/fhirpath/System.Boolean" |
-                    "http://hl7.org/fhirpath/System.String" |
-                    "http://hl7.org/fhirpath/System.Integer" |
-                    "http://hl7.org/fhirpath/System.Long" |
-                    "http://hl7.org/fhirpath/System.Decimal" |
-                    "http://hl7.org/fhirpath/System.Date" |
-                    "http://hl7.org/fhirpath/System.DateTime" |
-                    "http://hl7.org/fhirpath/System.Time" |
-                    "http://hl7.org/fhirpath/System.Quantity") {
-                    graph.entry(from_type.clone())
-                        .or_default()
-                        .push((ty.code.clone(), field_name.clone()));
-                }
-            }
-        }
-    }
-
-    // Detect cycles using DFS
-    let mut visited = std::collections::HashSet::new();
-    let mut path = Vec::new();
-
-    fn dfs(
-        current: &str,
-        graph: &std::collections::HashMap<String, Vec<(String, String)>>,
-        visited: &mut std::collections::HashSet<String>,
-        path: &mut Vec<String>,
-        field_path: &mut Vec<String>,
-        cycles: &mut std::collections::HashSet<(String, String)>,
-    ) {
-        if path.contains(&current.to_string()) {
-            let cycle_start_idx = path.iter().position(|x| x == current).unwrap();
-            // Only mark as cycle if the field path creates a recursive structure
-            let field_sequence = &field_path[cycle_start_idx..];
-            if field_sequence.iter().any(|f| f == "identifier") && 
-               field_sequence.iter().any(|f| f == "reference") {
-                for window in path[cycle_start_idx..].windows(2) {
-                    cycles.insert((window[0].clone(), window[1].clone()));
-                }
-            }
-            return;
-        }
-
-        if visited.contains(current) {
-            return;
-        }
-
-        visited.insert(current.to_string());
-        path.push(current.to_string());
-
-        if let Some(deps) = graph.get(current) {
-            for (dep, field) in deps {
-                field_path.push(field.clone());
-                dfs(dep, graph, visited, path, field_path, cycles);
-                field_path.pop();
-            }
-        }
-
-        path.pop();
-    }
-
-    for node in graph.keys() {
-        let mut field_path = Vec::new();
-        dfs(node, &graph, &mut visited, &mut path, &mut field_path, &mut cycles);
-    }
-
-    cycles
-}
 
 fn process_elements(
     elements: &[ElementDefinition],
@@ -285,8 +206,6 @@ fn process_elements(
     processed_types: &mut std::collections::HashSet<String>,
     base_name: &str,
 ) {
-    // Detect cycles first
-    let cycles = detect_cycles(elements, base_name);
     // Group elements by their parent path
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
@@ -418,18 +337,6 @@ fn process_elements(
                             base_type.to_string()
                         };
 
-                        // Check if this field is part of a cycle and needs to be boxed
-                        if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
-                            let from_type = element.path.split('.').next().unwrap_or(base_name);
-                            if cycles.contains(&(from_type.to_string(), field_type.code.clone())) {
-                                // Add Box<> around the type, preserving Option if present
-                                if type_str.starts_with("Option<") {
-                                    type_str = format!("Option<Box<{}>>", &type_str[7..type_str.len()-1]);
-                                } else {
-                                    type_str = format!("Box<{}>", type_str);
-                                }
-                            }
-                        }
 
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
