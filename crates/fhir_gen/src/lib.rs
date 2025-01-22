@@ -275,7 +275,7 @@ fn process_elements(
     for (path, group) in element_groups {
         // Skip if we've already processed this type
         let type_name = generate_type_name(&path, base_name);
-        // AI! println type_name
+        println!("Processing type: {}", type_name);
         if processed_types.contains(&type_name) {
             continue;
         }
