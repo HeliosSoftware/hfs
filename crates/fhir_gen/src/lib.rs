@@ -64,20 +64,6 @@ fn process_single_version(
             Ok(())
         })?;
 
-    // Write final {FhirVersion}.rs with all accumulated modules
-    let mut lib_content = String::new();
-
-    // Add pub mod statements for all modules
-    for module in all_generated_modules {
-        lib_content.push_str(&format!("pub mod {};\n", capitalize_first_letter(&module)));
-    }
-
-    std::fs::write(
-        base_output_path
-            .as_ref()
-            .join(&format!("{}.rs", version.to_string())),
-        lib_content,
-    )?;
 
     Ok(())
 }
@@ -161,9 +147,9 @@ fn generate_code(
                             && def.r#abstract == false
                         {
                             if let Some(id) = &def.id {
-                                let file_name = format!("{}.rs", id.to_lowercase());
-                                let file_path = output_path.join(&file_name);
-                                std::fs::write(file_path, structure_definition_to_rust_file(def))?;
+                                let mut content = String::new();
+                                content.push_str(&structure_definition_to_rust_file(def));
+                                std::fs::write(output_path, content)?;
                                 generated_modules.push(id.to_string());
                             }
                         }
