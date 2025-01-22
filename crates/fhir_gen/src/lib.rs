@@ -136,7 +136,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                             && def.derivation.as_deref() == Some("specialization")
                             && def.r#abstract == false
                         {
-                            let content = structure_definition_to_rust_file(def);
+                            let content = structure_definition_to_rust(def);
                             // Append the content to the version-specific file
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
@@ -176,75 +176,70 @@ fn capitalize_first_letter(s: &str) -> String {
     }
 }
 
-fn structure_definition_to_rust_file(sd: &StructureDefinition) -> String {
+fn structure_definition_to_rust(sd: &StructureDefinition) -> String {
     let mut output = String::new();
+    /*
+        // Generate main struct first
+        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+        output.push_str(&format!(
+            "pub struct {} {{\n",
+            capitalize_first_letter(&sd.name)
+        ));
 
-    // Generate main struct first
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-    output.push_str(&format!(
-        "pub struct {} {{\n",
-        capitalize_first_letter(&sd.name)
-    ));
+        // Add fields for the main struct
+        if let Some(snapshot) = &sd.snapshot {
+            if let Some(elements) = &snapshot.element {
 
-    // Add fields for the main struct
-    if let Some(snapshot) = &sd.snapshot {
-        if let Some(elements) = &snapshot.element {
-            for element in elements.iter().filter(|e| {
-                println!("Element path: {}", e.path);
-                let parts: Vec<&str> = e.path.split('.').collect();
-                parts.len() == 2 && parts[0] == sd.name
-            }) {
-                if let Some(field_name) = element.path.split('.').last() {
-                    if !field_name.contains("[x]") {
-                        let rust_field_name = make_rust_safe(field_name);
+                for element in elements.iter().filter(|e| {
+                    let parts: Vec<&str> = e.path.split('.').collect();
+                    parts.len() == 2 && parts[0] == sd.name
+                }) {
+                    if let Some(field_name) = element.path.split('.').last() {
+                        if !field_name.contains("[x]") {
+                            let rust_field_name = make_rust_safe(field_name);
 
-                        if field_name != rust_field_name {
-                            output
-                                .push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
-                        }
+                            if field_name != rust_field_name {
+                                output
+                                    .push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
+                            }
 
-                        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-                            let is_array = element.max.as_deref() == Some("*");
-                            println!("Type code: {}", ty.code);
-                            println!(
-                                "Generated Type Name {}",
-                                &generate_type_name(&element.path, &sd.name)
-                            );
-                            let base_type = match ty.code.as_str() {
-                                // https://build.fhir.org/fhirpath.html#types
-                                "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                                "http://hl7.org/fhirpath/System.String" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
-                                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
-                                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
-                                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                                "Element" | "BackboneElement" => {
-                                    &generate_type_name(&element.path, &sd.name)
-                                }
-                                _ => &capitalize_first_letter(&ty.code),
-                            };
+                            if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+                                let is_array = element.max.as_deref() == Some("*");
+                                let base_type = match ty.code.as_str() {
+                                    // https://build.fhir.org/fhirpath.html#types
+                                    "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                                    "http://hl7.org/fhirpath/System.String" => "std::string::String",
+                                    "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+                                    "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+                                    "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+                                    "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+                                    "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+                                    "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+                                    "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
+                                    "Element" | "BackboneElement" => {
+                                        &generate_type_name(&element.path, &sd.name)
+                                    }
+                                    _ => &capitalize_first_letter(&ty.code),
+                                };
 
-                            let type_str = if is_array {
-                                format!("Option<Vec<{}>>", base_type)
-                            } else if element.min.unwrap_or(0) == 0 {
-                                format!("Option<{}>", base_type)
-                            } else {
-                                base_type.to_string()
-                            };
+                                let type_str = if is_array {
+                                    format!("Option<Vec<{}>>", base_type)
+                                } else if element.min.unwrap_or(0) == 0 {
+                                    format!("Option<{}>", base_type)
+                                } else {
+                                    base_type.to_string()
+                                };
 
-                            output
-                                .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                                output
+                                    .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    output.push_str("}\n\n");
-
+        output.push_str("}\n\n");
+    */
     // Process elements recursively
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
@@ -266,6 +261,8 @@ fn process_elements(
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
 
+    // I would like this next block of code to also handle the root path and not skip over elements
+    // that have a path_parts.len() == 1 AI!
     for element in elements {
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
