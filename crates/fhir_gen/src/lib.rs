@@ -47,7 +47,7 @@ fn process_single_version(
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(base_output_path.as_ref())?;
 
-    let version_path = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
+    let version_path = output_path.as_ref().join(&format!("{}.rs", version.to_string()));
 
     // Create or truncate the version-specific output file with initial content
     let mut file = std::fs::File::create(&version_path)?;
@@ -58,7 +58,7 @@ fn process_single_version(
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &version_file, version)?,
+                Ok(bundle) => generate_code(bundle, &version_path, version)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
