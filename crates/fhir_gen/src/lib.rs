@@ -150,7 +150,6 @@ fn generate_code(
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
-                            // AI! Does this create a new file each time?  I want it to append
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
                                 .write(true)
