@@ -47,7 +47,9 @@ fn process_single_version(
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(base_output_path.as_ref())?;
 
-    let version_file = base_output_path.as_ref().join(&format!("{}.rs", version.to_string()));
+    let version_file = base_output_path
+        .as_ref()
+        .join(&format!("{}.rs", version.to_string()));
 
     // Create or truncate the version-specific output file with initial content
     let mut file = std::fs::File::create(&version_file)?;
@@ -126,7 +128,6 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-// Track all generated modules across files
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
@@ -149,6 +150,7 @@ fn generate_code(
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
+                            // AI! Does this create a new file each time?  I want it to append
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
                                 .write(true)
