@@ -254,13 +254,17 @@ fn detect_struct_cycles(
                     for ty in types {
                         // Only track struct-level dependencies
                         if !ty.code.contains('.') && from_type != ty.code {
-                            // Add the dependency if both sides have max=1
-                            let target_max = elements.iter()
-                                .find(|e| e.path == ty.code)
-                                .and_then(|e| e.max.as_ref())
-                                .map(|m| m.as_str());
-                            
-                            if target_max == Some("1") {
+                            // Check for bidirectional references between types
+                            let has_reverse_ref = elements.iter().any(|e| {
+                                if let Some(e_types) = &e.r#type {
+                                    e.path.starts_with(&ty.code) && 
+                                    e_types.iter().any(|t| t.code == from_type)
+                                } else {
+                                    false
+                                }
+                            });
+
+                            if has_reverse_ref {
                                 graph
                                     .entry(from_type.clone())
                                     .or_default()
