@@ -261,14 +261,14 @@ fn process_elements(
     let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
         std::collections::HashMap::new();
 
-    // I would like this next block of code to also handle the root path and not skip over elements
-    // that have a path_parts.len() == 1 AI!
     for element in elements {
         let path_parts: Vec<&str> = element.path.split('.').collect();
-        if path_parts.len() > 1 {
-            let parent_path = path_parts[..path_parts.len() - 1].join(".");
-            element_groups.entry(parent_path).or_default().push(element);
-        }
+        let parent_path = if path_parts.len() == 1 {
+            path_parts[0].to_string()
+        } else {
+            path_parts[..path_parts.len() - 1].join(".")
+        };
+        element_groups.entry(parent_path).or_default().push(element);
     }
 
     // Process each group
