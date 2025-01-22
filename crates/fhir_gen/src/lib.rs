@@ -54,13 +54,11 @@ fn process_single_version(
     std::fs::write(&version_file, "use serde::{Serialize, Deserialize};\n\n")?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
-    let mut all_generated_modules = Vec::new();
-
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &output_path, &mut all_generated_modules)?,
+                Ok(bundle) => generate_code(bundle, &output_path)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -133,7 +131,6 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn generate_code(
     _bundle: Bundle,
     output_path: impl AsRef<Path>,
-    generated_modules: &mut Vec<String>,
 ) -> io::Result<()> {
     // Create the output directory if it doesn't exist
     let output_path = output_path.as_ref();
@@ -157,7 +154,6 @@ fn generate_code(
                                     output_path.join(&format!("{}.rs", version.to_string())),
                                     content,
                                 )?;
-                                generated_modules.push(id.to_string());
                             }
                         }
                     }
