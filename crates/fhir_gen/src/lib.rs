@@ -252,9 +252,10 @@ fn detect_struct_cycles(
                     // Only track struct-level dependencies
                     if !ty.code.contains('.') && from_type != ty.code {
                         // Find the corresponding element for the target type
-                        if let Some(target_element) = elements.iter().find(|e| {
-                            e.path.split('.').next().unwrap_or("") == ty.code
-                        }) {
+                        if let Some(target_element) = elements
+                            .iter()
+                            .find(|e| e.path.split('.').next().unwrap_or("") == ty.code)
+                        {
                             // Only add if both sides have max=1
                             if target_element.max.as_deref() == Some("1") {
                                 graph
@@ -280,6 +281,8 @@ fn detect_struct_cycles(
             }
         }
     }
+
+    // AI!  printf graph and cycles here
 
     cycles
 }
