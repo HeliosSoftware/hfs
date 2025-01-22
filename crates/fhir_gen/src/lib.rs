@@ -162,6 +162,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
 }
 
 fn make_rust_safe(input: &str) -> String {
+    // Also handle the conversion to snake_case here AI!
     match input {
         "type" | "use" | "abstract" => format!("r#{}", input),
         _ => input.to_string(),
@@ -206,21 +207,20 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
-        println!("Parent path: {}, Element path: {}", parent_path, element.path);
         element_groups.entry(parent_path).or_default().push(element);
     }
 
     // Process each group
     for (path, group) in element_groups {
         let type_name = generate_type_name(&path, base_name);
-        
+
         // Skip if we've already processed this type
         if processed_types.contains(&type_name) {
             continue;
         }
-        
-        println!("Processing type: {}", type_name);
-        
+
+        processed_types.insert(type_name.clone());
+
         // Process choice types first
         let choice_fields: Vec<_> = group.iter().filter(|e| e.path.ends_with("[x]")).collect();
         for choice in choice_fields {
@@ -249,7 +249,7 @@ fn process_elements(
                     )
                     .collect::<String>()
             );
-            
+
             // Skip if we've already processed this enum
             if processed_types.contains(&enum_name) {
                 continue;
@@ -334,16 +334,6 @@ fn process_elements(
             }
         }
         output.push_str("}\n\n");
-        /*
-                // Recursively process nested types, but only for elements not in the current group
-                let nested_elements: Vec<&ElementDefinition> = elements
-                    .iter()
-                    .filter(|e| !group.contains(e))
-                    .collect();
-                if !nested_elements.is_empty() {
-                    process_elements(&nested_elements, output, processed_types, base_name);
-                }
-        */
     }
 }
 
