@@ -247,7 +247,7 @@ fn detect_struct_cycles(
     for element in elements {
         if let Some(types) = &element.r#type {
             let from_type = element.path.split('.').next().unwrap_or("").to_string();
-            if !from_type.is_empty() && element.max.as_deref() == Some("1") {
+            if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
                 for ty in types {
                     // Only track struct-level dependencies
                     if !ty.code.contains('.') && from_type != ty.code {
@@ -257,7 +257,7 @@ fn detect_struct_cycles(
                             .find(|e| e.path.split('.').next().unwrap_or("") == ty.code)
                         {
                             // Only add if both sides have max=1
-                            if target_element.max.as_deref() == Some("1") {
+                            if target_element.max.as_ref().map(|m| m.as_str()) == Some("1") {
                                 graph
                                     .entry(from_type.clone())
                                     .or_default()
