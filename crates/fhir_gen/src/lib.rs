@@ -139,7 +139,7 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                     {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().map(|e| e.clone()));
+                                all_elements.extend(elements.clone());
                             }
                         }
                     }
