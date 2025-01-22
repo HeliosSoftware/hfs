@@ -453,6 +453,46 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_struct_cycles() {
+        let elements = vec![
+            ElementDefinition {
+                path: "Identifier".to_string(),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
+                    code: "Reference".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Reference".to_string(),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
+                    code: "Identifier".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ElementDefinition {
+                path: "Patient".to_string(),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
+                    code: "Resource".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        ];
+
+        let cycles = detect_struct_cycles(&elements);
+        
+        // Should detect the Identifier <-> Reference cycle
+        assert!(cycles.contains(&("Identifier".to_string(), "Reference".to_string())) ||
+                cycles.contains(&("Reference".to_string(), "Identifier".to_string())));
+        
+        // Should not detect Patient -> Resource as a cycle (one-way dependency)
+        assert!(!cycles.contains(&("Patient".to_string(), "Resource".to_string())));
+        assert!(!cycles.contains(&("Resource".to_string(), "Patient".to_string())));
+    }
+
+    #[test]
     fn test_parse_structure_definitions() {
         let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
         let json_files = visit_dirs(&resources_dir).expect("Failed to read resource directory");
