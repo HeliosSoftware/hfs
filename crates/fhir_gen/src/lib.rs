@@ -485,11 +485,11 @@ mod tests {
     #[test]
     fn test_detect_struct_cycles() {
         let elements = vec![
-            ElementDefinition {
+            &ElementDefinition {
                 path: "Identifier".to_string(),
                 ..Default::default()
             },
-            ElementDefinition {
+            &ElementDefinition {
                 path: "Identifier.assigner".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Reference".to_string(),
@@ -497,11 +497,11 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            ElementDefinition {
+            &ElementDefinition {
                 path: "Reference".to_string(),
                 ..Default::default()
             },
-            ElementDefinition {
+            &ElementDefinition {
                 path: "Reference.identifier".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Identifier".to_string(),
@@ -509,7 +509,7 @@ mod tests {
                 }]),
                 ..Default::default()
             },
-            ElementDefinition {
+            &ElementDefinition {
                 path: "Patient".to_string(),
                 r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
                     code: "Resource".to_string(),
