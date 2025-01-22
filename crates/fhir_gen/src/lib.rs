@@ -199,7 +199,6 @@ fn process_elements(
         std::collections::HashMap::new();
 
     // First pass - collect all type names that will be generated
-    let mut all_type_names = std::collections::HashSet::new();
     for element in elements {
         let path_parts: Vec<&str> = element.path.split('.').collect();
         let parent_path = if path_parts.len() == 1 {
@@ -207,20 +206,16 @@ fn process_elements(
         } else {
             path_parts[..path_parts.len() - 1].join(".")
         };
-        let type_name = generate_type_name(&parent_path, base_name);
-        all_type_names.insert(type_name);
-        
         println!("Parent path: {}, Element path: {}", parent_path, element.path);
         element_groups.entry(parent_path).or_default().push(element);
     }
 
-    // Remove any types we've already processed
-    all_type_names.retain(|type_name| !processed_types.contains(type_name));
-
-    // Process each group, but only for types we haven't seen before
+    // Process each group
     for (path, group) in element_groups {
         let type_name = generate_type_name(&path, base_name);
-        if !all_type_names.contains(&type_name) {
+        
+        // Skip if we've already processed this type
+        if processed_types.contains(&type_name) {
             continue;
         }
         
