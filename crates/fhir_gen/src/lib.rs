@@ -48,16 +48,15 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         .as_ref()
         .join(&format!("{}.rs", version.to_string()));
 
-    // Create or truncate the version-specific output file with initial content
-    let mut file = std::fs::File::create(&version_path)?;
-    writeln!(file, "use serde::{{Serialize, Deserialize}};\n")?;
+    // Create the version-specific output file with initial content
+    std::fs::write(&version_path, "use serde::{Serialize, Deserialize};\n\n")?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, file)?,
+                Ok(bundle) => generate_code(bundle, &version_path)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
@@ -125,7 +124,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     serde_json::from_reader(reader)
 }
 
-fn generate_code(_bundle: Bundle, mut file: File) -> io::Result<()> {
+fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // Process each entry in the bundle
     if let Some(entries) = _bundle.entry.as_ref() {
         for entry in entries {
@@ -139,6 +138,11 @@ fn generate_code(_bundle: Bundle, mut file: File) -> io::Result<()> {
                         {
                             let content = structure_definition_to_rust_file(def);
                             // Append the content to the version-specific file
+                            let mut file = std::fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .append(true)
+                                .open(output_path.as_ref())?;
                             writeln!(file, "{}", content)?;
                         }
                     }
