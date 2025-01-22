@@ -162,10 +162,17 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
 }
 
 fn make_rust_safe(input: &str) -> String {
-    // Also handle the conversion to snake_case here AI!
-    match input {
-        "type" | "use" | "abstract" => format!("r#{}", input),
-        _ => input.to_string(),
+    let snake_case = input.chars().enumerate().fold(String::new(), |mut acc, (i, c)| {
+        if i > 0 && c.is_uppercase() {
+            acc.push('_');
+        }
+        acc.push(c.to_lowercase().next().unwrap());
+        acc
+    });
+    
+    match snake_case.as_str() {
+        "type" | "use" | "abstract" => format!("r#{}", snake_case),
+        _ => snake_case,
     }
 }
 
