@@ -458,7 +458,7 @@ fn process_elements(
     }
 }
 
-fn generate_type_name(path: &str, base_name: &str) -> String {
+fn generate_type_name(path: &str, base_name: &str) -> Result<String, &'static str> {
     let parts: Vec<&str> = path.split('.').collect();
     if !parts.is_empty() {
         let mut result = base_name.to_string();
@@ -473,9 +473,10 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
                     .collect::<String>(),
             );
         }
-        result
+        Ok(result)
+    } else {
+        Err("Empty path provided to generate_type_name")
     }
-    // AI! Add an else statement that returns an error
 }
 
 #[cfg(test)]
