@@ -459,6 +459,7 @@ fn process_elements(
 }
 
 fn generate_type_name(path: &str, base_name: &str) -> String {
+    // AI!  Can you fix the syntax error below?
     let parts: Vec<&str> = path.split('.').collect();
     if !parts.is_empty() {
         let mut result = base_name.to_string();
@@ -475,7 +476,7 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
         }
         result
     } else {
-        "error"
+        String::new().push_str("error")
     }
 }
 
