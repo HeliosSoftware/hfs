@@ -381,11 +381,10 @@ fn process_elements(
                         for choice_type in types {
                             let choice_type_type = capitalize_first_letter(&choice_type.code);
                             let mut new_choice_type = ElementDefinition::default();
-                            // AI! Can you help me with the syntax below here?
                             new_choice_type.id = element.id.clone().map(|id| {
-                                id.trim_end_matches("[x]")
-                                    .to_string()
-                                    .push_str(&choice_type_type)
+                                let mut s = id.trim_end_matches("[x]").to_string();
+                                s.push_str(&choice_type_type);
+                                s
                             });
                             new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
                             new_choice_type.path.push_str(&choice_type_type);
