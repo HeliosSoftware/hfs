@@ -455,7 +455,7 @@ fn process_elements(
                         new_choice_type.definition = element.definition.clone();
                         new_choice_type.min = element.min;
                         new_choice_type.max = element.max.clone();
-                        new_choice_type.r#type = Some(vec![choice_type.clone()]);
+                        new_choice_type.r#type = Some(vec![choice_type.clone().to_owned()]);
                         choice_fields.push(new_choice_type);
                     }
                     output.push_str("huh!!??");
