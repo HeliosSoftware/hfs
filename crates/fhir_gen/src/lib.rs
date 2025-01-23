@@ -445,8 +445,7 @@ fn process_elements(
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
                     for choice_type in &element.r#type {
-                        // AI! Instantiate a new ElementDefinition
-                        let new_choice_type: initial_fhir_model::ElementDefinition::new;
+                        let mut new_choice_type = initial_fhir_model::ElementDefinition::default();
                         new_choice_type.id = element
                             .id
                             .as_ref()
