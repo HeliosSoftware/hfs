@@ -443,8 +443,7 @@ fn process_elements(
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
                 } else {
-                    // AI! make choice_fields mutable
-                    let choice_fields: Vec<ElementDefinition> = vec![];
+                    let mut choice_fields: Vec<ElementDefinition> = vec![];
                     for choice_type in element.r#type {
                         let new_choice_type: ElementDefinition;
                         new_choice_type.id = element
