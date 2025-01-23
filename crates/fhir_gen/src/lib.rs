@@ -374,82 +374,21 @@ fn process_elements(
         for element in &group {
             if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
-                    let rust_field_name = make_rust_safe(field_name);
-
-                    if field_name != rust_field_name {
-                        output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
-                    }
-
-                    if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-                        let is_array = element.max.as_deref() == Some("*");
-                        let base_type = match ty.code.as_str() {
-                            // https://build.fhir.org/fhirpath.html#types
-                            "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                            "http://hl7.org/fhirpath/System.String" => "std::string::String",
-                            "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
-                            "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
-                            "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
-                            "http://hl7.org/fhirpath/System.Date" => "std::string::String",
-                            "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
-                            "http://hl7.org/fhirpath/System.Time" => "std::string::String",
-                            "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                            "Element" | "BackboneElement" => &generate_type_name(&element.path),
-                            _ => &capitalize_first_letter(&ty.code),
-                        };
-
-                        let mut type_str = if field_name.ends_with("[x]") {
-                            let base_name = field_name.trim_end_matches("[x]");
-                            let enum_name = format!(
-                                "{}{}",
-                                type_name,
-                                base_name
-                                    .chars()
-                                    .next()
-                                    .unwrap()
-                                    .to_uppercase()
-                                    .chain(base_name.chars().skip(1))
-                                    .collect::<String>()
-                            );
-                            format!("Option<{}>", enum_name)
-                        } else if is_array {
-                            format!("Option<Vec<{}>>", base_type)
-                        } else if element.min.unwrap_or(0) == 0 {
-                            format!("Option<{}>", base_type)
-                        } else {
-                            base_type.to_string()
-                        };
-
-                        // Add Box<> to break cycles (only to the "to" type in the cycle)
-                        if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
-                            let from_type = element.path.split('.').next().unwrap_or("");
-                            if !from_type.is_empty() {
-                                for (cycle_from, cycle_to) in cycles.iter() {
-                                    if cycle_from == from_type && cycle_to == &field_type.code {
-                                        // Add Box<> around the type, preserving Option if present
-                                        if type_str.starts_with("Option<") {
-                                            type_str = format!(
-                                                "Option<Box<{}>>",
-                                                &type_str[7..type_str.len() - 1]
-                                            );
-                                        } else {
-                                            type_str = format!("Box<{}>", type_str);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-                    }
+                    generate_element_definition(element, &type_name, output, cycles);
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
                     if let Some(types) = &element.r#type {
                         for choice_type in types {
+                            let choice_type_type = capitalize_first_letter(&choice_type.code);
                             let mut new_choice_type = ElementDefinition::default();
-                            new_choice_type.id = element.id.clone()
-                                .map(|id| id.trim_end_matches("[x]").to_string());
+                            // AI! Can you help me with the syntax below here?
+                            new_choice_type.id = element.id.clone().map(|id| {
+                                id.trim_end_matches("[x]")
+                                    .to_string()
+                                    .push_str(&choice_type_type)
+                            });
                             new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
+                            new_choice_type.path.push_str(&choice_type_type);
                             new_choice_type.short = element.short.clone();
                             new_choice_type.definition = element.definition.clone();
                             new_choice_type.min = element.min;
@@ -459,11 +398,88 @@ fn process_elements(
                             choice_fields.push(new_choice_type);
                         }
                     }
-                    output.push_str("huh!!??");
+                    for choice_field in choice_fields {
+                        generate_element_definition(&choice_field, &type_name, output, cycles);
+                    }
                 }
             }
         }
         output.push_str("}\n\n");
+    }
+}
+
+fn generate_element_definition(
+    element: &ElementDefinition,
+    type_name: &String,
+    output: &mut String,
+    cycles: &std::collections::HashSet<(String, String)>,
+) {
+    if let Some(field_name) = element.path.split('.').last() {
+        let rust_field_name = make_rust_safe(field_name);
+
+        if field_name != rust_field_name {
+            output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
+        }
+
+        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+            let is_array = element.max.as_deref() == Some("*");
+            let base_type = match ty.code.as_str() {
+                // https://build.fhir.org/fhirpath.html#types
+                "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                "http://hl7.org/fhirpath/System.String" => "std::string::String",
+                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
+                "Element" | "BackboneElement" => &generate_type_name(&element.path),
+                _ => &capitalize_first_letter(&ty.code),
+            };
+
+            let mut type_str = if field_name.ends_with("[x]") {
+                let base_name = field_name.trim_end_matches("[x]");
+                let enum_name = format!(
+                    "{}{}",
+                    type_name,
+                    base_name
+                        .chars()
+                        .next()
+                        .unwrap()
+                        .to_uppercase()
+                        .chain(base_name.chars().skip(1))
+                        .collect::<String>()
+                );
+                format!("Option<{}>", enum_name)
+            } else if is_array {
+                format!("Option<Vec<{}>>", base_type)
+            } else if element.min.unwrap_or(0) == 0 {
+                format!("Option<{}>", base_type)
+            } else {
+                base_type.to_string()
+            };
+
+            // Add Box<> to break cycles (only to the "to" type in the cycle)
+            if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
+                let from_type = element.path.split('.').next().unwrap_or("");
+                if !from_type.is_empty() {
+                    for (cycle_from, cycle_to) in cycles.iter() {
+                        if cycle_from == from_type && cycle_to == &field_type.code {
+                            // Add Box<> around the type, preserving Option if present
+                            if type_str.starts_with("Option<") {
+                                type_str =
+                                    format!("Option<Box<{}>>", &type_str[7..type_str.len() - 1]);
+                            } else {
+                                type_str = format!("Box<{}>", type_str);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+        }
     }
 }
 
@@ -521,10 +537,9 @@ mod tests {
             },
             ElementDefinition {
                 path: "Identifier.assigner".to_string(),
-                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
-                    code: "Reference".to_string(),
-                    ..Default::default()
-                }]),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                    "Reference".to_string(),
+                )]),
                 max: Some("1".to_string()),
                 ..Default::default()
             },
@@ -534,19 +549,17 @@ mod tests {
             },
             ElementDefinition {
                 path: "Reference.identifier".to_string(),
-                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
-                    code: "Identifier".to_string(),
-                    ..Default::default()
-                }]),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                    "Identifier".to_string(),
+                )]),
                 max: Some("1".to_string()),
                 ..Default::default()
             },
             ElementDefinition {
                 path: "Patient".to_string(),
-                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
-                    code: "Resource".to_string(),
-                    ..Default::default()
-                }]),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                    "Resource".to_string(),
+                )]),
                 ..Default::default()
             },
             ElementDefinition {
@@ -555,10 +568,9 @@ mod tests {
             },
             ElementDefinition {
                 path: "Extension.extension".to_string(),
-                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
-                    code: "Extension".to_string(),
-                    ..Default::default()
-                }]),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                    "Extension".to_string(),
+                )]),
                 max: Some("*".to_string()),
                 ..Default::default()
             },
@@ -568,10 +580,9 @@ mod tests {
             },
             ElementDefinition {
                 path: "Base64Binary.extension".to_string(),
-                r#type: Some(vec![initial_fhir_model::ElementDefinitionType {
-                    code: "Extension".to_string(),
-                    ..Default::default()
-                }]),
+                r#type: Some(vec![initial_fhir_model::ElementDefinitionType::new(
+                    "Extension".to_string(),
+                )]),
                 max: Some("*".to_string()),
                 ..Default::default()
             },
