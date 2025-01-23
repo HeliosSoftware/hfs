@@ -443,11 +443,16 @@ fn process_elements(
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
                 } else {
-                    let choice_fields: Vec<ElementDefinition>;
+                    // AI! make choice_fields mutable
+                    let choice_fields: Vec<ElementDefinition> = vec![];
                     for choice_type in element.r#type {
                         let new_choice_type: ElementDefinition;
-                        new_choice_type.id = element.id.as_ref().map(|id| id.trim_end_matches("[x]").to_string());
+                        new_choice_type.id = element
+                            .id
+                            .as_ref()
+                            .map(|id| id.trim_end_matches("[x]").to_string());
                         new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
+                        choice_fields.push(new_choice_type);
                     }
                     output.push_str("huh!!??");
                 }
