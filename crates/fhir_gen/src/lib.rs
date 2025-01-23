@@ -446,7 +446,7 @@ fn process_elements(
                     let choice_fields: Vec<ElementDefinition>;
                     for choice_type in element.r#type {
                         let new_choice_type: ElementDefinition;
-                        // AI! set new_choice_type.id to element.id but remove the trailing '[x]'
+                        new_choice_type.id = element.id.as_ref().map(|id| id.trim_end_matches("[x]").to_string());
                         new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
                     }
                     output.push_str("huh!!??");
