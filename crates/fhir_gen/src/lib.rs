@@ -460,8 +460,7 @@ fn process_elements(
 
 fn generate_type_name(path: &str, base_name: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
-    // AI!  why is this a syntax error?
-    if parts.len() > 0 {
+    if !parts.is_empty() {
         let mut result = base_name.to_string();
         for part in &parts[1..] {
             result.push_str(
