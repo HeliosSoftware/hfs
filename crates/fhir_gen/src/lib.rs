@@ -243,33 +243,19 @@ fn detect_struct_cycles(
     let mut graph: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
-    // Build direct struct dependencies
+    // Build direct dependencies where max=1
     for element in elements {
         if let Some(types) = &element.r#type {
             let path_parts: Vec<&str> = element.path.split('.').collect();
             if path_parts.len() > 1 {
                 let from_type = path_parts[0].to_string();
-                let field_name = path_parts[path_parts.len() - 1];
                 if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
                     for ty in types {
-                        // Only track struct-level dependencies
                         if !ty.code.contains('.') && from_type != ty.code {
-                            // Check for bidirectional references between types
-                            let has_reverse_ref = elements.iter().any(|e| {
-                                if let Some(e_types) = &e.r#type {
-                                    e.path.starts_with(&ty.code) && 
-                                    e_types.iter().any(|t| t.code == from_type)
-                                } else {
-                                    false
-                                }
-                            });
-
-                            if has_reverse_ref {
-                                graph
-                                    .entry(from_type.clone())
-                                    .or_default()
-                                    .push(ty.code.clone());
-                            }
+                            graph
+                                .entry(from_type.clone())
+                                .or_default()
+                                .push(ty.code.clone());
                         }
                     }
                 }
@@ -468,14 +454,14 @@ fn process_elements(
                 }
             }
         }
-        output.push_str("}\n\n");
+        output.push_str("}\n");
     }
 }
 
 fn generate_type_name(path: &str, base_name: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
-    if parts[0] == base_name {
-        // For nested types, combine all parts including the base name
+    // AI!  why is this a syntax error?
+    if parts.len() > 0 {
         let mut result = base_name.to_string();
         for part in &parts[1..] {
             result.push_str(
@@ -490,13 +476,7 @@ fn generate_type_name(path: &str, base_name: &str) -> String {
         }
         result
     } else {
-        // For root type, use as is with capitalized first letter
-        path.chars()
-            .next()
-            .unwrap_or_default()
-            .to_uppercase()
-            .chain(path.chars().skip(1))
-            .collect()
+        "error"
     }
 }
 
@@ -591,7 +571,8 @@ mod tests {
         let element_refs: Vec<&ElementDefinition> = elements.iter().collect();
         let cycles = detect_struct_cycles(&element_refs);
 
-        // Should detect the Identifier <-> Reference cycle
+        // Should detect the Identifier <-> Reference cycle with both sides have max="1"
+        // cardinality
         assert!(
             cycles.contains(&("Identifier".to_string(), "Reference".to_string()))
                 || cycles.contains(&("Reference".to_string(), "Identifier".to_string()))
@@ -604,6 +585,7 @@ mod tests {
         // Should also not detect self cycles - these are ok
         assert!(!cycles.contains(&("Extension".to_string(), "Extension".to_string())));
 
+        // This is ok too because it is a one to many relationship.
         assert!(!cycles.contains(&("Base64Binary".to_string(), "Extension".to_string())));
     }
 
