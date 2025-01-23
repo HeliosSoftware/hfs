@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Extension {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -87,7 +87,7 @@ pub struct Extension {
     */
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Coding {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -99,7 +99,7 @@ pub struct Coding {
     pub user_selected: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Meta {
     #[serde(rename = "versionString")]
     pub version_id: Option<String>,
@@ -111,7 +111,7 @@ pub struct Meta {
     pub tag: Option<Vec<Coding>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CodeableConcept {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -119,7 +119,7 @@ pub struct CodeableConcept {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Period {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -127,18 +127,18 @@ pub struct Period {
     pub end: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Reference {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub reference: Option<String>,
     #[serde(rename = "type")]
     pub r#type: Option<String>,
-    pub identifier: Option<Box<Identifier>>, // Use of Box here for recursive type
+    pub identifier: Option<Identifier>,
     pub display: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Identifier {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -152,7 +152,7 @@ pub struct Identifier {
     pub assigner: Option<Box<Reference>>, // Use of Box here for recursive type
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Narrative {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -160,7 +160,7 @@ pub struct Narrative {
     pub div: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContactDetail {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -168,7 +168,7 @@ pub struct ContactDetail {
     pub telecom: Option<Vec<ContactPoint>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ContactPoint {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -180,7 +180,7 @@ pub struct ContactPoint {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Range {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -277,7 +277,7 @@ pub struct ElementDefinitionSlicingDescriminator {
     pub path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionSlicing {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -287,7 +287,7 @@ pub struct ElementDefinitionSlicing {
     pub rules: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionBase {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -296,7 +296,7 @@ pub struct ElementDefinitionBase {
     pub max: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionType {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -308,7 +308,21 @@ pub struct ElementDefinitionType {
     pub versioning: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+impl ElementDefinitionType {
+    pub fn new(code: String) -> ElementDefinitionType {
+        ElementDefinitionType {
+            id: None,
+            extension: None,
+            code,
+            profile: None,
+            target_profile: None,
+            aggregation: None,
+            versioning: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Address {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -327,7 +341,7 @@ pub struct Address {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Duration {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -338,7 +352,7 @@ pub struct Duration {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Count {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -349,7 +363,7 @@ pub struct Count {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Distance {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -360,7 +374,7 @@ pub struct Distance {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Age {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -371,7 +385,7 @@ pub struct Age {
     pub code: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum AnnotationAuthor {
     #[serde(rename = "authorReference")]
     AuthorReference(Reference),
@@ -379,7 +393,7 @@ pub enum AnnotationAuthor {
     AuthorString(String),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Annotation {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -388,7 +402,7 @@ pub struct Annotation {
     pub text: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Attachment {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -603,7 +617,7 @@ pub struct TriggerDefinition {
     pub condition: Option<Expression>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ElementDefinitionDefaultValue {
     Base64Binary(String),
     Boolean(bool),
@@ -656,7 +670,7 @@ pub enum ElementDefinitionDefaultValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ElementDefinitionMinMaxValue {
     Date(String),
     DateTime(String),
@@ -670,13 +684,13 @@ pub enum ElementDefinitionMinMaxValue {
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Element {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -734,7 +748,7 @@ pub struct ElementDefinition {
     pub mapping: Option<Vec<ElementDefinitionMapping>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionMapping {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -744,7 +758,7 @@ pub struct ElementDefinitionMapping {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionBinding {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -755,7 +769,7 @@ pub struct ElementDefinitionBinding {
     pub additional: Option<Vec<ElementDefinitionBindingAdditional>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionBindingAdditional {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -769,7 +783,7 @@ pub struct ElementDefinitionBindingAdditional {
     pub any: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionExample {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -777,7 +791,7 @@ pub struct ElementDefinitionExample {
     pub value: Option<ElementDefinitionDefaultValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ElementDefinitionConstraint {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -1261,7 +1275,7 @@ pub struct OperationDefinitionParameter {
     pub binding: Option<OperationDefinitionParameterBinding>,
     #[serde(rename = "referencedFrom")]
     pub referenced_from: Option<Vec<OperationDefinitionParameterReferencedFrom>>,
-    pub part: Option<Vec<Box<OperationDefinitionParameter>>>,
+    pub part: Option<Vec<OperationDefinitionParameter>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

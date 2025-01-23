@@ -1,1 +1,7 @@
-Export all of the types
+Try expanding the scope of the processing to profiles-resources.json and see if it compiles!!
+The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to decide - could be helpful too in the future when we need to use it for Cassandra table separation
+Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
+Write readme for fhir_gen
+Needs to say it's ok to delete the crates/fhir folder, then run cargo new fhir --lib
+Need to add lib.rs to fhir/src/lib.rs.  
+There is probably a problem with resources/build it should just be r6

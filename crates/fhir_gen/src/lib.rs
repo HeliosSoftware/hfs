@@ -154,11 +154,6 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
         let element_refs: Vec<&ElementDefinition> = all_elements;
         let cycles = detect_struct_cycles(&element_refs);
 
-        // Print detected cycles
-        for (from_type, to_type) in &cycles {
-            println!("Cycle detected between {} and {}", from_type, to_type);
-        }
-
         // Second pass: generate code
         for entry in entries {
             if let Some(resource) = &entry.resource {
@@ -269,18 +264,6 @@ fn detect_struct_cycles(
         }
     }
 
-    // Print the dependency graph
-    println!("\nDependency graph:");
-    for (from_type, deps) in &graph {
-        println!("  {} -> {:?}", from_type, deps);
-    }
-
-    // Print detected cycles
-    println!("\nDetected cycles:");
-    for (from_type, to_type) in &cycles {
-        println!("  {} <-> {}", from_type, to_type);
-    }
-
     cycles
 }
 
@@ -386,7 +369,8 @@ fn process_elements(
                                 s.push_str(&choice_type_type);
                                 s
                             });
-                            new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
+                            new_choice_type.path =
+                                element.path.clone().trim_end_matches("[x]").to_string();
                             new_choice_type.path.push_str(&choice_type_type);
                             new_choice_type.short = element.short.clone();
                             new_choice_type.definition = element.definition.clone();
