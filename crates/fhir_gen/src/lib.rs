@@ -460,6 +460,7 @@ fn process_elements(
 
 fn generate_type_name(path: &str, base_name: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
+    // AI! Can you convert the below to an if let statement
     if !parts.is_empty() {
         let mut result = base_name.to_string();
         for part in &parts[1..] {
