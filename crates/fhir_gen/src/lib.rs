@@ -447,8 +447,7 @@ fn process_elements(
                     for choice_type in element.type {
                         let new_choice_type : ElementDefinition;
                         new_choice_type.id = element.id;
-                        // AI! Remove the trailing '[x]'
-                        new_choice_type.path = element.path
+                        new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
                     }
                     output.push_str("huh!!??");
                 }
