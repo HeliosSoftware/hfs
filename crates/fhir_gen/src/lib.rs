@@ -445,12 +445,20 @@ fn process_elements(
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
                     for choice_type in &element.r#type {
-                        let mut new_choice_type = initial_fhir_model::ElementDefinition::default();
+                        let mut new_choice_type = ElementDefinition::default();
                         new_choice_type.id = element
                             .id
                             .as_ref()
                             .map(|id| id.trim_end_matches("[x]").to_string());
                         new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
+                        new_choice_type.short = element.short.clone();
+                        new_choice_type.definition = element.definition.clone();
+                        new_choice_type.min = element.min;
+                        new_choice_type.max = element.max.clone();
+                        // AI! Create a single element Vec<ElementDefinitionType> and add
+                        // choice_type to it and assign it to new_choice_type.r#type
+                        new_choice_type.r#type 
+
                         choice_fields.push(new_choice_type);
                     }
                     output.push_str("huh!!??");
