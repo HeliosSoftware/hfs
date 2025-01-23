@@ -455,9 +455,7 @@ fn process_elements(
                         new_choice_type.definition = element.definition.clone();
                         new_choice_type.min = element.min;
                         new_choice_type.max = element.max.clone();
-                        // AI! Create a single element Vec<ElementDefinitionType> and add
-                        // choice_type to it and assign it to new_choice_type.r#type
-                        new_choice_type.r#type 
+                        new_choice_type.r#type = Some(vec![choice_type.clone()]);
 
                         choice_fields.push(new_choice_type);
                     }
