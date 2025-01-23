@@ -1,6 +1,6 @@
 pub mod initial_fhir_model;
 
-use crate::initial_fhir_model::{Bundle, Resource};
+use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
 use clap::ValueEnum;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
@@ -447,17 +447,18 @@ fn process_elements(
                     if let Some(types) = &element.r#type {
                         for choice_type in types {
                             let mut new_choice_type = ElementDefinition::default();
-                            new_choice_type.id = element
-                                .id
-                                .as_ref()
-                                .map(|id| id.trim_end_matches("[x]").to_string());
+                            new_choice_type.id = String::from(element.id.clone())
+                                .trim_end_matches("[x]")
+                                .to_string();
                             new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
                             new_choice_type.short = element.short.clone();
                             new_choice_type.definition = element.definition.clone();
                             new_choice_type.min = element.min;
                             new_choice_type.max = element.max.clone();
-                            new_choice_type.r#type = Some(vec![choice_type.clone()]);
-                        choice_fields.push(new_choice_type);
+                            let edt = ElementDefinitionType::new(choice_type.code.clone());
+                            new_choice_type.r#type = Some(vec![edt]);
+                            choice_fields.push(new_choice_type);
+                        }
                     }
                     output.push_str("huh!!??");
                 }
