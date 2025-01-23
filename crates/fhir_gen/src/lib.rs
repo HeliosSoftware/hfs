@@ -447,9 +447,8 @@ fn process_elements(
                     if let Some(types) = &element.r#type {
                         for choice_type in types {
                             let mut new_choice_type = ElementDefinition::default();
-                            new_choice_type.id = String::from(element.id.clone())
-                                .trim_end_matches("[x]")
-                                .to_string();
+                            new_choice_type.id = element.id.clone()
+                                .map(|id| id.trim_end_matches("[x]").to_string());
                             new_choice_type.path = element.path.trim_end_matches("[x]").to_string();
                             new_choice_type.short = element.short.clone();
                             new_choice_type.definition = element.definition.clone();
