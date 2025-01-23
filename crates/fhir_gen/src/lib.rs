@@ -224,13 +224,7 @@ fn structure_definition_to_rust(
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             let mut processed_types = std::collections::HashSet::new();
-            process_elements(
-                elements,
-                &mut output,
-                &mut processed_types,
-                &sd.name,
-                cycles,
-            );
+            process_elements(elements, &mut output, &mut processed_types, cycles);
         }
     }
     output
@@ -294,7 +288,6 @@ fn process_elements(
     elements: &[ElementDefinition],
     output: &mut String,
     processed_types: &mut std::collections::HashSet<String>,
-    base_name: &str,
     cycles: &std::collections::HashSet<(String, String)>,
 ) {
     // Group elements by their parent path
@@ -312,7 +305,7 @@ fn process_elements(
 
     // Process each group
     for (path, group) in element_groups {
-        let type_name = generate_type_name(&path, base_name);
+        let type_name = generate_type_name(&path);
 
         // Skip if we've already processed this type
         if processed_types.contains(&type_name) {
@@ -400,9 +393,7 @@ fn process_elements(
                             "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
                             "http://hl7.org/fhirpath/System.Time" => "std::string::String",
                             "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                            "Element" | "BackboneElement" => {
-                                &generate_type_name(&element.path, &base_name)
-                            }
+                            "Element" | "BackboneElement" => &generate_type_name(&element.path),
                             _ => &capitalize_first_letter(&ty.code),
                         };
 
@@ -451,17 +442,26 @@ fn process_elements(
 
                         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                     }
+                } else {
+                    let choice_fields: Vec<ElementDefinition>;
+                    for choice_type in element.type {
+                        let new_choice_type : ElementDefinition;
+                        new_choice_type.id = element.id;
+                        // AI! Remove the trailing '[x]'
+                        new_choice_type.path = element.path
+                    }
+                    output.push_str("huh!!??");
                 }
             }
         }
-        output.push_str("}\n");
+        output.push_str("}\n\n");
     }
 }
 
-fn generate_type_name(path: &str, base_name: &str) -> Result<String, &'static str> {
+fn generate_type_name(path: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
     if !parts.is_empty() {
-        let mut result = base_name.to_string();
+        let mut result = String::from(parts[0]);
         for part in &parts[1..] {
             result.push_str(
                 &part
@@ -473,9 +473,10 @@ fn generate_type_name(path: &str, base_name: &str) -> Result<String, &'static st
                     .collect::<String>(),
             );
         }
-        Ok(result)
+        result
     } else {
-        Err("Empty path provided to generate_type_name")
+        let result = String::from("Empty path provided to generate_type_name");
+        result
     }
 }
 
