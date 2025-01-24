@@ -457,8 +457,8 @@ fn generate_element_definition(
                     {
                         ref_ty
                     } else {
-                        //AI! Can I return an error here?
-                        Error
+                        output.push_str(&format!("    pub {}: Option<String>,\n", rust_field_name));
+                        return;
                     }
                 }
             }
