@@ -446,122 +446,81 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
-            if let Some(content_ref) = &element.content_reference {
-                if content_ref.starts_with('#') {
-                    let ref_id = &content_ref[1..];
-                    if let Some(referenced_element) = elements
-                        .iter()
-                        .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
-                    {
-                        if let Some(ref_ty) =
-                            referenced_element.r#type.as_ref().and_then(|t| t.first())
-                        {
-                            let is_array = element.max.as_deref() == Some("*");
-                            let base_type = match ref_ty.code.as_str() {
-                                "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                                "http://hl7.org/fhirpath/System.String" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
-                                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
-                                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
-                                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
-                                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                                "Element" | "BackboneElement" => {
-                                    &generate_type_name(&referenced_element.path)
-                                }
-                                _ => &capitalize_first_letter(&ref_ty.code),
-                            };
+        let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
+            // AI! Can you help me get this syntax correct?
+            let ty_ref = element.content_reference;
+            for ele in elements {
+                if ty_ref == ele.id {
+                    ele.r#type;
+                }
+            }
+        };
+        let is_array = element.max.as_deref() == Some("*");
+        let base_type = match ty.code.as_str() {
+            // https://build.fhir.org/fhirpath.html#types
+            "http://hl7.org/fhirpath/System.Boolean" => "bool",
+            "http://hl7.org/fhirpath/System.String" => "std::string::String",
+            "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+            "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+            "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+            "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+            "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+            "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+            "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
+            "Element" | "BackboneElement" => &generate_type_name(&element.path),
+            _ => &capitalize_first_letter(&ty.code),
+        };
 
-                            let type_str = if is_array {
-                                format!("Option<Vec<{}>>", base_type)
-                            } else if element.min.unwrap_or(0) == 0 {
-                                format!("Option<{}>", base_type)
-                            } else {
-                                base_type.to_string()
-                            };
+        let base_type = if let Some(content_ref) = &element.content_reference {
+            if content_ref.starts_with('#') {
+                generate_type_name(&content_ref[1..])
+            } else {
+                base_type.to_string()
+            }
+        } else {
+            base_type.to_string()
+        };
 
-                            output
-                                .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-                            return;
+        let mut type_str = if field_name.ends_with("[x]") {
+            let base_name = field_name.trim_end_matches("[x]");
+            let enum_name = format!(
+                "{}{}",
+                type_name,
+                base_name
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .to_uppercase()
+                    .chain(base_name.chars().skip(1))
+                    .collect::<String>()
+            );
+            format!("Option<{}>", enum_name)
+        } else if is_array {
+            format!("Option<Vec<{}>>", base_type)
+        } else if element.min.unwrap_or(0) == 0 {
+            format!("Option<{}>", base_type)
+        } else {
+            base_type.to_string()
+        };
+
+        // Add Box<> to break cycles (only to the "to" type in the cycle)
+        if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
+            let from_type = element.path.split('.').next().unwrap_or("");
+            if !from_type.is_empty() {
+                for (cycle_from, cycle_to) in cycles.iter() {
+                    if cycle_from == from_type && cycle_to == &field_type.code {
+                        // Add Box<> around the type, preserving Option if present
+                        if type_str.starts_with("Option<") {
+                            type_str = format!("Option<Box<{}>>", &type_str[7..type_str.len() - 1]);
+                        } else {
+                            type_str = format!("Box<{}>", type_str);
                         }
+                        break;
                     }
                 }
             }
-            // If we get here, either there was no content_reference or we couldn't resolve it
-            output.push_str(&format!("    pub {}: Option<String>,\n", rust_field_name));
-            return;
         }
-        {
-            let is_array = element.max.as_deref() == Some("*");
-            let base_type = match ty.code.as_str() {
-                // https://build.fhir.org/fhirpath.html#types
-                "http://hl7.org/fhirpath/System.Boolean" => "bool",
-                "http://hl7.org/fhirpath/System.String" => "std::string::String",
-                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
-                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
-                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
-                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
-                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
-                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
-                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                "Element" | "BackboneElement" => &generate_type_name(&element.path),
-                _ => &capitalize_first_letter(&ty.code),
-            };
-
-            let base_type = if let Some(content_ref) = &element.content_reference {
-                if content_ref.starts_with('#') {
-                    generate_type_name(&content_ref[1..])
-                } else {
-                    base_type.to_string()
-                }
-            } else {
-                base_type.to_string()
-            };
-
-            let mut type_str = if field_name.ends_with("[x]") {
-                let base_name = field_name.trim_end_matches("[x]");
-                let enum_name = format!(
-                    "{}{}",
-                    type_name,
-                    base_name
-                        .chars()
-                        .next()
-                        .unwrap()
-                        .to_uppercase()
-                        .chain(base_name.chars().skip(1))
-                        .collect::<String>()
-                );
-                format!("Option<{}>", enum_name)
-            } else if is_array {
-                format!("Option<Vec<{}>>", base_type)
-            } else if element.min.unwrap_or(0) == 0 {
-                format!("Option<{}>", base_type)
-            } else {
-                base_type.to_string()
-            };
-
-            // Add Box<> to break cycles (only to the "to" type in the cycle)
-            if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
-                let from_type = element.path.split('.').next().unwrap_or("");
-                if !from_type.is_empty() {
-                    for (cycle_from, cycle_to) in cycles.iter() {
-                        if cycle_from == from_type && cycle_to == &field_type.code {
-                            // Add Box<> around the type, preserving Option if present
-                            if type_str.starts_with("Option<") {
-                                type_str =
-                                    format!("Option<Box<{}>>", &type_str[7..type_str.len() - 1]);
-                            } else {
-                                type_str = format!("Box<{}>", type_str);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
-        }
+        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
     }
 }
 
