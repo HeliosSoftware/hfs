@@ -313,6 +313,7 @@ fn process_elements(
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
             let parent_path = path_parts[..path_parts.len() - 1].join(".");
+            //AI! println parent_path
             element_groups.entry(parent_path).or_default().push(element);
         }
     }
@@ -436,10 +437,6 @@ fn generate_element_definition(
         }
 
         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
-            // We want to be in this if let block if there is an element.r#type or if
-            // element.content_reference is not empty
-            //
-
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
                 // https://build.fhir.org/fhirpath.html#types
