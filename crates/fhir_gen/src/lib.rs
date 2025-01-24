@@ -186,7 +186,15 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
         }
 
         // Finally, generate the Resource enum
-        
+        if !all_resources.is_empty() {
+            let resource_enum = generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(output_path.as_ref())?;
+            writeln!(file, "{}", resource_enum)?;
+        }
     }
 
     Ok(())
