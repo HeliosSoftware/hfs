@@ -446,8 +446,7 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        let ty = element.r#type.as_ref().and_then(|t| t.first());
-        if ty.is_none() {
+        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
             if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
                     let ref_id = &content_ref[1..];
