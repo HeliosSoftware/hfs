@@ -388,7 +388,6 @@ fn process_elements(
         for element in &group {
             if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
-                    // AI! If
                     generate_element_definition(element, &type_name, output, cycles);
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
