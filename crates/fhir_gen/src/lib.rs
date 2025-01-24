@@ -446,27 +446,26 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
-            if let Some(content_ref) = &element.content_reference {
-                let ref_id = &content_ref[1..];
-                if let Some(referenced_element) = elements
-                    .iter()
-                    .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
-                {
-                    if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first())
+        let ty = match element.r#type.as_ref().and_then(|t| t.first()) {
+            Some(ty) => ty,
+            None => {
+                if let Some(content_ref) = &element.content_reference {
+                    let ref_id = &content_ref[1..];
+                    if let Some(referenced_element) = elements
+                        .iter()
+                        .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
                     {
-                        ref_ty
+                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first()) {
+                            ref_ty
+                        } else {
+                            return;
+                        }
                     } else {
-                        // output.push_str("ERROR!");
                         return;
                     }
                 } else {
-                    // output.push_str("ERROR!");
                     return;
                 }
-            } else {
-                // output.push_str("ERROR!");
-                return;
             }
         };
         let is_array = element.max.as_deref() == Some("*");
