@@ -207,10 +207,11 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
     
-    // Always include StructureDefinition, CapabilityStatement and CompartmentDefinition
+    // Always include StructureDefinition, CapabilityStatement, CompartmentDefinition and Bundle
     output.push_str("    StructureDefinition(StructureDefinition),\n");
     output.push_str("    CapabilityStatement(CapabilityStatement),\n");
     output.push_str("    CompartmentDefinition(CompartmentDefinition),\n");
+    output.push_str("    Bundle(Bundle),\n");
     
     // Add other resources
     for resource in resources {
