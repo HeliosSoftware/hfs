@@ -388,6 +388,7 @@ fn process_elements(
         for element in &group {
             if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
+                    // AI! If
                     generate_element_definition(element, &type_name, output, cycles);
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
@@ -435,8 +436,11 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        if element.r#type.as_ref().and_then(|t| t.first()).is_some() || element.content_reference.is_some() {
-            let ty = element.r#type.as_ref().and_then(|t| t.first());
+        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+            // We want to be in this if let block if there is an element.r#type or if
+            // element.content_reference is not empty
+            //
+
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
                 // https://build.fhir.org/fhirpath.html#types
