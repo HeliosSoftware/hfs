@@ -147,7 +147,7 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                                 all_elements.extend(elements.iter().map(|e| e));
                             }
                         }
-                        if def.kind == "resource" && def.abstract == false {
+                        if def.kind == "resource" && def.r#abstract == false {
                             all_resources.push(&def.name);
                         }
                     }
@@ -187,7 +187,8 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
         // Finally, generate the Resource enum
         if !all_resources.is_empty() {
-            let resource_enum = generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
+            let resource_enum =
+                generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -202,26 +203,14 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    output.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
-    output.push_str("#[serde(rename_all = \"camelCase\")]\n");
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
-    
-    // Always include StructureDefinition, CapabilityStatement, CompartmentDefinition, Bundle and OperationDefinition
-    output.push_str("    StructureDefinition(StructureDefinition),\n");
-    output.push_str("    CapabilityStatement(CapabilityStatement),\n");
-    output.push_str("    CompartmentDefinition(CompartmentDefinition),\n");
-    output.push_str("    Bundle(Bundle),\n");
-    output.push_str("    OperationDefinition(OperationDefinition),\n");
-    output.push_str("    SearchParameter(SearchParameter),\n");
-    
-    // Add other resources
+
     for resource in resources {
-        if resource != "StructureDefinition" {  // Skip if already added
-            output.push_str(&format!("    {}({}),\n", resource, resource));
-        }
+        output.push_str(&format!("    {}({}),\n", resource, resource));
     }
-    
+
     output.push_str("}\n\n");
     output
 }
