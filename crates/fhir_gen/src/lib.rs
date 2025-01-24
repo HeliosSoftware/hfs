@@ -462,7 +462,7 @@ fn generate_element_definition(
                 base_type.to_string()
             };
 
-            // AI! println base_type in a comment
+            // Generated type: {base_type}
 
             let mut type_str = if field_name.ends_with("[x]") {
                 let base_name = field_name.trim_end_matches("[x]");
