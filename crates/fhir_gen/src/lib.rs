@@ -417,7 +417,13 @@ fn process_elements(
                         }
                     }
                     for choice_field in choice_fields {
-                        generate_element_definition(&choice_field, &type_name, output, cycles, elements);
+                        generate_element_definition(
+                            &choice_field,
+                            &type_name,
+                            output,
+                            cycles,
+                            elements,
+                        );
                     }
                 }
             }
@@ -440,14 +446,18 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-
         let ty = element.r#type.as_ref().and_then(|t| t.first());
         if ty.is_none() {
             if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
                     let ref_id = &content_ref[1..];
-                    if let Some(referenced_element) = elements.iter().find(|e| e.id.as_ref().map_or(false, |id| id == ref_id)) {
-                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first()) {
+                    if let Some(referenced_element) = elements
+                        .iter()
+                        .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
+                    {
+                        if let Some(ref_ty) =
+                            referenced_element.r#type.as_ref().and_then(|t| t.first())
+                        {
                             let is_array = element.max.as_deref() == Some("*");
                             let base_type = match ref_ty.code.as_str() {
                                 "http://hl7.org/fhirpath/System.Boolean" => "bool",
@@ -459,7 +469,9 @@ fn generate_element_definition(
                                 "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
                                 "http://hl7.org/fhirpath/System.Time" => "std::string::String",
                                 "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-                                "Element" | "BackboneElement" => &generate_type_name(&referenced_element.path),
+                                "Element" | "BackboneElement" => {
+                                    &generate_type_name(&referenced_element.path)
+                                }
                                 _ => &capitalize_first_letter(&ref_ty.code),
                             };
 
@@ -471,7 +483,8 @@ fn generate_element_definition(
                                 base_type.to_string()
                             };
 
-                            output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                            output
+                                .push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
                             return;
                         }
                     }
@@ -480,7 +493,8 @@ fn generate_element_definition(
             // If we get here, either there was no content_reference or we couldn't resolve it
             output.push_str(&format!("    pub {}: Option<String>,\n", rust_field_name));
             return;
-        }{
+        }
+        {
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
                 // https://build.fhir.org/fhirpath.html#types
