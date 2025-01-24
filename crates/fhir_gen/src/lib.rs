@@ -313,7 +313,7 @@ fn process_elements(
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
             let parent_path = path_parts[..path_parts.len() - 1].join(".");
-            //AI! println parent_path
+            println!("Parent path: {}", parent_path);
             element_groups.entry(parent_path).or_default().push(element);
         }
     }
