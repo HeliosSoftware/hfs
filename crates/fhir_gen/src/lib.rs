@@ -436,6 +436,8 @@ fn generate_element_definition(
         }
 
         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+            // AI! We want to be in this if let block if there is an element.r#type or if
+            // element.content_reference is not empty
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
                 // https://build.fhir.org/fhirpath.html#types
