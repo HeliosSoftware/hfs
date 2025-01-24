@@ -125,16 +125,18 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 }
 
 fn is_valid_structure_definition(def: &StructureDefinition) -> bool {
-    (def.kind == "complex-type" || def.kind == "primitive-type")
+    (def.kind == "complex-type" || def.kind == "primitive-type" || def.kind == "resource")
         && def.derivation.as_deref() == Some("specialization")
         && def.r#abstract == false
 }
 
-fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // First collect all ElementDefinitions across all StructureDefinitions
+    // Also collect all Resource names
     let mut all_elements = Vec::new();
+    let mut all_resources = Vec::new();
 
-    if let Some(entries) = _bundle.entry.as_ref() {
+    if let Some(entries) = bundle.entry.as_ref() {
         // First pass: collect all elements
         for entry in entries {
             if let Some(resource) = &entry.resource {
@@ -144,6 +146,9 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                             if let Some(elements) = &snapshot.element {
                                 all_elements.extend(elements.iter().map(|e| e));
                             }
+                        }
+                        if def.kind == "resource" && def.abstract == false {
+                            all_resources.push(&def.name);
                         }
                     }
                 }
@@ -179,9 +184,16 @@ fn generate_code(_bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<(
                 }
             }
         }
+
+        // Finally, generate the Resource enum
+        
     }
 
     Ok(())
+}
+
+fn generate_resource_enum(resources: Vec<String>) -> String {
+
 }
 
 fn make_rust_safe(input: &str) -> String {
@@ -197,7 +209,7 @@ fn make_rust_safe(input: &str) -> String {
         });
 
     match snake_case.as_str() {
-        "type" | "use" | "abstract" => format!("r#{}", snake_case),
+        "type" | "use" | "abstract" | "for" | "ref" => format!("r#{}", snake_case),
         _ => snake_case,
     }
 }
