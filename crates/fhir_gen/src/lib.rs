@@ -224,6 +224,7 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     
     output.push_str("}\n\n");
     output
+}
 
 }
 
