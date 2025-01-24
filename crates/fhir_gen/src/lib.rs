@@ -454,13 +454,12 @@ fn generate_element_definition(
 
             let base_type = if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
-                    let type_name = generate_type_name(&content_ref[1..]);
-                    type_name.as_str()
+                    generate_type_name(&content_ref[1..])
                 } else {
-                    base_type
+                    base_type.to_string()
                 }
             } else {
-                base_type
+                base_type.to_string()
             };
 
             let mut type_str = if field_name.ends_with("[x]") {
