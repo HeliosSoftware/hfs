@@ -442,8 +442,43 @@ fn generate_element_definition(
 
 
         if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
-            // AI! take the element.content_reference, remove the leading '#' and loop through all
-            // the elements to find an id match, and use that value's type
+            if let Some(content_ref) = &element.content_reference {
+                if content_ref.starts_with('#') {
+                    let ref_id = &content_ref[1..];
+                    if let Some(referenced_element) = elements.iter().find(|e| e.id.as_ref().map_or(false, |id| id == ref_id)) {
+                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first()) {
+                            let is_array = element.max.as_deref() == Some("*");
+                            let base_type = match ref_ty.code.as_str() {
+                                "http://hl7.org/fhirpath/System.Boolean" => "bool",
+                                "http://hl7.org/fhirpath/System.String" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
+                                "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
+                                "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
+                                "http://hl7.org/fhirpath/System.Date" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Time" => "std::string::String",
+                                "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
+                                "Element" | "BackboneElement" => &generate_type_name(&referenced_element.path),
+                                _ => &capitalize_first_letter(&ref_ty.code),
+                            };
+
+                            let type_str = if is_array {
+                                format!("Option<Vec<{}>>", base_type)
+                            } else if element.min.unwrap_or(0) == 0 {
+                                format!("Option<{}>", base_type)
+                            } else {
+                                base_type.to_string()
+                            };
+
+                            output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+                            return;
+                        }
+                    }
+                }
+            }
+            // If we get here, either there was no content_reference or we couldn't resolve it
+            output.push_str(&format!("    pub {}: Option<String>,\n", rust_field_name));
+            return;
         }{
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
