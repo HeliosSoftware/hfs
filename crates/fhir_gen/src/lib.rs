@@ -454,7 +454,8 @@ fn generate_element_definition(
 
             let base_type = if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
-                    generate_type_name(&content_ref[1..]).as_str()
+                    let type_name = generate_type_name(&content_ref[1..]);
+                    type_name.as_str()
                 } else {
                     base_type
                 }
