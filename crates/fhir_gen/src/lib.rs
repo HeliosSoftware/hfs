@@ -457,10 +457,16 @@ fn generate_element_definition(
                     {
                         ref_ty
                     } else {
-                        output.push_str(&format!("    pub {}: Option<String>,\n", rust_field_name));
+                        // output.push_str("ERROR!");
                         return;
                     }
+                } else {
+                    // output.push_str("ERROR!");
+                    return;
                 }
+            } else {
+                // output.push_str("ERROR!");
+                return;
             }
         };
         let is_array = element.max.as_deref() == Some("*");
