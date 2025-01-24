@@ -447,11 +447,19 @@ fn generate_element_definition(
         }
 
         let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
-            // AI! Can you help me get this syntax correct?
-            let ty_ref = element.content_reference;
-            for ele in elements {
-                if ty_ref == ele.id {
-                    ele.r#type;
+            if let Some(content_ref) = &element.content_reference {
+                let ref_id = &content_ref[1..];
+                if let Some(referenced_element) = elements
+                    .iter()
+                    .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
+                {
+                    if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first())
+                    {
+                        ref_ty
+                    } else {
+                        //AI! Can I return an error here?
+                        Error
+                    }
                 }
             }
         };
