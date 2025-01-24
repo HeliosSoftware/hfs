@@ -451,8 +451,16 @@ fn generate_element_definition(
                 "Element" | "BackboneElement" => &generate_type_name(&element.path),
                 _ => &capitalize_first_letter(&ty.code),
             };
-            // AI! if element.contentReference starts with '#', set base_type to
-            // generate_type_name(element.contentReference) and remove the leading '#'
+
+            let base_type = if let Some(content_ref) = &element.content_reference {
+                if content_ref.starts_with('#') {
+                    generate_type_name(&content_ref[1..]).as_str()
+                } else {
+                    base_type
+                }
+            } else {
+                base_type
+            };
 
             let mut type_str = if field_name.ends_with("[x]") {
                 let base_name = field_name.trim_end_matches("[x]");
