@@ -196,6 +196,7 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
     output.push_str("#[derive(Debug, Clone, Serialize, Deserialize)]\n");
     output.push_str("#[serde(rename_all = \"camelCase\")]\n");
+    output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
     
     for resource in resources {
