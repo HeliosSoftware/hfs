@@ -313,7 +313,10 @@ fn process_elements(
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
             let parent_path = path_parts[..path_parts.len() - 1].join(".");
-            println!("Parent path: {}", parent_path);
+            println!(
+                "Parent path: {}, element.path: {}",
+                parent_path, &element.path
+            );
             element_groups.entry(parent_path).or_default().push(element);
         }
     }
@@ -389,7 +392,7 @@ fn process_elements(
         for element in &group {
             if let Some(field_name) = element.path.split('.').last() {
                 if !field_name.contains("[x]") {
-                    generate_element_definition(element, &type_name, output, cycles);
+                    generate_element_definition(element, &type_name, output, cycles, elements);
                 } else {
                     let mut choice_fields: Vec<ElementDefinition> = vec![];
                     if let Some(types) = &element.r#type {
@@ -414,7 +417,7 @@ fn process_elements(
                         }
                     }
                     for choice_field in choice_fields {
-                        generate_element_definition(&choice_field, &type_name, output, cycles);
+                        generate_element_definition(&choice_field, &type_name, output, cycles, elements);
                     }
                 }
             }
@@ -428,6 +431,7 @@ fn generate_element_definition(
     type_name: &String,
     output: &mut String,
     cycles: &std::collections::HashSet<(String, String)>,
+    elements: &[ElementDefinition],
 ) {
     if let Some(field_name) = element.path.split('.').last() {
         let rust_field_name = make_rust_safe(field_name);
@@ -436,7 +440,11 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) {
+
+        if let Some(ty) = element.r#type.as_ref().and_then(|t| t.first()) else {
+            // AI! take the element.content_reference, remove the leading '#' and loop through all
+            // the elements to find an id match, and use that value's type
+        }{
             let is_array = element.max.as_deref() == Some("*");
             let base_type = match ty.code.as_str() {
                 // https://build.fhir.org/fhirpath.html#types
@@ -453,11 +461,6 @@ fn generate_element_definition(
                 _ => &capitalize_first_letter(&ty.code),
             };
 
-            if let Some(content_ref) = &element.content_reference {
-                output.push_str(&format!("//Content reference: {}\n", content_ref));
-            }
-            output.push_str(&format!("//Generated type: {}\n", base_type));
-
             let base_type = if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
                     generate_type_name(&content_ref[1..])
@@ -467,8 +470,6 @@ fn generate_element_definition(
             } else {
                 base_type.to_string()
             };
-
-            output.push_str(&format!("//Generated type2: {}\n", base_type));
 
             let mut type_str = if field_name.ends_with("[x]") {
                 let base_name = field_name.trim_end_matches("[x]");
