@@ -226,8 +226,6 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     output
 }
 
-}
-
 fn make_rust_safe(input: &str) -> String {
     let snake_case = input
         .chars()
