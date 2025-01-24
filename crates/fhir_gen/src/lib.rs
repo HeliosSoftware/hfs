@@ -452,8 +452,10 @@ fn generate_element_definition(
                 _ => &capitalize_first_letter(&ty.code),
             };
 
-            // AI! output element.content_reference
-            output.push_str(&format!("//Generated type2: {}\n", base_type));
+            if let Some(content_ref) = &element.content_reference {
+                output.push_str(&format!("//Content reference: {}\n", content_ref));
+            }
+            output.push_str(&format!("//Generated type: {}\n", base_type));
 
             let base_type = if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
