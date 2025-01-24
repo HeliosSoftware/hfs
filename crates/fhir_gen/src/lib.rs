@@ -452,6 +452,9 @@ fn generate_element_definition(
                 _ => &capitalize_first_letter(&ty.code),
             };
 
+            // AI! output element.content_reference
+            output.push_str(&format!("//Generated type2: {}\n", base_type));
+
             let base_type = if let Some(content_ref) = &element.content_reference {
                 if content_ref.starts_with('#') {
                     generate_type_name(&content_ref[1..])
@@ -462,7 +465,7 @@ fn generate_element_definition(
                 base_type.to_string()
             };
 
-            // Generated type: {base_type}
+            output.push_str(&format!("//Generated type2: {}\n", base_type));
 
             let mut type_str = if field_name.ends_with("[x]") {
                 let base_name = field_name.trim_end_matches("[x]");
