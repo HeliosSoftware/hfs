@@ -440,9 +440,10 @@ fn generate_element_definition(
         {
             let ty = element.r#type.as_ref().and_then(|t| t.first());
             let is_array = element.max.as_deref() == Some("*");
-            // AI!  Create a mew variable that is either ty, or element.content_reference -
-            // whichever is not None
-            let base_type = match ty.code {
+            
+            let type_or_ref = ty.or_else(|| element.content_reference.as_ref());
+            
+            let base_type = match ty.map(|t| t.code.as_str()) {
                 // https://build.fhir.org/fhirpath.html#types
                 "http://hl7.org/fhirpath/System.Boolean" => "bool",
                 "http://hl7.org/fhirpath/System.String" => "std::string::String",
