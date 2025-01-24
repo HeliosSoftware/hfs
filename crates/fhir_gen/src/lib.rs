@@ -435,10 +435,14 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
         }
 
-        if element.r#type.as_ref().and_then(|t| t.first()).is_some() || element.content_reference.is_some() {
+        if element.r#type.as_ref().and_then(|t| t.first()).is_some()
+            || element.content_reference.is_some()
+        {
             let ty = element.r#type.as_ref().and_then(|t| t.first());
             let is_array = element.max.as_deref() == Some("*");
-            let base_type = match ty.code.as_str() {
+            // AI!  Create a mew variable that is either ty, or element.content_reference -
+            // whichever is not None
+            let base_type = match ty.code {
                 // https://build.fhir.org/fhirpath.html#types
                 "http://hl7.org/fhirpath/System.Boolean" => "bool",
                 "http://hl7.org/fhirpath/System.String" => "std::string::String",
