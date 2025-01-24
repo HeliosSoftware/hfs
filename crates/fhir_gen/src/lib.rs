@@ -193,6 +193,17 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 }
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
+    let mut output = String::new();
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    output.push_str("#[serde(rename_all = \"camelCase\")]\n");
+    output.push_str("pub enum Resource {\n");
+    
+    for resource in resources {
+        output.push_str(&format!("    {}({}),\n", resource, resource));
+    }
+    
+    output.push_str("}\n\n");
+    output
 
 }
 
