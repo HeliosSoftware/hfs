@@ -213,6 +213,7 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     output.push_str("    CompartmentDefinition(CompartmentDefinition),\n");
     output.push_str("    Bundle(Bundle),\n");
     output.push_str("    OperationDefinition(OperationDefinition),\n");
+    output.push_str("    SearchParameter(SearchParameter),\n");
     
     // Add other resources
     for resource in resources {
