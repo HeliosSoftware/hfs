@@ -96,7 +96,8 @@ fn main() {
         }
     }
 
-    // AI! delete the file output_path
+    // Delete the zip file after extraction
+    fs::remove_file(output_path).expect("Failed to delete zip file");
 
     println!("FHIR definitions downloaded successfully");
 }
