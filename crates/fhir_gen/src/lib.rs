@@ -295,8 +295,11 @@ fn detect_struct_cycles(
         }
     }
 
-    // Add cycle from Bundle to Resource since Bundle.issues contains Resources beginning in R5
-    if elements.iter().any(|e| e.id.as_ref().map_or(false, |id| id == "Bundle.issues")) {
+    // Add cycle from Bundle to Resource since Bundle.issues contains Resources (an specially generated enum) beginning in R5
+    if elements
+        .iter()
+        .any(|e| e.id.as_ref().map_or(false, |id| id == "Bundle.issues"))
+    {
         cycles.insert(("Bundle".to_string(), "Resource".to_string()));
     }
 
