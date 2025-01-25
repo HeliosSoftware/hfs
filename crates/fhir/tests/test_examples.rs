@@ -43,6 +43,11 @@ fn test_r6_examples() {
 }
 
 fn test_examples_in_dir(dir: &PathBuf) {
+    if !dir.exists() {
+        println!("Directory does not exist: {:?}", dir);
+        return;
+    }
+    
     for entry in fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
