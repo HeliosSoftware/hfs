@@ -295,7 +295,8 @@ fn detect_struct_cycles(
         }
     }
 
-    // Add cycle from Bundle to Resource since Bundle.entry contains Resources
+    // Add cycle from Bundle to Resource since Bundle.issues contains Resources beginning in R5
+    // AI! Only call this insert if Bundle.issues exists as an id in elements
     cycles.insert(("Bundle".to_string(), "Resource".to_string()));
 
     cycles
