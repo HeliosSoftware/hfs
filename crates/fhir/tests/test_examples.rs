@@ -47,8 +47,12 @@ fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> R
     match (left, right) {
         (serde_json::Value::Number(l), serde_json::Value::Number(r)) => {
             if let (Some(l_f64), Some(r_f64)) = (l.as_f64(), r.as_f64()) {
-                // For floating point numbers, check if they're very close
-                if (l_f64 - r_f64).abs() < f64::EPSILON * l_f64.abs().max(r_f64.abs()) * 100.0 {
+                // Special case for zero
+                if l_f64 == 0.0 && r_f64 == 0.0 {
+                    Ok(())
+                }
+                // For non-zero floating point numbers, check if they're very close
+                else if (l_f64 - r_f64).abs() < f64::EPSILON * l_f64.abs().max(r_f64.abs()) * 100.0 {
                     Ok(())
                 } else {
                     Err(format!("Numbers differ significantly: {} vs {}", l_f64, r_f64))
