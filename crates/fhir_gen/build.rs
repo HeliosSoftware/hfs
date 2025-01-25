@@ -10,18 +10,9 @@ fn main() {
         return;
     }
 
-    // Check if resources/build already exists
     let resources_dir = Path::new("resources/r6");
-    if resources_dir.exists() {
-        println!("Resources directory already exists, skipping download");
-        return;
-    }
-
-    // Create resources directory if it doesn't exist
-    let resources_dir = Path::new("resources/build");
-    fs::create_dir_all(resources_dir).expect("Failed to create resources directory");
-
     let url = "https://build.fhir.org/definitions.json.zip";
+
     let output_path = resources_dir.join("definitions.json.zip");
 
     println!("Downloading FHIR definitions...");
