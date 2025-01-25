@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use serde::Serialize;
 
 #[cfg(feature = "R4")]
 #[test]
