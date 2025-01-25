@@ -295,7 +295,8 @@ fn detect_struct_cycles(
         }
     }
 
-    // AI! manually add a cycle from Bundle to Resource
+    // Add cycle from Bundle to Resource since Bundle.entry contains Resources
+    cycles.insert(("Bundle".to_string(), "Resource".to_string()));
 
     cycles
 }
