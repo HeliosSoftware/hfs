@@ -313,10 +313,6 @@ fn process_elements(
         let path_parts: Vec<&str> = element.path.split('.').collect();
         if path_parts.len() > 1 {
             let parent_path = path_parts[..path_parts.len() - 1].join(".");
-            println!(
-                "Parent path: {}, element.path: {}",
-                parent_path, &element.path
-            );
             element_groups.entry(parent_path).or_default().push(element);
         }
     }
@@ -455,7 +451,9 @@ fn generate_element_definition(
                         .iter()
                         .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
                     {
-                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first()) {
+                        if let Some(ref_ty) =
+                            referenced_element.r#type.as_ref().and_then(|t| t.first())
+                        {
                             ref_ty
                         } else {
                             return;
