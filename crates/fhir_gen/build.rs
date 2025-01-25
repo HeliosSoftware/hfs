@@ -1,18 +1,17 @@
 use std::fs;
 use std::fs::File;
-use std::path::Path;
 use std::io::copy;
+use std::path::Path;
 use zip::ZipArchive;
 
 fn main() {
-
     // Check if R6 feature is enabled
     if !cfg!(feature = "R6") {
         return;
     }
 
     // Check if resources/build already exists
-    let resources_dir = Path::new("resources/build");
+    let resources_dir = Path::new("resources/r6");
     if resources_dir.exists() {
         println!("Resources directory already exists, skipping download");
         return;
@@ -34,42 +33,47 @@ fn main() {
         .expect("Failed to create HTTP client");
 
     // Download the file
-    let response = client.get(url)
-        .send()
-        .expect("Failed to GET from url");
-        
+    let response = client.get(url).send().expect("Failed to GET from url");
+
     // Check if request was successful
     if !response.status().is_success() {
-        panic!("Download failed with status: {} for URL: {}", response.status(), url);
+        panic!(
+            "Download failed with status: {} for URL: {}",
+            response.status(),
+            url
+        );
     }
-    
+
     // Verify content type
     if let Some(content_type) = response.headers().get("content-type") {
         let content_type_str = content_type.to_str().unwrap_or("");
         if !content_type_str.contains("zip") {
-            panic!("Expected ZIP file but got content-type: {}", content_type_str);
+            panic!(
+                "Expected ZIP file but got content-type: {}",
+                content_type_str
+            );
         }
     }
-    
-    let mut response = response;
-    
-    // Create the file
-    let mut downloaded_file = File::create(output_path.clone())
-        .expect("Failed to create the file");
 
-    let bytes_copied = copy(&mut response, &mut downloaded_file)
-        .expect("Failed to copy the file");
-    
+    let mut response = response;
+
+    // Create the file
+    let mut downloaded_file = File::create(output_path.clone()).expect("Failed to create the file");
+
+    let bytes_copied = copy(&mut response, &mut downloaded_file).expect("Failed to copy the file");
+
     // Ensure file is written to disk
-    downloaded_file.sync_all().expect("Failed to flush file to disk");
-    
+    downloaded_file
+        .sync_all()
+        .expect("Failed to flush file to disk");
+
     println!("Downloaded {} bytes", bytes_copied);
-    
+
     // Verify file exists and has content
     let file = fs::File::open(&output_path).expect("Failed to open downloaded file");
     let metadata = file.metadata().expect("Failed to get file metadata");
     println!("File size on disk: {} bytes", metadata.len());
-    
+
     if metadata.len() == 0 {
         panic!("Downloaded file is empty!");
     }
@@ -80,7 +84,7 @@ fn main() {
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).unwrap();
         let outpath = resources_dir.join(file.mangled_name());
-        
+
         if file.name().ends_with('/') {
             fs::create_dir_all(&outpath).unwrap();
         } else {
@@ -92,7 +96,7 @@ fn main() {
         }
     }
 
+    // AI! delete the file output_path
+
     println!("FHIR definitions downloaded successfully");
-
 }
-
