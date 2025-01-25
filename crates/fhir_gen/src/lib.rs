@@ -228,7 +228,7 @@ fn make_rust_safe(input: &str) -> String {
         });
 
     match snake_case.as_str() {
-        "type" | "use" | "abstract" | "for" | "ref" => format!("r#{}", snake_case),
+        "type" | "use" | "abstract" | "for" | "ref" | "const" => format!("r#{}", snake_case),
         _ => snake_case,
     }
 }
@@ -294,6 +294,8 @@ fn detect_struct_cycles(
             }
         }
     }
+
+    // AI! manually add a cycle from Bundle to Resource
 
     cycles
 }
