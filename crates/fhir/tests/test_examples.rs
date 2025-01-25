@@ -8,7 +8,7 @@ fn test_r4_examples() {
         .join("test")
         .join("data")
         .join("r4");
-    // AI! println examples_dir
+    println!("Testing R4 examples in directory: {:?}", examples_dir);
     test_examples_in_dir(&examples_dir);
 }
 
