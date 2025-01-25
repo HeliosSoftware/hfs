@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[test]
 fn test_r4_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test")
+        .join("tests")
         .join("data")
         .join("r4");
     println!("Testing R4 examples in directory: {:?}", examples_dir);
@@ -16,7 +16,7 @@ fn test_r4_examples() {
 #[test]
 fn test_r4b_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test")
+        .join("tests")
         .join("data")
         .join("r4b");
     test_examples_in_dir(&examples_dir);
@@ -26,7 +26,7 @@ fn test_r4b_examples() {
 #[test]
 fn test_r5_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test")
+        .join("tests")
         .join("data")
         .join("r5");
     test_examples_in_dir(&examples_dir);
@@ -36,7 +36,7 @@ fn test_r5_examples() {
 #[test]
 fn test_r6_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test")
+        .join("tests")
         .join("data")
         .join("r6");
     test_examples_in_dir(&examples_dir);
@@ -47,7 +47,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
         println!("Directory does not exist: {:?}", dir);
         return;
     }
-    
+
     for entry in fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
