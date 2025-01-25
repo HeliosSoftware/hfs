@@ -1,6 +1,6 @@
+use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
-use serde::Serialize;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -52,29 +52,42 @@ fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> R
                     Ok(())
                 }
                 // For non-zero floating point numbers, check if they're very close
-                else if (l_f64 - r_f64).abs() < f64::EPSILON * l_f64.abs().max(r_f64.abs()) * 100.0 {
+                else if (l_f64 - r_f64).abs()
+                    < f64::EPSILON * l_f64.abs().max(r_f64.abs()) * 100.0
+                {
                     Ok(())
                 } else {
-                    Err(format!("Numbers differ significantly: {} vs {}", l_f64, r_f64))
+                    Err(format!(
+                        "Numbers differ significantly: {} vs {}",
+                        l_f64, r_f64
+                    ))
                 }
             } else if l.as_i64() != r.as_i64() {
                 Err(format!("Integer numbers differ: {} vs {}", l, r))
             } else {
                 Ok(())
             }
-        },
+        }
         (serde_json::Value::Array(l), serde_json::Value::Array(r)) => {
             if l.len() != r.len() {
-                return Err(format!("Arrays have different lengths: {} vs {}", l.len(), r.len()));
+                return Err(format!(
+                    "Arrays have different lengths: {} vs {}",
+                    l.len(),
+                    r.len()
+                ));
             }
             for (l_val, r_val) in l.iter().zip(r.iter()) {
                 compare_json_values(l_val, r_val)?;
             }
             Ok(())
-        },
+        }
         (serde_json::Value::Object(l), serde_json::Value::Object(r)) => {
             if l.len() != r.len() {
-                return Err(format!("Objects have different lengths: {} vs {}", l.len(), r.len()));
+                return Err(format!(
+                    "Objects have different lengths: {} vs {}",
+                    l.len(),
+                    r.len()
+                ));
             }
             for (key, l_val) in l.iter() {
                 match r.get(key) {
@@ -83,7 +96,7 @@ fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> R
                 }
             }
             Ok(())
-        },
+        }
         (l, r) if l == r => Ok(()),
         (l, r) => Err(format!("Values differ: {:?} vs {:?}", l, r)),
     }
@@ -100,7 +113,6 @@ fn test_examples_in_dir(dir: &PathBuf) {
         let path = entry.path();
 
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
-            println!("Testing file: {}", path.display());
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
@@ -110,7 +122,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
             let serialized = {
                 let mut serializer = serde_json::Serializer::with_formatter(
                     Vec::new(),
-                    serde_json::ser::PrettyFormatter::new()
+                    serde_json::ser::PrettyFormatter::new(),
                 );
                 original.serialize(&mut serializer).unwrap();
                 String::from_utf8(serializer.into_inner()).unwrap()

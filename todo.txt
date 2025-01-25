@@ -1,4 +1,4 @@
-Try expanding the scope of the processing to profiles-resources.json and see if it compiles!!
+Try serde'ing the examples
 The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to decide - could be helpful too in the future when we need to use it for Cassandra table separation
 Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
 Write readme for fhir_gen
