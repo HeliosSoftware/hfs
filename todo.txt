@@ -1,7 +1,10 @@
-Try serde'ing the examples
-The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to decide - could be helpful too in the future when we need to use it for Cassandra table separation
-Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
-Write readme for fhir_gen
-Needs to say it's ok to delete the crates/fhir folder, then run cargo new fhir --lib
-Need to add lib.rs to fhir/src/lib.rs.  
-There is probably a problem with resources/build it should just be r6
+- Write README.md for the root - homepage!
+- Write README.md for fhir_gen
+- Write README.md for hfs
+- Write README.md for fhir
+- For FHIRPath, seems like it is chumsky vs LALROP with logos?  Still unsure how to convert a FHIRPath expression to the resulting nodes.  Should this be done entirely in json?  There 
+  are many uses of FHIRPath in the FHIR Spec.  Should we be building a generic tool?  Should chumsky be used for a nice validator only and LALRPOP and logos be used for speed purpposes?
+- Is there a fhir path validator endpoint, and an apply?
+- The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to 
+  decide - could be helpful too in the future when we need to use it for Cassandra table separation
+- Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.

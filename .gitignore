@@ -3,3 +3,4 @@
 .aider*
 crates/fhir_gen/resources/r6
 crates/fhir/tests/data/r6
+.idea
