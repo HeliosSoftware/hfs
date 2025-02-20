@@ -2,6 +2,7 @@
 
 <h1 align="center">
     <img src="helios-logo.png" alt="Helios Logo" width="150">
+    The Helios FHIR Server is an implementation of the HL7 FHIR standard written in Rust.
     <br>
 </h1>
 <p align="center">
