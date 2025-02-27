@@ -433,7 +433,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Final expression
         implies_expr
-        })
     })
     .padded()
     
