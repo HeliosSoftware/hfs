@@ -66,6 +66,7 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
+    // AI! Add a very basic implementatiion that returns nothing
     /*
         // Recursive parser definition
         recursive(|expr| {
