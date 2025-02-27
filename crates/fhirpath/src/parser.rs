@@ -74,7 +74,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
             let boolean = text::keyword("true")
                 .or(text::keyword("false"))
-                .map(|s| Literal::Boolean(s == "true"));
+                .map(|s: &str| Literal::Boolean(s == "true"));
 
             let string = just('\'')
                 .ignore_then(
