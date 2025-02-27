@@ -75,137 +75,137 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .or(text::keyword("false"))
             .map(|s: &str| Literal::Boolean(s == "true"));
 
-            let string = just('\'')
+        let string = just('\'')
+            .ignore_then(
+                none_of("\'\\")
+                    .or(just('\\').ignore_then(any()))
+                    .repeated()
+            )
+            .then_ignore(just('\''))
+            .collect::<String>()
+            .map(Literal::String);
+
+        let number = text::int(10)
+            .then(just('.').then(text::digits(10)).or_not())
+            .map(|(i, d)| {
+                if let Some((_, d)) = d {
+                    Literal::Number(format!("{}.{}", i, d).parse().unwrap())
+                } else {
+                    Literal::Number(i.parse().unwrap())
+                }
+            });
+
+        let date = just('@')
+            .ignore_then(
+                filter(|c: &char| c.is_ascii_digit() || *c == '-')
+                    .repeated()
+                    .at_least(4)
+                    .collect::<String>()
+            )
+            .map(Literal::Date);
+
+        let datetime = just('@')
+            .ignore_then(
+                filter(|c: &char| c.is_ascii_digit() || *c == '-' || *c == 'T' || *c == ':' || *c == '.' || *c == 'Z' || *c == '+')
+                    .repeated()
+                    .collect::<String>()
+            )
+            .map(Literal::DateTime);
+
+        let time = just('@')
+            .then(just('T'))
+            .ignore_then(
+                filter(|c: &char| c.is_ascii_digit() || *c == ':' || *c == '.')
+                    .repeated()
+                    .collect::<String>()
+            )
+            .map(Literal::Time);
+
+        let unit = text::ident()
+            .or(just('\'')
                 .ignore_then(
                     none_of("\'\\")
                         .or(just('\\').ignore_then(any()))
                         .repeated()
                 )
                 .then_ignore(just('\''))
-                .collect::<String>()
-                .map(Literal::String);
+                .collect::<String>());
 
-            let number = text::int(10)
-                .then(just('.').then(text::digits(10)).or_not())
-                .map(|(i, d)| {
-                    if let Some((_, d)) = d {
-                        Literal::Number(format!("{}.{}", i, d).parse().unwrap())
-                    } else {
-                        Literal::Number(i.parse().unwrap())
-                    }
-                });
+        let quantity = number.clone()
+            .then(unit.or_not())
+            .map(|(n, u)| {
+                if let Literal::Number(num) = n {
+                    Literal::Quantity(num, u)
+                } else {
+                    unreachable!()
+                }
+            });
 
-            let date = just('@')
-                .ignore_then(
-                    filter(|c: &char| c.is_ascii_digit() || *c == '-')
-                        .repeated()
-                        .at_least(4)
-                        .collect::<String>()
-                )
-                .map(Literal::Date);
+        let literal = null
+            .or(boolean)
+            .or(string)
+            .or(quantity)
+            .or(number)
+            .or(datetime.or(date))
+            .or(time)
+            .map(Term::Literal);
 
-            let datetime = just('@')
-                .ignore_then(
-                    filter(|c: &char| c.is_ascii_digit() || *c == '-' || *c == 'T' || *c == ':' || *c == '.' || *c == 'Z' || *c == '+')
-                        .repeated()
-                        .collect::<String>()
-                )
-                .map(Literal::DateTime);
-
-            let time = just('@')
-                .then(just('T'))
-                .ignore_then(
-                    filter(|c: &char| c.is_ascii_digit() || *c == ':' || *c == '.')
-                        .repeated()
-                        .collect::<String>()
-                )
-                .map(Literal::Time);
-
-            let unit = text::ident()
-                .or(just('\'')
+        // Identifiers
+        let identifier = text::ident()
+            .or(
+                just('`')
                     .ignore_then(
-                        none_of("\'\\")
+                        none_of("`\\")
                             .or(just('\\').ignore_then(any()))
                             .repeated()
                     )
-                    .then_ignore(just('\''))
-                    .collect::<String>());
+                    .then_ignore(just('`'))
+                    .collect::<String>()
+            );
 
-            let quantity = number.clone()
-                .then(unit.or_not())
-                .map(|(n, u)| {
-                    if let Literal::Number(num) = n {
-                        Literal::Quantity(num, u)
-                    } else {
-                        unreachable!()
-                    }
-                });
+        // External constants
+        let external_constant = just('%')
+            .ignore_then(identifier.or(string.map(|s| {
+                if let Literal::String(str) = s {
+                    str
+                } else {
+                    unreachable!()
+                }
+            })))
+            .map(Term::ExternalConstant);
 
-            let literal = null
-                .or(boolean)
-                .or(string)
-                .or(quantity)
-                .or(number)
-                .or(datetime.or(date))
-                .or(time)
-                .map(Term::Literal);
+        // Function parameters
+        let param_list = expr.clone()
+            .separated_by(just(','))
+            .collect::<Vec<_>>();
 
-            // Identifiers
-            let identifier = text::ident()
-                .or(
-                    just('`')
-                        .ignore_then(
-                            none_of("`\\")
-                                .or(just('\\').ignore_then(any()))
-                                .repeated()
-                        )
-                        .then_ignore(just('`'))
-                        .collect::<String>()
-                );
+        // Function invocation
+        let function = identifier.clone()
+            .then(
+                just('(')
+                    .ignore_then(param_list.or_not())
+                    .then_ignore(just(')'))
+            )
+            .map(|(name, params)| {
+                Invocation::Function(name, params.unwrap_or_default())
+            });
 
-            // External constants
-            let external_constant = just('%')
-                .ignore_then(identifier.or(string.map(|s| {
-                    if let Literal::String(str) = s {
-                        str
-                    } else {
-                        unreachable!()
-                    }
-                })))
-                .map(Term::ExternalConstant);
+        // Invocations
+        let invocation = choice((
+            function,
+            just("$this").to(Invocation::This),
+            just("$index").to(Invocation::Index),
+            just("$total").to(Invocation::Total),
+            identifier.map(Invocation::Member),
+        )).map(Term::Invocation);
 
-            // Function parameters
-            let param_list = expr.clone()
-                .separated_by(just(','))
-                .collect::<Vec<_>>();
-
-            // Function invocation
-            let function = identifier.clone()
-                .then(
-                    just('(')
-                        .ignore_then(param_list.or_not())
-                        .then_ignore(just(')'))
-                )
-                .map(|(name, params)| {
-                    Invocation::Function(name, params.unwrap_or_default())
-                });
-
-            // Invocations
-            let invocation = choice((
-                function,
-                just("$this").to(Invocation::This),
-                just("$index").to(Invocation::Index),
-                just("$total").to(Invocation::Total),
-                identifier.map(Invocation::Member),
-            )).map(Term::Invocation);
-
-            // Terms
-            let term = choice((
-                invocation,
-                literal,
-                external_constant,
-                expr.clone().delimited_by(just('('), just(')')).map(|e| Term::Parenthesized(Box::new(e))),
-            ));
+        // Terms
+        let term = choice((
+            invocation,
+            literal,
+            external_constant,
+            expr.clone().delimited_by(just('('), just(')')).map(|e| Term::Parenthesized(Box::new(e))),
+        ));
 
             // Build the expression parser with operator precedence
             let atom = term.map(Expression::Term);
