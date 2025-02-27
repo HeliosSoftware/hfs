@@ -67,7 +67,7 @@ impl fmt::Display for Literal {
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
     // Recursive parser definition
-    recursive(|expr| {
+    recursive(|_expr| {
         // Literals
         let null = just('{').then(just('}')).to(Literal::Null);
 
