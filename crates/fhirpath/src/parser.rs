@@ -66,16 +66,14 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
-    // AI! Add a very basic implementatiion that returns nothing
-    /*
-        // Recursive parser definition
-        recursive(|expr| {
-            // Literals
-            let null = just('{').then(just('}')).to(Literal::Null);
+    // Recursive parser definition
+    recursive(|expr| {
+        // Literals
+        let null = just('{').then(just('}')).to(Literal::Null);
 
-            let boolean = text::keyword("true")
-                .or(text::keyword("false"))
-                .map(|s: &str| Literal::Boolean(s == "true"));
+        let boolean = text::keyword("true")
+            .or(text::keyword("false"))
+            .map(|s: &str| Literal::Boolean(s == "true"));
 
             let string = just('\'')
                 .ignore_then(
@@ -436,5 +434,55 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             implies_expr
         })
         .padded()
-    */
+        // String literals
+        let string = just('\'')
+            .ignore_then(
+                none_of("\'\\")
+                    .or(just('\\').ignore_then(any()))
+                    .repeated()
+            )
+            .then_ignore(just('\''))
+            .collect::<String>()
+            .map(Literal::String);
+
+        // Number literals
+        let number = text::int(10)
+            .then(just('.').then(text::digits(10)).or_not())
+            .map(|(i, d)| {
+                if let Some((_, d)) = d {
+                    Literal::Number(format!("{}.{}", i, d).parse().unwrap())
+                } else {
+                    Literal::Number(i.parse().unwrap())
+                }
+            });
+
+        // Identifiers
+        let identifier = text::ident()
+            .or(
+                just('`')
+                    .ignore_then(
+                        none_of("`\\")
+                            .or(just('\\').ignore_then(any()))
+                            .repeated()
+                    )
+                    .then_ignore(just('`'))
+                    .collect::<String>()
+            );
+
+        // Member invocation
+        let member = identifier.clone().map(Invocation::Member);
+        
+        // Basic term
+        let term = choice((
+            member.map(Term::Invocation),
+            boolean.map(Term::Literal),
+            string.map(Term::Literal),
+            number.map(Term::Literal),
+            null.map(Term::Literal),
+        ));
+
+        // Basic expression
+        term.map(Expression::Term)
+    })
+    .padded()
 }
