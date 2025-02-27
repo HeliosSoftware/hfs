@@ -72,7 +72,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         
         let boolean = text::keyword("true")
             .or(text::keyword("false"))
-            .map(|s| Literal::Boolean(s == "true"));
+            .map(|s: String| Literal::Boolean(s == "true"));
         
         let string = just('\'')
             .ignore_then(
@@ -262,7 +262,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Multiplicative(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
                 })
             });
         
@@ -281,7 +281,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Additive(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
                 })
             });
         
@@ -334,7 +334,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
-                    Expression::Inequality(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
                 } else {
                     lhs
                 }
@@ -356,7 +356,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
-                    Expression::Equality(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
                 } else {
                     lhs
                 }
@@ -376,7 +376,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
-                    Expression::Membership(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
                 } else {
                     lhs
                 }
@@ -410,7 +410,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op, Box::new(rhs))
+                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
                 })
             });
         
