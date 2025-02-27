@@ -1,4 +1,4 @@
-use chumsky::prelude::*;
+use chumsky::{prelude::*, Parser};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,7 +72,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         
         let boolean = text::keyword("true")
             .or(text::keyword("false"))
-            .map(|s: String| Literal::Boolean(s == "true"));
+            .map(|s| Literal::Boolean(s == "true"));
         
         let string = just('\'')
             .ignore_then(

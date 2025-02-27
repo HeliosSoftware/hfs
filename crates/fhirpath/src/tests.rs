@@ -1,4 +1,5 @@
 use crate::parser::{parser, Expression};
+use chumsky::Parser;
 use std::fs::File;
 use std::io::Read;
 use roxmltree::{Document, Node};
@@ -44,7 +45,7 @@ fn find_first_test(node: &Node) -> Option<String> {
                 if test_node.has_tag_name("test") {
                     for expr_node in test_node.children() {
                         if expr_node.has_tag_name("expression") {
-                            return expr_node.text();
+                            return expr_node.text().map(|s| s.to_string());
                         }
                     }
                 }
