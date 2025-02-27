@@ -1,23 +1,38 @@
 use crate::parser::{parser, Expression};
 use chumsky::Parser;
+use std::path::PathBuf;
 use std::fs::File;
 use std::io::Read;
 use roxmltree::{Document, Node};
 
 #[test]
-fn test_parse_first_expression() {
-    // Parse the first expression from the test file
-    let expr = "birthDate";
-    let result = parser().parse(expr);
+fn test_parse_simple_expressions() {
+    let test_cases = vec![
+        "birthDate",
+        "Patient.name.given",
+        "Patient.name.where(given = 'Jim')",
+        "1 + 2 * 3",
+        "true and false",
+        "Patient.name.exists()",
+        "name.take(2).given"
+    ];
     
-    assert!(result.is_ok(), "Failed to parse expression: {:?}", result.err());
-    println!("Successfully parsed: {:?}", result.unwrap());
+    for expr in test_cases {
+        let result = parser().parse(expr);
+        assert!(result.is_ok(), "Failed to parse expression: '{}', error: {:?}", expr, result.err());
+        println!("Successfully parsed '{}': {:?}", expr, result.unwrap());
+    }
 }
 
 #[test]
+#[ignore] // Ignore until we have the test file in place
 fn test_load_test_file() {
+    // Get the path to the test file
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("resources/r4/tests-fhir-r4.xml");
+    
     // Load the test file
-    let mut file = File::open("resources/r4/tests-fhir-r4.xml").expect("Failed to open test file");
+    let mut file = File::open(path).expect("Failed to open test file");
     let mut contents = String::new();
     file.read_to_string(&mut contents).expect("Failed to read test file");
     

@@ -1,4 +1,4 @@
-use chumsky::{prelude::*, Parser};
+use chumsky::prelude::*;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
