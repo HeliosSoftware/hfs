@@ -207,11 +207,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             expr.clone().delimited_by(just('('), just(')')).map(|e| Term::Parenthesized(Box::new(e))),
         ));
 
-            // Build the expression parser with operator precedence
-            let atom = term.map(Expression::Term);
+        // Build the expression parser with operator precedence
+        let atom = term.map(Expression::Term);
 
-            // Invocation expression (highest precedence)
-            let invocation_expr = atom
+        // Invocation expression (highest precedence)
+        let invocation_expr = atom
                 .clone()
                 .then(
                     just('.')
@@ -224,8 +224,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Indexer expression
-            let indexer_expr = invocation_expr
+        // Indexer expression
+        let indexer_expr = invocation_expr
                 .clone()
                 .then(
                     expr.clone()
@@ -238,23 +238,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Polarity expression
-            let polarity_expr = choice((
+        // Polarity expression
+        let polarity_expr = choice((
                 just('+').or(just('-'))
                     .then(indexer_expr.clone())
                     .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
                 indexer_expr,
             ));
 
-            // Multiplicative expression
-            let op = choice((
+        // Multiplicative expression
+        let op = choice((
                 just('*').to("*"),
                 just('/').to("/"),
                 text::keyword("div").to("div"),
                 text::keyword("mod").to("mod"),
             ));
 
-            let multiplicative_expr = polarity_expr
+        let multiplicative_expr = polarity_expr
                 .clone()
                 .then(
                     op.then(polarity_expr.clone())
@@ -266,14 +266,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Additive expression
-            let op = choice((
+        // Additive expression
+        let op = choice((
                 just('+').to("+"),
                 just('-').to("-"),
                 just('&').to("&"),
             ));
 
-            let additive_expr = multiplicative_expr
+        let additive_expr = multiplicative_expr
                 .clone()
                 .then(
                     op.then(multiplicative_expr.clone())
@@ -285,8 +285,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Type expression
-            let type_expr = additive_expr
+        // Type expression
+        let type_expr = additive_expr
                 .clone()
                 .then(
                     choice((
@@ -304,8 +304,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-            // Union expression
-            let union_expr = type_expr
+        // Union expression
+        let union_expr = type_expr
                 .clone()
                 .then(
                     just('|')
@@ -318,15 +318,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Inequality expression
-            let op = choice((
+        // Inequality expression
+        let op = choice((
                 just("<=").to("<="),
                 just("<").to("<"),
                 just(">=").to(">="),
                 just(">").to(">"),
             ));
 
-            let inequality_expr = union_expr
+        let inequality_expr = union_expr
                 .clone()
                 .then(
                     op.then(union_expr.clone())
@@ -340,15 +340,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-            // Equality expression
-            let op = choice((
+        // Equality expression
+        let op = choice((
                 just("=").to("="),
                 just("~").to("~"),
                 just("!=").to("!="),
                 just("!~").to("!~"),
             ));
 
-            let equality_expr = inequality_expr
+        let equality_expr = inequality_expr
                 .clone()
                 .then(
                     op.then(inequality_expr.clone())
@@ -362,13 +362,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-            // Membership expression
-            let op = choice((
+        // Membership expression
+        let op = choice((
                 text::keyword("in").to("in"),
                 text::keyword("contains").to("contains"),
             ));
 
-            let membership_expr = equality_expr
+        let membership_expr = equality_expr
                 .clone()
                 .then(
                     op.then(equality_expr.clone())
@@ -382,8 +382,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-            // And expression
-            let and_expr = membership_expr
+        // And expression
+        let and_expr = membership_expr
                 .clone()
                 .then(
                     text::keyword("and")
@@ -396,13 +396,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Or expression
-            let op = choice((
+        // Or expression
+        let op = choice((
                 text::keyword("or").to("or"),
                 text::keyword("xor").to("xor"),
             ));
 
-            let or_expr = and_expr
+        let or_expr = and_expr
                 .clone()
                 .then(
                     op.then(and_expr.clone())
@@ -414,8 +414,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
-            // Implies expression
-            let implies_expr = or_expr
+        // Implies expression
+        let implies_expr = or_expr
                 .clone()
                 .then(
                     text::keyword("implies")
@@ -430,8 +430,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-            // Final expression
-            implies_expr
+        // Final expression
+        implies_expr
         })
     })
     .padded()
