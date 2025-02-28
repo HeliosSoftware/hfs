@@ -140,7 +140,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let literal = null
             .or(boolean)
-            .or(string)
+            .or(string.clone())
             .or(quantity)
             .or(number)
             .or(datetime.or(date))
@@ -155,7 +155,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // External constants
         let external_constant = just('%')
-            .ignore_then(identifier.or(string.map(|s| {
+            .ignore_then(identifier.or(string.clone().map(|s| {
                 if let Literal::String(str) = s {
                     str
                 } else {
