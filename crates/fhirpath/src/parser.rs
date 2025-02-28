@@ -164,7 +164,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         
         // External constants
         let external_constant = just('%')
-            .ignore_then(identifier.or(string_for_external))
+            .ignore_then(identifier.clone().or(string_for_external))
             .map(Term::ExternalConstant);
 
         // Function parameters
@@ -186,7 +186,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("$this").to(Invocation::This),
             just("$index").to(Invocation::Index),
             just("$total").to(Invocation::Total),
-            identifier.map(Invocation::Member),
+            identifier.clone().map(Invocation::Member),
         ))
         .map(Term::Invocation);
 
