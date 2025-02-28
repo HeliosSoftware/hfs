@@ -201,7 +201,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .then_ignore(just('\''))
             .collect::<String>());
 
-        let quantity = number.clone().then(unit.or_not()).map(|(n, u)| {
+        let quantity = number.then(unit.or_not()).map(|(n, u)| {
             if let Literal::Number(num) = n {
                 Literal::Quantity(num, u)
             } else {
@@ -211,7 +211,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let literal = null
             .or(boolean)
-            .or(string.clone())
+            .or(string)
             .or(quantity)
             .or(number)
             .or(datetime.or(date))
@@ -233,10 +233,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Qualified identifier (for type specifiers)
         let qualified_identifier = identifier
-            .clone()
             .then(
                 just('.')
-                    .ignore_then(identifier.clone())
+                    .ignore_then(identifier)
                     .repeated()
                     .collect::<Vec<_>>(),
             )
@@ -261,15 +260,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // External constants
         let external_constant = just('%')
-            .ignore_then(choice((identifier.clone(), string_for_external)))
+            .ignore_then(choice((identifier, string_for_external)))
             .map(Term::ExternalConstant);
 
         // Function parameters
-        let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
+        let param_list = expr.separated_by(just(',')).collect::<Vec<_>>();
 
         // Function invocation
         let function = identifier
-            .clone()
             .then(
                 just('(')
                     .ignore_then(param_list.or_not())
@@ -283,9 +281,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
             just("$total").to(Term::Invocation(Invocation::Total)),
-            identifier
-                .clone()
-                .map(|id| Term::Invocation(Invocation::Member(id))),
+            identifier.map(|id| Term::Invocation(Invocation::Member(id))),
         ));
 
         // Terms
@@ -293,8 +289,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             invocation,
             literal,
             external_constant,
-            expr.clone()
-                .delimited_by(just('('), just(')'))
+            expr.delimited_by(just('('), just(')'))
                 .map(|e| Term::Parenthesized(Box::new(e))),
         ));
 
@@ -302,19 +297,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.map(Expression::Term);
 
         // Invocation expression (highest precedence)
-        let invocation_expr = atom
-            .clone()
-            .then(just('.').ignore_then(identifier.clone()).repeated())
-            .map(|(expr, invocations)| {
-                invocations
-                    .into_iter()
-                    .fold(expr, |acc, inv| Expression::Invocation(Box::new(acc), inv))
-            });
+        let invocation_expr =
+            atom.then(just('.').ignore_then(identifier).repeated())
+                .map(|(expr, invocations)| {
+                    invocations
+                        .into_iter()
+                        .fold(expr, |acc, inv| Expression::Invocation(Box::new(acc), inv))
+                });
 
         // Indexer expression
         let indexer_expr = invocation_expr
-            .clone()
-            .then(expr.clone().delimited_by(just('['), just(']')).repeated())
+            .then(expr.delimited_by(just('['), just(']')).repeated())
             .map(|(expr, indices)| {
                 indices.into_iter().fold(expr, |acc, idx| {
                     Expression::Indexer(Box::new(acc), Box::new(idx))
@@ -325,7 +318,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let polarity_expr = choice((
             just('+')
                 .or(just('-'))
-                .then(indexer_expr.clone())
+                .then(indexer_expr)
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
             indexer_expr,
         ));
@@ -338,21 +331,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             text::keyword("mod").to("mod"),
         ));
 
-        let multiplicative_expr = polarity_expr
-            .clone()
-            .then(op.then(polarity_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            });
+        let multiplicative_expr =
+            polarity_expr
+                .then(op.then(polarity_expr).repeated())
+                .map(|(first, rest)| {
+                    rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                        Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+                    })
+                });
 
         // Additive expression
         let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&")));
 
         let additive_expr = multiplicative_expr
-            .clone()
-            .then(op.then(multiplicative_expr.clone()).repeated())
+            .then(op.then(multiplicative_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -361,10 +353,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Type expression
         let type_expr = additive_expr
-            .clone()
             .then(
                 choice((text::keyword("is"), text::keyword("as")))
-                    .then(qualified_identifier.clone())
+                    .then(qualified_identifier)
                     .or_not(),
             )
             .map(|(expr, type_op)| {
@@ -377,8 +368,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Union expression
         let union_expr = type_expr
-            .clone()
-            .then(just('|').ignore_then(type_expr.clone()).repeated())
+            .then(just('|').ignore_then(type_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
                     Expression::Union(Box::new(lhs), Box::new(rhs))
@@ -394,8 +384,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         let inequality_expr = union_expr
-            .clone()
-            .then(op.then(union_expr.clone()).or_not())
+            .then(op.then(union_expr).or_not())
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
                     Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -411,16 +400,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("!~").to("!~"),
         ));
 
-        let equality_expr = inequality_expr
-            .clone()
-            .then(op.then(inequality_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+        let equality_expr =
+            inequality_expr
+                .then(op.then(inequality_expr).or_not())
+                .map(|(lhs, rhs)| {
+                    if let Some((op, rhs)) = rhs {
+                        Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                    } else {
+                        lhs
+                    }
+                });
 
         // Membership expression
         let op = choice((
@@ -428,25 +417,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             text::keyword("contains").to("contains"),
         ));
 
-        let membership_expr = equality_expr
-            .clone()
-            .then(op.then(equality_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+        let membership_expr =
+            equality_expr
+                .then(op.then(equality_expr).or_not())
+                .map(|(lhs, rhs)| {
+                    if let Some((op, rhs)) = rhs {
+                        Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
+                    } else {
+                        lhs
+                    }
+                });
 
         // And expression
         let and_expr = membership_expr
-            .clone()
-            .then(
-                text::keyword("and")
-                    .ignore_then(membership_expr.clone())
-                    .repeated(),
-            )
+            .then(text::keyword("and").ignore_then(membership_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
                     Expression::And(Box::new(lhs), Box::new(rhs))
@@ -457,8 +441,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor")));
 
         let or_expr = and_expr
-            .clone()
-            .then(op.then(and_expr.clone()).repeated())
+            .then(op.then(and_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -467,12 +450,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Implies expression
         let implies_expr = or_expr
-            .clone()
-            .then(
-                text::keyword("implies")
-                    .ignore_then(or_expr.clone())
-                    .or_not(),
-            )
+            .then(text::keyword("implies").ignore_then(or_expr).or_not())
             .map(|(lhs, rhs)| {
                 if let Some(rhs) = rhs {
                     Expression::Implies(Box::new(lhs), Box::new(rhs))
@@ -481,66 +459,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 }
             });
 
-        // Lambda expression
-        let lambda_with_id = identifier
-            .clone()
-            .then(just("=>"))
-            .then(expr.clone())
-            .map(|((id, _), expr)| Expression::Lambda(Some(id), Box::new(expr)));
-
-        let lambda_without_id = just("=>")
-            .then(expr.clone())
-            .map(|(_, expr)| Expression::Lambda(None, Box::new(expr)));
-
-        // Final expression
-        choice((implies_expr.clone(), lambda_with_id, lambda_without_id))
+        implies_expr
     })
     .then_ignore(end())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lambda_expressions() {
-        let parser = parser();
-
-        // Test lambda with identifier
-        let result = parser.parse("x => x.name");
-        assert!(result.is_ok());
-        if let Ok(expr) = result {
-            if let Expression::Lambda(Some(id), expr) = expr {
-                assert_eq!(id, "x");
-                // Check that the inner expression is correct
-                if let Expression::Invocation(inner, name) = *expr {
-                    assert_eq!(name, "name");
-                    if let Expression::Term(Term::Invocation(Invocation::Member(member))) = *inner {
-                        assert_eq!(member, "x");
-                    } else {
-                        panic!("Expected member invocation");
-                    }
-                } else {
-                    panic!("Expected invocation expression");
-                }
-            } else {
-                panic!("Expected lambda expression");
-            }
-        }
-
-        // Test lambda without identifier
-        let result = parser.parse("=> 'hello'");
-        assert!(result.is_ok());
-        if let Ok(expr) = result {
-            if let Expression::Lambda(None, expr) = expr {
-                if let Expression::Term(Term::Literal(Literal::String(s))) = *expr {
-                    assert_eq!(s, "hello");
-                } else {
-                    panic!("Expected string literal");
-                }
-            } else {
-                panic!("Expected lambda expression without identifier");
-            }
-        }
-    }
 }
