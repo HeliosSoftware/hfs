@@ -94,14 +94,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Date format: YYYY(-MM(-DD))?
         let date_format = text::digits(10)
-            .exactly(4)
+            .repeated().exactly(4)
             .collect::<String>()
             .then(
                 just('-')
-                    .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                    .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
                     .then(
                         just('-')
-                            .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                            .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
                             .or_not(),
                     )
                     .or_not(),
@@ -121,17 +121,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Time format: HH(:mm(:ss(.sss)?)?)?
         let time_format = text::digits(10)
-            .exactly(2)
+            .repeated().exactly(2)
             .collect::<String>()
             .then(
                 just(':')
-                    .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                    .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
                     .then(
                         just(':')
-                            .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                            .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
                             .then(
                                 just('.')
-                                    .ignore_then(text::digits(10).at_least(1).collect::<String>())
+                                    .ignore_then(text::digits(10).repeated().at_least(1).collect::<String>())
                                     .or_not(),
                             )
                             .or_not(),
@@ -158,10 +158,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Timezone format: Z | (+|-)HH:mm
         let timezone_format = just('Z')
             .to("Z".to_string())
-            .or(choice((just('+'), just('-')))
-                .then(text::digits(10).exactly(2))
+            .or(one_of("+-").map(|c| c.to_string())
+                .then(text::digits(10).repeated().exactly(2).collect::<String>())
                 .then(just(':'))
-                .then(text::digits(10).exactly(2))
+                .then(text::digits(10).repeated().exactly(2).collect::<String>())
                 .map(|(((sign, hour), _), min)| {
                     format!("{}{:02}:{:02}", sign, hour.parse::<u8>().unwrap(), min.parse::<u8>().unwrap())
                 }));
@@ -217,22 +217,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(Term::Literal);
 
         // Identifiers
-        let identifier = choice((
-            text::ident(),
-            just('`')
+        let identifier = text::ident()
+            .or(just('`')
                 .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
                 .then_ignore(just('`'))
-                .collect::<String>(),
-            text::keyword("as"),
-            text::keyword("contains"),
-            text::keyword("in"),
-            text::keyword("is"),
-        ));
+                .collect::<String>())
+            .or(text::keyword("as"))
+            .or(text::keyword("contains"))
+            .or(text::keyword("in"))
+            .or(text::keyword("is"));
         
         // Qualified identifier (for type specifiers)
         let qualified_identifier = identifier
             .clone()
-            .then(just('.').ignore_then(identifier.clone()).repeated())
+            .then(
+                just('.')
+                    .ignore_then(identifier.clone())
+                    .repeated()
+                    .collect::<Vec<_>>()
+            )
             .map(|(first, rest)| {
                 if rest.is_empty() {
                     first
@@ -247,13 +250,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Create a separate string parser for external constants
-        let string_for_external = string.clone().map(|s| {
-            if let Literal::String(str) = s {
-                str
-            } else {
-                unreachable!()
-            }
-        });
+        let string_for_external = just('\'')
+            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+            .then_ignore(just('\''))
+            .collect::<String>();
 
         // External constants
         let external_constant = just('%')
@@ -274,14 +274,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(name, params)| Invocation::Function(name, params.unwrap_or_default()));
 
         // Invocations
-        let invocation = choice((
-            function,
-            just("$this").to(Invocation::This),
-            just("$index").to(Invocation::Index),
-            just("$total").to(Invocation::Total),
-            identifier.clone().map(Invocation::Member),
-        ))
-        .map(Term::Invocation);
+        let invocation = function
+            .map(Term::Invocation)
+            .or(just("$this").to(Term::Invocation(Invocation::This)))
+            .or(just("$index").to(Term::Invocation(Invocation::Index)))
+            .or(just("$total").to(Term::Invocation(Invocation::Total)))
+            .or(identifier.clone().map(|id| Term::Invocation(Invocation::Member(id))));
 
         // Terms
         let term = choice((
@@ -477,18 +475,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Lambda expression
-        let lambda_expr = implies_expr
+        let lambda_with_id = identifier
             .clone()
-            .or(identifier
-                .clone()
-                .then(just("=>").ignore_then(expr.clone()))
-                .map(|(id, expr)| Expression::Lambda(Some(id), Box::new(expr))))
-            .or(just("=>")
-                .ignore_then(expr.clone())
-                .map(|expr| Expression::Lambda(None, Box::new(expr))));
+            .then(just("=>").ignore_then(expr.clone()))
+            .map(|(id, expr)| Expression::Lambda(Some(id), Box::new(expr)));
+            
+        let lambda_without_id = just("=>")
+            .ignore_then(expr.clone())
+            .map(|expr| Expression::Lambda(None, Box::new(expr)));
                 
         // Final expression
-        lambda_expr
+        implies_expr
+            .clone()
+            .or(lambda_with_id)
+            .or(lambda_without_id)
     })
     .then_ignore(end())
 }
