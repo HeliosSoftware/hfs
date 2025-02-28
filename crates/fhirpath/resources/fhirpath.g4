@@ -6,6 +6,10 @@ grammar fhirpath;
 //prog: line (line)*;
 //line: ID ( '(' expr ')') ':' expr '\r'? '\n';
 
+entireExpression
+        : expression EOF
+        ;
+        
 expression
         : term                                                      #termExpression
         | expression '.' invocation                                 #invocationExpression
@@ -36,6 +40,7 @@ literal
         | ('true' | 'false')                                    #booleanLiteral
         | STRING                                                #stringLiteral
         | NUMBER                                                #numberLiteral
+        | LONGNUMBER                                            #longNumberLiteral
         | DATE                                                  #dateLiteral
         | DATETIME                                              #dateTimeLiteral
         | TIME                                                  #timeLiteral
@@ -147,6 +152,10 @@ STRING
 // Also allows leading zeroes now (just like CQL and XSD)
 NUMBER
         : [0-9]+('.' [0-9]+)?
+        ;
+
+LONGNUMBER
+        : [0-9]+ 'L'?
         ;
 
 // Pipe whitespace to the HIDDEN channel to support retrieving source text through the parser.
