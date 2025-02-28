@@ -158,7 +158,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Timezone format: Z | (+|-)HH:mm
         let timezone_format = just('Z')
             .to("Z".to_string())
-            .or(one_of("+-").map(|c| c.to_string())
+            .or(one_of("+-").map(|c: char| c.to_string())
                 .then(text::digits(10).repeated().exactly(2).collect::<String>())
                 .then(just(':'))
                 .then(text::digits(10).repeated().exactly(2).collect::<String>())
@@ -217,15 +217,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(Term::Literal);
 
         // Identifiers
-        let identifier = text::ident()
-            .or(just('`')
+        let identifier = choice((
+            text::ident(),
+            just('`')
                 .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
                 .then_ignore(just('`'))
-                .collect::<String>())
-            .or(text::keyword("as"))
-            .or(text::keyword("contains"))
-            .or(text::keyword("in"))
-            .or(text::keyword("is"));
+                .collect::<String>(),
+            text::keyword("as").to(String::from("as")),
+            text::keyword("contains").to(String::from("contains")),
+            text::keyword("in").to(String::from("in")),
+            text::keyword("is").to(String::from("is"))
+        ));
         
         // Qualified identifier (for type specifiers)
         let qualified_identifier = identifier
@@ -257,7 +259,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // External constants
         let external_constant = just('%')
-            .ignore_then(identifier.clone().or(string_for_external))
+            .ignore_then(choice((identifier.clone(), string_for_external)))
             .map(Term::ExternalConstant);
 
         // Function parameters
@@ -274,12 +276,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(name, params)| Invocation::Function(name, params.unwrap_or_default()));
 
         // Invocations
-        let invocation = function
-            .map(Term::Invocation)
-            .or(just("$this").to(Term::Invocation(Invocation::This)))
-            .or(just("$index").to(Term::Invocation(Invocation::Index)))
-            .or(just("$total").to(Term::Invocation(Invocation::Total)))
-            .or(identifier.clone().map(|id| Term::Invocation(Invocation::Member(id))));
+        let invocation = choice((
+            function.map(Term::Invocation),
+            just("$this").to(Term::Invocation(Invocation::This)),
+            just("$index").to(Term::Invocation(Invocation::Index)),
+            just("$total").to(Term::Invocation(Invocation::Total)),
+            identifier.clone().map(|id| Term::Invocation(Invocation::Member(id)))
+        ));
 
         // Terms
         let term = choice((
@@ -485,10 +488,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|expr| Expression::Lambda(None, Box::new(expr)));
                 
         // Final expression
-        implies_expr
-            .clone()
-            .or(lambda_with_id)
-            .or(lambda_without_id)
+        choice((
+            implies_expr.clone(),
+            lambda_with_id,
+            lambda_without_id
+        ))
     })
     .then_ignore(end())
 }
