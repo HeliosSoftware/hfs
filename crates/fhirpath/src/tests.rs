@@ -1,9 +1,9 @@
 use crate::parser::{parser, Expression};
 use chumsky::Parser;
-use std::path::PathBuf;
+use roxmltree::{Document, Node};
 use std::fs::File;
 use std::io::Read;
-use roxmltree::{Document, Node};
+use std::path::PathBuf;
 
 #[test]
 fn test_parse_simple_expressions() {
@@ -14,41 +14,50 @@ fn test_parse_simple_expressions() {
         "1 + 2 * 3",
         "true and false",
         "Patient.name.exists()",
-        "name.take(2).given"
+        "name.take(2).given",
     ];
-    
+
     for expr in test_cases {
         let result = parser().parse(expr);
-        assert!(result.is_ok(), "Failed to parse expression: '{}', error: {:?}", expr, result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to parse expression: '{}', error: {:?}",
+            expr,
+            result.err()
+        );
         println!("Successfully parsed '{}': {:?}", expr, result.unwrap());
     }
 }
 
 #[test]
-#[ignore] // Ignore until we have the test file in place
 fn test_load_test_file() {
     // Get the path to the test file
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("resources/r4/tests-fhir-r4.xml");
-    
+
     // Load the test file
     let mut file = File::open(path).expect("Failed to open test file");
     let mut contents = String::new();
-    file.read_to_string(&mut contents).expect("Failed to read test file");
-    
+    file.read_to_string(&mut contents)
+        .expect("Failed to read test file");
+
     // Parse the XML
     let doc = Document::parse(&contents).expect("Failed to parse XML");
-    
+
     // Find the first test expression
     let first_test = find_first_test(&doc.root_element());
     assert!(first_test.is_some(), "Failed to find first test");
-    
+
     let first_test = first_test.unwrap();
     println!("First test: {}", first_test);
-    
+
     // Parse the expression
-    let result = parser().parse(&first_test);
-    assert!(result.is_ok(), "Failed to parse expression: {:?}", result.err());
+    let result = parser().parse(first_test);
+    assert!(
+        result.is_ok(),
+        "Failed to parse expression: {:?}",
+        result.err()
+    );
     println!("Successfully parsed: {:?}", result.unwrap());
 }
 
@@ -66,13 +75,13 @@ fn find_first_test(node: &Node) -> Option<String> {
                 }
             }
         }
-        
+
         // Recursively search
         let result = find_first_test(&child);
         if result.is_some() {
             return result;
         }
     }
-    
+
     None
 }
