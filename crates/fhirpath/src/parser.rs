@@ -30,6 +30,7 @@ pub enum Expression {
     And(Box<Expression>, Box<Expression>),
     Or(Box<Expression>, String, Box<Expression>),
     Implies(Box<Expression>, Box<Expression>),
+    Lambda(Option<String>, Box<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,38 +92,106 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 }
             });
 
-        let date = just('@')
-            .ignore_then(
-                filter(|c: &char| c.is_ascii_digit() || *c == '-')
-                    .repeated()
-                    .at_least(4)
-                    .collect::<String>(),
+        // Date format: YYYY(-MM(-DD))?
+        let date_format = text::digits(10)
+            .exactly(4)
+            .collect::<String>()
+            .then(
+                just('-')
+                    .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                    .then(
+                        just('-')
+                            .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                            .or_not(),
+                    )
+                    .or_not(),
             )
+            .map(|(year, month_day)| {
+                let mut result = year;
+                if let Some((month, day)) = month_day {
+                    result.push('-');
+                    result.push_str(&month);
+                    if let Some(day) = day {
+                        result.push('-');
+                        result.push_str(&day);
+                    }
+                }
+                result
+            });
+
+        // Time format: HH(:mm(:ss(.sss)?)?)?
+        let time_format = text::digits(10)
+            .exactly(2)
+            .collect::<String>()
+            .then(
+                just(':')
+                    .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                    .then(
+                        just(':')
+                            .ignore_then(text::digits(10).exactly(2).collect::<String>())
+                            .then(
+                                just('.')
+                                    .ignore_then(text::digits(10).at_least(1).collect::<String>())
+                                    .or_not(),
+                            )
+                            .or_not(),
+                    )
+                    .or_not(),
+            )
+            .map(|(hour, min_sec)| {
+                let mut result = hour;
+                if let Some((min, sec_ms)) = min_sec {
+                    result.push(':');
+                    result.push_str(&min);
+                    if let Some((sec, ms)) = sec_ms {
+                        result.push(':');
+                        result.push_str(&sec);
+                        if let Some(ms) = ms {
+                            result.push('.');
+                            result.push_str(&ms);
+                        }
+                    }
+                }
+                result
+            });
+
+        // Timezone format: Z | (+|-)HH:mm
+        let timezone_format = just('Z')
+            .to("Z".to_string())
+            .or(choice((just('+'), just('-')))
+                .then(text::digits(10).exactly(2))
+                .then(just(':'))
+                .then(text::digits(10).exactly(2))
+                .map(|(((sign, hour), _), min)| {
+                    format!("{}{:02}:{:02}", sign, hour.parse::<u8>().unwrap(), min.parse::<u8>().unwrap())
+                }));
+
+        let date = just('@')
+            .ignore_then(date_format)
             .map(Literal::Date);
 
         let datetime = just('@')
-            .ignore_then(
-                filter(|c: &char| {
-                    c.is_ascii_digit()
-                        || *c == '-'
-                        || *c == 'T'
-                        || *c == ':'
-                        || *c == '.'
-                        || *c == 'Z'
-                        || *c == '+'
-                })
-                .repeated()
-                .collect::<String>(),
-            )
-            .map(Literal::DateTime);
+            .ignore_then(date_format)
+            .then(just('T').ignore_then(
+                time_format
+                    .then(timezone_format.or_not())
+                    .or_not()
+            ))
+            .map(|(date, time_tz)| {
+                let mut result = date;
+                result.push('T');
+                if let Some((time, tz)) = time_tz {
+                    result.push_str(&time);
+                    if let Some(tz) = tz {
+                        result.push_str(&tz);
+                    }
+                }
+                Literal::DateTime(result)
+            });
 
         let time = just('@')
             .then(just('T'))
-            .ignore_then(
-                filter(|c: &char| c.is_ascii_digit() || *c == ':' || *c == '.')
-                    .repeated()
-                    .collect::<String>(),
-            )
+            .ignore_then(time_format)
             .map(Literal::Time);
 
         let unit = text::ident().or(just('\'')
@@ -148,10 +217,34 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(Term::Literal);
 
         // Identifiers
-        let identifier = text::ident().or(just('`')
-            .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('`'))
-            .collect::<String>());
+        let identifier = choice((
+            text::ident(),
+            just('`')
+                .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
+                .then_ignore(just('`'))
+                .collect::<String>(),
+            text::keyword("as"),
+            text::keyword("contains"),
+            text::keyword("in"),
+            text::keyword("is"),
+        ));
+        
+        // Qualified identifier (for type specifiers)
+        let qualified_identifier = identifier
+            .clone()
+            .then(just('.').ignore_then(identifier.clone()).repeated())
+            .map(|(first, rest)| {
+                if rest.is_empty() {
+                    first
+                } else {
+                    let mut result = first;
+                    for part in rest {
+                        result.push_str(".");
+                        result.push_str(&part);
+                    }
+                    result
+                }
+            });
 
         // Create a separate string parser for external constants
         let string_for_external = string.clone().map(|s| {
@@ -266,7 +359,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .clone()
             .then(
                 choice((text::keyword("is"), text::keyword("as")))
-                    .then(identifier.clone())
+                    .then(qualified_identifier.clone())
                     .or_not(),
             )
             .map(|(expr, type_op)| {
@@ -383,8 +476,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 }
             });
 
+        // Lambda expression
+        let lambda_expr = implies_expr
+            .clone()
+            .or(identifier
+                .clone()
+                .then(just("=>").ignore_then(expr.clone()))
+                .map(|(id, expr)| Expression::Lambda(Some(id), Box::new(expr))))
+            .or(just("=>")
+                .ignore_then(expr.clone())
+                .map(|expr| Expression::Lambda(None, Box::new(expr))));
+                
         // Final expression
-        implies_expr
+        lambda_expr
     })
     .then_ignore(end())
 }
