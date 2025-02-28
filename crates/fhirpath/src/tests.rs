@@ -52,8 +52,9 @@ fn test_load_test_file() {
                 println!("Warning: Could not write test file: {:?}", e);
             });
             
-            // Return a cursor to the test content
-            return test_simple_expressions();
+            // Run the simple expressions test instead
+            test_parse_simple_expressions();
+            return;
         }
     };
     let mut contents = String::new();
@@ -115,8 +116,9 @@ fn test_multiple_expressions_from_file() {
                 println!("Warning: Could not write test file: {:?}", e);
             });
             
-            // Return a cursor to the test content
-            return test_simple_expressions();
+            // Run the simple expressions test instead
+            test_parse_simple_expressions();
+            return;
         }
     };
     let mut contents = String::new();
