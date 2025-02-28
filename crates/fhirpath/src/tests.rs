@@ -52,7 +52,7 @@ fn test_load_test_file() {
     println!("First test: {}", first_test);
 
     // Parse the expression
-    let result = parser().parse(first_test);
+    let result = parser().parse(first_test.clone());
     assert!(
         result.is_ok(),
         "Failed to parse expression: '{}', error: {:?}",
@@ -89,7 +89,7 @@ fn test_multiple_expressions_from_file() {
     let mut failure_count = 0;
     
     for (i, expr) in expressions.iter().enumerate().take(10) { // Limit to first 10 for brevity
-        let result = parser().parse(expr);
+        let result = parser().parse(expr.clone());
         if result.is_ok() {
             success_count += 1;
         } else {
