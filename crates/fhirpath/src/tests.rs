@@ -1,4 +1,4 @@
-use crate::parser::{parser, Expression};
+use crate::parser::parser;
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use std::fs::File;
@@ -18,7 +18,7 @@ fn test_parse_simple_expressions() {
     ];
 
     for expr in test_cases {
-        let result = parser().parse(expr);
+        let result = parser().parse(expr.clone());
         assert!(
             result.is_ok(),
             "Failed to parse expression: '{}', error: {:?}",
@@ -52,7 +52,7 @@ fn test_load_test_file() {
     println!("First test: {}", first_test);
 
     // Parse the expression
-    let result = parser().parse(&first_test);
+    let result = parser().parse(first_test);
     assert!(
         result.is_ok(),
         "Failed to parse expression: '{}', error: {:?}",
