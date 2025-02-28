@@ -153,15 +153,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .then_ignore(just('`'))
             .collect::<String>());
 
+        // Create a separate string parser for external constants
+        let string_for_external = string.clone().map(|s| {
+            if let Literal::String(str) = s {
+                str
+            } else {
+                unreachable!()
+            }
+        });
+        
         // External constants
         let external_constant = just('%')
-            .ignore_then(identifier.or(string.clone().map(|s| {
-                if let Literal::String(str) = s {
-                    str
-                } else {
-                    unreachable!()
-                }
-            })))
+            .ignore_then(identifier.or(string_for_external))
             .map(Term::ExternalConstant);
 
         // Function parameters
