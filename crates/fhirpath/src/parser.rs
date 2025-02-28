@@ -495,6 +495,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Final expression
         choice((implies_expr.clone(), lambda_with_id, lambda_without_id))
     })
+    .then_ignore(end())
 }
 
 #[cfg(test)]
