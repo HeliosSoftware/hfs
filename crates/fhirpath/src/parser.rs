@@ -492,3 +492,50 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
     })
     .then_ignore(end())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lambda_expressions() {
+        let parser = parser();
+        
+        // Test lambda with identifier
+        let result = parser.parse("x => x.name");
+        assert!(result.is_ok());
+        if let Ok(expr) = result {
+            if let Expression::Lambda(Some(id), expr) = expr {
+                assert_eq!(id, "x");
+                // Check that the inner expression is correct
+                if let Expression::Invocation(inner, name) = *expr {
+                    assert_eq!(name, "name");
+                    if let Expression::Term(Term::Invocation(Invocation::Member(member))) = *inner {
+                        assert_eq!(member, "x");
+                    } else {
+                        panic!("Expected member invocation");
+                    }
+                } else {
+                    panic!("Expected invocation expression");
+                }
+            } else {
+                panic!("Expected lambda expression");
+            }
+        }
+        
+        // Test lambda without identifier
+        let result = parser.parse("=> 'hello'");
+        assert!(result.is_ok());
+        if let Ok(expr) = result {
+            if let Expression::Lambda(None, expr) = expr {
+                if let Expression::Term(Term::Literal(Literal::String(s))) = *expr {
+                    assert_eq!(s, "hello");
+                } else {
+                    panic!("Expected string literal");
+                }
+            } else {
+                panic!("Expected lambda expression without identifier");
+            }
+        }
+    }
+}
