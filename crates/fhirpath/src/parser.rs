@@ -94,7 +94,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Date format: YYYY(-MM(-DD))?
         let date_format = text::digits(10)
-            .repeated().exactly(4)
+            .repeated()
+            .exactly(4)
             .collect::<String>()
             .then(
                 just('-')
@@ -121,7 +122,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Time format: HH(:mm(:ss(.sss)?)?)?
         let time_format = text::digits(10)
-            .repeated().exactly(2)
+            .repeated()
+            .exactly(2)
             .collect::<String>()
             .then(
                 just(':')
@@ -131,7 +133,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
                             .then(
                                 just('.')
-                                    .ignore_then(text::digits(10).repeated().at_least(1).collect::<String>())
+                                    .ignore_then(
+                                        text::digits(10).repeated().at_least(1).collect::<String>(),
+                                    )
                                     .or_not(),
                             )
                             .or_not(),
@@ -156,27 +160,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Timezone format: Z | (+|-)HH:mm
-        let timezone_format = just('Z')
-            .to("Z".to_string())
-            .or(one_of("+-").map(|c: char| c.to_string())
-                .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                .then(just(':'))
-                .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                .map(|(((sign, hour), _), min)| {
-                    format!("{}{:02}:{:02}", sign, hour.parse::<u8>().unwrap(), min.parse::<u8>().unwrap())
-                }));
+        let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
+            .map(|c: char| c.to_string())
+            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .then(just(':'))
+            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .map(|(((sign, hour), _), min)| {
+                format!(
+                    "{}{:02}:{:02}",
+                    sign,
+                    hour.parse::<u8>().unwrap(),
+                    min.parse::<u8>().unwrap()
+                )
+            }));
 
-        let date = just('@')
-            .ignore_then(date_format)
-            .map(Literal::Date);
+        let date = just('@').ignore_then(date_format).map(Literal::Date);
 
         let datetime = just('@')
             .ignore_then(date_format)
-            .then(just('T').ignore_then(
-                time_format
-                    .then(timezone_format.or_not())
-                    .or_not()
-            ))
+            .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
             .map(|(date, time_tz)| {
                 let mut result = date;
                 result.push('T');
@@ -226,9 +228,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             text::keyword("as").to(String::from("as")),
             text::keyword("contains").to(String::from("contains")),
             text::keyword("in").to(String::from("in")),
-            text::keyword("is").to(String::from("is"))
+            text::keyword("is").to(String::from("is")),
         ));
-        
+
         // Qualified identifier (for type specifiers)
         let qualified_identifier = identifier
             .clone()
@@ -236,7 +238,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 just('.')
                     .ignore_then(identifier.clone())
                     .repeated()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
             )
             .map(|(first, rest)| {
                 if rest.is_empty() {
@@ -281,7 +283,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
             just("$total").to(Term::Invocation(Invocation::Total)),
-            identifier.clone().map(|id| Term::Invocation(Invocation::Member(id)))
+            identifier
+                .clone()
+                .map(|id| Term::Invocation(Invocation::Member(id))),
         ));
 
         // Terms
@@ -480,21 +484,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Lambda expression
         let lambda_with_id = identifier
             .clone()
-            .then(just("=>").ignore_then(expr.clone()))
-            .map(|(id, expr)| Expression::Lambda(Some(id), Box::new(expr)));
-            
+            .then(just("=>"))
+            .then(expr.clone())
+            .map(|((id, _), expr)| Expression::Lambda(Some(id), Box::new(expr)));
+
         let lambda_without_id = just("=>")
-            .ignore_then(expr.clone())
-            .map(|expr| Expression::Lambda(None, Box::new(expr)));
-                
+            .then(expr.clone())
+            .map(|(_, expr)| Expression::Lambda(None, Box::new(expr)));
+
         // Final expression
-        choice((
-            implies_expr.clone(),
-            lambda_with_id,
-            lambda_without_id
-        ))
+        choice((implies_expr.clone(), lambda_with_id, lambda_without_id))
     })
-    .then_ignore(end())
 }
 
 #[cfg(test)]
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn test_lambda_expressions() {
         let parser = parser();
-        
+
         // Test lambda with identifier
         let result = parser.parse("x => x.name");
         assert!(result.is_ok());
@@ -526,7 +526,7 @@ mod tests {
                 panic!("Expected lambda expression");
             }
         }
-        
+
         // Test lambda without identifier
         let result = parser.parse("=> 'hello'");
         assert!(result.is_ok());
