@@ -51,14 +51,8 @@ fn test_load_test_file() {
     let first_test = first_test.unwrap();
     println!("First test: {}", first_test);
 
-    // Replace any XML-escaped characters
-    let processed_test = first_test
-        .replace("&gt;", ">")
-        .replace("&lt;", "<")
-        .replace("&amp;", "&");
-    
     // Parse the expression
-    let result = parser().parse(&processed_test);
+    let result = parser().parse(first_test);
     assert!(
         result.is_ok(),
         "Failed to parse expression: {:?}",
