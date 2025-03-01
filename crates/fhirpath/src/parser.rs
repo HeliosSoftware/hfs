@@ -384,11 +384,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         .map(|(expr, invocations)| {
             invocations.into_iter().fold(expr, |acc, (name, params_opt)| {
                 if let Some(params) = params_opt {
-                    // It's a function call
-                    Expression::Term(Term::Invocation(Invocation::MemberFunction(
-                        name,
-                        params.unwrap_or_default(),
-                    )))
+                    // It's a function call with parameters
+                    Expression::Invocation(
+                        Box::new(acc),
+                        format!("{}()", name)
+                    )
                 } else {
                     // It's a simple member access
                     Expression::Invocation(Box::new(acc), name)
