@@ -1,6 +1,6 @@
 use chumsky::Parser;
-use chumsky::prelude::*;
 use chumsky::error::Simple;
+use chumsky::prelude::*;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +97,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     Literal::Number(i.parse().unwrap())
                 }
             })
-            .padded();  // Allow whitespace around numbers
+            .padded(); // Allow whitespace around numbers
 
         // Date format: YYYY(-MM(-DD))?
         let _date_format = text::int::<char, E>(10)
@@ -135,7 +135,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             .ignore_then(text::int::<char, E>(10))
                             .then(
                                 just::<char, char, E>('.')
-                                    .ignore_then(text::digits::<char, E>(10).repeated().at_least(1).collect::<String>())
+                                    .ignore_then(
+                                        text::digits::<char, E>(10)
+                                            .repeated()
+                                            .at_least(1)
+                                            .collect::<String>(),
+                                    )
                                     .or_not(),
                             )
                             .or_not(),
@@ -160,14 +165,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Timezone format: Z | (+|-)HH:mm
-        let _timezone_format = just::<char, char, E>('Z').to("Z".to_string()).or(one_of::<char, &str, E>("+-")
-            .map(|c: char| c.to_string())
-            .then(text::int::<char, E>(10))
-            .then(just::<char, char, E>(':'))
-            .then(text::int::<char, E>(10))
-            .map(|(((sign, hour), _), min)| {
-                format!("{}{}:{}", sign, hour, min)
-            }));
+        let _timezone_format =
+            just::<char, char, E>('Z')
+                .to("Z".to_string())
+                .or(one_of::<char, &str, E>("+-")
+                    .map(|c: char| c.to_string())
+                    .then(text::int::<char, E>(10))
+                    .then(just::<char, char, E>(':'))
+                    .then(text::int::<char, E>(10))
+                    .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
         // Create a parser for date literals that captures the entire date string
         let date_literal = just::<char, char, E>('@')
@@ -175,7 +181,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 filter(|c: &char| c.is_digit(10) || *c == '-')
                     .repeated()
                     .at_least(1)
-                    .collect::<String>()
+                    .collect::<String>(),
             )
             .map(Literal::Date);
 
@@ -189,14 +195,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .then(
                         just::<char, char, E>('T')
                             .ignore_then(
-                                filter(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
-                                    .repeated()
-                                    .at_least(1)
-                                    .collect::<String>()
+                                filter(|c: &char| {
+                                    c.is_digit(10)
+                                        || *c == ':'
+                                        || *c == '.'
+                                        || *c == '+'
+                                        || *c == '-'
+                                        || *c == 'Z'
+                                })
+                                .repeated()
+                                .at_least(1)
+                                .collect::<String>(),
                             )
-                            .map(|t| format!("T{}", t))
+                            .map(|t| format!("T{}", t)),
                     )
-                    .map(|(d, t)| format!("{}{}", d, t))
+                    .map(|(d, t)| format!("{}{}", d, t)),
             )
             .map(Literal::DateTime);
 
@@ -204,10 +217,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let time_literal = just::<char, char, E>('@')
             .then(just::<char, char, E>('T'))
             .ignore_then(
-                filter(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
-                    .repeated()
-                    .at_least(1)
-                    .collect::<String>()
+                filter(|c: &char| {
+                    c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z'
+                })
+                .repeated()
+                .at_least(1)
+                .collect::<String>(),
             )
             .map(Literal::Time);
 
@@ -321,32 +336,32 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let function_param = recursive(|_| {
             // Create a specialized parser for function parameters that handles equality expressions
             let param_atom = term.clone().map(Expression::Term);
-            
-            let param_member = param_atom.then(
-                just('.')
-                    .ignore_then(identifier.clone())
-                    .repeated()
-            )
-            .map(|(expr, members)| {
-                members.into_iter().fold(expr, |acc, member| {
-                    Expression::Invocation(Box::new(acc), member)
-                })
-            });
-            
+
+            let param_member = param_atom
+                .then(just('.').ignore_then(identifier.clone()).repeated())
+                .map(|(expr, members)| {
+                    members.into_iter().fold(expr, |acc, member| {
+                        Expression::Invocation(Box::new(acc), member)
+                    })
+                });
+
             // Handle equality expressions in parameters
-            let param_equality = param_member.clone()
+            let param_equality = param_member
+                .clone()
                 .then(
                     just('=')
-                    .padded()  // Allow whitespace around equals sign
-                    .to("=")
-                    .then(
-                        just('\'')
-                        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-                        .then_ignore(just('\''))
-                        .collect::<String>()
-                        .map(|s| Expression::Term(Term::Literal(Literal::String(s))))
-                    )
-                    .or_not()
+                        .padded() // Allow whitespace around equals sign
+                        .to("=")
+                        .then(
+                            just('\'')
+                                .ignore_then(
+                                    none_of("\'\\").or(just('\\').ignore_then(any())).repeated(),
+                                )
+                                .then_ignore(just('\''))
+                                .collect::<String>()
+                                .map(|s| Expression::Term(Term::Literal(Literal::String(s)))),
+                        )
+                        .or_not(),
                 )
                 .map(|(expr, eq_opt)| {
                     if let Some((op, rhs)) = eq_opt {
@@ -355,46 +370,44 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         expr
                     }
                 });
-                
+
             param_equality
         });
-        
+
         // Function parameters list
         let function_params = function_param
-            .padded()  // Allow whitespace around parameters
-            .separated_by(just(',').padded())  // Allow whitespace around commas
+            .padded() // Allow whitespace around parameters
+            .separated_by(just(',').padded()) // Allow whitespace around commas
             .collect::<Vec<_>>();
-            
+
         // Invocation expression (highest precedence)
-        let invocation_expr = atom.then(
-            just('.')
-                .ignore_then(
-                    // Either a function call or a simple member access
-                    identifier
-                        .clone()
-                        .then(
+        let invocation_expr = atom
+            .then(
+                just('.')
+                    .ignore_then(
+                        // Either a function call or a simple member access
+                        identifier.clone().then(
                             just('(')
-                                .ignore_then(function_params.padded().or_not())  // Allow whitespace inside parentheses
+                                .ignore_then(function_params.padded().or_not()) // Allow whitespace inside parentheses
                                 .then_ignore(just(')'))
                                 .or_not(),
                         ),
-                )
-                .repeated(),
-        )
-        .map(|(expr, invocations)| {
-            invocations.into_iter().fold(expr, |acc, (name, params_opt)| {
-                if let Some(_params) = params_opt {
-                    // It's a function call with parameters
-                    Expression::Invocation(
-                        Box::new(acc),
-                        format!("{}()", name)
                     )
-                } else {
-                    // It's a simple member access
-                    Expression::Invocation(Box::new(acc), name)
-                }
-            })
-        });
+                    .repeated(),
+            )
+            .map(|(expr, invocations)| {
+                invocations
+                    .into_iter()
+                    .fold(expr, |acc, (name, params_opt)| {
+                        if let Some(_params) = params_opt {
+                            // It's a function call with parameters
+                            Expression::Invocation(Box::new(acc), format!("{}()", name))
+                        } else {
+                            // It's a simple member access
+                            Expression::Invocation(Box::new(acc), name)
+                        }
+                    })
+            });
 
         // Indexer expression
         let indexer_expr = invocation_expr
@@ -409,7 +422,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let polarity_expr = choice((
             just('+')
                 .or(just('-'))
-                .padded()  // Allow whitespace after operator
+                .padded() // Allow whitespace after operator
                 .then(indexer_expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
             indexer_expr.clone(),
@@ -422,7 +435,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just('/').to("/"),
             text::keyword("div").to("div"),
             text::keyword("mod").to("mod"),
-        )).padded();  // Allow whitespace around operators
+        ))
+        .padded(); // Allow whitespace around operators
 
         let multiplicative_expr = polarity_expr
             .clone()
@@ -435,7 +449,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Additive expression
-        let op2 = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded();  // Allow whitespace around operators
+        let op2 = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
         let additive_expr = multiplicative_expr
             .clone()
@@ -452,7 +466,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .clone()
             .then(
                 choice((text::keyword("is"), text::keyword("as")))
-                    .padded()  // Allow whitespace around 'is' and 'as'
+                    .padded() // Allow whitespace around 'is' and 'as'
                     .then(
                         // Handle both simple identifiers and qualified identifiers
                         choice((
@@ -460,13 +474,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             just("Date").to("Date".to_string()),
                             just("DateTime").to("DateTime".to_string()),
                             just("Time").to("Time".to_string()),
-                            qualified_identifier
-                        ))
+                            qualified_identifier,
+                        )),
                     )
                     .or_not(),
             )
             .map(|(expr, type_op)| {
-                if let Some((op, type_name)) = type_op {
+                if let Some((_, type_name)) = type_op {
                     Expression::Type(Box::new(expr), type_name)
                 } else {
                     expr
@@ -477,7 +491,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Union expression
         let union_expr = type_expr
             .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone()).repeated())  // Allow whitespace around '|'
+            .then(just('|').padded().ignore_then(type_expr.clone()).repeated()) // Allow whitespace around '|'
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
                     Expression::Union(Box::new(lhs), Box::new(rhs))
@@ -491,7 +505,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("<").to("<"),
             just(">=").to(">="),
             just(">").to(">"),
-        )).padded();  // Allow whitespace around operators
+        ))
+        .padded(); // Allow whitespace around operators
 
         let inequality_expr = union_expr
             .clone()
@@ -511,7 +526,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("~").to("~"),
             just("!=").to("!="),
             just("!~").to("!~"),
-        )).padded();  // Allow whitespace around operators
+        ))
+        .padded(); // Allow whitespace around operators
 
         let equality_expr = inequality_expr
             .clone()
@@ -529,7 +545,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let op5 = choice((
             text::keyword("in").to("in"),
             text::keyword("contains").to("contains"),
-        )).padded();  // Allow whitespace around operators
+        ))
+        .padded(); // Allow whitespace around operators
 
         let membership_expr = equality_expr
             .clone()
@@ -546,7 +563,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // And expression
         let and_expr = membership_expr
             .clone()
-            .then(text::keyword("and").padded().ignore_then(membership_expr).repeated())  // Allow whitespace around 'and'
+            .then(
+                text::keyword("and")
+                    .padded()
+                    .ignore_then(membership_expr)
+                    .repeated(),
+            ) // Allow whitespace around 'and'
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
                     Expression::And(Box::new(lhs), Box::new(rhs))
@@ -555,7 +577,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Or expression
-        let op6 = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded();  // Allow whitespace around operators
+        let op6 = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
         let or_expr = and_expr
             .clone()
@@ -570,7 +592,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Implies expression
         let implies_expr = or_expr
             .clone()
-            .then(text::keyword("implies").padded().ignore_then(or_expr).or_not())  // Allow whitespace around 'implies'
+            .then(
+                text::keyword("implies")
+                    .padded()
+                    .ignore_then(or_expr)
+                    .or_not(),
+            ) // Allow whitespace around 'implies'
             .map(|(lhs, rhs)| {
                 if let Some(rhs) = rhs {
                     Expression::Implies(Box::new(lhs), Box::new(rhs))
