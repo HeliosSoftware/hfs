@@ -398,18 +398,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just(">").to(">"),
         ));
 
-        let inequality_expr =
-            union_expr
-                .clone()
-                .then(op3.then(union_expr.clone()).or_not())
-                .map(|(lhs, rhs)| {
-                    if let Some((op, rhs)) = rhs {
-                        Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    } else {
-                        lhs
-                    }
-                })
-                .boxed();
+        let inequality_expr = union_expr
+            .clone()
+            .then(op3.then(union_expr.clone()).or_not())
+            .map(|(lhs, rhs)| {
+                if let Some((op, rhs)) = rhs {
+                    Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                } else {
+                    lhs
+                }
+            })
+            .boxed();
+
         // Equality expression
         let op4 = choice((
             just("=").to("="),
@@ -429,58 +429,63 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 }
             })
             .boxed();
-        equality_expr
-        /*
-                // Membership expression
-                let op = choice((
-                    text::keyword("in").to("in"),
-                    text::keyword("contains").to("contains"),
-                ));
 
-                let membership_expr =
-                    equality_expr
-                        .then(op.then(equality_expr).or_not())
-                        .map(|(lhs, rhs)| {
-                            if let Some((op, rhs)) = rhs {
-                                Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
-                            } else {
-                                lhs
-                            }
-                        });
+        // Membership expression
+        let op5 = choice((
+            text::keyword("in").to("in"),
+            text::keyword("contains").to("contains"),
+        ));
 
-                // And expression
-                let and_expr = membership_expr
-                    .then(text::keyword("and").ignore_then(membership_expr).repeated())
-                    .map(|(first, rest)| {
-                        rest.into_iter().fold(first, |lhs, rhs| {
-                            Expression::And(Box::new(lhs), Box::new(rhs))
-                        })
-                    });
+        let membership_expr = equality_expr
+            .clone()
+            .then(op5.then(equality_expr).or_not())
+            .map(|(lhs, rhs)| {
+                if let Some((op, rhs)) = rhs {
+                    Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
+                } else {
+                    lhs
+                }
+            })
+            .boxed();
 
-                // Or expression
-                let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor")));
+        // And expression
+        let and_expr = membership_expr
+            .clone()
+            .then(text::keyword("and").ignore_then(membership_expr).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, rhs| {
+                    Expression::And(Box::new(lhs), Box::new(rhs))
+                })
+            })
+            .boxed();
 
-                let or_expr = and_expr
-                    .then(op.then(and_expr).repeated())
-                    .map(|(first, rest)| {
-                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                        })
-                    });
+        // Or expression
+        let op6 = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor")));
 
-                // Implies expression
-                let implies_expr = or_expr
-                    .then(text::keyword("implies").ignore_then(or_expr).or_not())
-                    .map(|(lhs, rhs)| {
-                        if let Some(rhs) = rhs {
-                            Expression::Implies(Box::new(lhs), Box::new(rhs))
-                        } else {
-                            lhs
-                        }
-                    });
+        let or_expr = and_expr
+            .clone()
+            .then(op6.then(and_expr).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            })
+            .boxed();
 
-                implies_expr
-        */
+        // Implies expression
+        let implies_expr = or_expr
+            .clone()
+            .then(text::keyword("implies").ignore_then(or_expr).or_not())
+            .map(|(lhs, rhs)| {
+                if let Some(rhs) = rhs {
+                    Expression::Implies(Box::new(lhs), Box::new(rhs))
+                } else {
+                    lhs
+                }
+            })
+            .boxed();
+
+        implies_expr
     })
     .then_ignore(end())
 }
