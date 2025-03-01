@@ -50,16 +50,19 @@ fn test_multiple_expressions_from_file() {
         .expect("Failed to read test file");
 
     // Parse the XML with relaxed parsing options
-    let doc = Document::parse_with_options(
+    let doc = match Document::parse_with_options(
         &contents,
         roxmltree::ParsingOptions {
             allow_dtd: true,
             ..Default::default()
         },
-    )
-    .unwrap_or_else(|e| {
-        println!("Warning: XML parsing failed: {:?}.", e);
-    });
+    ) {
+        Ok(doc) => doc,
+        Err(e) => {
+            println!("Warning: XML parsing failed: {:?}.", e);
+            panic!("XML parsing failed, cannot continue test");
+        }
+    };
 
     // Find all test expressions
     let expressions = find_test_expressions(&doc.root_element());
