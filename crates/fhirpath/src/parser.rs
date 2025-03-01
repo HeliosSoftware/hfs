@@ -325,7 +325,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .or(just('-'))
                 .then(indexer_expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
-            indexer_expr,
+            indexer_expr.clone(),
         ));
 
         // Multiplicative expression
