@@ -1,6 +1,5 @@
 use chumsky::Parser;
 use chumsky::prelude::*;
-use chumsky::primitive::take_while;
 use chumsky::error::Simple;
 use std::fmt;
 
@@ -173,7 +172,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Create a parser for date literals that captures the entire date string
         let date_literal = just::<char, char, E>('@')
             .ignore_then(
-                take_while(|c: &char| c.is_digit(10) || *c == '-')
+                filter(|c: &char| c.is_digit(10) || *c == '-')
+                    .repeated()
                     .at_least(1)
                     .collect::<String>()
             )
@@ -182,13 +182,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Create a parser for datetime literals that captures the entire datetime string
         let datetime_literal = just::<char, char, E>('@')
             .ignore_then(
-                take_while(|c: &char| c.is_digit(10) || *c == '-')
+                filter(|c: &char| c.is_digit(10) || *c == '-')
+                    .repeated()
                     .at_least(1)
                     .collect::<String>()
                     .then(
                         just::<char, char, E>('T')
                             .ignore_then(
-                                take_while(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
+                                filter(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
+                                    .repeated()
                                     .at_least(1)
                                     .collect::<String>()
                             )
@@ -202,7 +204,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let time_literal = just::<char, char, E>('@')
             .then(just::<char, char, E>('T'))
             .ignore_then(
-                take_while(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
+                filter(|c: &char| c.is_digit(10) || *c == ':' || *c == '.' || *c == '+' || *c == '-' || *c == 'Z')
+                    .repeated()
                     .at_least(1)
                     .collect::<String>()
             )
