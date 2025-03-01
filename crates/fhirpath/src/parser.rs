@@ -133,7 +133,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             .ignore_then(text::int(10))
                             .then(
                                 just('.')
-                                    .ignore_then(text::digits(10).at_least(1).collect::<String>())
+                                    .ignore_then(text::digits(10).repeated().at_least(1).collect::<String>())
                                     .or_not(),
                             )
                             .or_not(),
