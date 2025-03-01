@@ -31,7 +31,6 @@ fn test_parse_simple_expressions() {
 }
 
 #[test]
-#[ignore]
 fn test_multiple_expressions_from_file() {
     // Get the path to the test file
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -75,8 +74,7 @@ fn test_multiple_expressions_from_file() {
     let mut success_count = 0;
     let mut failure_count = 0;
 
-    for (_i, expr) in expressions.iter().enumerate().take(10) {
-        // Limit to first 10 for brevity
+    for expr in expressions.iter() {
         let result = parser().parse(expr.clone());
         if result.is_ok() {
             success_count += 1;
@@ -86,6 +84,7 @@ fn test_multiple_expressions_from_file() {
         }
     }
 
+    // This next line is not printing when runnign cargo test AI!
     println!(
         "Successfully parsed {}/{} expressions",
         success_count,
