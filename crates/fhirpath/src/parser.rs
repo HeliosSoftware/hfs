@@ -1,5 +1,6 @@
 use chumsky::Parser;
 use chumsky::prelude::*;
+use chumsky::primitive::take_until;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,16 +98,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .padded();  // Allow whitespace around numbers
 
         // Date format: YYYY(-MM(-DD))?
-        let date_format = text::digits(10)
-            .repeated()
-            .exactly(4)
-            .collect::<String>()
+        let date_format = text::int(10)
+            .map(|s: String| s)
             .then(
                 just('-')
-                    .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
+                    .ignore_then(text::int(10))
                     .then(
                         just('-')
-                            .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
+                            .ignore_then(text::int(10))
                             .or_not(),
                     )
                     .or_not(),
@@ -125,21 +124,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Time format: HH(:mm(:ss(.sss)?)?)?
-        let time_format = text::digits(10)
-            .repeated()
-            .exactly(2)
-            .collect::<String>()
+        let time_format = text::int(10)
             .then(
                 just(':')
-                    .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
+                    .ignore_then(text::int(10))
                     .then(
                         just(':')
-                            .ignore_then(text::digits(10).repeated().exactly(2).collect::<String>())
+                            .ignore_then(text::int(10))
                             .then(
                                 just('.')
-                                    .ignore_then(
-                                        text::digits(10).repeated().at_least(1).collect::<String>(),
-                                    )
+                                    .ignore_then(text::digits(10).at_least(1).collect::<String>())
                                     .or_not(),
                             )
                             .or_not(),
@@ -166,38 +160,61 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Timezone format: Z | (+|-)HH:mm
         let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
             .map(|c: char| c.to_string())
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .then(text::int(10))
             .then(just(':'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .then(text::int(10))
             .map(|(((sign, hour), _), min)| {
-                format!(
-                    "{}{:02}:{:02}",
-                    sign,
-                    hour.parse::<u8>().unwrap(),
-                    min.parse::<u8>().unwrap()
-                )
+                format!("{}{}:{}", sign, hour, min)
             }));
 
-        let date = just('@').ignore_then(date_format).map(Literal::Date);
+        // Create a parser for date literals that captures the entire date string
+        let date_literal = just('@')
+            .ignore_then(
+                take_until(
+                    choice((
+                        just('.').to(()),
+                        just(' ').to(()),
+                        just('T').to(()),
+                        end().to(()),
+                    ))
+                )
+                .map(|(chars, _)| chars.into_iter().collect::<String>())
+            )
+            .map(Literal::Date);
 
-        let datetime = just('@')
-            .ignore_then(date_format)
-            .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
-            .map(|(date, time_tz)| {
-                let mut result = date;
-                result.push('T');
-                if let Some((time, tz)) = time_tz {
-                    result.push_str(&time);
-                    if let Some(tz) = tz {
-                        result.push_str(&tz);
-                    }
+        // Create a parser for datetime literals that captures the entire datetime string
+        let datetime_literal = just('@')
+            .ignore_then(
+                take_until(
+                    choice((
+                        just('.').to(()),
+                        just(' ').to(()),
+                        end().to(()),
+                    ))
+                )
+                .map(|(chars, _)| chars.into_iter().collect::<String>())
+            )
+            .map(|s| {
+                if s.contains('T') {
+                    Literal::DateTime(s)
+                } else {
+                    Literal::Date(s)
                 }
-                Literal::DateTime(result)
             });
 
-        let time = just('@')
+        // Create a parser for time literals that captures the entire time string
+        let time_literal = just('@')
             .then(just('T'))
-            .ignore_then(time_format)
+            .ignore_then(
+                take_until(
+                    choice((
+                        just('.').to(()),
+                        just(' ').to(()),
+                        end().to(()),
+                    ))
+                )
+                .map(|(chars, _)| chars.into_iter().collect::<String>())
+            )
             .map(Literal::Time);
 
         let unit = text::ident().or(just('\'')
@@ -218,8 +235,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .or(string)
             .or(quantity)
             .or(number)
-            .or(datetime.or(date))
-            .or(time)
+            .or(datetime_literal)
+            .or(time_literal)
             .map(Term::Literal);
 
         // Identifiers
