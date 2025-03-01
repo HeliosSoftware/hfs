@@ -302,12 +302,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Build the expression parser with operator precedence
-        let atom = term.map(Expression::Term);
+        let atom = term.clone().map(Expression::Term);
 
         // Function call parameter parser - handles expressions inside function calls
         let function_param = recursive(|_| {
             // Create a specialized parser for function parameters that handles equality expressions
-            let param_atom = term.map(Expression::Term);
+            let param_atom = term.clone().map(Expression::Term);
             
             let param_member = param_atom.then(
                 just('.')
