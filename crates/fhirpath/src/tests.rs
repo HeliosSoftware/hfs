@@ -12,10 +12,10 @@ fn test_parse_simple_expressions() {
         "birthDate",
         "Patient.name.given",
         "Patient.name.where(given = 'Jim')",
-        // "1 + 2 * 3",
-        // "true and false",
-        // "Patient.name.exists()",
-        // "name.take(2).given",
+        "1 + 2 * 3",
+        "true and false",
+        "Patient.name.exists()",
+        "name.take(2).given",
     ];
 
     for expr in test_cases {

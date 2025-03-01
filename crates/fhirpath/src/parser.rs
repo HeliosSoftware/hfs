@@ -45,6 +45,7 @@ pub enum Term {
 pub enum Invocation {
     Member(String),
     Function(String, Vec<Expression>),
+    MemberFunction(String, Vec<Expression>), // For member.function() syntax
     This,
     Index,
     Total,
@@ -304,13 +305,35 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.map(Expression::Term);
 
         // Invocation expression (highest precedence)
-        let invocation_expr =
-            atom.then(just('.').ignore_then(identifier).repeated())
-                .map(|(expr, invocations)| {
-                    invocations
-                        .into_iter()
-                        .fold(expr, |acc, inv| Expression::Invocation(Box::new(acc), inv))
-                });
+        let invocation_expr = atom.then(
+            just('.')
+                .ignore_then(
+                    // Either a function call or a simple member access
+                    identifier
+                        .clone()
+                        .then(
+                            just('(')
+                                .ignore_then(param_list.or_not())
+                                .then_ignore(just(')'))
+                                .or_not(),
+                        ),
+                )
+                .repeated(),
+        )
+        .map(|(expr, invocations)| {
+            invocations.into_iter().fold(expr, |acc, (name, params_opt)| {
+                if let Some(params) = params_opt {
+                    // It's a function call
+                    Expression::Term(Term::Invocation(Invocation::MemberFunction(
+                        name,
+                        params.unwrap_or_default(),
+                    )))
+                } else {
+                    // It's a simple member access
+                    Expression::Invocation(Box::new(acc), name)
+                }
+            })
+        });
 
         // Indexer expression
         let indexer_expr = invocation_expr
