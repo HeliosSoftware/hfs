@@ -324,6 +324,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             let param_equality = param_member.clone()
                 .then(
                     just('=')
+                    .padded()  // Allow whitespace around equals sign
                     .to("=")
                     .then(
                         just('\'')
@@ -347,7 +348,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         
         // Function parameters list
         let function_params = function_param
-            .separated_by(just(','))
+            .padded()  // Allow whitespace around parameters
+            .separated_by(just(',').padded())  // Allow whitespace around commas
             .collect::<Vec<_>>();
             
         // Invocation expression (highest precedence)
@@ -359,7 +361,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         .clone()
                         .then(
                             just('(')
-                                .ignore_then(function_params.or_not())
+                                .ignore_then(function_params.padded().or_not())  // Allow whitespace inside parentheses
                                 .then_ignore(just(')'))
                                 .or_not(),
                         ),
