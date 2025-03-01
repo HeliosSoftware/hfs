@@ -1,5 +1,5 @@
+<?xml version="1.0" encoding="utf-8" ?>
 <tests name="FHIRPathTestSuite" description="FHIRPath Test Suite" reference="http://hl7.org/fhirpath|2.0.0">
-	<?xml version="1.0" encoding="utf-8" ?>
 	<group name="testMiscellaneousAccessorTests" description="Miscellaneous accessor tests">
     <test name="testExtractBirthDate" description="Extract birthDate" inputfile="patient-example.xml" predicate="false">
 			<expression>birthDate</expression>
