@@ -32,79 +32,6 @@ fn test_parse_simple_expressions() {
 
 #[test]
 #[ignore]
-fn test_load_test_file() {
-    // Get the path to the test file
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("resources/r4/tests-fhir-r4.xml");
-
-    // Load the test file or use a fallback if it doesn't exist
-    let mut file = match File::open(&path) {
-        Ok(file) => file,
-        Err(e) => {
-            println!(
-                "Warning: Could not open test file: {:?}. Using fallback test data.",
-                e
-            );
-            // Create resources directory if it doesn't exist
-            let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/r4");
-            std::fs::create_dir_all(&resources_dir).unwrap_or_else(|e| {
-                println!("Warning: Could not create resources directory: {:?}", e);
-            });
-
-            // Create a simple test file
-            let test_content =
-                r#"<Tests><test><expression>Patient.name</expression></test></Tests>"#;
-            std::fs::write(&path, test_content).unwrap_or_else(|e| {
-                println!("Warning: Could not write test file: {:?}", e);
-            });
-
-            // Run the simple expressions test instead
-            test_parse_simple_expressions();
-            return;
-        }
-    };
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .expect("Failed to read test file");
-
-    // Parse the XML with relaxed parsing options
-    let doc = Document::parse_with_options(
-        &contents,
-        roxmltree::ParsingOptions {
-            allow_dtd: true,
-            ..Default::default()
-        },
-    )
-    .unwrap_or_else(|e| {
-        // If parsing fails, try to create a simple test document
-        println!(
-            "Warning: XML parsing failed: {:?}. Using fallback test document.",
-            e
-        );
-        Document::parse("<Tests><test><expression>Patient.name</expression></test></Tests>")
-            .expect("Failed to create fallback test document")
-    });
-
-    // Find the first test expression
-    let first_test = find_first_test(&doc.root_element());
-    assert!(first_test.is_some(), "Failed to find first test");
-
-    let first_test = first_test.unwrap();
-    println!("First test: {}", first_test);
-
-    // Parse the expression
-    let result = parser().parse(first_test.clone());
-    assert!(
-        result.is_ok(),
-        "Failed to parse expression: '{}', error: {:?}",
-        first_test,
-        result.err()
-    );
-    println!("Successfully parsed: {:?}", result.unwrap());
-}
-
-#[test]
-#[ignore]
 fn test_multiple_expressions_from_file() {
     // Get the path to the test file
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -114,25 +41,7 @@ fn test_multiple_expressions_from_file() {
     let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(e) => {
-            println!(
-                "Warning: Could not open test file: {:?}. Using fallback test data.",
-                e
-            );
-            // Create resources directory if it doesn't exist
-            let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/r4");
-            std::fs::create_dir_all(&resources_dir).unwrap_or_else(|e| {
-                println!("Warning: Could not create resources directory: {:?}", e);
-            });
-
-            // Create a simple test file
-            let test_content =
-                r#"<Tests><test><expression>Patient.name</expression></test></Tests>"#;
-            std::fs::write(&path, test_content).unwrap_or_else(|e| {
-                println!("Warning: Could not write test file: {:?}", e);
-            });
-
-            // Run the simple expressions test instead
-            test_parse_simple_expressions();
+            println!("Warning: Could not open test file: {:?}.", e);
             return;
         }
     };
@@ -149,13 +58,7 @@ fn test_multiple_expressions_from_file() {
         },
     )
     .unwrap_or_else(|e| {
-        // If parsing fails, try to create a simple test document
-        println!(
-            "Warning: XML parsing failed: {:?}. Using fallback test document.",
-            e
-        );
-        Document::parse("<Tests><test><expression>Patient.name</expression></test></Tests>")
-            .expect("Failed to create fallback test document")
+        println!("Warning: XML parsing failed: {:?}.", e);
     });
 
     // Find all test expressions
@@ -208,33 +111,4 @@ fn collect_expressions(node: &Node, expressions: &mut Vec<String>) {
             collect_expressions(&child, expressions);
         }
     }
-}
-
-fn find_first_test(node: &Node) -> Option<String> {
-    // Look for the first expression element
-    for child in node.children() {
-        if child.has_tag_name("group") {
-            for test_node in child.children() {
-                if test_node.has_tag_name("test") {
-                    // Find the expression node directly under test
-                    for expr_node in test_node.children() {
-                        if expr_node.has_tag_name("expression") {
-                            // Get the text content of the expression node
-                            if let Some(text) = expr_node.text() {
-                                return Some(text.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Recursively search
-        let result = find_first_test(&child);
-        if result.is_some() {
-            return result;
-        }
-    }
-
-    None
 }
