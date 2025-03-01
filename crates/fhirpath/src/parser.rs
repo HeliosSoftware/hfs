@@ -304,6 +304,52 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Build the expression parser with operator precedence
         let atom = term.map(Expression::Term);
 
+        // Function call parameter parser - handles expressions inside function calls
+        let function_param = recursive(|_| {
+            // Create a specialized parser for function parameters that handles equality expressions
+            let param_atom = term.map(Expression::Term);
+            
+            let param_member = param_atom.then(
+                just('.')
+                    .ignore_then(identifier.clone())
+                    .repeated()
+            )
+            .map(|(expr, members)| {
+                members.into_iter().fold(expr, |acc, member| {
+                    Expression::Invocation(Box::new(acc), member)
+                })
+            });
+            
+            // Handle equality expressions in parameters
+            let param_equality = param_member.clone()
+                .then(
+                    just('=')
+                    .to("=")
+                    .then(
+                        just('\'')
+                        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+                        .then_ignore(just('\''))
+                        .collect::<String>()
+                        .map(|s| Expression::Term(Term::Literal(Literal::String(s))))
+                    )
+                    .or_not()
+                )
+                .map(|(expr, eq_opt)| {
+                    if let Some((op, rhs)) = eq_opt {
+                        Expression::Equality(Box::new(expr), op.to_string(), Box::new(rhs))
+                    } else {
+                        expr
+                    }
+                });
+                
+            param_equality
+        });
+        
+        // Function parameters list
+        let function_params = function_param
+            .separated_by(just(','))
+            .collect::<Vec<_>>();
+            
         // Invocation expression (highest precedence)
         let invocation_expr = atom.then(
             just('.')
@@ -313,7 +359,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         .clone()
                         .then(
                             just('(')
-                                .ignore_then(expr.clone().separated_by(just(',')).collect::<Vec<_>>().or_not())
+                                .ignore_then(function_params.or_not())
                                 .then_ignore(just(')'))
                                 .or_not(),
                         ),
