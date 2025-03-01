@@ -170,54 +170,111 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 format!("{}{}:{}", sign, hour, min)
             }));
 
-        // Create a parser for date literals that captures the entire date string
-        let _date_literal = just::<char, char, E>('@')
-            .ignore_then(
-                take_until(
-                    choice((
-                        just::<char, char, E>('.').to(()),
-                        just::<char, char, E>(' ').to(()),
-                        just::<char, char, E>('T').to(()),
-                        end().to(()),
-                    ))
-                )
-                .map(|(chars, _)| chars.into_iter().collect::<String>())
+        // Date format parser - captures the entire date string
+        let date_format = text::int::<char, E>(10)
+            .then(
+                just::<char, char, E>('-')
+                    .ignore_then(text::int::<char, E>(10))
+                    .then(
+                        just::<char, char, E>('-')
+                            .ignore_then(text::int::<char, E>(10))
+                            .or_not(),
+                    )
+                    .or_not(),
             )
-            .map(Literal::Date);
-
-        // Create a parser for datetime literals that captures the entire datetime string
-        let datetime_literal = just::<char, char, E>('@')
-            .ignore_then(
-                take_until(
-                    choice((
-                        just::<char, char, E>('.').to(()),
-                        just::<char, char, E>(' ').to(()),
-                        end().to(()),
-                    ))
-                )
-                .map(|(chars, _)| chars.into_iter().collect::<String>())
-            )
-            .map(|s| {
-                if s.contains('T') {
-                    Literal::DateTime(s)
-                } else {
-                    Literal::Date(s)
+            .map(|(year, month_day)| {
+                let mut result = year;
+                if let Some((month, day)) = month_day {
+                    result.push('-');
+                    result.push_str(&month);
+                    if let Some(day) = day {
+                        result.push('-');
+                        result.push_str(&day);
+                    }
                 }
+                result
             });
 
-        // Create a parser for time literals that captures the entire time string
+        // Time format parser
+        let time_format = text::int::<char, E>(10)
+            .then(
+                just::<char, char, E>(':')
+                    .ignore_then(text::int::<char, E>(10))
+                    .then(
+                        just::<char, char, E>(':')
+                            .ignore_then(text::int::<char, E>(10))
+                            .then(
+                                just::<char, char, E>('.')
+                                    .ignore_then(text::digits::<char, E>(10).repeated().at_least(1).collect::<String>())
+                                    .or_not(),
+                            )
+                            .or_not(),
+                    )
+                    .or_not(),
+            )
+            .map(|(hour, min_sec)| {
+                let mut result = hour;
+                if let Some((min, sec_ms)) = min_sec {
+                    result.push(':');
+                    result.push_str(&min);
+                    if let Some((sec, ms)) = sec_ms {
+                        result.push(':');
+                        result.push_str(&sec);
+                        if let Some(ms) = ms {
+                            result.push('.');
+                            result.push_str(&ms);
+                        }
+                    }
+                }
+                result
+            });
+
+        // Timezone format parser
+        let timezone_format = just::<char, char, E>('Z').to("Z".to_string()).or(one_of::<char, &str, E>("+-")
+            .map(|c: char| c.to_string())
+            .then(text::int::<char, E>(10))
+            .then(just::<char, char, E>(':'))
+            .then(text::int::<char, E>(10))
+            .map(|(((sign, hour), _), min)| {
+                format!("{}{}:{}", sign, hour, min)
+            }));
+
+        // Date literal parser
+        let date_literal = just::<char, char, E>('@')
+            .ignore_then(date_format)
+            .map(Literal::Date);
+
+        // DateTime literal parser
+        let datetime_literal = just::<char, char, E>('@')
+            .ignore_then(
+                date_format.then(
+                    just::<char, char, E>('T')
+                        .ignore_then(
+                            time_format
+                                .then(timezone_format.or_not())
+                                .map(|(t, tz)| {
+                                    if let Some(tz) = tz {
+                                        format!("T{}{}",t, tz)
+                                    } else {
+                                        format!("T{}", t)
+                                    }
+                                })
+                                .or_not()
+                        )
+                )
+                .map(|(d, t)| {
+                    if let Some(t) = t {
+                        Literal::DateTime(format!("{}{}", d, t))
+                    } else {
+                        Literal::Date(d)
+                    }
+                })
+            );
+
+        // Time literal parser
         let time_literal = just::<char, char, E>('@')
             .then(just::<char, char, E>('T'))
-            .ignore_then(
-                take_until(
-                    choice((
-                        just::<char, char, E>('.').to(()),
-                        just::<char, char, E>(' ').to(()),
-                        end().to(()),
-                    ))
-                )
-                .map(|(chars, _)| chars.into_iter().collect::<String>())
-            )
+            .ignore_then(time_format)
             .map(Literal::Time);
 
         let unit = text::ident().or(just('\'')
