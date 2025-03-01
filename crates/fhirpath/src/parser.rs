@@ -233,26 +233,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Qualified identifier (for type specifiers)
-        /*        let qualified_identifier = identifier
-                    .then(
-                        just('.')
-                            .ignore_then(identifier)
-                            .repeated()
-                            .collect::<Vec<_>>(),
-                    )
-                    .map(|(first, rest)| {
-                        if rest.is_empty() {
-                            first
-                        } else {
-                            let mut result = first;
-                            for part in rest {
-                                result.push_str(".");
-                                result.push_str(&part);
-                            }
-                            result
-                        }
-                    });
-        */
+        let qualified_identifier = identifier
+            .clone()
+            .then(
+                just('.')
+                    .ignore_then(identifier.clone())
+                    .repeated()
+                    .collect::<Vec<_>>(),
+            )
+            .map(|(first, rest)| {
+                if rest.is_empty() {
+                    first
+                } else {
+                    let mut result = first;
+                    for part in rest {
+                        result.push_str(".");
+                        result.push_str(&part);
+                    }
+                    result
+                }
+            });
+
         // Create a separate string parser for external constants
         let string_for_external = just('\'')
             .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
@@ -336,22 +337,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             text::keyword("mod").to("mod"),
         ));
 
-        let multiplicative_expr =
-            polarity_expr
-                .then(op1.then(polarity_expr).repeated())
-                .map(|(first, rest)| {
-                    rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                        Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    })
-                });
-        multiplicative_expr
-
-        /*
+        let multiplicative_expr = polarity_expr
+            .clone()
+            .then(op1.then(polarity_expr).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            });
 
         // Additive expression
         let op2 = choice((just('+').to("+"), just('-').to("-"), just('&').to("&")));
 
         let additive_expr = multiplicative_expr
+            .clone()
             .then(op2.then(multiplicative_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
@@ -376,6 +375,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Union expression
         let union_expr = type_expr
+            .clone()
             .then(just('|').ignore_then(type_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
@@ -384,41 +384,44 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Inequality expression
-        let op = choice((
+        let op3 = choice((
             just("<=").to("<="),
             just("<").to("<"),
             just(">=").to(">="),
             just(">").to(">"),
         ));
 
-        let inequality_expr = union_expr
-            .then(op.then(union_expr).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+        let inequality_expr =
+            union_expr
+                .clone()
+                .then(op3.then(union_expr).or_not())
+                .map(|(lhs, rhs)| {
+                    if let Some((op, rhs)) = rhs {
+                        Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                    } else {
+                        lhs
+                    }
+                });
         // Equality expression
-        let op = choice((
+        let op4 = choice((
             just("=").to("="),
             just("~").to("~"),
             just("!=").to("!="),
             just("!~").to("!~"),
         ));
 
-        let equality_expr =
-            inequality_expr
-                .then(op.then(inequality_expr).or_not())
-                .map(|(lhs, rhs)| {
-                    if let Some((op, rhs)) = rhs {
-                        Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    } else {
-                        lhs
-                    }
-                });
-
+        let equality_expr = inequality_expr
+            .clone()
+            .then(op4.then(inequality_expr).or_not())
+            .map(|(lhs, rhs)| {
+                if let Some((op, rhs)) = rhs {
+                    Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                } else {
+                    lhs
+                }
+            });
+        equality_expr
+        /*
                 // Membership expression
                 let op = choice((
                     text::keyword("in").to("in"),
