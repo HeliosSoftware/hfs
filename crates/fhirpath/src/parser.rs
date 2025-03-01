@@ -313,7 +313,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         .clone()
                         .then(
                             just('(')
-                                .ignore_then(param_list.clone().or_not())
+                                .ignore_then(expr.clone().separated_by(just(',')).collect::<Vec<_>>().or_not())
                                 .then_ignore(just(')'))
                                 .or_not(),
                         ),
