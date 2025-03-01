@@ -409,14 +409,53 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
             });
 
+        // Special case for date/time literals with method calls
+        let date_time_method = choice((
+            date_literal.map(Term::Literal),
+            datetime_literal.map(Term::Literal),
+            time_literal.map(Term::Literal),
+        ))
+        .map(Expression::Term)
+        .then(
+            just('.')
+                .ignore_then(
+                    just("is")
+                        .padded()
+                        .then(
+                            choice((
+                                just("Date").to("Date".to_string()),
+                                just("DateTime").to("DateTime".to_string()),
+                                just("Time").to("Time".to_string()),
+                            ))
+                        )
+                        .then(
+                            just('(')
+                                .ignore_then(just(')'))
+                                .or_not()
+                        )
+                )
+                .or_not()
+        )
+        .map(|(expr, method_opt)| {
+            if let Some((method_type, _)) = method_opt {
+                let (_, type_name) = method_type;
+                Expression::Type(Box::new(expr), type_name)
+            } else {
+                expr
+            }
+        });
+
         // Indexer expression
-        let indexer_expr = invocation_expr
-            .then(expr.clone().delimited_by(just('['), just(']')).repeated())
-            .map(|(expr, indices)| {
-                indices.into_iter().fold(expr, |acc, idx| {
-                    Expression::Indexer(Box::new(acc), Box::new(idx))
+        let indexer_expr = choice((
+            date_time_method,
+            invocation_expr
+                .then(expr.clone().delimited_by(just('['), just(']')).repeated())
+                .map(|(expr, indices)| {
+                    indices.into_iter().fold(expr, |acc, idx| {
+                        Expression::Indexer(Box::new(acc), Box::new(idx))
+                    })
                 })
-            });
+        ));
 
         // Polarity expression
         let polarity_expr = choice((
