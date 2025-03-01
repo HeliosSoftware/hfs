@@ -84,8 +84,8 @@ fn test_multiple_expressions_from_file() {
         }
     }
 
-    // This next line is not printing when runnign cargo test AI!
-    println!(
+    // Use eprintln! instead of println! to ensure output appears during cargo test
+    eprintln!(
         "Successfully parsed {}/{} expressions",
         success_count,
         success_count + failure_count
