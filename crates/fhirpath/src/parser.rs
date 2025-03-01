@@ -275,7 +275,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .clone()
             .then(
                 just('(')
-                    .ignore_then(param_list.or_not())
+                    .ignore_then(param_list.clone().or_not())
                     .then_ignore(just(')')),
             )
             .map(|(name, params)| Invocation::Function(name, params.unwrap_or_default()));
@@ -313,7 +313,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         .clone()
                         .then(
                             just('(')
-                                .ignore_then(param_list.or_not())
+                                .ignore_then(param_list.clone().or_not())
                                 .then_ignore(just(')'))
                                 .or_not(),
                         ),
