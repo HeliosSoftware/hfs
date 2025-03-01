@@ -1,5 +1,5 @@
-use chumsky::prelude::*;
 use chumsky::Parser;
+use chumsky::prelude::*;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -8,6 +8,7 @@ pub enum Literal {
     Boolean(bool),
     String(String),
     Number(f64),
+    LongNumber(i64),
     Date(String),
     DateTime(String),
     Time(String),
@@ -30,7 +31,6 @@ pub enum Expression {
     And(Box<Expression>, Box<Expression>),
     Or(Box<Expression>, String, Box<Expression>),
     Implies(Box<Expression>, Box<Expression>),
-    Lambda(Option<String>, Box<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +57,7 @@ impl fmt::Display for Literal {
             Literal::Boolean(b) => write!(f, "{}", b),
             Literal::String(s) => write!(f, "'{}'", s),
             Literal::Number(n) => write!(f, "{}", n),
+            Literal::LongNumber(n) => write!(f, "{}", n),
             Literal::Date(d) => write!(f, "@{}", d),
             Literal::DateTime(dt) => write!(f, "@{}", dt),
             Literal::Time(t) => write!(f, "@T{}", t),
@@ -260,14 +261,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // External constants
         let external_constant = just('%')
-            .ignore_then(choice((identifier, string_for_external)))
+            .ignore_then(choice((identifier.clone(), string_for_external)))
             .map(Term::ExternalConstant);
 
         // Function parameters
-        let param_list = expr.separated_by(just(',')).collect::<Vec<_>>();
+        let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
 
         // Function invocation
         let function = identifier
+            .clone()
             .then(
                 just('(')
                     .ignore_then(param_list.or_not())
@@ -281,7 +283,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
             just("$total").to(Term::Invocation(Invocation::Total)),
-            identifier.map(|id| Term::Invocation(Invocation::Member(id))),
+            identifier
+                .clone()
+                .map(|id| Term::Invocation(Invocation::Member(id))),
         ));
 
         // Terms
@@ -289,7 +293,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             invocation,
             literal,
             external_constant,
-            expr.delimited_by(just('('), just(')'))
+            expr.clone()
+                .delimited_by(just('('), just(')'))
                 .map(|e| Term::Parenthesized(Box::new(e))),
         ));
 
@@ -318,13 +323,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let polarity_expr = choice((
             just('+')
                 .or(just('-'))
-                .then(indexer_expr)
+                .then(indexer_expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
             indexer_expr,
         ));
 
         // Multiplicative expression
-        let op = choice((
+        let op1 = choice((
             just('*').to("*"),
             just('/').to("/"),
             text::keyword("div").to("div"),
@@ -333,18 +338,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let multiplicative_expr =
             polarity_expr
-                .then(op.then(polarity_expr).repeated())
+                .then(op1.then(polarity_expr).repeated())
                 .map(|(first, rest)| {
                     rest.into_iter().fold(first, |lhs, (op, rhs)| {
                         Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
                     })
                 });
+        multiplicative_expr
+
+        /*
 
         // Additive expression
-        let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&")));
+        let op2 = choice((just('+').to("+"), just('-').to("-"), just('&').to("&")));
 
         let additive_expr = multiplicative_expr
-            .then(op.then(multiplicative_expr).repeated())
+            .then(op2.then(multiplicative_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -411,55 +419,56 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     }
                 });
 
-        // Membership expression
-        let op = choice((
-            text::keyword("in").to("in"),
-            text::keyword("contains").to("contains"),
-        ));
+                // Membership expression
+                let op = choice((
+                    text::keyword("in").to("in"),
+                    text::keyword("contains").to("contains"),
+                ));
 
-        let membership_expr =
-            equality_expr
-                .then(op.then(equality_expr).or_not())
-                .map(|(lhs, rhs)| {
-                    if let Some((op, rhs)) = rhs {
-                        Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    } else {
-                        lhs
-                    }
-                });
+                let membership_expr =
+                    equality_expr
+                        .then(op.then(equality_expr).or_not())
+                        .map(|(lhs, rhs)| {
+                            if let Some((op, rhs)) = rhs {
+                                Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
+                            } else {
+                                lhs
+                            }
+                        });
 
-        // And expression
-        let and_expr = membership_expr
-            .then(text::keyword("and").ignore_then(membership_expr).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, rhs| {
-                    Expression::And(Box::new(lhs), Box::new(rhs))
-                })
-            });
+                // And expression
+                let and_expr = membership_expr
+                    .then(text::keyword("and").ignore_then(membership_expr).repeated())
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, rhs| {
+                            Expression::And(Box::new(lhs), Box::new(rhs))
+                        })
+                    });
 
-        // Or expression
-        let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor")));
+                // Or expression
+                let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor")));
 
-        let or_expr = and_expr
-            .then(op.then(and_expr).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            });
+                let or_expr = and_expr
+                    .then(op.then(and_expr).repeated())
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        })
+                    });
 
-        // Implies expression
-        let implies_expr = or_expr
-            .then(text::keyword("implies").ignore_then(or_expr).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some(rhs) = rhs {
-                    Expression::Implies(Box::new(lhs), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Implies expression
+                let implies_expr = or_expr
+                    .then(text::keyword("implies").ignore_then(or_expr).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some(rhs) = rhs {
+                            Expression::Implies(Box::new(lhs), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        implies_expr
+                implies_expr
+        */
     })
     .then_ignore(end())
 }
