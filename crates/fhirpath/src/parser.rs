@@ -233,26 +233,26 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Qualified identifier (for type specifiers)
-        let qualified_identifier = identifier
-            .then(
-                just('.')
-                    .ignore_then(identifier)
-                    .repeated()
-                    .collect::<Vec<_>>(),
-            )
-            .map(|(first, rest)| {
-                if rest.is_empty() {
-                    first
-                } else {
-                    let mut result = first;
-                    for part in rest {
-                        result.push_str(".");
-                        result.push_str(&part);
-                    }
-                    result
-                }
-            });
-
+        /*        let qualified_identifier = identifier
+                    .then(
+                        just('.')
+                            .ignore_then(identifier)
+                            .repeated()
+                            .collect::<Vec<_>>(),
+                    )
+                    .map(|(first, rest)| {
+                        if rest.is_empty() {
+                            first
+                        } else {
+                            let mut result = first;
+                            for part in rest {
+                                result.push_str(".");
+                                result.push_str(&part);
+                            }
+                            result
+                        }
+                    });
+        */
         // Create a separate string parser for external constants
         let string_for_external = just('\'')
             .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
