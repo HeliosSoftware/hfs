@@ -383,7 +383,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         )
         .map(|(expr, invocations)| {
             invocations.into_iter().fold(expr, |acc, (name, params_opt)| {
-                if let Some(params) = params_opt {
+                if let Some(_params) = params_opt {
                     // It's a function call with parameters
                     Expression::Invocation(
                         Box::new(acc),
@@ -453,11 +453,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .then(
                 choice((text::keyword("is"), text::keyword("as")))
                     .padded()  // Allow whitespace around 'is' and 'as'
-                    .then(qualified_identifier)
+                    .then(
+                        // Handle both simple identifiers and qualified identifiers
+                        choice((
+                            // Handle Date, DateTime, Time as special cases
+                            just("Date").to("Date".to_string()),
+                            just("DateTime").to("DateTime".to_string()),
+                            just("Time").to("Time".to_string()),
+                            qualified_identifier
+                        ))
+                    )
                     .or_not(),
             )
             .map(|(expr, type_op)| {
-                if let Some((_op, type_name)) = type_op {
+                if let Some((op, type_name)) = type_op {
                     Expression::Type(Box::new(expr), type_name)
                 } else {
                     expr
