@@ -412,10 +412,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Special case for date/time literals with method calls
         let date_time_method = choice((
-            date_literal.map(Term::Literal),
-            datetime_literal.map(Term::Literal),
-            time_literal.map(Term::Literal),
+            date_literal.clone(),
+            datetime_literal.clone(),
+            time_literal.clone(),
         ))
+        .map(Term::Literal)
         .map(Expression::Term)
         .then(
             just('.')
@@ -438,7 +439,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             } else {
                 expr
             }
-        });
+        })
+        .boxed();
 
         // Indexer expression
         let indexer_expr = choice((
