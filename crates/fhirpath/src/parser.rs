@@ -117,15 +117,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .padded(); // Allow whitespace around numbers
 
         // Date format: YYYY(-MM(-DD)?)?
-        let date_format = text::digits::<char, E>(10)
+        let year_digits = text::digits::<char, E>(10)
+            .repeated()
             .exactly(4)
-            .collect::<String>()
+            .collect::<String>();
+            
+        let month_day_digits = text::digits::<char, E>(10)
+            .repeated()
+            .exactly(2)
+            .collect::<String>();
+            
+        let date_format = year_digits
             .then(
                 just::<char, char, E>('-')
-                    .ignore_then(text::digits::<char, E>(10).exactly(2).collect::<String>())
+                    .ignore_then(month_day_digits.clone())
                     .then(
                         just::<char, char, E>('-')
-                            .ignore_then(text::digits::<char, E>(10).exactly(2).collect::<String>())
+                            .ignore_then(month_day_digits)
                             .or_not(),
                     )
                     .or_not(),
