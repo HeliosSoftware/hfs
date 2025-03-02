@@ -75,6 +75,11 @@ impl fmt::Display for Literal {
     }
 }
 
+// Add a test function to parse and debug FHIRPath expressions
+pub fn parse_test(input: &str) -> Result<Expression, Vec<Simple<char>>> {
+    parser().parse(input)
+}
+
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
@@ -198,12 +203,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Create a parser for date literals
         let date = just('@')
-            .ignore_then(date_format.clone())
+            .ignore_then(choice((
+                full_date.clone(),
+                year_month.clone(),
+                year_only.clone()
+            )))
             .map(Literal::Date);
 
         // Create a parser for datetime literals
         let datetime = just('@')
-            .ignore_then(date_format.clone())
+            .ignore_then(choice((
+                full_date.clone(),
+                year_month.clone(),
+                year_only.clone()
+            )))
             .then(
                 just('T')
                     .ignore_then(time_format.clone())
@@ -391,7 +404,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 invocations
                     .into_iter()
                     .fold(expr, |acc, (name, params_opt)| {
-                        if let Some(_params) = params_opt {
+                        if let Some(params) = params_opt {
                             // It's a function call with parameters
                             Expression::Invocation(Box::new(acc), format!("{}()", name))
                         } else {
