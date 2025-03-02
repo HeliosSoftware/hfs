@@ -123,33 +123,45 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Date format: YYYY(-MM(-DD)?)?
         // This handles all three valid formats: 1972, 1972-12, 1972-12-14
-        let year_digits = text::digits::<char, E>(10)
+        
+        // Year only: YYYY (4 digits)
+        let year_only = text::digits::<char, E>(10)
             .repeated()
             .exactly(4)
             .collect::<String>();
-
-        let two_digits = text::digits::<char, E>(10)
-            .repeated()
-            .exactly(2)
-            .collect::<String>();
-
-        // Year only: YYYY
-        let year_only = year_digits.clone();
-
+        
         // Year and month: YYYY-MM
-        let year_month = year_digits
-            .clone()
-            .then(just::<char, char, E>('-').ignore_then(two_digits.clone()))
+        let year_month = year_only.clone()
+            .then(
+                just::<char, char, E>('-')
+                .ignore_then(
+                    text::digits::<char, E>(10)
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>()
+                )
+            )
             .map(|(year, month)| format!("{}-{}", year, month));
-
+            
         // Full date: YYYY-MM-DD
-        let full_date = year_digits
-            .then(just::<char, char, E>('-').ignore_then(two_digits.clone()))
-            .then(just::<char, char, E>('-').ignore_then(two_digits))
-            .map(|((year, month), day)| format!("{}-{}-{}", year, month, day));
-
+        let full_date = year_month.clone()
+            .then(
+                just::<char, char, E>('-')
+                .ignore_then(
+                    text::digits::<char, E>(10)
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>()
+                )
+            )
+            .map(|(year_month, day)| format!("{}-{}", year_month, day));
+            
         // Combine all three formats with priority to the most specific match
-        let date_format = choice((full_date, year_month, year_only));
+        let date_format = choice((
+            full_date.clone(),
+            year_month.clone(),
+            year_only.clone()
+        ));
 
         // Time format: HH(:mm(:ss(.sss)?)?)?
         let time_format = text::int::<char, E>(10)
