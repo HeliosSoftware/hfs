@@ -421,20 +421,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .ignore_then(
                     just("is")
                         .padded()
-                        .then(
-                            choice((
-                                just("Date").to("Date".to_string()),
-                                just("DateTime").to("DateTime".to_string()),
-                                just("Time").to("Time".to_string()),
-                            ))
-                        )
-                        .then(
-                            just('(')
-                                .ignore_then(just(')'))
-                                .or_not()
-                        )
+                        .then(choice((
+                            just("Date").to("Date".to_string()),
+                            just("DateTime").to("DateTime".to_string()),
+                            just("Time").to("Time".to_string()),
+                        )))
+                        .then(just('(').ignore_then(just(')'))),
                 )
-                .or_not()
+                .or_not(),
         )
         .map(|(expr, method_opt)| {
             if let Some((method_type, _)) = method_opt {
@@ -454,7 +448,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     indices.into_iter().fold(expr, |acc, idx| {
                         Expression::Indexer(Box::new(acc), Box::new(idx))
                     })
-                })
+                }),
         ));
 
         // Polarity expression
@@ -504,7 +498,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((text::keyword("is"), text::keyword("as")))
+                choice((just("is"), just("as")))
                     .padded() // Allow whitespace around 'is' and 'as'
                     .then(
                         // Handle both simple identifiers and qualified identifiers
@@ -519,7 +513,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .or_not(),
             )
             .map(|(expr, type_op)| {
-                if let Some((_, type_name)) = type_op {
+                if let Some((_op, type_name)) = type_op {
                     Expression::Type(Box::new(expr), type_name)
                 } else {
                     expr
