@@ -99,6 +99,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             })
             .padded(); // Allow whitespace around numbers
 
+        // Add longnumber, which is LONGNUMBER in the grammar AI!
+
         // Date format: YYYY(-MM(-DD))?
         let _date_format = text::int::<char, E>(10)
             .map(|s: String| s)
@@ -191,15 +193,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         just("is")
                             .padded()
                             .then(just("Date"))
-                            .then(just('(').ignore_then(just(')')))
+                            .then(just('(').ignore_then(just(')'))),
                     )
-                    .or_not()
+                    .or_not(),
             )
             .map(|(date, is_check)| {
                 if is_check.is_some() {
                     Expression::Type(
                         Box::new(Expression::Term(Term::Literal(date))),
-                        "Date".to_string()
+                        "Date".to_string(),
                     )
                 } else {
                     Expression::Term(Term::Literal(date))
@@ -264,11 +266,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let literal = null
             .or(boolean)
             .or(string)
-            .or(quantity)
             .or(number)
-            .or(datetime_literal.clone())
-            .or(date_literal.clone())
-            .or(time_literal.clone())
+            .or(long_number)
+            .or(datetime_literal)
+            .or(date_literal)
+            .or(time_literal)
+            .or(quantity)
             .map(Term::Literal);
 
         // Identifiers
@@ -433,7 +436,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Special case for date/time literals with method calls
         let date_time_method = choice((
-            datetime_literal.clone()
+            datetime_literal
+                .clone()
                 .map(Term::Literal)
                 .map(Expression::Term)
                 .then(
@@ -442,9 +446,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             just("is")
                                 .padded()
                                 .then(just("DateTime").to("DateTime".to_string()))
-                                .then(just('(').ignore_then(just(')')))
+                                .then(just('(').ignore_then(just(')'))),
                         )
-                        .or_not()
+                        .or_not(),
                 )
                 .map(|(expr, method_opt)| {
                     if let Some((method_type, _)) = method_opt {
@@ -454,7 +458,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         expr
                     }
                 }),
-            time_literal.clone()
+            time_literal
+                .clone()
                 .map(Term::Literal)
                 .map(Expression::Term)
                 .then(
@@ -463,9 +468,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             just("is")
                                 .padded()
                                 .then(just("Time").to("Time".to_string()))
-                                .then(just('(').ignore_then(just(')')))
+                                .then(just('(').ignore_then(just(')'))),
                         )
-                        .or_not()
+                        .or_not(),
                 )
                 .map(|(expr, method_opt)| {
                     if let Some((method_type, _)) = method_opt {
@@ -540,16 +545,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .then(
                 choice((just("is"), just("as")))
                     .padded() // Allow whitespace around 'is' and 'as'
-                    .then(
-                        // Handle both simple identifiers and qualified identifiers
-                        choice((
-                            // Handle Date, DateTime, Time as special cases
-                            just("Date").to("Date".to_string()),
-                            just("DateTime").to("DateTime".to_string()),
-                            just("Time").to("Time".to_string()),
-                            qualified_identifier,
-                        )),
-                    )
+                    .then(qualified_identifier)
                     .or_not(),
             )
             .map(|(expr, type_op)| {
