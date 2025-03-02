@@ -157,7 +157,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(year_month, day)| format!("{}-{}", year_month, day));
             
         // Combine all three formats with priority to the most specific match
-        let date_format = choice((
+        let date_format: impl Parser<char, String, Error = E> = choice((
             full_date.clone(),
             year_month.clone(),
             year_only.clone()
@@ -215,20 +215,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Create a parser for date literals
         let date = just('@')
-            .ignore_then(choice((
-                full_date.clone(),
-                year_month.clone(),
-                year_only.clone()
-            )))
+            .ignore_then(date_format.clone())
             .map(Literal::Date);
 
         // Create a parser for datetime literals
         let datetime = just('@')
-            .ignore_then(choice((
-                full_date.clone(),
-                year_month.clone(),
-                year_only.clone()
-            )))
+            .ignore_then(date_format.clone())
             .then(
                 just('T')
                     .ignore_then(time_format.clone())
