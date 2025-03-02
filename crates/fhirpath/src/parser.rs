@@ -11,7 +11,7 @@ pub enum Literal {
     Number(f64),
     LongNumber(i64),
     Date(String),
-    DateTime(String),
+    DateTime(String, String, Option<String>), // date, time, timezone
     Time(String),
     Quantity(f64, Option<String>),
 }
@@ -61,7 +61,13 @@ impl fmt::Display for Literal {
             Literal::Number(n) => write!(f, "{}", n),
             Literal::LongNumber(n) => write!(f, "{}", n),
             Literal::Date(d) => write!(f, "@{}", d),
-            Literal::DateTime(dt) => write!(f, "@{}", dt),
+            Literal::DateTime(date, time, tz) => {
+                write!(f, "@{}T{}", date, time)?;
+                if let Some(tz) = tz {
+                    write!(f, "{}", tz)?;
+                }
+                Ok(())
+            },
             Literal::Time(t) => write!(f, "@T{}", t),
             Literal::Quantity(n, Some(u)) => write!(f, "{} '{}'", n, u),
             Literal::Quantity(n, None) => write!(f, "{}", n),
@@ -199,7 +205,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .ignore_then(time_format.clone())
                     .then(timezone_format.or_not()),
             )
-            .map(Literal::DateTime);
+            .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
 
         // Create a parser for time literals
         let time = just('@')
