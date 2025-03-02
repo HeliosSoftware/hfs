@@ -211,63 +211,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Create a parser for datetime literals that captures the entire datetime string
-                    .ignore_then(
-                        filter(|c: &char| c.is_digit(10) || *c == '-')
-                            .repeated()
-                            .at_least(1)
-                            .collect::<String>(),
-                    )
-                    .map(Literal::Date)
-                    .boxed()
-                    .then(
-                        just('.')
-                            .ignore_then(
-                                just("is")
-                                    .padded()
-                                    .then(just("Date"))
-                                    .then(just('(').ignore_then(just(')'))),
-                            )
-                            .or_not(),
-                    )
-                    .map(|(date, is_check)| {
-                        if is_check.is_some() {
-                            Expression::Type(
-                                Box::new(Expression::Term(Term::Literal(date))),
-                                "Date".to_string(),
-                            )
+        let datetime_literal = just::<char, char, E>('@')
+            .ignore_then(date_format.clone())
+            .then(
+                just::<char, char, E>('T')
+                    .ignore_then(time_format.clone())
+                    .then(timezone_format.or_not())
+                    .map(|(t, tz)| {
+                        if let Some(tz) = tz {
+                            format!("T{}{}", t, tz)
                         } else {
-                            Expression::Term(Term::Literal(date))
+                            format!("T{}", t)
                         }
                     })
-                    .boxed();
-        */
-
-        // Create a parser for datetime literals that captures the entire datetime string
-        let datetime_literal = just::<char, char, E>('@')
-            .ignore_then(
-                filter(|c: &char| c.is_digit(10) || *c == '-')
-                    .repeated()
-                    .at_least(1)
-                    .collect::<String>()
-                    .then(
-                        just::<char, char, E>('T')
-                            .ignore_then(
-                                filter(|c: &char| {
-                                    c.is_digit(10)
-                                        || *c == ':'
-                                        || *c == '.'
-                                        || *c == '+'
-                                        || *c == '-'
-                                        || *c == 'Z'
-                                })
-                                .repeated()
-                                .at_least(1)
-                                .collect::<String>(),
-                            )
-                            .map(|t| format!("T{}", t)),
-                    )
-                    .map(|(d, t)| format!("{}{}", d, t)),
             )
+            .map(|(d, t)| format!("{}{}", d, t))
             .map(Literal::DateTime);
 
         // Create a parser for time literals that captures the entire time string
