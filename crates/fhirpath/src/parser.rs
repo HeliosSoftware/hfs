@@ -245,9 +245,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .or(string)
             .or(quantity)
             .or(number)
-            .or(datetime_literal)
-            .or(date_literal)
-            .or(time_literal)
+            .or(datetime_literal.clone())
+            .or(date_literal.clone())
+            .or(time_literal.clone())
             .map(Term::Literal);
 
         // Identifiers
