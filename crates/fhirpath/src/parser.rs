@@ -184,6 +184,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .collect::<String>(),
             )
             .map(Literal::Date)
+            .boxed()
+            .then(
+                just('.')
+                    .ignore_then(
+                        just("is")
+                            .padded()
+                            .then(just("Date"))
+                            .then(just('(').ignore_then(just(')')))
+                    )
+                    .or_not()
+            )
+            .map(|(date, is_check)| {
+                if is_check.is_some() {
+                    Expression::Type(
+                        Box::new(Expression::Term(Term::Literal(date))),
+                        "Date".to_string()
+                    )
+                } else {
+                    Expression::Term(Term::Literal(date))
+                }
+            })
             .boxed();
 
         // Create a parser for datetime literals that captures the entire datetime string
@@ -412,34 +433,50 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Special case for date/time literals with method calls
         let date_time_method = choice((
-            date_literal.clone(),
-            datetime_literal.clone(),
-            time_literal.clone(),
-        ))
-        .map(Term::Literal)
-        .map(Expression::Term)
-        .then(
-            just('.')
-                .ignore_then(
-                    just("is")
-                        .padded()
-                        .then(choice((
-                            just("Date").to("Date".to_string()),
-                            just("DateTime").to("DateTime".to_string()),
-                            just("Time").to("Time".to_string()),
-                        )))
-                        .then(just('(').ignore_then(just(')'))),
+            datetime_literal.clone()
+                .map(Term::Literal)
+                .map(Expression::Term)
+                .then(
+                    just('.')
+                        .ignore_then(
+                            just("is")
+                                .padded()
+                                .then(just("DateTime").to("DateTime".to_string()))
+                                .then(just('(').ignore_then(just(')')))
+                        )
+                        .or_not()
                 )
-                .or_not(),
-        )
-        .map(|(expr, method_opt)| {
-            if let Some((method_type, _)) = method_opt {
-                let (_, type_name) = method_type;
-                Expression::Type(Box::new(expr), type_name)
-            } else {
-                expr
-            }
-        })
+                .map(|(expr, method_opt)| {
+                    if let Some((method_type, _)) = method_opt {
+                        let (_, type_name) = method_type;
+                        Expression::Type(Box::new(expr), type_name)
+                    } else {
+                        expr
+                    }
+                }),
+            time_literal.clone()
+                .map(Term::Literal)
+                .map(Expression::Term)
+                .then(
+                    just('.')
+                        .ignore_then(
+                            just("is")
+                                .padded()
+                                .then(just("Time").to("Time".to_string()))
+                                .then(just('(').ignore_then(just(')')))
+                        )
+                        .or_not()
+                )
+                .map(|(expr, method_opt)| {
+                    if let Some((method_type, _)) = method_opt {
+                        let (_, type_name) = method_type;
+                        Expression::Type(Box::new(expr), type_name)
+                    } else {
+                        expr
+                    }
+                }),
+            date_literal.clone(),
+        ))
         .boxed();
 
         // Indexer expression
