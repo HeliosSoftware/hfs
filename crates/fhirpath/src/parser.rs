@@ -262,7 +262,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .or(string)
             .or(number)
             .or(long_number)
-            .or(datetime_literal)
+            .or(datetime_literal.clone())
             .or(date_literal_simple)
             .or(time_literal)
             .or(quantity)
@@ -431,7 +431,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Special case for date/time literals with method calls
         let date_time_method = choice((
             datetime_literal
-                .clone()
                 .map(Term::Literal)
                 .map(Expression::Term)
                 .then(
