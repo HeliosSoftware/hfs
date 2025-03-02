@@ -187,9 +187,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
         // Create a parser for date literals that captures the entire date string
-        let date_literal = just::<char, char, E>('@')
+        let date_literal_simple = just::<char, char, E>('@')
             .ignore_then(date_format.clone())
-            .map(Literal::Date)
+            .map(Literal::Date);
+
+        // Create a parser for date literals with type checking
+        let date_literal_with_type = date_literal_simple.clone()
             .map(Term::Literal)
             .map(Expression::Term)
             .then(
@@ -260,7 +263,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .or(number)
             .or(long_number)
             .or(datetime_literal)
-            .or(date_literal)
+            .or(date_literal_simple)
             .or(time_literal)
             .or(quantity)
             .map(Term::Literal);
@@ -471,7 +474,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         expr
                     }
                 }),
-            date_literal.clone(),
+            date_literal_with_type.clone(),
         ))
         .boxed();
 
