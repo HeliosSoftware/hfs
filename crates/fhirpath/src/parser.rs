@@ -67,7 +67,7 @@ impl fmt::Display for Literal {
                     write!(f, "{}", tz)?;
                 }
                 Ok(())
-            },
+            }
             Literal::Time(t) => write!(f, "@T{}", t),
             Literal::Quantity(n, Some(u)) => write!(f, "{} '{}'", n, u),
             Literal::Quantity(n, None) => write!(f, "{}", n),
@@ -116,7 +116,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             })
             .padded(); // Allow whitespace around numbers
 
-        // Date format: YYYY(-MM(-DD))?
+        // Date format: YYYY(-MM(-DD)?)?
         let date_format = text::int::<char, E>(10)
             .map(|s: String| s)
             .then(
