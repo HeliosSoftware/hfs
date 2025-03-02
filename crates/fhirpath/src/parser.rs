@@ -111,7 +111,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .padded(); // Allow whitespace around numbers
 
         // Date format: YYYY(-MM(-DD))?
-        let _date_format = text::int::<char, E>(10)
+        let date_format = text::int::<char, E>(10)
             .map(|s: String| s)
             .then(
                 just::<char, char, E>('-')
@@ -137,7 +137,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Time format: HH(:mm(:ss(.sss)?)?)?
-        let _time_format = text::int::<char, E>(10)
+        let time_format = text::int::<char, E>(10)
             .then(
                 just::<char, char, E>(':')
                     .ignore_then(text::int::<char, E>(10))
@@ -176,7 +176,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Timezone format: Z | (+|-)HH:mm
-        let _timezone_format =
+        let timezone_format =
             just::<char, char, E>('Z')
                 .to("Z".to_string())
                 .or(one_of::<char, &str, E>("+-")
@@ -186,37 +186,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .then(text::int::<char, E>(10))
                     .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
+        // Implement date_literal using date_format AI!
+
         // Create a parser for date literals that captures the entire date string
-        let date_literal = just::<char, char, E>('@')
-            .ignore_then(
-                filter(|c: &char| c.is_digit(10) || *c == '-')
-                    .repeated()
-                    .at_least(1)
-                    .collect::<String>(),
-            )
-            .map(Literal::Date)
-            .boxed()
-            .then(
-                just('.')
+        /*  let date_literal = just::<char, char, E>('@')
                     .ignore_then(
-                        just("is")
-                            .padded()
-                            .then(just("Date"))
-                            .then(just('(').ignore_then(just(')'))),
+                        filter(|c: &char| c.is_digit(10) || *c == '-')
+                            .repeated()
+                            .at_least(1)
+                            .collect::<String>(),
                     )
-                    .or_not(),
-            )
-            .map(|(date, is_check)| {
-                if is_check.is_some() {
-                    Expression::Type(
-                        Box::new(Expression::Term(Term::Literal(date))),
-                        "Date".to_string(),
+                    .map(Literal::Date)
+                    .boxed()
+                    .then(
+                        just('.')
+                            .ignore_then(
+                                just("is")
+                                    .padded()
+                                    .then(just("Date"))
+                                    .then(just('(').ignore_then(just(')'))),
+                            )
+                            .or_not(),
                     )
-                } else {
-                    Expression::Term(Term::Literal(date))
-                }
-            })
-            .boxed();
+                    .map(|(date, is_check)| {
+                        if is_check.is_some() {
+                            Expression::Type(
+                                Box::new(Expression::Term(Term::Literal(date))),
+                                "Date".to_string(),
+                            )
+                        } else {
+                            Expression::Term(Term::Literal(date))
+                        }
+                    })
+                    .boxed();
+        */
 
         // Create a parser for datetime literals that captures the entire datetime string
         let datetime_literal = just::<char, char, E>('@')
