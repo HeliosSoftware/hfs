@@ -157,7 +157,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(year_month, day)| format!("{}-{}", year_month, day));
             
         // Combine all three formats with priority to the most specific match
-        let date_format: impl Parser<char, String, Error = E> = choice((
+        let date_format = choice((
             full_date.clone(),
             year_month.clone(),
             year_only.clone()
