@@ -99,7 +99,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             })
             .padded(); // Allow whitespace around numbers
 
-        // Add longnumber, which is LONGNUMBER in the grammar AI!
+        let long_number = text::int(10)
+            .then(just('L').or_not())
+            .map(|(i, l)| {
+                if l.is_some() {
+                    Literal::LongNumber(i.parse().unwrap())
+                } else {
+                    Literal::LongNumber(i.parse().unwrap())
+                }
+            })
+            .padded(); // Allow whitespace around numbers
 
         // Date format: YYYY(-MM(-DD))?
         let _date_format = text::int::<char, E>(10)
