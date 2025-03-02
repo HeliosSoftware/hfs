@@ -186,10 +186,31 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .then(text::int::<char, E>(10))
                     .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-        // Implement date_literal using date_format AI!
-
         // Create a parser for date literals that captures the entire date string
-        /*  let date_literal = just::<char, char, E>('@')
+        let date_literal = just::<char, char, E>('@')
+            .ignore_then(date_format.clone())
+            .map(Literal::Date)
+            .map(Term::Literal)
+            .map(Expression::Term)
+            .then(
+                just('.')
+                    .ignore_then(
+                        just("is")
+                            .padded()
+                            .then(just("Date").to("Date".to_string()))
+                            .then(just('(').ignore_then(just(')')))
+                    )
+                    .or_not()
+            )
+            .map(|(expr, is_check)| {
+                if let Some((_, _)) = is_check {
+                    Expression::Type(Box::new(expr), "Date".to_string())
+                } else {
+                    expr
+                }
+            });
+
+        // Create a parser for datetime literals that captures the entire datetime string
                     .ignore_then(
                         filter(|c: &char| c.is_digit(10) || *c == '-')
                             .repeated()
