@@ -183,7 +183,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .at_least(1)
                     .collect::<String>(),
             )
-            .map(Literal::Date);
+            .map(Literal::Date)
+            .boxed();
 
         // Create a parser for datetime literals that captures the entire datetime string
         let datetime_literal = just::<char, char, E>('@')
