@@ -331,7 +331,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term;
 
         // Invocation expression (highest precedence)
-        let invocation_expr = atom.then(just('.').ignore_then(invocation));
+        let invocation_expr = atom.then(just('.').ignore_then(invocation)).boxed();
 
         // Function call parameter parser - handles expressions inside function calls
         let function_param = recursive(|_| {
