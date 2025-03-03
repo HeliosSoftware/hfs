@@ -341,6 +341,38 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .map(|e| Term::Parenthesized(Box::new(e))),
         ));
 
+        // Atom expression (basic building block)
+        let atom = term.clone().map(Expression::Term);
+
+        // Invocation expression (expression.invocation)
+        let invocation_expr = atom
+            .clone()
+            .then(
+                just('.')
+                    .ignore_then(identifier.clone())
+                    .then(
+                        just('(')
+                            .ignore_then(param_list.clone().or_not())
+                            .then_ignore(just(')'))
+                            .or_not(),
+                    )
+                    .repeated(),
+            )
+            .map(|(first, invocations)| {
+                invocations.into_iter().fold(first, |acc, (name, params)| {
+                    if let Some(params) = params {
+                        // It's a function invocation: expr.func(params)
+                        Expression::Invocation(
+                            Box::new(acc),
+                            format!("{}({})", name, params.unwrap_or_default().len()),
+                        )
+                    } else {
+                        // It's a member invocation: expr.member
+                        Expression::Invocation(Box::new(acc), name)
+                    }
+                })
+            });
+
         // Indexer expression
         let indexer_expr = choice((invocation_expr.clone(), atom.clone()))
             .then(expr.clone().delimited_by(just('['), just(']')).repeated())
