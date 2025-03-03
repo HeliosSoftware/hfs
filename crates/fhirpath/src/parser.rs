@@ -330,7 +330,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Terms
         let term = choice((
-            invocation,
+            invocation.clone(),
             literal,
             external_constant,
             expr.clone()
@@ -339,16 +339,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Build the expression parser with operator precedence
-        let atom = term.map(Expression::Term);
+        let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (highest precedence)
-        let invocation_expr = atom.then(just('.').ignore_then(invocation).map(|inv| match inv {
+        let invocation_expr = atom.clone().then(just('.').ignore_then(invocation.clone()).map(|inv| match inv {
             Term::Invocation(i) => i,
             _ => unreachable!(),
         })).map(|(expr, inv)| {
             match inv {
                 Invocation::Member(name) => Expression::Invocation(Box::new(expr), name),
-                Invocation::Function(name, params) => {
+                Invocation::Function(name, _params) => {
                     // Handle function invocation after a dot (member function)
                     Expression::Invocation(Box::new(expr), name)
                 },
@@ -402,7 +402,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         });
 
         // Function parameters list
-        let function_params = function_param
+        let _function_params = function_param
             .padded() // Allow whitespace around parameters
             .separated_by(just(',').padded()) // Allow whitespace around commas
             .collect::<Vec<_>>();
@@ -410,7 +410,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Indexer expression
         let indexer_expr = choice((
             invocation_expr.clone(),
-            atom.clone().map(|a| a),
+            atom.clone(),
         ))
         .then(expr.clone().delimited_by(just('['), just(']')).repeated())
         .map(|(expr, indices)| {
