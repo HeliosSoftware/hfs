@@ -465,13 +465,28 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((just("is"), just("as")))
-                    .padded() // Allow whitespace around 'is' and 'as'
-                    .then(qualified_identifier)
-                    .or_not(),
+                choice((
+                    // Traditional syntax: expr is Type
+                    choice((just("is"), just("as")))
+                        .padded() // Allow whitespace around 'is' and 'as'
+                        .then(qualified_identifier)
+                        .map(|(op, type_name)| (op.to_string(), type_name)),
+                    // Method call syntax: expr.is(Type)
+                    just('.')
+                        .ignore_then(
+                            choice((just("is"), just("as")))
+                                .then(
+                                    just('(')
+                                        .ignore_then(qualified_identifier.padded())
+                                        .then_ignore(just(')')),
+                                )
+                                .map(|(op, type_name)| (op.to_string(), type_name)),
+                        ),
+                ))
+                .or_not(),
             )
             .map(|(expr, type_op)| {
-                if let Some((_op, type_name)) = type_op {
+                if let Some((op, type_name)) = type_op {
                     Expression::Type(Box::new(expr), type_name)
                 } else {
                     expr
