@@ -481,7 +481,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .then(
                 choice((just("is"), just("as")))
                     .padded() // Allow whitespace around 'is' and 'as'
-                    .then(qualified_identifier)
+                    .then(
+                        // Handle both simple type names and function-like syntax: is(Quantity)
+                        qualified_identifier.clone()
+                            .or(
+                                qualified_identifier
+                                    .delimited_by(just('('), just(')'))
+                            )
+                    )
                     .or_not(),
             )
             .map(|(expr, type_op)| {
