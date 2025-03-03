@@ -485,10 +485,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                         // Handle both simple type names and function-like syntax: is(Quantity)
                         qualified_identifier.clone()
                             .or(
-                                just('(')
-                                    .padded()
-                                    .ignore_then(qualified_identifier.clone())
-                                    .then_ignore(just(')').padded())
+                                qualified_identifier.clone()
+                                    .delimited_by(just('(').padded(), just(')').padded())
                             )
                     )
                     .or_not(),
