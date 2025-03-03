@@ -328,7 +328,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Build the expression parser with operator precedence
-        let atom = term.clone().map(Expression::Term);
+        let atom = term;
 
         // Invocation expression (highest precedence)
         let invocation_expr = atom.then(just('.').ignore_then(invocation));
