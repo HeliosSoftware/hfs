@@ -341,88 +341,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .map(|e| Term::Parenthesized(Box::new(e))),
         ));
 
-        // Build the expression parser with operator precedence
-        let atom = term.clone().map(Expression::Term);
-
-        // Invocation expression (highest precedence)
-        // Support for chained member invocations like Patient.name.given
-        let invocation_expr = atom
-            .clone()
-            .then(
-                just('.')
-                    .ignore_then(invocation.clone())
-                    .map(|inv| match inv {
-                        Term::Invocation(i) => i,
-                        _ => unreachable!(),
-                    })
-                    .repeated()
-                    .at_least(1),
-            )
-            .map(|(expr, invs)| {
-                invs.into_iter().fold(expr, |acc, inv| {
-                    match inv {
-                        Invocation::Member(name) => Expression::Invocation(Box::new(acc), name),
-                        Invocation::Function(name, _params) => {
-                            // Handle function invocation after a dot (member function)
-                            Expression::Invocation(Box::new(acc), name)
-                        }
-                        Invocation::This => unreachable!(),
-                        Invocation::Index => unreachable!(),
-                        Invocation::Total => unreachable!(),
-                        Invocation::MemberFunction(_, _) => unreachable!(),
-                    }
-                })
-            })
-            .boxed();
-
-        // Function call parameter parser - handles expressions inside function calls
-        let function_param = recursive(|_| {
-            // Create a specialized parser for function parameters that handles equality expressions
-            let param_atom = term.clone().map(Expression::Term);
-
-            let param_member = param_atom
-                .then(just('.').ignore_then(identifier.clone()).repeated())
-                .map(|(expr, members)| {
-                    members.into_iter().fold(expr, |acc, member| {
-                        Expression::Invocation(Box::new(acc), member)
-                    })
-                });
-
-            // Handle equality expressions in parameters
-            let param_equality = param_member
-                .clone()
-                .then(
-                    just('=')
-                        .padded() // Allow whitespace around equals sign
-                        .to("=")
-                        .then(
-                            just('\'')
-                                .ignore_then(
-                                    none_of("\'\\").or(just('\\').ignore_then(any())).repeated(),
-                                )
-                                .then_ignore(just('\''))
-                                .collect::<String>()
-                                .map(|s| Expression::Term(Term::Literal(Literal::String(s)))),
-                        )
-                        .or_not(),
-                )
-                .map(|(expr, eq_opt)| {
-                    if let Some((op, rhs)) = eq_opt {
-                        Expression::Equality(Box::new(expr), op.to_string(), Box::new(rhs))
-                    } else {
-                        expr
-                    }
-                });
-
-            param_equality
-        });
-
-        // Function parameters list
-        let _function_params = function_param
-            .padded() // Allow whitespace around parameters
-            .separated_by(just(',').padded()) // Allow whitespace around commas
-            .collect::<Vec<_>>();
-
         // Indexer expression
         let indexer_expr = choice((invocation_expr.clone(), atom.clone()))
             .then(expr.clone().delimited_by(just('['), just(']')).repeated())
@@ -475,24 +393,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             })
             .boxed();
 
+        let type_specifier = qualified_identifier;
+
         // Type expression
         let type_expr = additive_expr
             .clone()
             .then(
                 choice((just("is"), just("as")))
                     .padded() // Allow whitespace around 'is' and 'as'
-                    .then(
-                        // First try the parenthesized form
-                        just('(')
-                            .padded()
-                            .ignore_then(qualified_identifier.clone())
-                            .then_ignore(just(')').padded())
-                            .or(qualified_identifier.clone()) // Then try the simple form
-                    )
+                    .then(type_specifier.clone())
                     .or_not(),
             )
             .map(|(expr, type_op)| {
-                if let Some((op, type_name)) = type_op {
+                if let Some((_op, type_name)) = type_op {
                     Expression::Type(Box::new(expr), type_name)
                 } else {
                     expr
