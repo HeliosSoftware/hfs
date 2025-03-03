@@ -310,13 +310,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Invocations
         let invocation = choice((
-            function.map(Term::Invocation),
+            identifier,
+            function,
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
             just("$total").to(Term::Invocation(Invocation::Total)),
-            identifier
-                .clone()
-                .map(|id| Term::Invocation(Invocation::Member(id))),
         ));
 
         // Terms
@@ -331,6 +329,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Build the expression parser with operator precedence
         let atom = term.clone().map(Expression::Term);
+
+        // Invocation expression (highest precedence)
+        let invocation_expr = atom.then(just('.').ignore_then(invocation));
 
         // Function call parameter parser - handles expressions inside function calls
         let function_param = recursive(|_| {
@@ -379,35 +380,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .padded() // Allow whitespace around parameters
             .separated_by(just(',').padded()) // Allow whitespace around commas
             .collect::<Vec<_>>();
-
-        // Invocation expression (highest precedence)
-        let invocation_expr = atom
-            .then(
-                just('.')
-                    .ignore_then(
-                        // Either a function call or a simple member access
-                        identifier.clone().then(
-                            just('(')
-                                .ignore_then(function_params.padded().or_not()) // Allow whitespace inside parentheses
-                                .then_ignore(just(')'))
-                                .or_not(),
-                        ),
-                    )
-                    .repeated(),
-            )
-            .map(|(expr, invocations)| {
-                invocations
-                    .into_iter()
-                    .fold(expr, |acc, (name, params_opt)| {
-                        if let Some(params) = params_opt {
-                            // It's a function call with parameters
-                            Expression::Invocation(Box::new(acc), format!("{}()", name))
-                        } else {
-                            // It's a simple member access
-                            Expression::Invocation(Box::new(acc), name)
-                        }
-                    })
-            });
 
         // Indexer expression
         let indexer_expr = choice((invocation_expr
