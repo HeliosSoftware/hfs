@@ -345,6 +345,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (highest precedence)
+        // Support for chained member invocations like Patient.name.given
         let invocation_expr = atom
             .clone()
             .then(
@@ -353,20 +354,24 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     .map(|inv| match inv {
                         Term::Invocation(i) => i,
                         _ => unreachable!(),
-                    }),
+                    })
+                    .repeated()
+                    .at_least(1),
             )
-            .map(|(expr, inv)| {
-                match inv {
-                    Invocation::Member(name) => Expression::Invocation(Box::new(expr), name),
-                    Invocation::Function(name, _params) => {
-                        // Handle function invocation after a dot (member function)
-                        Expression::Invocation(Box::new(expr), name)
+            .map(|(expr, invs)| {
+                invs.into_iter().fold(expr, |acc, inv| {
+                    match inv {
+                        Invocation::Member(name) => Expression::Invocation(Box::new(acc), name),
+                        Invocation::Function(name, _params) => {
+                            // Handle function invocation after a dot (member function)
+                            Expression::Invocation(Box::new(acc), name)
+                        }
+                        Invocation::This => unreachable!(),
+                        Invocation::Index => unreachable!(),
+                        Invocation::Total => unreachable!(),
+                        Invocation::MemberFunction(_, _) => unreachable!(),
                     }
-                    Invocation::This => unreachable!(),
-                    Invocation::Index => unreachable!(),
-                    Invocation::Total => unreachable!(),
-                    Invocation::MemberFunction(_, _) => unreachable!(),
-                }
+                })
             })
             .boxed();
 
