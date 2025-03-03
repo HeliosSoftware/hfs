@@ -320,7 +320,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Invocations
         let invocation = choice((
-            identifier.clone().map(Invocation::Member).map(Term::Invocation),
+            identifier
+                .clone()
+                .map(Invocation::Member)
+                .map(Term::Invocation),
             function.map(Term::Invocation),
             member_function.map(Term::Invocation),
             just("$this").to(Term::Invocation(Invocation::This)),
@@ -342,22 +345,30 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (highest precedence)
-        let invocation_expr = atom.clone().then(just('.').ignore_then(invocation.clone()).map(|inv| match inv {
-            Term::Invocation(i) => i,
-            _ => unreachable!(),
-        })).map(|(expr, inv)| {
-            match inv {
-                Invocation::Member(name) => Expression::Invocation(Box::new(expr), name),
-                Invocation::Function(name, _params) => {
-                    // Handle function invocation after a dot (member function)
-                    Expression::Invocation(Box::new(expr), name)
-                },
-                Invocation::This => unreachable!(),
-                Invocation::Index => unreachable!(),
-                Invocation::Total => unreachable!(),
-                Invocation::MemberFunction(_, _) => unreachable!(),
-            }
-        }).boxed();
+        let invocation_expr = atom
+            .clone()
+            .then(
+                just('.')
+                    .ignore_then(invocation.clone())
+                    .map(|inv| match inv {
+                        Term::Invocation(i) => i,
+                        _ => unreachable!(),
+                    }),
+            )
+            .map(|(expr, inv)| {
+                match inv {
+                    Invocation::Member(name) => Expression::Invocation(Box::new(expr), name),
+                    Invocation::Function(name, _params) => {
+                        // Handle function invocation after a dot (member function)
+                        Expression::Invocation(Box::new(expr), name)
+                    }
+                    Invocation::This => unreachable!(),
+                    Invocation::Index => unreachable!(),
+                    Invocation::Total => unreachable!(),
+                    Invocation::MemberFunction(_, _) => unreachable!(),
+                }
+            })
+            .boxed();
 
         // Function call parameter parser - handles expressions inside function calls
         let function_param = recursive(|_| {
@@ -408,16 +419,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .collect::<Vec<_>>();
 
         // Indexer expression
-        let indexer_expr = choice((
-            invocation_expr.clone(),
-            atom.clone(),
-        ))
-        .then(expr.clone().delimited_by(just('['), just(']')).repeated())
-        .map(|(expr, indices)| {
-            indices.into_iter().fold(expr, |acc, idx| {
-                Expression::Indexer(Box::new(acc), Box::new(idx))
-            })
-        });
+        let indexer_expr = choice((invocation_expr.clone(), atom.clone()))
+            .then(expr.clone().delimited_by(just('['), just(']')).repeated())
+            .map(|(expr, indices)| {
+                indices.into_iter().fold(expr, |acc, idx| {
+                    Expression::Indexer(Box::new(acc), Box::new(idx))
+                })
+            });
 
         // Polarity expression
         let polarity_expr = choice((
