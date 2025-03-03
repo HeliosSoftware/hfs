@@ -349,25 +349,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .clone()
             .then(
                 just('.')
-                    .ignore_then(choice((
-                        // Function invocation: expr.func(params)
-                        function.clone().map(|inv| {
-                            if let Invocation::Function(name, params) = inv {
-                                (name, Some(params))
-                            } else {
-                                unreachable!()
-                            }
-                        }),
-                        // Member invocation: expr.member
-                        identifier.clone().map(|name| (name, None)),
-                    )))
+                    .ignore_then(identifier.clone())
+                    .then(
+                        just('(')
+                            .ignore_then(param_list.clone().or_not())
+                            .then_ignore(just(')'))
+                            .or_not(),
+                    )
                     .repeated(),
             )
             .map(|(first, invocations)| {
                 invocations.into_iter().fold(first, |acc, (name, params)| {
                     if let Some(params) = params {
                         // It's a function invocation: expr.func(params)
-                        Expression::Invocation(Box::new(acc), format!("{}({})", name, params.len()))
+                        Expression::Invocation(
+                            Box::new(acc),
+                            format!("{}({})", name, params.unwrap_or_default().len()),
+                        )
                     } else {
                         // It's a member invocation: expr.member
                         Expression::Invocation(Box::new(acc), name)
