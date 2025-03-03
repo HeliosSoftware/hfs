@@ -324,7 +324,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .clone()
                 .map(Invocation::Member)
                 .map(Term::Invocation),
-            function.map(Term::Invocation),
+            function.clone().map(Term::Invocation),
             member_function.map(Term::Invocation),
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
