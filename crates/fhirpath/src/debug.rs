@@ -1,5 +1,6 @@
 use crate::parser::{Expression, parser};
 use chumsky::Parser;
+use chumsky::error::Simple;
 use std::fmt::Debug;
 
 /// A debug wrapper for the FHIRPath parser that logs parsing steps
@@ -24,7 +25,7 @@ pub fn debug_parse(input: &str) -> Result<Expression, Vec<String>> {
 }
 
 /// Trace execution of a parser with detailed logging
-pub fn trace_parse<T: Debug>(input: &str, parser_name: &str, parser_fn: impl Parser<char, T>) -> Result<T, Vec<String>> {
+pub fn trace_parse<T: Debug>(input: &str, parser_name: &str, parser_fn: impl Parser<char, T, Error = Simple<char>>) -> Result<T, Vec<String>> {
     println!("Tracing parser '{}' with input: {}", parser_name, input);
     
     let result = parser_fn.parse(input);
