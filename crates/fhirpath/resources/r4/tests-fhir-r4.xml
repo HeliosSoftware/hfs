@@ -757,11 +757,11 @@
 		<test name="testLessThan20" inputfile="patient-example.xml"><expression>@2014-12-13T12:00:01 &lt; @2014-12-13T12:00:00</expression><output type="boolean">false</output></test>
 		<test name="testLessThan21" inputfile="patient-example.xml"><expression>@T12:00:01 &lt; @T12:00:00</expression><output type="boolean">false</output></test>
     <test name="testLessThan22" inputfile="observation-example.xml"><expression>Observation.value &lt; 200 '[lb_av]'</expression><output type="boolean">true</output></test>
-		<test name="testLessThan23" inputfile="patient-example.xml"><expression>@2018-03 < @2018-03-01</expression></test>
-		<test name="testLessThan24" inputfile="patient-example.xml"><expression>@2018-03-01T10 < @2018-03-01T10:30</expression></test>
-		<test name="testLessThan25" inputfile="patient-example.xml"><expression>@T10 < @T10:30</expression></test>
-		<test name="testLessThan26" inputfile="patient-example.xml"><expression>@2018-03-01T10:30:00 < @2018-03-01T10:30:00.0</expression><output type="boolean">false</output></test>
-		<test name="testLessThan27" inputfile="patient-example.xml"><expression>@T10:30:00 < @T10:30:00.0</expression><output type="boolean">false</output></test>
+		<test name="testLessThan23" inputfile="patient-example.xml"><expression>@2018-03 &lt; @2018-03-01</expression></test>
+		<test name="testLessThan24" inputfile="patient-example.xml"><expression>@2018-03-01T10 &lt; @2018-03-01T10:30</expression></test>
+		<test name="testLessThan25" inputfile="patient-example.xml"><expression>@T10 &lt; @T10:30</expression></test>
+		<test name="testLessThan26" inputfile="patient-example.xml"><expression>@2018-03-01T10:30:00 &lt; @2018-03-01T10:30:00.0</expression><output type="boolean">false</output></test>
+		<test name="testLessThan27" inputfile="patient-example.xml"><expression>@T10:30:00 &lt; @T10:30:00.0</expression><output type="boolean">false</output></test>
   </group>
 
 	<group name="testLessOrEqual">
@@ -786,12 +786,12 @@
 		<test name="testLessOrEqual19" inputfile="patient-example.xml"><expression>@2014-12-13 &lt;= @2014-12-12</expression><output type="boolean">false</output></test>
 		<test name="testLessOrEqual20" inputfile="patient-example.xml"><expression>@2014-12-13T12:00:01 &lt;= @2014-12-13T12:00:00</expression><output type="boolean">false</output></test>
 		<test name="testLessOrEqual21" inputfile="patient-example.xml"><expression>@T12:00:01 &lt;= @T12:00:00</expression><output type="boolean">false</output></test>
-    <test name="testLessOrEqual22" inputfile="observation-example.xml"><expression>Observation.value &lt;= 200 '[lb_av]'</expression><output type="boolean">true</output></test>
-		<test name="testLessOrEqual23" inputfile="patient-example.xml"><expression>@2018-03 <= @2018-03-01</expression></test>
-		<test name="testLessOrEqual24" inputfile="patient-example.xml"><expression>@2018-03-01T10 <= @2018-03-01T10:30</expression></test>
-		<test name="testLessOrEqual25" inputfile="patient-example.xml"><expression>@T10 <= @T10:30</expression></test>
-		<test name="testLessOrEqual26" inputfile="patient-example.xml"><expression>@2018-03-01T10:30:00 <= @2018-03-01T10:30:00.0</expression><output type="boolean">true</output></test>
-		<test name="testLessOrEqual27" inputfile="patient-example.xml"><expression>@T10:30:00 <= @T10:30:00.0</expression><output type="boolean">true</output></test>
+                <test name="testLessOrEqual22" inputfile="observation-example.xml"><expression>Observation.value &lt;= 200 '[lb_av]'</expression><output type="boolean">true</output></test>
+		<test name="testLessOrEqual23" inputfile="patient-example.xml"><expression>@2018-03 &lt;= @2018-03-01</expression></test>
+		<test name="testLessOrEqual24" inputfile="patient-example.xml"><expression>@2018-03-01T10 &lt;= @2018-03-01T10:30</expression></test>
+		<test name="testLessOrEqual25" inputfile="patient-example.xml"><expression>@T10 &lt;= @T10:30</expression></test>
+		<test name="testLessOrEqual26" inputfile="patient-example.xml"><expression>@2018-03-01T10:30:00 &lt;= @2018-03-01T10:30:00.0</expression><output type="boolean">true</output></test>
+		<test name="testLessOrEqual27" inputfile="patient-example.xml"><expression>@T10:30:00 &lt;= @T10:30:00.0</expression><output type="boolean">true</output></test>
   </group>
 
 	<group name="testGreatorOrEqual">
@@ -1049,7 +1049,7 @@
   </group>
   
 	<group name="testPrecedence">
-    <test name="testPrecedence1" name="testUnaryPrecedence" inputfile="patient-example.xml">
+    <test name="testPrecedence1" inputfile="patient-example.xml">
       <expression invalid="semantic">-1.convertsToInteger()</expression>
       <!-- should error because unary does not work on boolean: -(1.convertsToInteger()) -->
     </test>
