@@ -90,7 +90,8 @@ fn test_multiple_expressions_from_file() {
         success_count,
         success_count + failure_count
     );
-    // We don't assert all must pass yet, as we're still developing the parser
+
+    assert!(failure_count == 0, "There are test failures.");
 }
 
 fn find_test_expressions(root: &Node) -> Vec<String> {
