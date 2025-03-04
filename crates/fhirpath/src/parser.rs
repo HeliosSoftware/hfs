@@ -435,11 +435,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Union expression
         let union_expr = type_expr
             .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone())) // Allow whitespace around '|'
+            .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
             .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, rhs| {
-                    Expression::Union(Box::new(lhs), Box::new(rhs))
-                })
+                if let Some(rest) = rest {
+                    Expression::Union(Box::new(first), Box::new(rest))
+                } else {
+                    first
+                }
             })
             .boxed();
 
