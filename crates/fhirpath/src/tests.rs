@@ -1,9 +1,25 @@
 use crate::parser::parser;
+use crate::debug::debug_parse;
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+
+#[test]
+fn test_debug_parse() {
+    let result = debug_parse("Patient.name.given");
+    assert!(result.is_ok(), "Failed to parse 'Patient.name.given': {:?}", result.err());
+    
+    // The expected structure should be:
+    // Expression::Invocation(
+    //   Expression::Invocation(
+    //     Expression::Term(Term::Invocation(Invocation::Member("Patient"))),
+    //     "name"
+    //   ),
+    //   "given"
+    // )
+}
 
 #[test]
 fn test_parse_simple_expressions() {
