@@ -333,7 +333,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Terms
         let term = choice((
-            invocation,
+            invocation.clone(),
             literal,
             external_constant,
             expr.clone()
@@ -345,32 +345,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
-        let invocation_expr =
-            atom.clone()
-                .then(just('.').then(invocation))
-                .map(|(expr, (_, invoc))| {
-                    match invoc {
-                        Term::Invocation(Invocation::Member(name)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        },
-                        Term::Invocation(Invocation::Function(name, params)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        },
-                        Term::Invocation(Invocation::MemberFunction(name, params)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        },
-                        Term::Invocation(Invocation::This) => {
-                            Expression::Invocation(Box::new(expr), "$this".to_string())
-                        },
-                        Term::Invocation(Invocation::Index) => {
-                            Expression::Invocation(Box::new(expr), "$index".to_string())
-                        },
-                        Term::Invocation(Invocation::Total) => {
-                            Expression::Invocation(Box::new(expr), "$total".to_string())
-                        },
-                        _ => unreachable!("Only invocations should be here")
-                    }
-                });
+        // AI! Need to return a Term::Invocation
+        let invocation_expr = atom.clone().then(just('.').then(invocation));
 
         // Indexer expression
         let indexer_expr = choice((invocation_expr, atom.clone()))
