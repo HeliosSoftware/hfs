@@ -46,7 +46,6 @@ pub enum Term {
 pub enum Invocation {
     Member(String),
     Function(String, Vec<Expression>),
-    MemberFunction(String, Vec<Expression>), // For member.function() syntax
     This,
     Index,
     Total,
@@ -81,14 +80,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
     // Recursive parser definition with explicit recursion limit
     recursive(|expr| {
         let expr = expr.boxed();
-        
+
         // Literals
         let null = just('{').then(just('}')).to(Literal::Null);
 
         let boolean = text::keyword("true")
             .to(Literal::Boolean(true))
-            .or(text::keyword("false")
-                .to(Literal::Boolean(false)));
+            .or(text::keyword("false").to(Literal::Boolean(false)));
 
         let string = just('\'')
             .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
@@ -310,16 +308,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(name, params)| Invocation::Function(name, params.unwrap_or_default()));
 
-        // Member function for handling member.function() syntax
-        let member_function = identifier
-            .clone()
-            .then(
-                just('(')
-                    .ignore_then(param_list.clone().or_not())
-                    .then_ignore(just(')')),
-            )
-            .map(|(name, params)| Invocation::MemberFunction(name, params.unwrap_or_default()));
-
         // Invocations
         let invocation = choice((
             identifier
@@ -327,7 +315,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .map(Invocation::Member)
                 .map(Term::Invocation),
             function.clone().map(Term::Invocation),
-            member_function.map(Term::Invocation),
             just("$this").to(Term::Invocation(Invocation::This)),
             just("$index").to(Term::Invocation(Invocation::Index)),
             just("$total").to(Term::Invocation(Invocation::Total)),
@@ -347,22 +334,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation) - supports chaining like Patient.name.given
-        let invocation_expr = atom.clone()
-            .then(
-                just('.')
-                .then(invocation)
-                .repeated()
-            )
+        let invocation_expr = atom
+            .clone()
+            .then(just('.').then(invocation).repeated())
             .map(|(initial_expr, invocations)| {
-                invocations.into_iter().fold(initial_expr, |expr, (_, invoc)| {
-                    match invoc {
+                invocations
+                    .into_iter()
+                    .fold(initial_expr, |expr, (_, invoc)| match invoc {
                         Term::Invocation(Invocation::Member(name)) => {
                             Expression::Invocation(Box::new(expr), name)
                         }
                         Term::Invocation(Invocation::Function(name, _)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        }
-                        Term::Invocation(Invocation::MemberFunction(name, _)) => {
                             Expression::Invocation(Box::new(expr), name)
                         }
                         Term::Invocation(Invocation::This) => {
@@ -375,12 +357,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                             Expression::Invocation(Box::new(expr), "$total".to_string())
                         }
                         _ => unreachable!("Only invocations should be here"),
-                    }
-                })
+                    })
             });
 
         // Indexer expression
-        let indexer_expr = choice((invocation_expr, atom.clone()))
+        let indexer_expr = invocation_expr
             .then(expr.clone().delimited_by(just('['), just(']')).repeated())
             .map(|(expr, indices)| {
                 indices.into_iter().fold(expr, |acc, idx| {
@@ -400,7 +381,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         .boxed();
 
         // Multiplicative expression
-        let op1 = choice((
+        let op = choice((
             just('*').to("*"),
             just('/').to("/"),
             text::keyword("div").to("div"),
@@ -410,7 +391,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let multiplicative_expr = polarity_expr
             .clone()
-            .then(op1.then(polarity_expr.clone()).repeated())
+            .then(op.then(polarity_expr.clone()).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -419,11 +400,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Additive expression
-        let op2 = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
+        let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
         let additive_expr = multiplicative_expr
             .clone()
-            .then(op2.then(multiplicative_expr.clone()).repeated())
+            .then(op.then(multiplicative_expr.clone()).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -454,7 +435,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Union expression
         let union_expr = type_expr
             .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone()).repeated()) // Allow whitespace around '|'
+            .then(just('|').padded().ignore_then(type_expr.clone())) // Allow whitespace around '|'
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, rhs| {
                     Expression::Union(Box::new(lhs), Box::new(rhs))
@@ -463,7 +444,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Inequality expression
-        let op3 = choice((
+        let op = choice((
             just("<=").to("<="),
             just("<").to("<"),
             just(">=").to(">="),
@@ -473,7 +454,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let inequality_expr = union_expr
             .clone()
-            .then(op3.then(union_expr.clone()).or_not())
+            .then(op.then(union_expr.clone()).or_not())
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
                     Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -484,7 +465,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Equality expression
-        let op4 = choice((
+        let op = choice((
             just("=").to("="),
             just("~").to("~"),
             just("!=").to("!="),
@@ -494,7 +475,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let equality_expr = inequality_expr
             .clone()
-            .then(op4.then(inequality_expr.clone()).or_not())
+            .then(op.then(inequality_expr.clone()).or_not())
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
                     Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -505,7 +486,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Membership expression
-        let op5 = choice((
+        let op = choice((
             text::keyword("in").to("in"),
             text::keyword("contains").to("contains"),
         ))
@@ -513,7 +494,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let membership_expr = equality_expr
             .clone()
-            .then(op5.then(equality_expr).or_not())
+            .then(op.then(equality_expr).or_not())
             .map(|(lhs, rhs)| {
                 if let Some((op, rhs)) = rhs {
                     Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
@@ -540,11 +521,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .boxed();
 
         // Or expression
-        let op6 = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
+        let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
         let or_expr = and_expr
             .clone()
-            .then(op6.then(and_expr).repeated())
+            .then(op.then(and_expr).repeated())
             .map(|(first, rest)| {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
