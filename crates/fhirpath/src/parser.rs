@@ -2,6 +2,8 @@ use chumsky::Parser;
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -76,22 +78,51 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
+    // Create a shared log buffer
+    let log_buffer = Arc::new(Mutex::new(String::new()));
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
     // Recursive parser definition with explicit recursion limit
     recursive(|expr| {
         let expr = expr.boxed();
+        // Helper function for logging parser progress
+        let log = |msg: &str, log_buffer: Arc<Mutex<String>>| {
+            let mut buffer = log_buffer.lock().unwrap();
+            buffer.push_str(msg);
+            buffer.push('\n');
+            println!("{}", msg);
+        };
+        
+        let log_buffer_clone = log_buffer.clone();
+        
         // Literals
-        let null = just('{').then(just('}')).to(Literal::Null);
+        let null = just('{').then(just('}')).inspect(move |_| {
+            log("Parsed null literal", log_buffer_clone.clone());
+        }).to(Literal::Null);
 
+        let log_buffer_clone = log_buffer.clone();
         let boolean = text::keyword("true")
+            .inspect(move |_| {
+                log("Parsed boolean true", log_buffer_clone.clone());
+            })
             .to(Literal::Boolean(true))
-            .or(text::keyword("false").to(Literal::Boolean(false)));
+            .or(text::keyword("false")
+                .inspect({
+                    let log_buffer_clone = log_buffer.clone();
+                    move |_| {
+                        log("Parsed boolean false", log_buffer_clone.clone());
+                    }
+                })
+                .to(Literal::Boolean(false)));
 
+        let log_buffer_clone = log_buffer.clone();
         let string = just('\'')
             .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
             .then_ignore(just('\''))
             .collect::<String>()
+            .inspect(move |s: &String| {
+                log(&format!("Parsed string literal: '{}'", s), log_buffer_clone.clone());
+            })
             .map(Literal::String);
 
         let number = text::int(10)
@@ -345,9 +376,35 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
+        let log_buffer_clone = log_buffer.clone();
         let invocation_expr =
             atom.clone()
                 .then(just('.').then(invocation))
+                .inspect(move |(expr, (_, invoc))| {
+                    match invoc {
+                        Term::Invocation(Invocation::Member(name)) => {
+                            log(&format!("Parsed member invocation: .{}", name), log_buffer_clone.clone());
+                        }
+                        Term::Invocation(Invocation::Function(name, params)) => {
+                            log(&format!("Parsed function invocation: .{}() with {} params", 
+                                name, params.len()), log_buffer_clone.clone());
+                        }
+                        Term::Invocation(Invocation::MemberFunction(name, params)) => {
+                            log(&format!("Parsed member function invocation: .{}() with {} params", 
+                                name, params.len()), log_buffer_clone.clone());
+                        }
+                        Term::Invocation(Invocation::This) => {
+                            log("Parsed $this invocation", log_buffer_clone.clone());
+                        }
+                        Term::Invocation(Invocation::Index) => {
+                            log("Parsed $index invocation", log_buffer_clone.clone());
+                        }
+                        Term::Invocation(Invocation::Total) => {
+                            log("Parsed $total invocation", log_buffer_clone.clone());
+                        }
+                        _ => {}
+                    }
+                })
                 .map(|(expr, (_, invoc))| match invoc {
                     Term::Invocation(Invocation::Member(name)) => {
                         Expression::Invocation(Box::new(expr), name)
@@ -561,7 +618,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             })
             .boxed();
 
-        implies_expr
+        // Return the final parser with logging
+        let log_buffer_clone = log_buffer.clone();
+        implies_expr.inspect(move |expr| {
+            log(&format!("Final parsed expression: {:?}", expr), log_buffer_clone.clone());
+        })
     })
     .then_ignore(end())
 }
