@@ -333,7 +333,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         // Terms
         let term = choice((
-            invocation.clone(),
+            invocation,
             literal,
             external_constant,
             expr.clone()
@@ -345,43 +345,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
-        let invocation_expr = atom
-            .clone()
-            .then(
-                just('.')
-                    .ignore_then(
-                        // Member invocation: expr.member
-                        identifier.clone().map(|name| (name, None))
-                        .or(
-                            // Function invocation: expr.func(params)
-                            identifier.clone()
-                                .then(
-                                    just('(')
-                                        .ignore_then(param_list.clone().or_not())
-                                        .then_ignore(just(')'))
-                                )
-                                .map(|(name, params)| (name, Some(params.unwrap_or_default())))
-                        )
-                    )
-                    .repeated(),
-            )
-            .map(|(first, invocations)| {
-                invocations.into_iter().fold(first, |acc, (name, params)| {
-                    if let Some(params) = params {
-                        // It's a function invocation: expr.func(params)
-                        Expression::Invocation(
-                            Box::new(acc),
-                            format!("{}({})", name, params.len()),
-                        )
-                    } else {
-                        // It's a member invocation: expr.member
-                        Expression::Invocation(Box::new(acc), name)
-                    }
-                })
-            });
+        let invocation_expr =
+            atom.clone()
+                .then(just('.').then(invocation))
+                .map(|(first, invocations)| {
+                    // AI! Add map implementation
+                });
 
         // Indexer expression
-        let indexer_expr = choice((invocation_expr.clone(), atom.clone()))
+        let indexer_expr = choice((invocation_expr, atom.clone()))
             .then(expr.clone().delimited_by(just('['), just(']')).repeated())
             .map(|(expr, indices)| {
                 indices.into_iter().fold(expr, |acc, idx| {
