@@ -335,7 +335,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Atom expression (basic building block)
-        //let atom = term.clone().map(Expression::Term);
+        let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
         let invocation_expr =
@@ -351,7 +351,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 });
 
         // Indexer expression
-        let indexer_expr = invocation_expr
+        let indexer_expr = expr.clone()
             .then(expr.clone().delimited_by(just('['), just(']')))
             .map(|(expr, indices)| Expression::Indexer(Box::new(expr), Box::new(indices)));
 
@@ -360,9 +360,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             just('+')
                 .or(just('-'))
                 .padded() // Allow whitespace after operator
-                .then(indexer_expr.clone())
+                .then(expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
-            indexer_expr.clone(),
+            expr.clone(),
         ));
 
         // Multiplicative expression
@@ -374,32 +374,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ))
         .padded(); // Allow whitespace around operators
 
-        let multiplicative_expr = polarity_expr
-            .clone()
-            .then(op.then(polarity_expr.clone()))
-            .map(|(lhs, (op, rhs))| {
-                Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+        let multiplicative_expr = expr.clone()
+            .then(op.then(expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
             });
 
         // Additive expression
         let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
-        let additive_expr = multiplicative_expr
-            .clone()
-            .then(op.then(multiplicative_expr.clone()))
-            .map(|(lhs, (op, rhs))| {
-                Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
-            })
-            .boxed();
+        let additive_expr = expr.clone()
+            .then(op.then(expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            });
 
-        let atom = term
-            .or(invocation_expr)
-            .or(indexer_expr)
-            .or(polarity_expr)
-            .or(multiplicative_expr)
-            .or(additive_expr);
-
-        additive_expr
+        // Start with the term and build up
+        atom
 
         /*
 
