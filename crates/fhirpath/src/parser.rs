@@ -297,6 +297,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         .ignore_then(choice((identifier.clone(), string_for_external)))
         .map(Term::ExternalConstant);
 
+    let type_specifier = qualified_identifier;
+
     // Recursive parser definition
     recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
@@ -357,15 +359,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(expr, indices)| Expression::Indexer(Box::new(expr), Box::new(indices)));
 
         // Polarity expression
-        let polarity_expr = choice((
-            just('+')
-                .or(just('-'))
-                .padded() // Allow whitespace after operator
-                .then(expr.clone())
-                .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
-            expr.clone(),
-        ));
-
+        /*  let polarity_expr = choice((
+                    just('+')
+                        .or(just('-'))
+                        .padded() // Allow whitespace after operator
+                        .then(expr.clone())
+                        .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
+                    expr.clone(),
+                ));
+        */
         // Multiplicative expression
         let op = choice((
             just('*').to("*"),
@@ -385,11 +387,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 });
 
         // Additive expression
-        let op = choice((
-            just('+').to("+"), 
-            just('-').to("-"), 
-            just('&').to("&")
-        )).padded(); // Allow whitespace around operators
+        let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
         let additive_expr =
             expr.clone()
@@ -400,31 +398,31 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                     })
                 });
 
+        // Type expression
+        let type_expr = expr
+            .clone()
+            .then(
+                choice((just("is"), just("as")))
+                    .padded() // Allow whitespace around 'is' and 'as'
+                    .then(type_specifier.clone())
+                    .or_not(),
+            )
+            .map(|(expr, type_op)| {
+                if let Some((_op, type_name)) = type_op {
+                    Expression::Type(Box::new(expr), type_name)
+                } else {
+                    expr
+                }
+            })
+            .boxed();
+
         // Start with the term and build up
-        atom
-
+        atom.or(invocation_expr)
+            .or(indexer_expr)
+            .or(multiplicative_expr)
+            .or(additive_expr)
+            .or(type_expr)
         /*
-
-                let type_specifier = qualified_identifier;
-
-                // Type expression
-                let type_expr = additive_expr
-                    .clone()
-                    .then(
-                        choice((just("is"), just("as")))
-                            .padded() // Allow whitespace around 'is' and 'as'
-                            .then(type_specifier.clone())
-                            .or_not(),
-                    )
-                    .map(|(expr, type_op)| {
-                        if let Some((_op, type_name)) = type_op {
-                            Expression::Type(Box::new(expr), type_name)
-                        } else {
-                            expr
-                        }
-                    })
-                    .boxed();
-
                 // Union expression
                 let union_expr = type_expr
                     .clone()
