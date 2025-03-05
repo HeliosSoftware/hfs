@@ -339,16 +339,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
-        let invocation_expr =
-            atom.clone()
-                .then(just('.').ignore_then(choice((
-                    identifier.clone().map(Invocation::Member),
-                    function.clone(),
-                    just("$this").to(Invocation::This),
-                    just("$index").to(Invocation::Index),
-                    just("$total").to(Invocation::Total),
-                ))))
-                .map(|(expr, invocation)| Expression::Invocation(Box::new(expr), invocation));
+        let invocation_expr = atom
+            .clone()
+            .then(just('.').ignore_then(invocation))
+            .map(|(expr, invocation)| Expression::Invocation(Box::new(expr), invocation));
 
         // Indexer expression
         let indexer_expr = invocation_expr
