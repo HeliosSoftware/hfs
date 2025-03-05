@@ -82,224 +82,223 @@ impl fmt::Display for Literal {
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
-    // Recursive parser definition with explicit recursion limit
-    recursive(|expr| {
-        let expr = expr.boxed();
 
-        // Literals
-        let null = just('{').then(just('}')).to(Literal::Null);
+    // Literals
+    let null = just('{').then(just('}')).to(Literal::Null);
 
-        let boolean = text::keyword("true")
-            .to(Literal::Boolean(true))
-            .or(text::keyword("false").to(Literal::Boolean(false)));
+    let boolean = text::keyword("true")
+        .to(Literal::Boolean(true))
+        .or(text::keyword("false").to(Literal::Boolean(false)));
 
-        let string = just('\'')
-            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('\''))
-            .collect::<String>()
-            .map(Literal::String);
+    let string = just('\'')
+        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+        .then_ignore(just('\''))
+        .collect::<String>()
+        .map(Literal::String);
 
-        let number = text::int(10)
-            .then(just('.').then(text::digits(10)).or_not())
-            .map(|(i, d)| {
-                if let Some((_, d)) = d {
-                    Literal::Number(format!("{}.{}", i, d).parse().unwrap())
-                } else {
-                    Literal::Number(i.parse().unwrap())
-                }
-            })
-            .padded(); // Allow whitespace around numbers
+    let number = text::int(10)
+        .then(just('.').then(text::digits(10)).or_not())
+        .map(|(i, d)| {
+            if let Some((_, d)) = d {
+                Literal::Number(format!("{}.{}", i, d).parse().unwrap())
+            } else {
+                Literal::Number(i.parse().unwrap())
+            }
+        })
+        .padded(); // Allow whitespace around numbers
 
-        let long_number = text::int(10)
-            .then(just('L').or_not())
-            .map(|(i, l)| {
-                if l.is_some() {
-                    Literal::LongNumber(i.parse().unwrap())
-                } else {
-                    Literal::LongNumber(i.parse().unwrap())
-                }
-            })
-            .padded(); // Allow whitespace around numbers
+    let long_number = text::int(10)
+        .then(just('L').or_not())
+        .map(|(i, l)| {
+            if l.is_some() {
+                Literal::LongNumber(i.parse().unwrap())
+            } else {
+                Literal::LongNumber(i.parse().unwrap())
+            }
+        })
+        .padded(); // Allow whitespace around numbers
 
-        // Date format: YYYY(-MM(-DD)?)?
-        // This handles all three valid formats: 1972, 1972-12, 1972-12-14
+    // Date format: YYYY(-MM(-DD)?)?
+    // This handles all three valid formats: 1972, 1972-12, 1972-12-14
 
-        // Year only: YYYY (4 digits)
-        let year_only = text::digits::<char, E>(10)
-            .repeated()
-            .exactly(4)
-            .collect::<String>();
+    // Year only: YYYY (4 digits)
+    let year_only = text::digits::<char, E>(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>();
 
-        // Year and month: YYYY-MM
-        let year_month = year_only
-            .clone()
-            .then(
-                just::<char, char, E>('-').ignore_then(
-                    text::digits::<char, E>(10)
-                        .repeated()
-                        .exactly(2)
-                        .collect::<String>(),
-                ),
-            )
-            .map(|(year, month)| format!("{}-{}", year, month));
+    // Year and month: YYYY-MM
+    let year_month = year_only
+        .clone()
+        .then(
+            just::<char, char, E>('-').ignore_then(
+                text::digits::<char, E>(10)
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>(),
+            ),
+        )
+        .map(|(year, month)| format!("{}-{}", year, month));
 
-        // Full date: YYYY-MM-DD
-        let full_date = year_month
-            .clone()
-            .then(
-                just::<char, char, E>('-').ignore_then(
-                    text::digits::<char, E>(10)
-                        .repeated()
-                        .exactly(2)
-                        .collect::<String>(),
-                ),
-            )
-            .map(|(year_month, day)| format!("{}-{}", year_month, day));
+    // Full date: YYYY-MM-DD
+    let full_date = year_month
+        .clone()
+        .then(
+            just::<char, char, E>('-').ignore_then(
+                text::digits::<char, E>(10)
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>(),
+            ),
+        )
+        .map(|(year_month, day)| format!("{}-{}", year_month, day));
 
-        // Combine all three formats with priority to the most specific match
-        let date_format = choice((full_date.clone(), year_month.clone(), year_only.clone()));
+    // Combine all three formats with priority to the most specific match
+    let date_format = choice((full_date.clone(), year_month.clone(), year_only.clone()));
 
-        // Time format: HH(:mm(:ss(.sss)?)?)?
-        let time_format = text::int::<char, E>(10)
-            .then(
-                just::<char, char, E>(':')
-                    .ignore_then(text::int::<char, E>(10))
-                    .then(
-                        just::<char, char, E>(':')
-                            .ignore_then(text::int::<char, E>(10))
-                            .then(
-                                just::<char, char, E>('.')
-                                    .ignore_then(
-                                        text::digits::<char, E>(10)
-                                            .repeated()
-                                            .at_least(1)
-                                            .collect::<String>(),
-                                    )
-                                    .or_not(),
-                            )
-                            .or_not(),
-                    )
-                    .or_not(),
-            )
-            .map(|(hour, min_sec)| {
-                let mut result = hour;
-                if let Some((min, sec_ms)) = min_sec {
+    // Time format: HH(:mm(:ss(.sss)?)?)?
+    let time_format = text::int::<char, E>(10)
+        .then(
+            just::<char, char, E>(':')
+                .ignore_then(text::int::<char, E>(10))
+                .then(
+                    just::<char, char, E>(':')
+                        .ignore_then(text::int::<char, E>(10))
+                        .then(
+                            just::<char, char, E>('.')
+                                .ignore_then(
+                                    text::digits::<char, E>(10)
+                                        .repeated()
+                                        .at_least(1)
+                                        .collect::<String>(),
+                                )
+                                .or_not(),
+                        )
+                        .or_not(),
+                )
+                .or_not(),
+        )
+        .map(|(hour, min_sec)| {
+            let mut result = hour;
+            if let Some((min, sec_ms)) = min_sec {
+                result.push(':');
+                result.push_str(&min);
+                if let Some((sec, ms)) = sec_ms {
                     result.push(':');
-                    result.push_str(&min);
-                    if let Some((sec, ms)) = sec_ms {
-                        result.push(':');
-                        result.push_str(&sec);
-                        if let Some(ms) = ms {
-                            result.push('.');
-                            result.push_str(&ms);
-                        }
+                    result.push_str(&sec);
+                    if let Some(ms) = ms {
+                        result.push('.');
+                        result.push_str(&ms);
                     }
                 }
-                result
-            });
+            }
+            result
+        });
 
-        // Timezone format: Z | (+|-)HH:mm
-        let timezone_format =
-            just::<char, char, E>('Z')
-                .to("Z".to_string())
-                .or(one_of::<char, &str, E>("+-")
-                    .map(|c: char| c.to_string())
-                    .then(text::int::<char, E>(10))
-                    .then(just::<char, char, E>(':'))
-                    .then(text::int::<char, E>(10))
-                    .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
+    // Timezone format: Z | (+|-)HH:mm
+    let timezone_format =
+        just::<char, char, E>('Z')
+            .to("Z".to_string())
+            .or(one_of::<char, &str, E>("+-")
+                .map(|c: char| c.to_string())
+                .then(text::int::<char, E>(10))
+                .then(just::<char, char, E>(':'))
+                .then(text::int::<char, E>(10))
+                .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-        // Create a parser for date literals
-        let date = just('@')
-            .ignore_then(date_format.clone())
-            .map(Literal::Date);
+    // Create a parser for date literals
+    let date = just('@')
+        .ignore_then(date_format.clone())
+        .map(Literal::Date);
 
-        // Create a parser for datetime literals
-        let datetime = just('@')
-            .ignore_then(date_format.clone())
-            .then(
-                just('T')
-                    .ignore_then(time_format.clone())
-                    .then(timezone_format.or_not()),
-            )
-            .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
+    // Create a parser for datetime literals
+    let datetime = just('@')
+        .ignore_then(date_format.clone())
+        .then(
+            just('T')
+                .ignore_then(time_format.clone())
+                .then(timezone_format.or_not()),
+        )
+        .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
 
-        // Create a parser for time literals
-        let time = just('@')
-            .then(just('T'))
-            .ignore_then(time_format)
-            .map(Literal::Time);
+    // Create a parser for time literals
+    let time = just('@')
+        .then(just('T'))
+        .ignore_then(time_format)
+        .map(Literal::Time);
 
-        let unit = text::ident().or(just('\'')
-            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('\''))
-            .collect::<String>());
+    let unit = text::ident().or(just('\'')
+        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+        .then_ignore(just('\''))
+        .collect::<String>());
 
-        let quantity = number.then(unit.or_not()).map(|(n, u)| {
-            if let Literal::Number(num) = n {
-                Literal::Quantity(num, u)
+    let quantity = number.then(unit.or_not()).map(|(n, u)| {
+        if let Literal::Number(num) = n {
+            Literal::Quantity(num, u)
+        } else {
+            unreachable!()
+        }
+    });
+
+    let literal = null
+        .or(boolean)
+        .or(string)
+        .or(number)
+        .or(long_number)
+        .or(datetime)
+        .or(date)
+        .or(time)
+        .or(quantity)
+        .map(Term::Literal);
+
+    // Identifiers
+    let identifier = choice((
+        text::ident(),
+        just('`')
+            .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
+            .then_ignore(just('`'))
+            .collect::<String>(),
+        text::keyword("as").to(String::from("as")),
+        text::keyword("contains").to(String::from("contains")),
+        text::keyword("in").to(String::from("in")),
+        text::keyword("is").to(String::from("is")),
+    ));
+
+    // Qualified identifier (for type specifiers)
+    let qualified_identifier = identifier
+        .clone()
+        .then(
+            just('.')
+                .ignore_then(identifier.clone())
+                .repeated()
+                .collect::<Vec<_>>(),
+        )
+        .map(|(first, rest)| {
+            if rest.is_empty() {
+                first
             } else {
-                unreachable!()
+                let mut result = first;
+                for part in rest {
+                    result.push_str(".");
+                    result.push_str(&part);
+                }
+                result
             }
         });
 
-        let literal = null
-            .or(boolean)
-            .or(string)
-            .or(number)
-            .or(long_number)
-            .or(datetime)
-            .or(date)
-            .or(time)
-            .or(quantity)
-            .map(Term::Literal);
+    // Create a separate string parser for external constants
+    let string_for_external = just('\'')
+        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+        .then_ignore(just('\''))
+        .collect::<String>();
 
-        // Identifiers
-        let identifier = choice((
-            text::ident(),
-            just('`')
-                .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
-                .then_ignore(just('`'))
-                .collect::<String>(),
-            text::keyword("as").to(String::from("as")),
-            text::keyword("contains").to(String::from("contains")),
-            text::keyword("in").to(String::from("in")),
-            text::keyword("is").to(String::from("is")),
-        ));
+    // External constants
+    let external_constant = just('%')
+        .ignore_then(choice((identifier.clone(), string_for_external)))
+        .map(Term::ExternalConstant);
 
-        // Qualified identifier (for type specifiers)
-        let qualified_identifier = identifier
-            .clone()
-            .then(
-                just('.')
-                    .ignore_then(identifier.clone())
-                    .repeated()
-                    .collect::<Vec<_>>(),
-            )
-            .map(|(first, rest)| {
-                if rest.is_empty() {
-                    first
-                } else {
-                    let mut result = first;
-                    for part in rest {
-                        result.push_str(".");
-                        result.push_str(&part);
-                    }
-                    result
-                }
-            });
-
-        // Create a separate string parser for external constants
-        let string_for_external = just('\'')
-            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('\''))
-            .collect::<String>();
-
-        // External constants
-        let external_constant = just('%')
-            .ignore_then(choice((identifier.clone(), string_for_external)))
-            .map(Term::ExternalConstant);
-
+    // Recursive parser definition
+    recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
 
@@ -336,20 +335,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Atom expression (basic building block)
-        let atom = term.clone().map(Expression::Term);
+        //let atom = term.clone().map(Expression::Term);
 
         // Invocation expression (expression.invocation)
-        let invocation_expr = atom
-            .clone()
-            .then(just('.').ignore_then(invocation))
-            .map(|(expr, invocation_term)| {
-                if let Term::Invocation(invocation) = invocation_term {
-                    Expression::Invocation(Box::new(expr), invocation)
-                } else {
-                    // This should never happen if our parser is correct
-                    panic!("Expected Term::Invocation but got something else")
-                }
-            });
+        let invocation_expr =
+            expr.clone()
+                .then(just('.').ignore_then(invocation))
+                .map(|(expr, invocation_term)| {
+                    if let Term::Invocation(invocation) = invocation_term {
+                        Expression::Invocation(Box::new(expr), invocation)
+                    } else {
+                        // This should never happen if our parser is correct
+                        panic!("Expected Term::Invocation but got something else")
+                    }
+                });
 
         // Indexer expression
         let indexer_expr = invocation_expr
@@ -392,6 +391,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
+
+        let atom = term
+            .or(invocation_expr)
+            .or(indexer_expr)
+            .or(polarity_expr)
+            .or(multiplicative_expr)
+            .or(additive_expr);
 
         additive_expr
 
