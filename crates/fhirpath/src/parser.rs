@@ -409,12 +409,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             )
             .map(|(expr, type_op)| {
                 if let Some((_op, type_name)) = type_op {
-                    Expression::Type(Box::new(expr), TypeSpecifier::QualifiedIdentifier(type_name))
+                    Expression::Type(
+                        Box::new(expr),
+                        TypeSpecifier::QualifiedIdentifier(type_name),
+                    )
                 } else {
                     expr
                 }
-            })
-            .boxed();
+            });
 
         // Start with the term and build up
         atom.or(invocation_expr)
