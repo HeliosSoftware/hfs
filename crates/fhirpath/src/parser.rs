@@ -357,7 +357,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             .map(|(expr, indices)| Expression::Indexer(Box::new(expr), Box::new(indices)));
 
         // Polarity expression
-        let polarity_expr = choice((
+        let polarity_expr: chumsky::combinator::Choice<_, Simple<char>> = choice((
             just('+')
                 .or(just('-'))
                 .padded() // Allow whitespace after operator
@@ -367,7 +367,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Multiplicative expression
-        let op = choice((
+        let op: chumsky::combinator::Padded<_, Simple<char>> = choice((
             just('*').to("*"),
             just('/').to("/"),
             text::keyword("div").to("div"),
@@ -385,7 +385,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 });
 
         // Additive expression
-        let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
+        let op: chumsky::combinator::Padded<_, Simple<char>> = choice((
+            just('+').to("+"), 
+            just('-').to("-"), 
+            just('&').to("&")
+        )).padded(); // Allow whitespace around operators
 
         let additive_expr =
             expr.clone()
