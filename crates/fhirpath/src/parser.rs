@@ -342,7 +342,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let invocation_expr = atom
             .clone()
             .then(just('.').ignore_then(invocation))
-            .map(|(expr, invocation)| Expression::Invocation(Box::new(expr), invocation));
+            .map(|(expr, invocation_term)| {
+                if let Term::Invocation(invocation) = invocation_term {
+                    Expression::Invocation(Box::new(expr), invocation)
+                } else {
+                    // This should never happen if our parser is correct
+                    panic!("Expected Term::Invocation but got something else")
+                }
+            });
 
         // Indexer expression
         let indexer_expr = invocation_expr
