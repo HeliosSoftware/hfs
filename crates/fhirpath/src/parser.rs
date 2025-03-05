@@ -19,12 +19,12 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     Term(Term),
-    Invocation(Box<Expression>, String),
+    Invocation(Box<Expression>, Invocation),
     Indexer(Box<Expression>, Box<Expression>),
     Polarity(char, Box<Expression>),
     Multiplicative(Box<Expression>, String, Box<Expression>),
     Additive(Box<Expression>, String, Box<Expression>),
-    Type(Box<Expression>, String),
+    Type(Box<Expression>, TypeSpecifier),
     Union(Box<Expression>, Box<Expression>),
     Inequality(Box<Expression>, String, Box<Expression>),
     Equality(Box<Expression>, String, Box<Expression>),
@@ -32,6 +32,11 @@ pub enum Expression {
     And(Box<Expression>, Box<Expression>),
     Or(Box<Expression>, String, Box<Expression>),
     Implies(Box<Expression>, Box<Expression>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeSpecifier {
+    QualifiedIdentifier(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -333,41 +338,33 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Atom expression (basic building block)
         let atom = term.clone().map(Expression::Term);
 
-        // Invocation expression (expression.invocation) - supports chaining like Patient.name.given
-        let invocation_expr = atom
-            .clone()
-            .then(just('.').then(invocation).repeated())
-            .map(|(initial_expr, invocations)| {
-                invocations
-                    .into_iter()
-                    .fold(initial_expr, |expr, (_, invoc)| match invoc {
-                        Term::Invocation(Invocation::Member(name)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        }
-                        Term::Invocation(Invocation::Function(name, _)) => {
-                            Expression::Invocation(Box::new(expr), name)
-                        }
-                        Term::Invocation(Invocation::This) => {
-                            Expression::Invocation(Box::new(expr), "$this".to_string())
-                        }
-                        Term::Invocation(Invocation::Index) => {
-                            Expression::Invocation(Box::new(expr), "$index".to_string())
-                        }
-                        Term::Invocation(Invocation::Total) => {
-                            Expression::Invocation(Box::new(expr), "$total".to_string())
-                        }
-                        _ => unreachable!("Only invocations should be here"),
-                    })
-            });
+        // Invocation expression (expression.invocation)
+        let invocation_expr =
+            atom.clone()
+                .then(just('.').then(invocation))
+                .map(|(expr, invocations)| match invocations {
+                    Term::Invocation(Invocation::Member(name)) => {
+                        Expression::Invocation(Box::new(expr), Invocation::Member(name))
+                    }
+                    Term::Invocation(Invocation::Function(name, exprs)) => {
+                        Expression::Invocation(Box::new(expr), Invocation::Function(name, exprs))
+                    }
+                    Term::Invocation(Invocation::This) => {
+                        Expression::Invocation(Box::new(expr), "$this".to_string())
+                    }
+                    Term::Invocation(Invocation::Index) => {
+                        Expression::Invocation(Box::new(expr), "$index".to_string())
+                    }
+                    Term::Invocation(Invocation::Total) => {
+                        Expression::Invocation(Box::new(expr), "$total".to_string())
+                    }
+                    _ => unreachable!("Only invocations should be here"),
+                });
 
         // Indexer expression
         let indexer_expr = invocation_expr
-            .then(expr.clone().delimited_by(just('['), just(']')).repeated())
-            .map(|(expr, indices)| {
-                indices.into_iter().fold(expr, |acc, idx| {
-                    Expression::Indexer(Box::new(acc), Box::new(idx))
-                })
-            });
+            .then(expr.clone().delimited_by(just('['), just(']')))
+            .map(|(expr, indices)| Expression::Indexer(Box::new(expr), Box::new(indices)));
 
         // Polarity expression
         let polarity_expr = choice((
@@ -377,8 +374,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 .then(indexer_expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
             indexer_expr.clone(),
-        ))
-        .boxed();
+        ));
 
         // Multiplicative expression
         let op = choice((
@@ -391,170 +387,170 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
         let multiplicative_expr = polarity_expr
             .clone()
-            .then(op.then(polarity_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            })
-            .boxed();
+            .then(op.then(polarity_expr.clone()))
+            .map(|(lhs, (op, rhs))| {
+                Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+            });
 
         // Additive expression
         let op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
         let additive_expr = multiplicative_expr
             .clone()
-            .then(op.then(multiplicative_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
+            .then(op.then(multiplicative_expr.clone()))
+            .map(|(lhs, (op, rhs))| {
+                Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
 
-        let type_specifier = qualified_identifier;
+        additive_expr
 
-        // Type expression
-        let type_expr = additive_expr
-            .clone()
-            .then(
-                choice((just("is"), just("as")))
-                    .padded() // Allow whitespace around 'is' and 'as'
-                    .then(type_specifier.clone())
-                    .or_not(),
-            )
-            .map(|(expr, type_op)| {
-                if let Some((_op, type_name)) = type_op {
-                    Expression::Type(Box::new(expr), type_name)
-                } else {
-                    expr
-                }
-            })
-            .boxed();
+        /*
 
-        // Union expression
-        let union_expr = type_expr
-            .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
-            .map(|(first, rest)| {
-                if let Some(rest) = rest {
-                    Expression::Union(Box::new(first), Box::new(rest))
-                } else {
-                    first
-                }
-            })
-            .boxed();
+                let type_specifier = qualified_identifier;
 
-        // Inequality expression
-        let op = choice((
-            just("<=").to("<="),
-            just("<").to("<"),
-            just(">=").to(">="),
-            just(">").to(">"),
-        ))
-        .padded(); // Allow whitespace around operators
+                // Type expression
+                let type_expr = additive_expr
+                    .clone()
+                    .then(
+                        choice((just("is"), just("as")))
+                            .padded() // Allow whitespace around 'is' and 'as'
+                            .then(type_specifier.clone())
+                            .or_not(),
+                    )
+                    .map(|(expr, type_op)| {
+                        if let Some((_op, type_name)) = type_op {
+                            Expression::Type(Box::new(expr), type_name)
+                        } else {
+                            expr
+                        }
+                    })
+                    .boxed();
 
-        let inequality_expr = union_expr
-            .clone()
-            .then(op.then(union_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            })
-            .boxed();
+                // Union expression
+                let union_expr = type_expr
+                    .clone()
+                    .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
+                    .map(|(first, rest)| {
+                        if let Some(rest) = rest {
+                            Expression::Union(Box::new(first), Box::new(rest))
+                        } else {
+                            first
+                        }
+                    })
+                    .boxed();
 
-        // Equality expression
-        let op = choice((
-            just("=").to("="),
-            just("~").to("~"),
-            just("!=").to("!="),
-            just("!~").to("!~"),
-        ))
-        .padded(); // Allow whitespace around operators
+                // Inequality expression
+                let op = choice((
+                    just("<=").to("<="),
+                    just("<").to("<"),
+                    just(">=").to(">="),
+                    just(">").to(">"),
+                ))
+                .padded(); // Allow whitespace around operators
 
-        let equality_expr = inequality_expr
-            .clone()
-            .then(op.then(inequality_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            })
-            .boxed();
+                let inequality_expr = union_expr
+                    .clone()
+                    .then(op.then(union_expr.clone()).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    })
+                    .boxed();
 
-        // Membership expression
-        let op = choice((
-            text::keyword("in").to("in"),
-            text::keyword("contains").to("contains"),
-        ))
-        .padded(); // Allow whitespace around operators
+                // Equality expression
+                let op = choice((
+                    just("=").to("="),
+                    just("~").to("~"),
+                    just("!=").to("!="),
+                    just("!~").to("!~"),
+                ))
+                .padded(); // Allow whitespace around operators
 
-        let membership_expr = equality_expr
-            .clone()
-            .then(op.then(equality_expr).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            })
-            .boxed();
+                let equality_expr = inequality_expr
+                    .clone()
+                    .then(op.then(inequality_expr.clone()).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    })
+                    .boxed();
 
-        // And expression
-        let and_expr = membership_expr
-            .clone()
-            .then(
-                text::keyword("and")
-                    .padded()
-                    .ignore_then(membership_expr)
-                    .repeated(),
-            ) // Allow whitespace around 'and'
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, rhs| {
-                    Expression::And(Box::new(lhs), Box::new(rhs))
-                })
-            })
-            .boxed();
+                // Membership expression
+                let op = choice((
+                    text::keyword("in").to("in"),
+                    text::keyword("contains").to("contains"),
+                ))
+                .padded(); // Allow whitespace around operators
 
-        // Or expression
-        let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
+                let membership_expr = equality_expr
+                    .clone()
+                    .then(op.then(equality_expr).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    })
+                    .boxed();
 
-        let or_expr = and_expr
-            .clone()
-            .then(op.then(and_expr).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            })
-            .boxed();
+                // And expression
+                let and_expr = membership_expr
+                    .clone()
+                    .then(
+                        text::keyword("and")
+                            .padded()
+                            .ignore_then(membership_expr)
+                            .repeated(),
+                    ) // Allow whitespace around 'and'
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, rhs| {
+                            Expression::And(Box::new(lhs), Box::new(rhs))
+                        })
+                    })
+                    .boxed();
 
-        // Implies expression
-        let implies_expr = or_expr
-            .clone()
-            .then(
-                text::keyword("implies")
-                    .padded()
-                    .ignore_then(or_expr)
-                    .or_not(),
-            ) // Allow whitespace around 'implies'
-            .map(|(lhs, rhs)| {
-                if let Some(rhs) = rhs {
-                    Expression::Implies(Box::new(lhs), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            })
-            .boxed();
+                // Or expression
+                let op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
-        // Return the final parser
-        implies_expr
+                let or_expr = and_expr
+                    .clone()
+                    .then(op.then(and_expr).repeated())
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        })
+                    })
+                    .boxed();
+
+                // Implies expression
+                let implies_expr = or_expr
+                    .clone()
+                    .then(
+                        text::keyword("implies")
+                            .padded()
+                            .ignore_then(or_expr)
+                            .or_not(),
+                    ) // Allow whitespace around 'implies'
+                    .map(|(lhs, rhs)| {
+                        if let Some(rhs) = rhs {
+                            Expression::Implies(Box::new(lhs), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    })
+                    .boxed();
+
+                // Return the final parser
+                implies_expr
+        */
     })
     .then_ignore(end())
 }
