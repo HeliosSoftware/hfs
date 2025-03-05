@@ -341,25 +341,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         // Invocation expression (expression.invocation)
         let invocation_expr =
             atom.clone()
-                .then(just('.').then(invocation))
-                .map(|(expr, invocations)| match invocations {
-                    Term::Invocation(Invocation::Member(name)) => {
-                        Expression::Invocation(Box::new(expr), Invocation::Member(name))
-                    }
-                    Term::Invocation(Invocation::Function(name, exprs)) => {
-                        Expression::Invocation(Box::new(expr), Invocation::Function(name, exprs))
-                    }
-                    Term::Invocation(Invocation::This) => {
-                        Expression::Invocation(Box::new(expr), "$this".to_string())
-                    }
-                    Term::Invocation(Invocation::Index) => {
-                        Expression::Invocation(Box::new(expr), "$index".to_string())
-                    }
-                    Term::Invocation(Invocation::Total) => {
-                        Expression::Invocation(Box::new(expr), "$total".to_string())
-                    }
-                    _ => unreachable!("Only invocations should be here"),
-                });
+                .then(just('.').ignore_then(choice((
+                    identifier.clone().map(Invocation::Member),
+                    function.clone(),
+                    just("$this").to(Invocation::This),
+                    just("$index").to(Invocation::Index),
+                    just("$total").to(Invocation::Total),
+                ))))
+                .map(|(expr, invocation)| Expression::Invocation(Box::new(expr), invocation));
 
         // Indexer expression
         let indexer_expr = invocation_expr
