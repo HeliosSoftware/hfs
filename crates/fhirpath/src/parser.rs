@@ -428,17 +428,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 })
             });
 
-        // Type expression - handles 'is' and 'as' as operators (not function calls)
-        // We've already handled function calls in the invocation chain
+        // Type expression - handles 'is' and 'as' as operators
+        // Since we've already handled function calls in the invocation chain,
+        // we can simply parse 'is' and 'as' as operators here
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((
-                    just("is").padded().not_followed_by(just('(')), // Ensure it's not a function call
-                    just("as").padded().not_followed_by(just('(')), // Ensure it's not a function call
-                ))
-                .then(type_specifier.clone())
-                .or_not(),
+                choice((just("is"), just("as")))
+                    .padded() // Allow whitespace around 'is' and 'as'
+                    .then(type_specifier.clone())
+                    .or_not(),
             )
             .map(|(expr, type_op)| {
                 if let Some((_op, type_name)) = type_op {
