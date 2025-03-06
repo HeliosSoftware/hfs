@@ -80,7 +80,7 @@ impl fmt::Display for Literal {
     }
 }
 
-pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
+pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
 
@@ -338,6 +338,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
     // Recursive parser definition
     recursive(|expr| {
+        let expr = expr.boxed();
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
 
@@ -536,7 +537,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Return the final parser
-        implies_expr
+        implies_expr.boxed()
     })
     .then_ignore(end())
+    .boxed()
 }
