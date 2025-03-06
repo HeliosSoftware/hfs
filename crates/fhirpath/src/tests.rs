@@ -29,6 +29,28 @@ fn test_debug_parse() {
 }
 
 #[test]
+fn test_date_formats() {
+    let date_expressions = vec![
+        "@2015",
+        "@2015.is(Date)",
+        "@2015-01",
+        "@2015-01-01",
+        "@T12:00",
+        "@2015T12:00",
+    ];
+    
+    for expr in date_expressions {
+        let result = parser().parse(expr);
+        assert!(
+            result.is_ok(),
+            "Failed to parse date expression: '{}', error: {:?}",
+            expr,
+            result.err()
+        );
+    }
+}
+
+#[test]
 fn test_parse_simple_expressions() {
     let test_cases = vec![
         "true",
@@ -39,6 +61,10 @@ fn test_parse_simple_expressions() {
         "true and false",
         "Patient.name.exists()",
         "name.take(2).given",
+        "@2015",
+        "@2015.is(Date)",
+        "@2015-01",
+        "@2015-01-01",
     ];
 
     for expr in test_cases {

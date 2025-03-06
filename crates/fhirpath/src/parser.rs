@@ -122,7 +122,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .padded(); // Allow whitespace around numbers
 
     // Date format: YYYY(-MM(-DD)?)?
-    // This handles all three valid formats: 1972, 1972-12, 1972-12-14
+    // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
+    // Also handles the format without dashes: @2015
 
     // Year only: YYYY (4 digits)
     let year_only = text::digits::<char, E>(10)
