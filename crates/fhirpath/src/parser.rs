@@ -300,6 +300,42 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
 
     let type_specifier = qualified_identifier.map(TypeSpecifier::QualifiedIdentifier);
 
+    // Define operators outside the recursive block
+    let multiplicative_op = choice((
+        just('*').to("*"),
+        just('/').to("/"),
+        text::keyword("div").to("div"),
+        text::keyword("mod").to("mod"),
+    ))
+    .padded(); // Allow whitespace around operators
+
+    let additive_op =
+        choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
+
+    let inequality_op = choice((
+        just("<=").to("<="),
+        just("<").to("<"),
+        just(">=").to(">="),
+        just(">").to(">"),
+    ))
+    .padded(); // Allow whitespace around operators
+
+    let equality_op = choice((
+        just("=").to("="),
+        just("~").to("~"),
+        just("!=").to("!="),
+        just("!~").to("!~"),
+    ))
+    .padded(); // Allow whitespace around operators
+
+    let membership_op = choice((
+        text::keyword("in").to("in"),
+        text::keyword("contains").to("contains"),
+    ))
+    .padded(); // Allow whitespace around operators
+
+    let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
+
     // Recursive parser definition
     recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
@@ -373,14 +409,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ));
 
         // Multiplicative expression - handles * / div mod
-        let multiplicative_op = choice((
-            just('*').to("*"),
-            just('/').to("/"),
-            text::keyword("div").to("div"),
-            text::keyword("mod").to("mod"),
-        ))
-        .padded(); // Allow whitespace around operators
-
         let multiplicative_expr = polarity_expr
             .clone()
             .then(multiplicative_op.then(polarity_expr.clone()).repeated())
@@ -391,9 +419,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Additive expression - handles + - &
-        let additive_op =
-            choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
-
         let additive_expr = multiplicative_expr
             .clone()
             .then(additive_op.then(multiplicative_expr.clone()).repeated())
@@ -433,14 +458,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Inequality expression - handles <= < > >=
-        let inequality_op = choice((
-            just("<=").to("<="),
-            just("<").to("<"),
-            just(">=").to(">="),
-            just(">").to(">"),
-        ))
-        .padded(); // Allow whitespace around operators
-
         let inequality_expr = union_expr
             .clone()
             .then(inequality_op.then(union_expr.clone()).or_not())
@@ -453,14 +470,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Equality expression - handles = ~ != !~
-        let equality_op = choice((
-            just("=").to("="),
-            just("~").to("~"),
-            just("!=").to("!="),
-            just("!~").to("!~"),
-        ))
-        .padded(); // Allow whitespace around operators
-
         let equality_expr = inequality_expr
             .clone()
             .then(equality_op.then(inequality_expr.clone()).or_not())
@@ -473,12 +482,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Membership expression - handles 'in' and 'contains'
-        let membership_op = choice((
-            text::keyword("in").to("in"),
-            text::keyword("contains").to("contains"),
-        ))
-        .padded(); // Allow whitespace around operators
-
         let membership_expr = equality_expr
             .clone()
             .then(membership_op.then(equality_expr.clone()).or_not())
@@ -506,8 +509,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Or expression - handles 'or' and 'xor'
-        let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
-
         let or_expr = and_expr
             .clone()
             .then(or_op.then(and_expr.clone()).repeated())
