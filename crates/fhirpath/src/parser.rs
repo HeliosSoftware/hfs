@@ -335,7 +335,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
+    // let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
     // Recursive parser definition
     recursive(|expr| {
@@ -448,7 +448,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .then(
                             type_specifier
                                 .clone()
-                                .delimited_by(just('(').padded(), just(')').padded())
+                                .delimited_by(just('(').padded(), just(')').padded()),
                         )
                         .map(|(op, type_name)| (op, type_name)),
                 ))
@@ -510,50 +510,53 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             });
 
-        // And expression - handles 'and'
-        let and_expr = membership_expr
-            .clone()
-            .then(
-                text::keyword("and")
-                    .padded()
-                    .ignore_then(membership_expr.clone())
-                    .repeated(),
-            ) // Allow whitespace around 'and'
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, rhs| {
-                    Expression::And(Box::new(lhs), Box::new(rhs))
-                })
-            });
+        membership_expr
+        /*
+                // And expression - handles 'and'
+                let and_expr = membership_expr
+                    .clone()
+                    .then(
+                        text::keyword("and")
+                            .padded()
+                            .ignore_then(membership_expr.clone())
+                            .repeated(),
+                    ) // Allow whitespace around 'and'
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, rhs| {
+                            Expression::And(Box::new(lhs), Box::new(rhs))
+                        })
+                    });
 
-        // Or expression - handles 'or' and 'xor'
-        let or_expr = and_expr
-            .clone()
-            .then(or_op.then(and_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            });
+                // Or expression - handles 'or' and 'xor'
+                let or_expr = and_expr
+                    .clone()
+                    .then(or_op.then(and_expr.clone()).repeated())
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        })
+                    });
 
-        // Implies expression - handles 'implies'
-        let implies_expr = or_expr
-            .clone()
-            .then(
-                text::keyword("implies")
-                    .padded()
-                    .ignore_then(or_expr.clone())
-                    .or_not(),
-            ) // Allow whitespace around 'implies'
-            .map(|(lhs, rhs)| {
-                if let Some(rhs) = rhs {
-                    Expression::Implies(Box::new(lhs), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Implies expression - handles 'implies'
+                let implies_expr = or_expr
+                    .clone()
+                    .then(
+                        text::keyword("implies")
+                            .padded()
+                            .ignore_then(or_expr.clone())
+                            .or_not(),
+                    ) // Allow whitespace around 'implies'
+                    .map(|(lhs, rhs)| {
+                        if let Some(rhs) = rhs {
+                            Expression::Implies(Box::new(lhs), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        // Return the final parser
-        implies_expr
+                // Return the final parser
+                implies_expr
+        */
     })
     .then_ignore(end())
 }
