@@ -302,7 +302,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .ignore_then(choice((identifier.clone(), string_for_external)))
         .map(Term::ExternalConstant);
 
-    let type_specifier = qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier);
+    let type_specifier = qualified_identifier
+        .clone()
+        .map(TypeSpecifier::QualifiedIdentifier);
 
     // Define operators outside the recursive block
     let multiplicative_op = choice((
@@ -337,7 +339,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    // let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
+    let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
     // Recursive parser definition - limit recursion depth to prevent stack overflow
     recursive(|expr| {
@@ -366,7 +368,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             just("$this").to(Invocation::This),
             just("$index").to(Invocation::Index),
             just("$total").to(Invocation::Total),
-        )).boxed();
+        ))
+        .boxed();
 
         // Term - following the grammar rule for 'term'
         let term = choice((
@@ -376,7 +379,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             expr.clone()
                 .delimited_by(just('('), just(')'))
                 .map(|e| Term::Parenthesized(Box::new(e))),
-        )).boxed();
+        ))
+        .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
         let atom = term.clone().map(Expression::Term).boxed();
@@ -453,20 +457,30 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .then(type_specifier.clone())
                         .map(|(op, type_name)| (op, type_name)),
                     // Handle is/as followed by parenthesized type name - special case
-                    just("is").padded()
+                    just("is")
+                        .padded()
                         .then(
                             just('(')
                                 .padded()
-                                .ignore_then(qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier))
-                                .then_ignore(just(')').padded())
+                                .ignore_then(
+                                    qualified_identifier
+                                        .clone()
+                                        .map(TypeSpecifier::QualifiedIdentifier),
+                                )
+                                .then_ignore(just(')').padded()),
                         )
                         .map(|(op, type_name)| (op, type_name)),
-                    just("as").padded()
+                    just("as")
+                        .padded()
                         .then(
                             just('(')
                                 .padded()
-                                .ignore_then(qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier))
-                                .then_ignore(just(')').padded())
+                                .ignore_then(
+                                    qualified_identifier
+                                        .clone()
+                                        .map(TypeSpecifier::QualifiedIdentifier),
+                                )
+                                .then_ignore(just(')').padded()),
                         )
                         .map(|(op, type_name)| (op, type_name)),
                 ))
@@ -533,53 +547,50 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
 
-        membership_expr
-        /*
-                // And expression - handles 'and'
-                let and_expr = membership_expr
-                    .clone()
-                    .then(
-                        text::keyword("and")
-                            .padded()
-                            .ignore_then(membership_expr.clone())
-                            .repeated(),
-                    ) // Allow whitespace around 'and'
-                    .map(|(first, rest)| {
-                        rest.into_iter().fold(first, |lhs, rhs| {
-                            Expression::And(Box::new(lhs), Box::new(rhs))
-                        })
-                    });
+        // And expression - handles 'and'
+        let and_expr = membership_expr
+            .clone()
+            .then(
+                text::keyword("and")
+                    .padded()
+                    .ignore_then(membership_expr.clone())
+                    .repeated(),
+            ) // Allow whitespace around 'and'
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, rhs| {
+                    Expression::And(Box::new(lhs), Box::new(rhs))
+                })
+            });
 
-                // Or expression - handles 'or' and 'xor'
-                let or_expr = and_expr
-                    .clone()
-                    .then(or_op.then(and_expr.clone()).repeated())
-                    .map(|(first, rest)| {
-                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                        })
-                    });
+        // Or expression - handles 'or' and 'xor'
+        let or_expr = and_expr
+            .clone()
+            .then(or_op.then(and_expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            });
 
-                // Implies expression - handles 'implies'
-                let implies_expr = or_expr
-                    .clone()
-                    .then(
-                        text::keyword("implies")
-                            .padded()
-                            .ignore_then(or_expr.clone())
-                            .or_not(),
-                    ) // Allow whitespace around 'implies'
-                    .map(|(lhs, rhs)| {
-                        if let Some(rhs) = rhs {
-                            Expression::Implies(Box::new(lhs), Box::new(rhs))
-                        } else {
-                            lhs
-                        }
-                    });
+        // Implies expression - handles 'implies'
+        let implies_expr = or_expr
+            .clone()
+            .then(
+                text::keyword("implies")
+                    .padded()
+                    .ignore_then(or_expr.clone())
+                    .or_not(),
+            ) // Allow whitespace around 'implies'
+            .map(|(lhs, rhs)| {
+                if let Some(rhs) = rhs {
+                    Expression::Implies(Box::new(lhs), Box::new(rhs))
+                } else {
+                    lhs
+                }
+            });
 
-                // Return the final parser
-                implies_expr
-        */
+        // Return the final parser
+        implies_expr
     })
     .then_ignore(end())
 }
