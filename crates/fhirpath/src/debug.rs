@@ -12,7 +12,8 @@ pub fn debug_parse(input: &str) -> Result<Expression, Vec<String>> {
     
     match &result {
         Ok(expr) => {
-            println!("Successfully parsed: {:?}", expr);
+            // Don't print the full expression to avoid deep recursion in Debug formatting
+            println!("Successfully parsed expression");
         }
         Err(errors) => {
             println!("Parse errors:");

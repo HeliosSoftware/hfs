@@ -338,13 +338,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
-    // Recursive parser definition
+    // Recursive parser definition - limit recursion depth to prevent stack overflow
     recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr
             .clone()
             .separated_by(just(',').padded())
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .boxed();
 
         // Function invocation
         let function = identifier
@@ -354,7 +355,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     .ignore_then(param_list.clone().or_not().map(|p| p.unwrap_or_default()))
                     .then_ignore(just(')')),
             )
-            .map(|(name, params)| Invocation::Function(name, params));
+            .map(|(name, params)| Invocation::Function(name, params))
+            .boxed();
 
         // Member invocation
         let member_invocation = choice((
@@ -363,7 +365,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             just("$this").to(Invocation::This),
             just("$index").to(Invocation::Index),
             just("$total").to(Invocation::Total),
-        ));
+        )).boxed();
 
         // Term - following the grammar rule for 'term'
         let term = choice((
@@ -373,10 +375,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             expr.clone()
                 .delimited_by(just('('), just(')'))
                 .map(|e| Term::Parenthesized(Box::new(e))),
-        ));
+        )).boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        let atom = term.clone().map(Expression::Term);
+        let atom = term.clone().map(Expression::Term).boxed();
 
         // Invocation chain - handles expression.invocation
         // This needs to handle function calls including 'is' as a function name
@@ -387,7 +389,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 invocations.into_iter().fold(first, |expr, invocation| {
                     Expression::Invocation(Box::new(expr), invocation)
                 })
-            });
+            })
+            .boxed();
 
         // Indexer expression - handles expression[expression]
         let indexer_expr = invocation_chain
@@ -402,7 +405,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 indices.into_iter().fold(first, |expr, (idx,)| {
                     Expression::Indexer(Box::new(expr), Box::new(idx))
                 })
-            });
+            })
+            .boxed();
 
         // Polarity expression - handles +/- expression
         let polarity_expr = choice((
@@ -412,7 +416,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(indexer_expr.clone())
                 .map(|(op, expr)| Expression::Polarity(op, Box::new(expr))),
             indexer_expr.clone(),
-        ));
+        ))
+        .boxed();
 
         // Multiplicative expression - handles * / div mod
         let multiplicative_expr = polarity_expr
@@ -422,7 +427,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
                 })
-            });
+            })
+            .boxed();
 
         // Additive expression - handles + - &
         let additive_expr = multiplicative_expr
@@ -432,7 +438,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 rest.into_iter().fold(first, |lhs, (op, rhs)| {
                     Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
                 })
-            });
+            })
+            .boxed();
 
         // Type expression - handles 'is' and 'as' as operators
         // We need to be careful not to confuse this with function calls
@@ -470,7 +477,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 } else {
                     expr
                 }
-            });
+            })
+            .boxed();
 
         // Union expression - handles |
         let union_expr = type_expr
@@ -482,7 +490,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 } else {
                     first
                 }
-            });
+            })
+            .boxed();
 
         // Inequality expression - handles <= < > >=
         let inequality_expr = union_expr
@@ -494,7 +503,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 } else {
                     lhs
                 }
-            });
+            })
+            .boxed();
 
         // Equality expression - handles = ~ != !~
         let equality_expr = inequality_expr
@@ -506,7 +516,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 } else {
                     lhs
                 }
-            });
+            })
+            .boxed();
 
         // Membership expression - handles 'in' and 'contains'
         let membership_expr = equality_expr
@@ -518,7 +529,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 } else {
                     lhs
                 }
-            });
+            })
+            .boxed();
 
         membership_expr
         /*
