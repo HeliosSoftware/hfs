@@ -338,12 +338,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation chain - handles expression.invocation
-        let invocation_chain = atom.clone()
-            .then(
-                just('.')
-                    .ignore_then(member_invocation.clone())
-                    .repeated()
-            )
+        let invocation_chain = atom
+            .clone()
+            .then(just('.').ignore_then(member_invocation.clone()).repeated())
             .map(|(first, invocations)| {
                 invocations.into_iter().fold(first, |expr, invocation| {
                     Expression::Invocation(Box::new(expr), invocation)
@@ -351,12 +348,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Indexer expression - handles expression[expression]
-        let indexer_expr = invocation_chain.clone()
+        let indexer_expr = invocation_chain
+            .clone()
             .then(
                 expr.clone()
                     .delimited_by(just('['), just(']'))
                     .map(|idx| (idx,))
-                    .repeated()
+                    .repeated(),
             )
             .map(|(first, indices)| {
                 indices.into_iter().fold(first, |expr, (idx,)| {
@@ -383,30 +381,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
         ))
         .padded(); // Allow whitespace around operators
 
-        let multiplicative_expr =
-            polarity_expr.clone()
-                .then(multiplicative_op.then(polarity_expr.clone()).repeated())
-                .map(|(first, rest)| {
-                    rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                        Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    })
-                });
+        let multiplicative_expr = polarity_expr
+            .clone()
+            .then(multiplicative_op.then(polarity_expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            });
 
         // Additive expression - handles + - &
-        let additive_op = choice((
-            just('+').to("+"), 
-            just('-').to("-"), 
-            just('&').to("&")
-        )).padded(); // Allow whitespace around operators
+        let additive_op =
+            choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
-        let additive_expr =
-            multiplicative_expr.clone()
-                .then(additive_op.then(multiplicative_expr.clone()).repeated())
-                .map(|(first, rest)| {
-                    rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                        Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
-                    })
-                });
+        let additive_expr = multiplicative_expr
+            .clone()
+            .then(additive_op.then(multiplicative_expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            });
 
         // Type expression - handles 'is' and 'as'
         let type_expr = additive_expr
@@ -511,10 +506,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
             });
 
         // Or expression - handles 'or' and 'xor'
-        let or_op = choice((
-            text::keyword("or").to("or"), 
-            text::keyword("xor").to("xor")
-        )).padded(); // Allow whitespace around operators
+        let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
         let or_expr = and_expr
             .clone()
@@ -542,17 +534,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> {
                 }
             });
 
-        // Lambda expression - handles identifier => expression
-        let lambda_expr = identifier
-            .clone()
-            .or_not()
-            .then_ignore(just("=>").padded())
-            .then(implies_expr.clone())
-            .map(|(ident, expr)| Expression::Lambda(ident, Box::new(expr)))
-            .or(implies_expr);
-
         // Return the final parser
-        lambda_expr
+        implies_expr
     })
     .then_ignore(end())
 }
