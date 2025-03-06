@@ -443,12 +443,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     choice((just("is").padded(), just("as").padded()))
                         .then(type_specifier.clone())
                         .map(|(op, type_name)| (op, type_name)),
-                    // Handle is/as followed by parenthesized type name
-                    choice((just("is").padded(), just("as").padded()))
+                    // Handle is/as followed by parenthesized type name - special case
+                    just("is").padded()
                         .then(
-                            type_specifier
-                                .clone()
-                                .delimited_by(just('(').padded(), just(')').padded()),
+                            just('(')
+                                .padded()
+                                .ignore_then(qualified_identifier.map(TypeSpecifier::QualifiedIdentifier))
+                                .then_ignore(just(')').padded())
+                        )
+                        .map(|(op, type_name)| (op, type_name)),
+                    just("as").padded()
+                        .then(
+                            just('(')
+                                .padded()
+                                .ignore_then(qualified_identifier.map(TypeSpecifier::QualifiedIdentifier))
+                                .then_ignore(just(')').padded())
                         )
                         .map(|(op, type_name)| (op, type_name)),
                 ))

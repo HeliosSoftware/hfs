@@ -8,14 +8,24 @@ use std::path::PathBuf;
 
 #[test]
 fn test_debug_parse() {
-    let result = debug_parse("Observation.value.is(Quantity)");
+    let expr = "Observation.value.is(Quantity)";
+    let result = debug_parse(expr);
     assert!(
         result.is_ok(),
-        "Failed to parse 'Observation.value.is(Quantity)': {:?}",
+        "Failed to parse '{}': {:?}",
+        expr,
         result.err()
     );
-    //    let result = debug_parse("Patient.name.given");
-    //    assert!(result.is_ok(), "Failed to parse 'Patient.name.given': {:?}", result.err());
+    
+    // Add a simpler test case to help with debugging
+    let simple_expr = "Patient.name.given";
+    let simple_result = debug_parse(simple_expr);
+    assert!(
+        simple_result.is_ok(),
+        "Failed to parse '{}': {:?}",
+        simple_expr,
+        simple_result.err()
+    );
 }
 
 #[test]

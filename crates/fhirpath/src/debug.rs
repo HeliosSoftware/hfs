@@ -7,6 +7,7 @@ use std::fmt::Debug;
 pub fn debug_parse(input: &str) -> Result<Expression, Vec<String>> {
     println!("Parsing input: {}", input);
     
+    // Use a non-recursive approach to avoid stack overflow
     let result = parser().parse(input);
     
     match &result {
