@@ -81,6 +81,8 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
+    // Enable this for debugging
+    // println!("Creating FHIRPath parser");
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
 
@@ -338,17 +340,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Recursive parser definition
     recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
-        let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
+        let param_list = expr
+            .clone()
+            .separated_by(just(',').padded())
+            .collect::<Vec<_>>();
 
         // Function invocation
         let function = identifier
             .clone()
             .then(
                 just('(')
-                    .ignore_then(param_list.clone().or_not())
+                    .ignore_then(param_list.clone().or_not().map(|p| p.unwrap_or_default()))
                     .then_ignore(just(')')),
             )
-            .map(|(name, params)| Invocation::Function(name, params.unwrap_or_default()));
+            .map(|(name, params)| Invocation::Function(name, params));
 
         // Member invocation
         let member_invocation = choice((
@@ -429,15 +434,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             });
 
         // Type expression - handles 'is' and 'as' as operators
-        // Since we've already handled function calls in the invocation chain,
-        // we can simply parse 'is' and 'as' as operators here
+        // We need to be careful not to confuse this with function calls
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((just("is"), just("as")))
-                    .padded() // Allow whitespace around 'is' and 'as'
-                    .then(type_specifier.clone())
-                    .or_not(),
+                choice((
+                    just("is").padded(),
+                    just("as").padded(),
+                ))
+                .then(type_specifier.clone())
+                .or_not(),
             )
             .map(|(expr, type_op)| {
                 if let Some((_op, type_name)) = type_op {
