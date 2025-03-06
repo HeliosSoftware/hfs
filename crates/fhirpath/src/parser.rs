@@ -287,7 +287,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
                 result
             }
-        });
+        })
+        .boxed(); // Box the parser to make it easier to clone
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
@@ -300,7 +301,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .ignore_then(choice((identifier.clone(), string_for_external)))
         .map(Term::ExternalConstant);
 
-    let type_specifier = qualified_identifier.map(TypeSpecifier::QualifiedIdentifier);
+    let type_specifier = qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier);
 
     // Define operators outside the recursive block
     let multiplicative_op = choice((
@@ -448,7 +449,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .then(
                             just('(')
                                 .padded()
-                                .ignore_then(qualified_identifier.map(TypeSpecifier::QualifiedIdentifier))
+                                .ignore_then(qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier))
                                 .then_ignore(just(')').padded())
                         )
                         .map(|(op, type_name)| (op, type_name)),
@@ -456,7 +457,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .then(
                             just('(')
                                 .padded()
-                                .ignore_then(qualified_identifier.map(TypeSpecifier::QualifiedIdentifier))
+                                .ignore_then(qualified_identifier.clone().map(TypeSpecifier::QualifiedIdentifier))
                                 .then_ignore(just(')').padded())
                         )
                         .map(|(op, type_name)| (op, type_name)),
