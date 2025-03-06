@@ -309,8 +309,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    let additive_op =
-        choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
+    let additive_op = choice((just('+').to("+"), just('-').to("-"), just('&').to("&"))).padded(); // Allow whitespace around operators
 
     let inequality_op = choice((
         just("<=").to("<="),
@@ -338,7 +337,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Recursive parser definition
     recursive(|expr| {
-        let expr = expr.boxed();
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr.clone().separated_by(just(',')).collect::<Vec<_>>();
 
@@ -446,99 +444,101 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             });
 
-        // Union expression - handles |
-        let union_expr = type_expr
-            .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
-            .map(|(first, rest)| {
-                if let Some(rest) = rest {
-                    Expression::Union(Box::new(first), Box::new(rest))
-                } else {
-                    first
-                }
-            });
+        type_expr
+        /*
+                // Union expression - handles |
+                let union_expr = type_expr
+                    .clone()
+                    .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
+                    .map(|(first, rest)| {
+                        if let Some(rest) = rest {
+                            Expression::Union(Box::new(first), Box::new(rest))
+                        } else {
+                            first
+                        }
+                    });
 
-        // Inequality expression - handles <= < > >=
-        let inequality_expr = union_expr
-            .clone()
-            .then(inequality_op.then(union_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Inequality expression - handles <= < > >=
+                let inequality_expr = union_expr
+                    .clone()
+                    .then(inequality_op.then(union_expr.clone()).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        // Equality expression - handles = ~ != !~
-        let equality_expr = inequality_expr
-            .clone()
-            .then(equality_op.then(inequality_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Equality expression - handles = ~ != !~
+                let equality_expr = inequality_expr
+                    .clone()
+                    .then(equality_op.then(inequality_expr.clone()).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        // Membership expression - handles 'in' and 'contains'
-        let membership_expr = equality_expr
-            .clone()
-            .then(membership_op.then(equality_expr.clone()).or_not())
-            .map(|(lhs, rhs)| {
-                if let Some((op, rhs)) = rhs {
-                    Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Membership expression - handles 'in' and 'contains'
+                let membership_expr = equality_expr
+                    .clone()
+                    .then(membership_op.then(equality_expr.clone()).or_not())
+                    .map(|(lhs, rhs)| {
+                        if let Some((op, rhs)) = rhs {
+                            Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        // And expression - handles 'and'
-        let and_expr = membership_expr
-            .clone()
-            .then(
-                text::keyword("and")
-                    .padded()
-                    .ignore_then(membership_expr.clone())
-                    .repeated(),
-            ) // Allow whitespace around 'and'
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, rhs| {
-                    Expression::And(Box::new(lhs), Box::new(rhs))
-                })
-            });
+                // And expression - handles 'and'
+                let and_expr = membership_expr
+                    .clone()
+                    .then(
+                        text::keyword("and")
+                            .padded()
+                            .ignore_then(membership_expr.clone())
+                            .repeated(),
+                    ) // Allow whitespace around 'and'
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, rhs| {
+                            Expression::And(Box::new(lhs), Box::new(rhs))
+                        })
+                    });
 
-        // Or expression - handles 'or' and 'xor'
-        let or_expr = and_expr
-            .clone()
-            .then(or_op.then(and_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            });
+                // Or expression - handles 'or' and 'xor'
+                let or_expr = and_expr
+                    .clone()
+                    .then(or_op.then(and_expr.clone()).repeated())
+                    .map(|(first, rest)| {
+                        rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                            Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+                        })
+                    });
 
-        // Implies expression - handles 'implies'
-        let implies_expr = or_expr
-            .clone()
-            .then(
-                text::keyword("implies")
-                    .padded()
-                    .ignore_then(or_expr.clone())
-                    .or_not(),
-            ) // Allow whitespace around 'implies'
-            .map(|(lhs, rhs)| {
-                if let Some(rhs) = rhs {
-                    Expression::Implies(Box::new(lhs), Box::new(rhs))
-                } else {
-                    lhs
-                }
-            });
+                // Implies expression - handles 'implies'
+                let implies_expr = or_expr
+                    .clone()
+                    .then(
+                        text::keyword("implies")
+                            .padded()
+                            .ignore_then(or_expr.clone())
+                            .or_not(),
+                    ) // Allow whitespace around 'implies'
+                    .map(|(lhs, rhs)| {
+                        if let Some(rhs) = rhs {
+                            Expression::Implies(Box::new(lhs), Box::new(rhs))
+                        } else {
+                            lhs
+                        }
+                    });
 
-        // Return the final parser
-        implies_expr.boxed()
+                // Return the final parser
+                implies_expr
+        */
     })
     .then_ignore(end())
-    .boxed()
 }
