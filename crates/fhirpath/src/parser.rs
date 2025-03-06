@@ -373,6 +373,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let atom = term.clone().map(Expression::Term);
 
         // Invocation chain - handles expression.invocation
+        // This needs to handle function calls including 'is' as a function name
         let invocation_chain = atom
             .clone()
             .then(just('.').ignore_then(member_invocation.clone()).repeated())
@@ -427,14 +428,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 })
             });
 
-        // Type expression - handles 'is' and 'as'
+        // Type expression - handles 'is' and 'as' as operators (not function calls)
+        // We've already handled function calls in the invocation chain
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((just("is"), just("as")))
-                    .padded() // Allow whitespace around 'is' and 'as'
-                    .then(type_specifier.clone())
-                    .or_not(),
+                choice((
+                    just("is").padded().not_followed_by(just('(')), // Ensure it's not a function call
+                    just("as").padded().not_followed_by(just('(')), // Ensure it's not a function call
+                ))
+                .then(type_specifier.clone())
+                .or_not(),
             )
             .map(|(expr, type_op)| {
                 if let Some((_op, type_name)) = type_op {
