@@ -438,12 +438,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((
-                    just("is").padded(),
-                    just("as").padded(),
-                ))
-                .then(type_specifier.clone())
-                .or_not(),
+                choice((just("is").padded(), just("as").padded()))
+                    .then(type_specifier.clone())
+                    .or_not(),
             )
             .map(|(expr, type_op)| {
                 if let Some((_op, type_name)) = type_op {
