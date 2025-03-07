@@ -120,32 +120,34 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
     // Create a simpler date format parser
+    let year_only = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>();
+        
+    let year_month = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .map(|((year, _), month)| format!("{}-{}", year, month));
+        
+    let full_date = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
+    
+    // Important: order matters here - try the most specific patterns first
     let date_format = choice((
-        // Year only: YYYY - must be first for proper matching
-        text::digits(10)
-            .repeated()
-            .exactly(4)
-            .collect::<String>(),
-            
-        // Year and month: YYYY-MM
-        text::digits(10)
-            .repeated()
-            .exactly(4)
-            .collect::<String>()
-            .then(just('-'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
-            .map(|((year, _), month)| format!("{}-{}", year, month)),
-            
-        // Full date: YYYY-MM-DD
-        text::digits(10)
-            .repeated()
-            .exactly(4)
-            .collect::<String>()
-            .then(just('-'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
-            .then(just('-'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
-            .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
+        full_date,
+        year_month,
+        year_only
     )).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?

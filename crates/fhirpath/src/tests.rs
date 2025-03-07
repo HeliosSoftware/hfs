@@ -60,34 +60,12 @@ fn test_just_date() {
     // Test only the date parser directly
     let date_parser = just::<char, char, Simple<char>>('@')
         .ignore_then(
-            choice((
-                // Year only: YYYY
-                text::digits::<char, Simple<char>>(10)
-                    .repeated()
-                    .exactly(4)
-                    .collect::<String>(),
-                    
-                // Year and month: YYYY-MM
-                text::digits::<char, Simple<char>>(10)
-                    .repeated()
-                    .exactly(4)
-                    .collect::<String>()
-                    .then(just::<char, char, Simple<char>>('-'))
-                    .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
-                    .map(|((year, _), month)| format!("{}-{}", year, month)),
-                    
-                // Full date: YYYY-MM-DD
-                text::digits::<char, Simple<char>>(10)
-                    .repeated()
-                    .exactly(4)
-                    .collect::<String>()
-                    .then(just::<char, char, Simple<char>>('-'))
-                    .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
-                    .then(just::<char, char, Simple<char>>('-'))
-                    .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
-                    .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
-            ))
+            text::digits::<char, Simple<char>>(10)
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
         )
+        .then_ignore(end())
         .map(|d| d);
         
     let result = date_parser.parse("@2015");
