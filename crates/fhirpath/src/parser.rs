@@ -245,8 +245,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             date_str.push_str(&day_str);
                         }
                     }
-                    // AI! Print out the date_str
-
+                    
+                    println!("Parsed date: {}", date_str);
+                    
                     Literal::Date(date_str)
                 }
                 None => Literal::Date("".to_string()), // This shouldn't happen with the current parser structure
