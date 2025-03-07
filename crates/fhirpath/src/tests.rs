@@ -53,6 +53,54 @@ fn test_date_formats() {
 }
 
 #[test]
+fn test_just_date() {
+    // Test only the date parser directly
+    let date_parser = just('@')
+        .ignore_then(
+            choice((
+                // Year only: YYYY
+                text::digits(10)
+                    .repeated()
+                    .exactly(4)
+                    .collect::<String>(),
+                    
+                // Year and month: YYYY-MM
+                text::digits(10)
+                    .repeated()
+                    .exactly(4)
+                    .collect::<String>()
+                    .then(just('-'))
+                    .then(text::digits(10).repeated().exactly(2).collect::<String>())
+                    .map(|((year, _), month)| format!("{}-{}", year, month)),
+                    
+                // Full date: YYYY-MM-DD
+                text::digits(10)
+                    .repeated()
+                    .exactly(4)
+                    .collect::<String>()
+                    .then(just('-'))
+                    .then(text::digits(10).repeated().exactly(2).collect::<String>())
+                    .then(just('-'))
+                    .then(text::digits(10).repeated().exactly(2).collect::<String>())
+                    .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
+            ))
+        )
+        .then_ignore(end())
+        .map(|d| d);
+        
+    let result = date_parser.parse("@2015");
+    assert!(
+        result.is_ok(),
+        "Failed to parse simple date '@2015', error: {:?}",
+        result.err()
+    );
+    
+    if let Ok(date) = result {
+        println!("Successfully parsed '@2015' as: '{}'", date);
+    }
+}
+
+#[test]
 fn test_simple_date_parsing() {
     // Test year-only format
     let result = parser().parse("@2015");
