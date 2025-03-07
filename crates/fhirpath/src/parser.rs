@@ -203,17 +203,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .repeated()
                 .exactly(4)
                 .collect::<String>()
-                .map(|year| Literal::Date(year)),
+                .then(
+                    just('-')
+                        .then(
+                            text::digits(10)
+                                .repeated()
+                                .exactly(2)
+                                .collect::<String>()
+                                .then(just('-').then(
+                                    text::digits(10).repeated().exactly(2).collect::<String>(),
+                                ))
+                                .or_not(),
+                        )
+                        .or_not(),
+                )
+                .or_not(),
         )
-        .then(
-            just('-').then(
-                filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                    .repeated()
-                    .exactly(2)
-                    .collect::<String>()
-                    .map(|year_month| Literal::Date(year_month)),
-            ),
-        )
+        // Add a valid map statement here AI!
         .boxed();
 
     // Create a parser for datetime literals
