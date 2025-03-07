@@ -342,7 +342,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
     // Recursive parser definition - limit recursion depth to prevent stack overflow
-    recursive(|expr| {
+    let expr_parser = recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr
             .clone()
@@ -551,8 +551,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             });
 
+        // Lambda expression - handles (IDENTIFIER)? '=>' expression
+        let lambda_expr = implies_expr
+            .clone()
+            .or(identifier
+                .clone()
+                .map(|id| Expression::Term(Term::Invocation(Invocation::Member(id)))))
+            .then_ignore(end());
+
         // Return the final parser
-        implies_expr
-    })
-    .then_ignore(end())
+        lambda_expr
+    });
+    
+    // Handle both complete expressions and standalone identifiers
+    choice((
+        expr_parser.clone().then_ignore(end()),
+        identifier.clone().map(|id| 
+            Expression::Term(Term::Invocation(Invocation::Member(id)))
+        ).then_ignore(end())
+    ))
 }
