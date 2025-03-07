@@ -200,64 +200,31 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-    // Create a parser for date literals - simplify to the most basic approach
-    // Year only: YYYY (4 digits)
-    let year_only = text::digits(10)
-        .repeated()
-        .at_least(4)
-        .at_most(4)
-        .collect::<String>();
-        
-    // Year and month: YYYY-MM
-    let year_month = text::digits(10)
-        .repeated()
-        .at_least(4)
-        .at_most(4)
-        .collect::<String>()
-        .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
-        .map(|((year, _), month)| format!("{}-{}", year, month));
-        
-    // Full date: YYYY-MM-DD
-    let full_date = text::digits(10)
-        .repeated()
-        .at_least(4)
-        .at_most(4)
-        .collect::<String>()
-        .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
-        .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
-        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
-    
-    // Create a parser for date literals
+    // Create a parser for date literals using a simpler approach
     let date = just('@')
-        .ignore_then(choice((
-            // Try the more specific patterns first
-            full_date,
-            year_month,
-            // Year only pattern last
-            year_only.clone()
-        )))
-        .map(|year| {
-            println!("Successfully parsed date: '{}'", year);
-            Literal::Date(year)
+        .then(take_until(choice((
+            just('T'),
+            just('.'),
+            end(),
+            just(' '),
+        ))))
+        .map(|(_, chars)| {
+            let date_str: String = chars.into_iter().collect();
+            println!("Successfully parsed date: '{}'", date_str);
+            Literal::Date(date_str)
         })
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .ignore_then(choice((
-            // Try the more specific patterns first
-            full_date.clone(),
-            year_month.clone(),
-            // Year only pattern last
-            year_only.clone()
-        )))
+        .then(take_until(just('T')))
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
-        .map(|(((date, _), time), timezone)| Literal::DateTime(date, time, timezone))
+        .map(|((((_, date_chars), _), time), timezone)| {
+            let date: String = date_chars.into_iter().collect();
+            Literal::DateTime(date, time, timezone)
+        })
         .boxed();
 
     // Create a parser for time literals

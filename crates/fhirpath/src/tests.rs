@@ -57,23 +57,8 @@ fn test_date_formats() {
 
 #[test]
 fn test_just_date() {
-    // Create a very simple parser just for the year format
-    let year_digits = text::digits::<char, Simple<char>>(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>();
-        
-    // Use a simpler parser without any extra requirements
-    // Important: don't use end() as it requires the entire input to be consumed
-    let date_parser = just::<char, char, Simple<char>>('@')
-        .ignore_then(text::digits::<char, Simple<char>>(10)
-            .repeated()
-            .at_least(4)
-            .at_most(4)
-            .collect::<String>());
-        
-    // Use the standard parse method
-    let result = date_parser.parse("@2015");
+    // Use the main parser directly
+    let result = parser().parse("@2015");
     
     // Print detailed error information if it fails
     if let Err(ref err) = result {
@@ -90,8 +75,8 @@ fn test_just_date() {
         result.err()
     );
     
-    if let Ok(date) = result {
-        println!("Successfully parsed '@2015' as: '{}'", date);
+    if let Ok(expr) = result {
+        println!("Successfully parsed '@2015': {:?}", expr);
     }
 }
 
