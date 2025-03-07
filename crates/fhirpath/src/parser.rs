@@ -243,16 +243,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         }
     });
 
-    let literal = null
-        .or(boolean)
-        .or(string)
-        .or(number)
-        .or(long_number)
-        .or(datetime)
-        .or(date)
-        .or(time)
-        .or(quantity)
-        .map(Term::Literal);
+    let literal = choice((
+        null,
+        boolean,
+        string,
+        datetime,  // Order matters - try datetime before date
+        date,
+        time,
+        quantity,  // Try quantity before number
+        number,
+        long_number,
+    ))
+    .map(Term::Literal);
 
     // Identifiers
     let identifier = choice((
@@ -465,13 +467,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Union expression - handles |
         let union_expr = type_expr
             .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone()).or_not()) // Allow whitespace around '|'
+            .then(just('|').padded().ignore_then(type_expr.clone()).repeated()) // Allow whitespace around '|'
             .map(|(first, rest)| {
-                if let Some(rest) = rest {
-                    Expression::Union(Box::new(first), Box::new(rest))
-                } else {
-                    first
-                }
+                rest.into_iter().fold(first, |acc, next| {
+                    Expression::Union(Box::new(acc), Box::new(next))
+                })
             })
             .boxed();
 
