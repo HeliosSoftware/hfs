@@ -152,9 +152,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         year_month.clone(),
         year_only.clone(),
     ))
-    .recover_with(via_parser(full_date.clone()))
-    .recover_with(via_parser(year_month.clone()))
-    .recover_with(via_parser(year_only.clone()))
     .boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
