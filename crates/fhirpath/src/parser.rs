@@ -81,8 +81,6 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
-    // Enable this for debugging
-    // println!("Creating FHIRPath parser");
     // Define the error type we'll use throughout the parser
     type E = Simple<char>;
 
@@ -139,7 +137,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .at_most(4)
         .collect::<String>()
         .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
+        .then(
+            text::digits(10)
+                .repeated()
+                .at_least(2)
+                .at_most(2)
+                .collect::<String>(),
+        )
         .map(|((year, _), month)| format!("{}-{}", year, month))
         .boxed();
 
@@ -150,9 +154,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .at_most(4)
         .collect::<String>()
         .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
+        .then(
+            text::digits(10)
+                .repeated()
+                .at_least(2)
+                .at_most(2)
+                .collect::<String>(),
+        )
         .then(just('-'))
-        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
+        .then(
+            text::digits(10)
+                .repeated()
+                .at_least(2)
+                .at_most(2)
+                .collect::<String>(),
+        )
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
         .boxed();
 
@@ -161,27 +177,32 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let date_format = choice((full_date, year_month, year_only)).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
-    let time_format = text::int::<char, E>(2)
+    let time_format = text::digits(10)
+        .repeated()
+        .at_least(2)
+        .at_most(2)
         .then(
-            just::<char, char, E>(':')
-                .ignore_then(text::int::<char, E>(2))
+            just(':')
+                .then(text::digits(10))
+                .repeated()
+                .at_least(2)
+                .at_most(2),
+        )
+        .or_not()
+        .then(just(':').then(text::digits(10)).repeated().at_least(2))
+        .or_not()
+        .then(
+            just('.')
                 .then(
-                    just::<char, char, E>(':')
-                        .ignore_then(text::int::<char, E>(2))
-                        .then(
-                            just::<char, char, E>('.')
-                                .ignore_then(
-                                    text::digits::<char, E>(3)
-                                        .repeated()
-                                        .at_least(1)
-                                        .collect::<String>(),
-                                )
-                                .or_not(),
-                        )
-                        .or_not(),
+                    text::digits(10)
+                        .repeated()
+                        .at_least(1)
+                        .at_most(3)
+                        .collect::<String>(),
                 )
                 .or_not(),
         )
+        .or_not()
         .map(|(hour, min_sec)| {
             let mut result = hour;
             if let Some((min, sec_ms)) = min_sec {
