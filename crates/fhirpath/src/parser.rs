@@ -125,47 +125,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
     // Year only: YYYY (4 digits)
-    let year_only = text::int::<char, E>(10)
-        .map(|s: String| s)
-        .boxed();
+    let year_only = text::int::<char, E>(4).map(|s: String| s).boxed();
 
     // Year and month: YYYY-MM
-    let year_month = text::int::<char, E>(10)
+    let year_month = text::int::<char, E>(4)
         .then(just('-'))
-        .then(text::int::<char, E>(10))
+        .then(text::int::<char, E>(2))
         .map(|((year, _), month)| format!("{}-{}", year, month))
         .boxed();
 
     // Full date: YYYY-MM-DD
-    let full_date = text::int::<char, E>(10)
+    let full_date = text::int::<char, E>(4)
         .then(just('-'))
-        .then(text::int::<char, E>(10))
+        .then(text::int::<char, E>(2))
         .then(just('-'))
-        .then(text::int::<char, E>(10))
+        .then(text::int::<char, E>(2))
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
         .boxed();
 
     // Combine all three formats with priority to the most specific match
     // Try the most specific formats first - order matters for proper parsing
-    let date_format = choice((
-        full_date.clone(),
-        year_month.clone(),
-        year_only.clone(),
-    ))
-    .boxed();
+    let date_format = choice((full_date.clone(), year_month.clone(), year_only.clone())).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
-    let time_format = text::int::<char, E>(10)
+    let time_format = text::int::<char, E>(2)
         .then(
             just::<char, char, E>(':')
-                .ignore_then(text::int::<char, E>(10))
+                .ignore_then(text::int::<char, E>(2))
                 .then(
                     just::<char, char, E>(':')
-                        .ignore_then(text::int::<char, E>(10))
+                        .ignore_then(text::int::<char, E>(2))
                         .then(
                             just::<char, char, E>('.')
                                 .ignore_then(
-                                    text::digits::<char, E>(10)
+                                    text::digits::<char, E>(3)
                                         .repeated()
                                         .at_least(1)
                                         .collect::<String>(),
@@ -199,9 +192,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .to("Z".to_string())
             .or(one_of::<char, &str, E>("+-")
                 .map(|c: char| c.to_string())
-                .then(text::int::<char, E>(10))
+                .then(text::int::<char, E>(2))
                 .then(just::<char, char, E>(':'))
-                .then(text::int::<char, E>(10))
+                .then(text::int::<char, E>(2))
                 .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals
