@@ -200,104 +200,72 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-    // Create a parser for date literals
-    // Simplify to a single approach that works reliably
+    // Create a parser for date literals - simplify to the most basic approach
     let date = just('@')
-        .ignore_then(
-            // Year only: YYYY (4 digits)
+        .then(
             text::digits(10)
                 .repeated()
                 .exactly(4)
                 .collect::<String>()
-                .map(|year| {
-                    println!("Successfully parsed year: '{}'", year);
-                    year
-                })
                 .then(
-                    // Optional month-day part: -MM(-DD)?
                     just('-')
-                        .ignore_then(
-                            text::digits(10)
-                                .repeated()
-                                .exactly(2)
-                                .collect::<String>()
-                        )
+                        .then(text::digits(10).repeated().exactly(2).collect::<String>())
                         .then(
                             just('-')
-                                .ignore_then(
-                                    text::digits(10)
-                                        .repeated()
-                                        .exactly(2)
-                                        .collect::<String>()
-                                )
+                                .then(text::digits(10).repeated().exactly(2).collect::<String>())
                                 .or_not()
                         )
                         .or_not()
                 )
-                .map(|(year, month_day)| {
-                    if let Some((month, day_opt)) = month_day {
-                        if let Some(day) = day_opt {
-                            format!("{}-{}-{}", year, month, day)
-                        } else {
-                            format!("{}-{}", year, month)
-                        }
-                    } else {
-                        year
-                    }
-                })
         )
-        .map(|d| {
-            println!("Successfully parsed date: '{}'", d);
-            Literal::Date(d)
+        .map(|(_, (year, month_day))| {
+            let date_str = if let Some(((_, month), day_opt)) = month_day {
+                if let Some((_, day)) = day_opt {
+                    format!("{}-{}-{}", year, month, day)
+                } else {
+                    format!("{}-{}", year, month)
+                }
+            } else {
+                year
+            };
+            println!("Successfully parsed date: '{}'", date_str);
+            Literal::Date(date_str)
         })
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .ignore_then(
-            // Year only: YYYY (4 digits)
+        .then(
             text::digits(10)
                 .repeated()
                 .exactly(4)
                 .collect::<String>()
                 .then(
-                    // Optional month-day part: -MM(-DD)?
                     just('-')
-                        .ignore_then(
-                            text::digits(10)
-                                .repeated()
-                                .exactly(2)
-                                .collect::<String>()
-                        )
+                        .then(text::digits(10).repeated().exactly(2).collect::<String>())
                         .then(
                             just('-')
-                                .ignore_then(
-                                    text::digits(10)
-                                        .repeated()
-                                        .exactly(2)
-                                        .collect::<String>()
-                                )
+                                .then(text::digits(10).repeated().exactly(2).collect::<String>())
                                 .or_not()
                         )
                         .or_not()
                 )
-                .map(|(year, month_day)| {
-                    if let Some((month, day_opt)) = month_day {
-                        if let Some(day) = day_opt {
-                            format!("{}-{}-{}", year, month, day)
-                        } else {
-                            format!("{}-{}", year, month)
-                        }
-                    } else {
-                        year
-                    }
-                })
         )
+        .map(|(_, (year, month_day))| {
+            if let Some(((_, month), day_opt)) = month_day {
+                if let Some((_, day)) = day_opt {
+                    format!("{}-{}-{}", year, month, day)
+                } else {
+                    format!("{}-{}", year, month)
+                }
+            } else {
+                year
+            }
+        })
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
         .map(|(((date, _), time), timezone)| Literal::DateTime(date, time, timezone))
-        .padded()  // Allow whitespace after the datetime
         .boxed();
 
     // Create a parser for time literals

@@ -63,9 +63,10 @@ fn test_just_date() {
         .exactly(4)
         .collect::<String>();
         
-    // Important: don't use end() as it requires the entire input to be consumed
+    // Use then() instead of ignore_then() to keep the @ character
     let date_parser = just::<char, char, Simple<char>>('@')
-        .ignore_then(year_digits);
+        .then(year_digits)
+        .map(|(_, year)| year);
         
     let result = date_parser.parse("@2015");
     
