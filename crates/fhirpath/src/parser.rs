@@ -235,15 +235,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         });
 
     // Timezone format: Z | (+|-)HH:mm
-    let timezone_format =
-        just::<char, char, E>('Z')
-            .to("Z".to_string())
-            .or(one_of::<char, &str, E>("+-")
-                .map(|c: char| c.to_string())
-                .then(text::int::<char, E>(2))
-                .then(just::<char, char, E>(':'))
-                .then(text::int::<char, E>(2))
-                .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
+    let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
+        .map(|c: char| c.to_string())
+        .then(text::digits(10).repeated().at_most(2).at_least(2))
+        .then(just(':'))
+        .then(text::digits(10).repeated().at_most(2).at_least(2))
+        .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals
     let date = just('@')
