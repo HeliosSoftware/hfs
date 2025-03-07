@@ -16,8 +16,8 @@ fn test_date_formats() {
     if let Err(ref err) = result {
         println!("Error parsing '@2015': {:?}", err);
         for e in err {
-            println!("  Span: {:?}, Reason: {:?}, Expected: {:?}, Found: {:?}", 
-                     e.span(), e.reason(), e.expected(), e.found());
+            println!("  Span: {:?}, Reason: {:?}", 
+                     e.span(), e.reason());
         }
     }
     

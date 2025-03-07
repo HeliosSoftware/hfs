@@ -119,37 +119,53 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
-    // Simpler date format parser using a regex-like approach
-    let date_format = filter_map(|span, input: &str| {
-        println!("Attempting to parse date format from: '{}'", input);
-        
-        // Match YYYY
-        if input.len() >= 4 && input[0..4].chars().all(|c| c.is_digit(10)) {
-            let year = &input[0..4];
-            println!("Found year: {}", year);
-            
-            // If there's more input, check for YYYY-MM
-            if input.len() >= 7 && input.chars().nth(4) == Some('-') && 
-               input[5..7].chars().all(|c| c.is_digit(10)) {
-                let month = &input[5..7];
-                println!("Found month: {}", month);
-                
-                // If there's more input, check for YYYY-MM-DD
-                if input.len() >= 10 && input.chars().nth(7) == Some('-') && 
-                   input[8..10].chars().all(|c| c.is_digit(10)) {
-                    let day = &input[8..10];
-                    println!("Found day: {}", day);
-                    return Ok((format!("{}-{}-{}", year, month, day), &input[10..]));
-                }
-                
-                return Ok((format!("{}-{}", year, month), &input[7..]));
-            }
-            
-            return Ok((year.to_string(), &input[4..]));
-        }
-        
-        Err(Simple::expected_input_found(span, Vec::new(), None))
-    }).boxed();
+    // Year only: YYYY (4 digits)
+    let year_only = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .boxed();
+
+    // Year and month: YYYY-MM
+    let year_month = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(
+            text::digits(10)
+                .repeated()
+                .exactly(2)
+                .collect::<String>(),
+        )
+        .map(|((year, _), month)| format!("{}-{}", year, month))
+        .boxed();
+
+    // Full date: YYYY-MM-DD
+    let full_date = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(
+            text::digits(10)
+                .repeated()
+                .exactly(2)
+                .collect::<String>(),
+        )
+        .then(just('-'))
+        .then(
+            text::digits(10)
+                .repeated()
+                .exactly(2)
+                .collect::<String>(),
+        )
+        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
+        .boxed();
+
+    // Combine all three formats with priority to the most specific match
+    // Try the most specific formats first - order matters for proper parsing
+    let date_format = choice((full_date, year_month, year_only)).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
     let time_format = text::digits(10)
@@ -236,18 +252,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             println!("Successfully parsed date: '{}'", d);
             Literal::Date(d)
         })
-        .padded() // Allow whitespace around date literals
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
         .ignore_then(date_format.clone())
-        .then(
-            just('T')
-                .ignore_then(time_format.clone())
-                .then(timezone_format.clone().or_not()),
-        )
-        .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone))
+        .then(just('T'))
+        .then(time_format.clone())
+        .then(timezone_format.clone().or_not())
+        .map(|(((date, _), time), timezone)| Literal::DateTime(date, time, timezone))
         .boxed();
 
     // Create a parser for time literals
