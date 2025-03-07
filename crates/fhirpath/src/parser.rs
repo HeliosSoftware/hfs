@@ -204,18 +204,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .exactly(4)
                 .collect::<String>()
                 .then(
-                    just('-')
-                        .then(
-                            text::digits(10)
-                                .repeated()
-                                .exactly(2)
-                                .collect::<String>()
-                                .then(just('-').then(
-                                    text::digits(10).repeated().exactly(2).collect::<String>(),
-                                ))
-                                .or_not(),
-                        )
-                        .or_not(),
+                    just('-').then(
+                        filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                            .repeated()
+                            .exactly(2)
+                            .collect::<String>()
+                            .then(
+                                just('-').then(
+                                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                                        .repeated()
+                                        .exactly(2)
+                                        .collect::<String>(),
+                                ),
+                            )
+                            .or_not(),
+                    ),
                 )
                 .or_not(),
         )
@@ -223,22 +226,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             match date_parts {
                 Some((year, month_opt)) => {
                     let mut date_str = year;
-                    
-                    if let Some((_, month_day_opt)) = month_opt {
-                        if let Some((month, day_opt)) = month_day_opt {
-                            date_str.push('-');
-                            date_str.push_str(&month);
-                            
-                            // day_opt is a tuple of (char, String), not an Option
-                            let (_, day) = day_opt;
-                            date_str.push('-');
-                            date_str.push_str(&day);
-                        }
-                    }
-                    
+                    // AI! Complete this map
+
                     Literal::Date(date_str)
-                },
-                None => Literal::Date("".to_string()) // This shouldn't happen with the current parser structure
+                }
+                None => Literal::Date("".to_string()), // This shouldn't happen with the current parser structure
             }
         })
         .boxed();
