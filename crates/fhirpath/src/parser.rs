@@ -131,8 +131,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .collect::<String>();
 
     // Year and month: YYYY-MM
-    let year_month = year_only
-        .clone()
+    let year_month = text::digits::<char, E>(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
         .then(
             just::<char, char, E>('-').ignore_then(
                 text::digits::<char, E>(10)
@@ -144,8 +146,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(year, month)| format!("{}-{}", year, month));
 
     // Full date: YYYY-MM-DD
-    let full_date = year_month
-        .clone()
+    let full_date = text::digits::<char, E>(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
         .then(
             just::<char, char, E>('-').ignore_then(
                 text::digits::<char, E>(10)
@@ -154,7 +158,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     .collect::<String>(),
             ),
         )
-        .map(|(year_month, day)| format!("{}-{}", year_month, day));
+        .then(
+            just::<char, char, E>('-').ignore_then(
+                text::digits::<char, E>(10)
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>(),
+            ),
+        )
+        .map(|((year, month), day)| format!("{}-{}-{}", year, month, day));
 
     // Combine all three formats with priority to the most specific match
     let date_format = choice((full_date, year_month, year_only));
@@ -243,13 +255,117 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         }
     });
 
+    // Create a term-level date literal parser that can be used in expressions
+    let date_literal = just('@')
+        .ignore_then(
+            // Full date: YYYY-MM-DD
+            text::digits::<char, E>(10)
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
+                .then(
+                    just::<char, char, E>('-').ignore_then(
+                        text::digits::<char, E>(10)
+                            .repeated()
+                            .exactly(2)
+                            .collect::<String>(),
+                    ),
+                )
+                .then(
+                    just::<char, char, E>('-').ignore_then(
+                        text::digits::<char, E>(10)
+                            .repeated()
+                            .exactly(2)
+                            .collect::<String>(),
+                    ),
+                )
+                .map(|((year, month), day)| format!("{}-{}-{}", year, month, day))
+                .or(
+                    // Year and month: YYYY-MM
+                    text::digits::<char, E>(10)
+                        .repeated()
+                        .exactly(4)
+                        .collect::<String>()
+                        .then(
+                            just::<char, char, E>('-').ignore_then(
+                                text::digits::<char, E>(10)
+                                    .repeated()
+                                    .exactly(2)
+                                    .collect::<String>(),
+                            ),
+                        )
+                        .map(|(year, month)| format!("{}-{}", year, month))
+                )
+                .or(
+                    // Year only: YYYY
+                    text::digits::<char, E>(10)
+                        .repeated()
+                        .exactly(4)
+                        .collect::<String>()
+                )
+        )
+        .map(Literal::Date);
+
+    // Create a term-level datetime literal parser
+    let datetime_literal = just('@')
+        .ignore_then(
+            // Date part
+            text::digits::<char, E>(10)
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
+                .then(
+                    just::<char, char, E>('-')
+                        .ignore_then(
+                            text::digits::<char, E>(10)
+                                .repeated()
+                                .exactly(2)
+                                .collect::<String>(),
+                        )
+                        .or_not()
+                        .map(|m| m.unwrap_or_default())
+                )
+                .then(
+                    just::<char, char, E>('-')
+                        .ignore_then(
+                            text::digits::<char, E>(10)
+                                .repeated()
+                                .exactly(2)
+                                .collect::<String>(),
+                        )
+                        .or_not()
+                        .map(|d| d.unwrap_or_default())
+                )
+                .map(|((year, month), day)| {
+                    if month.is_empty() {
+                        year
+                    } else if day.is_empty() {
+                        format!("{}-{}", year, month)
+                    } else {
+                        format!("{}-{}-{}", year, month, day)
+                    }
+                })
+                .then(
+                    just('T')
+                        .ignore_then(time_format.clone())
+                        .then(timezone_format.or_not())
+                )
+        )
+        .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
+
+    // Create a term-level time literal parser
+    let time_literal = just('@')
+        .then(just('T'))
+        .ignore_then(time_format.clone())
+        .map(Literal::Time);
+
     let literal = choice((
         null,
         boolean,
         string,
-        datetime,  // Order matters - try datetime before date
-        date,
-        time,
+        datetime_literal,  // Order matters - try datetime before date
+        date_literal,
+        time_literal,
         quantity,  // Try quantity before number
         number,
         long_number,
@@ -404,11 +520,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .then(
                 expr.clone()
                     .delimited_by(just('['), just(']'))
-                    .map(|idx| (idx,))
+                    .map(|idx| idx)
                     .repeated(),
             )
             .map(|(first, indices)| {
-                indices.into_iter().fold(first, |expr, (idx,)| {
+                indices.into_iter().fold(first, |expr, idx| {
                     Expression::Indexer(Box::new(expr), Box::new(idx))
                 })
             })
@@ -453,10 +569,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .clone()
             .then(
                 // Handle is/as followed by a type name
-                choice((just("is").padded(), just("as").padded())).then(type_specifier.clone()).or_not(),
+                choice((
+                    just("is").padded().map(|_| "is"),
+                    just("as").padded().map(|_| "as")
+                ))
+                .then(type_specifier.clone())
+                .or_not(),
             )
             .map(|(expr, op_type)| {
-                if let Some((_, type_specifier)) = op_type {
+                if let Some((op, type_specifier)) = op_type {
                     Expression::Type(Box::new(expr), type_specifier)
                 } else {
                     expr
