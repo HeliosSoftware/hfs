@@ -1,6 +1,6 @@
 use crate::parser::parser;
 use chumsky::Parser;
-use chumsky::prelude::{just, choice, end};
+use chumsky::prelude::just;
 use chumsky::text;
 use chumsky::error::Simple;
 use roxmltree::{Document, Node};
@@ -63,7 +63,7 @@ fn test_just_date() {
         .exactly(4)
         .collect::<String>();
         
-    // Important: don't use then_ignore(end()) as it requires the entire input to be consumed
+    // Important: don't use end() as it requires the entire input to be consumed
     let date_parser = just::<char, char, Simple<char>>('@')
         .ignore_then(year_digits);
         

@@ -254,7 +254,45 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .ignore_then(date_format.clone())
+        .ignore_then(
+            // Year only: YYYY (4 digits)
+            text::digits(10)
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
+                .then(
+                    // Optional month-day part: -MM(-DD)?
+                    just('-')
+                        .ignore_then(
+                            text::digits(10)
+                                .repeated()
+                                .exactly(2)
+                                .collect::<String>()
+                        )
+                        .then(
+                            just('-')
+                                .ignore_then(
+                                    text::digits(10)
+                                        .repeated()
+                                        .exactly(2)
+                                        .collect::<String>()
+                                )
+                                .or_not()
+                        )
+                        .or_not()
+                )
+                .map(|(year, month_day)| {
+                    if let Some((month, day_opt)) = month_day {
+                        if let Some(day) = day_opt {
+                            format!("{}-{}-{}", year, month, day)
+                        } else {
+                            format!("{}-{}", year, month)
+                        }
+                    } else {
+                        year
+                    }
+                })
+        )
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
