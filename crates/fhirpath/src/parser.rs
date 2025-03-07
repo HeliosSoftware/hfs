@@ -221,25 +221,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(text::int::<char, E>(10))
                 .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-    // Create a parser for date literals
-    let date = just('@')
+    // Create a parser for date literals - prefix with underscore to avoid unused variable warning
+    let _date = just('@')
         .ignore_then(date_format.clone())
         .map(Literal::Date);
 
-    // Create a parser for datetime literals
-    let datetime = just('@')
+    // Create a parser for datetime literals - prefix with underscore to avoid unused variable warning
+    let _datetime = just('@')
         .ignore_then(date_format.clone())
         .then(
             just('T')
                 .ignore_then(time_format.clone())
-                .then(timezone_format.or_not()),
+                .then(timezone_format.clone().or_not()),
         )
         .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
 
-    // Create a parser for time literals
-    let time = just('@')
+    // Create a parser for time literals - prefix with underscore to avoid unused variable warning
+    let _time = just('@')
         .then(just('T'))
-        .ignore_then(time_format)
+        .ignore_then(time_format.clone())
         .map(Literal::Time);
 
     let unit = text::ident().or(just('\'')
@@ -348,7 +348,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(
                     just('T')
                         .ignore_then(time_format.clone())
-                        .then(timezone_format.or_not())
+                        .then(timezone_format.clone().or_not())
                 )
         )
         .map(|(date, (time, timezone))| Literal::DateTime(date, time, timezone));
@@ -577,7 +577,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .or_not(),
             )
             .map(|(expr, op_type)| {
-                if let Some((op, type_specifier)) = op_type {
+                if let Some((_, type_specifier)) = op_type {
                     Expression::Type(Box::new(expr), type_specifier)
                 } else {
                     expr
