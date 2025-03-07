@@ -215,28 +215,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .or_not(),
         )
-        .map(|opt| {
-            match opt {
-                Some((hours, rest)) => {
-                    let mut result = hours;
-                    if let Some((minutes, seconds_part)) = rest {
-                        result.push(':');
-                        result.push_str(&minutes);
+        .map(|(hours, rest_opt)| {
+            let mut result = hours;
+            if let Some(((_, minutes), seconds_part)) = rest_opt {
+                result.push(':');
+                result.push_str(&minutes);
 
-                        if let Some((seconds, milliseconds)) = seconds_part {
-                            result.push(':');
-                            result.push_str(&seconds);
+                if let Some(((_, seconds), milliseconds)) = seconds_part {
+                    result.push(':');
+                    result.push_str(&seconds);
 
-                            if let Some(ms) = milliseconds {
-                                result.push('.');
-                                result.push_str(&ms);
-                            }
-                        }
+                    if let Some((_, ms)) = milliseconds {
+                        result.push('.');
+                        result.push_str(&ms);
                     }
-                    result
                 }
-                None => "00".to_string(), // Default value if no time is provided
             }
+            result
         });
 
     // Timezone format: Z | (+|-)HH:mm
