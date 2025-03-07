@@ -201,29 +201,33 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals - simplify to the most basic approach
+    // Year only: YYYY (4 digits)
     let year_only = text::digits(10)
         .repeated()
-        .exactly(4)
+        .at_least(4)
+        .at_most(4)
         .collect::<String>();
         
     // Year and month: YYYY-MM
     let year_month = text::digits(10)
         .repeated()
-        .exactly(4)
+        .at_least(4)
+        .at_most(4)
         .collect::<String>()
         .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((year, _), month)| format!("{}-{}", year, month));
         
     // Full date: YYYY-MM-DD
     let full_date = text::digits(10)
         .repeated()
-        .exactly(4)
+        .at_least(4)
+        .at_most(4)
         .collect::<String>()
         .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
     
     // Create a parser for date literals
@@ -233,7 +237,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             full_date,
             year_month,
             // Year only pattern last
-            year_only
+            year_only.clone()
         )))
         .map(|year| {
             println!("Successfully parsed date: '{}'", year);
