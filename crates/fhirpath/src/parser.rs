@@ -144,8 +144,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Combine all three formats with priority to the most specific match
     let date_format = choice((
-        full_date.attempt(),
-        year_month.attempt(),
+        full_date,
+        year_month,
         year_only,
     )).boxed();
 
