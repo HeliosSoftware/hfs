@@ -1,32 +1,9 @@
-use crate::debug::debug_parse;
 use crate::parser::parser;
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-
-#[test]
-fn test_debug_parse() {
-    let expr = "Observation.value.is(Quantity)";
-    let result = debug_parse(expr);
-    assert!(
-        result.is_ok(),
-        "Failed to parse '{}': {:?}",
-        expr,
-        result.err()
-    );
-    
-    // Add a simpler test case to help with debugging
-    let simple_expr = "Patient.name.given";
-    let simple_result = debug_parse(simple_expr);
-    assert!(
-        simple_result.is_ok(),
-        "Failed to parse '{}': {:?}",
-        simple_expr,
-        simple_result.err()
-    );
-}
 
 #[test]
 fn test_date_formats() {
@@ -38,7 +15,7 @@ fn test_date_formats() {
         "@T12:00",
         "@2015T12:00",
     ];
-    
+
     for expr in date_expressions {
         let result = parser().parse(expr);
         assert!(

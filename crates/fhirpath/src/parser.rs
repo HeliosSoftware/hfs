@@ -81,9 +81,6 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
-    // Define the error type we'll use throughout the parser
-    type E = Simple<char>;
-
     // Literals
     let null = just('{').then(just('}')).to(Literal::Null);
 
@@ -237,9 +234,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Timezone format: Z | (+|-)HH:mm
     let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
         .map(|c: char| c.to_string())
-        .then(text::digits(10).repeated().at_most(2).at_least(2).collect::<String>())
+        .then(
+            text::digits(10)
+                .repeated()
+                .at_most(2)
+                .at_least(2)
+                .collect::<String>(),
+        )
         .then(just(':'))
-        .then(text::digits(10).repeated().at_most(2).at_least(2).collect::<String>())
+        .then(
+            text::digits(10)
+                .repeated()
+                .at_most(2)
+                .at_least(2)
+                .collect::<String>(),
+        )
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals
