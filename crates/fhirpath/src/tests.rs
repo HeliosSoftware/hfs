@@ -24,7 +24,40 @@ fn test_date_formats() {
             expr,
             result.err()
         );
+        
+        if expr == "@2015" {
+            if let Ok(parsed) = result {
+                println!("Successfully parsed '@2015': {:?}", parsed);
+            }
+        }
     }
+}
+
+#[test]
+fn test_simple_date_parsing() {
+    // Test year-only format
+    let result = parser().parse("@2015");
+    assert!(
+        result.is_ok(),
+        "Failed to parse simple date '@2015', error: {:?}",
+        result.err()
+    );
+    
+    // Test year-month format
+    let result = parser().parse("@2015-01");
+    assert!(
+        result.is_ok(),
+        "Failed to parse date '@2015-01', error: {:?}",
+        result.err()
+    );
+    
+    // Test full date format
+    let result = parser().parse("@2015-01-01");
+    assert!(
+        result.is_ok(),
+        "Failed to parse date '@2015-01-01', error: {:?}",
+        result.err()
+    );
 }
 
 #[test]

@@ -122,23 +122,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Year only: YYYY (4 digits)
     let year_only = text::digits(10)
         .repeated()
-        .at_least(4)
-        .at_most(4)
+        .exactly(4)
         .collect::<String>()
         .boxed();
 
     // Year and month: YYYY-MM
     let year_month = text::digits(10)
         .repeated()
-        .at_least(4)
-        .at_most(4)
+        .exactly(4)
         .collect::<String>()
         .then(just('-'))
         .then(
             text::digits(10)
                 .repeated()
-                .at_least(2)
-                .at_most(2)
+                .exactly(2)
                 .collect::<String>(),
         )
         .map(|((year, _), month)| format!("{}-{}", year, month))
@@ -147,23 +144,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Full date: YYYY-MM-DD
     let full_date = text::digits(10)
         .repeated()
-        .at_least(4)
-        .at_most(4)
+        .exactly(4)
         .collect::<String>()
         .then(just('-'))
         .then(
             text::digits(10)
                 .repeated()
-                .at_least(2)
-                .at_most(2)
+                .exactly(2)
                 .collect::<String>(),
         )
         .then(just('-'))
         .then(
             text::digits(10)
                 .repeated()
-                .at_least(2)
-                .at_most(2)
+                .exactly(2)
                 .collect::<String>(),
         )
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
@@ -255,6 +249,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let date = just('@')
         .ignore_then(date_format.clone())
         .map(Literal::Date)
+        .padded() // Allow whitespace around date literals
         .boxed();
 
     // Create a parser for datetime literals
