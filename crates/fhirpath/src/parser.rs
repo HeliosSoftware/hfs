@@ -552,12 +552,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             });
 
         // Lambda expression - handles (IDENTIFIER)? '=>' expression
-        let lambda_expr = implies_expr
-            .clone()
-            .or(identifier
-                .clone()
-                .map(|id| Expression::Term(Term::Invocation(Invocation::Member(id)))))
-            .then_ignore(end());
+        let lambda_expr = implies_expr.clone();
 
         // Return the final parser
         lambda_expr
