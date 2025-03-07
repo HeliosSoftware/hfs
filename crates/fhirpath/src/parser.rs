@@ -119,40 +119,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
-    // Create a simpler date format parser
-    // Year only: YYYY (4 digits)
-    let year_only = text::digits(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>();
-        
-    // Year and month: YYYY-MM
-    let year_month = text::digits(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>()
-        .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
-        .map(|((year, _), month)| format!("{}-{}", year, month));
-        
-    // Full date: YYYY-MM-DD
-    let full_date = text::digits(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>()
-        .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
-        .then(just('-'))
-        .then(text::digits(10).repeated().exactly(2).collect::<String>())
-        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
-    
-    // Important: order matters here - try the most specific patterns first
-    // We need to try the longer patterns first to avoid partial matches
-    let date_format = choice((
-        full_date,
-        year_month,
-        year_only.clone() // Clone so we can use it directly in the date parser
-    )).boxed();
+    // We'll use a different approach for date parsing, so we don't need these separate parsers
+    // The date parser will handle all formats directly
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
     let time_format = text::digits(10)
@@ -233,26 +201,56 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals
-    // We'll create two versions and combine them with choice()
-    
-    // First version: direct year-only format (most common case)
-    let date_year_only = just('@')
-        .ignore_then(year_only)
-        .map(|d| {
-            println!("Successfully parsed simple date: '{}'", d);
-            Literal::Date(d)
-        });
-        
-    // Second version: all formats through date_format
-    let date_all_formats = just('@')
-        .ignore_then(date_format.clone())
+    // Simplify to a single approach that works reliably
+    let date = just('@')
+        .ignore_then(
+            // Year only: YYYY (4 digits)
+            text::digits(10)
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
+                .map(|year| {
+                    println!("Successfully parsed year: '{}'", year);
+                    year
+                })
+                .then(
+                    // Optional month-day part: -MM(-DD)?
+                    just('-')
+                        .ignore_then(
+                            text::digits(10)
+                                .repeated()
+                                .exactly(2)
+                                .collect::<String>()
+                        )
+                        .then(
+                            just('-')
+                                .ignore_then(
+                                    text::digits(10)
+                                        .repeated()
+                                        .exactly(2)
+                                        .collect::<String>()
+                                )
+                                .or_not()
+                        )
+                        .or_not()
+                )
+                .map(|(year, month_day)| {
+                    if let Some((month, day_opt)) = month_day {
+                        if let Some(day) = day_opt {
+                            format!("{}-{}-{}", year, month, day)
+                        } else {
+                            format!("{}-{}", year, month)
+                        }
+                    } else {
+                        year
+                    }
+                })
+        )
         .map(|d| {
             println!("Successfully parsed date: '{}'", d);
             Literal::Date(d)
-        });
-        
-    // Combine both approaches
-    let date = choice((date_year_only, date_all_formats)).boxed();
+        })
+        .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
