@@ -246,7 +246,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     let literal = null
         .or(boolean)
-        .or(string)
+        .or(string.map(Literal::String)) // Ensure string is mapped to Literal::String
         .or(number)
         .or(long_number)
         .or(datetime)
