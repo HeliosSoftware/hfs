@@ -218,10 +218,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                                 .exactly(2)
                                                 .collect::<String>(),
                                         )
-                                        .or_not(),
+                                        .or_not()
+                                        .map(|day_opt| day_opt),
                                 ),
                         )
-                        .or_not(),
+                        .or_not()
+                        .map(|month_day_opt| month_day_opt),
                 )
                 .or_not(),
         )
@@ -230,18 +232,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Some((year, month_part)) => {
                     let mut date_str = year;
 
-                    // month_part is Option<(char, Option<(String, Option<(char, String)>)>)>
-                    if let Some((_, month_day_part)) = month_part {
-                        // month_day_part is Option<(String, Option<(char, String)>)>
-                        if let Some((month, day_part)) = month_day_part {
-                            date_str.push('-');
-                            date_str.push_str(&month);
+                    // month_part is Option<(month_str, Option<day_str>)>
+                    if let Some((month_str, day_part)) = month_part {
+                        date_str.push('-');
+                        date_str.push_str(&month_str);
 
-                            // day_part is Option<(char, String)>
-                            if let Some((_, day)) = day_part {
-                                date_str.push('-');
-                                date_str.push_str(&day);
-                            }
+                        // day_part is Option<day_str>
+                        if let Some(day_str) = day_part {
+                            date_str.push('-');
+                            date_str.push_str(&day_str);
                         }
                     }
 
