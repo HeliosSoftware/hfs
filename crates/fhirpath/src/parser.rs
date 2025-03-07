@@ -125,51 +125,29 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
     // Year only: YYYY (4 digits)
-    let year_only = text::digits::<char, E>(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>();
+    let year_only = text::int::<char, E>(10)
+        .map(|s: String| s)
+        .boxed();
 
     // Year and month: YYYY-MM
-    let year_month = text::digits::<char, E>(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>()
-        .then(
-            just::<char, char, E>('-').ignore_then(
-                text::digits::<char, E>(10)
-                    .repeated()
-                    .exactly(2)
-                    .collect::<String>(),
-            ),
-        )
-        .map(|(year, month)| format!("{}-{}", year, month));
+    let year_month = text::int::<char, E>(10)
+        .then(just::<char, char, E>('-').ignore_then(text::int::<char, E>(10)))
+        .map(|(year, month)| format!("{}-{}", year, month))
+        .boxed();
 
     // Full date: YYYY-MM-DD
-    let full_date = text::digits::<char, E>(10)
-        .repeated()
-        .exactly(4)
-        .collect::<String>()
-        .then(
-            just::<char, char, E>('-').ignore_then(
-                text::digits::<char, E>(10)
-                    .repeated()
-                    .exactly(2)
-                    .collect::<String>(),
-            ),
-        )
-        .then(
-            just::<char, char, E>('-').ignore_then(
-                text::digits::<char, E>(10)
-                    .repeated()
-                    .exactly(2)
-                    .collect::<String>(),
-            ),
-        )
-        .map(|((year, month), day)| format!("{}-{}-{}", year, month, day));
+    let full_date = text::int::<char, E>(10)
+        .then(just::<char, char, E>('-').ignore_then(text::int::<char, E>(10)))
+        .then(just::<char, char, E>('-').ignore_then(text::int::<char, E>(10)))
+        .map(|((year, month), day)| format!("{}-{}-{}", year, month, day))
+        .boxed();
 
     // Combine all three formats with priority to the most specific match
-    let date_format = choice((full_date, year_month, year_only));
+    let date_format = choice((
+        full_date.attempt(),
+        year_month.attempt(),
+        year_only,
+    )).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
     let time_format = text::int::<char, E>(10)
@@ -221,10 +199,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(text::int::<char, E>(10))
                 .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-    // Create a parser for date literals - prefix with underscore to avoid unused variable warning
+    // Create a parser for date literals
     let date = just('@')
         .ignore_then(date_format.clone())
-        .map(Literal::Date);
+        .map(Literal::Date)
+        .boxed();
 
     // Create a parser for datetime literals - prefix with underscore to avoid unused variable warning
     let datetime = just('@')
