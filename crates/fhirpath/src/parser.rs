@@ -553,4 +553,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         implies_expr
     });
+    
+    // Return the parser
+    expr_parser.then_ignore(end())
 }
