@@ -551,18 +551,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             });
 
-        // Lambda expression - handles (IDENTIFIER)? '=>' expression
-        let lambda_expr = implies_expr.clone();
-
-        // Return the final parser
-        lambda_expr
+        implies_expr
     });
-    
-    // Handle both complete expressions and standalone identifiers
-    choice((
-        expr_parser.clone().then_ignore(end()),
-        identifier.clone().map(|id| 
-            Expression::Term(Term::Invocation(Invocation::Member(id)))
-        ).then_ignore(end())
-    ))
 }
