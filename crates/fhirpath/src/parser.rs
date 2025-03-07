@@ -226,8 +226,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             match date_parts {
                 Some((year, month_opt)) => {
                     let mut date_str = year;
-                    // AI! Complete this map
-
+                    
+                    if let Some((_, month_day)) = month_opt {
+                        if let Some((month, day_opt)) = month_day {
+                            date_str.push('-');
+                            date_str.push_str(&month);
+                            
+                            if let Some((_, day)) = day_opt {
+                                date_str.push('-');
+                                date_str.push_str(&day);
+                            }
+                        }
+                    }
+                    
                     Literal::Date(date_str)
                 }
                 None => Literal::Date("".to_string()), // This shouldn't happen with the current parser structure
