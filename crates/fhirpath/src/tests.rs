@@ -88,7 +88,6 @@ fn test_just_date() {
                     .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
             ))
         )
-        .then_ignore(end())
         .map(|d| d);
         
     let result = date_parser.parse("@2015");

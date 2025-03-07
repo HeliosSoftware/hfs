@@ -121,16 +121,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a simpler date format parser
     let date_format = choice((
-        // Full date: YYYY-MM-DD
+        // Year only: YYYY - must be first for proper matching
         text::digits(10)
             .repeated()
             .exactly(4)
-            .collect::<String>()
-            .then(just('-'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
-            .then(just('-'))
-            .then(text::digits(10).repeated().exactly(2).collect::<String>())
-            .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day)),
+            .collect::<String>(),
             
         // Year and month: YYYY-MM
         text::digits(10)
@@ -141,11 +136,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .then(text::digits(10).repeated().exactly(2).collect::<String>())
             .map(|((year, _), month)| format!("{}-{}", year, month)),
             
-        // Year only: YYYY
+        // Full date: YYYY-MM-DD
         text::digits(10)
             .repeated()
             .exactly(4)
             .collect::<String>()
+            .then(just('-'))
+            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .then(just('-'))
+            .then(text::digits(10).repeated().exactly(2).collect::<String>())
+            .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
     )).boxed();
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
@@ -233,7 +233,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             println!("Successfully parsed date: '{}'", d);
             Literal::Date(d)
         })
-        .padded()  // Allow whitespace after the date
         .boxed();
 
     // Create a parser for datetime literals
