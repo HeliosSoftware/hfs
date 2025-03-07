@@ -123,8 +123,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
-    // Also handles the format without dashes: @2015
-
+    
     // Year only: YYYY (4 digits)
     let year_only = text::digits::<char, E>(10)
         .repeated()
@@ -158,7 +157,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(year_month, day)| format!("{}-{}", year_month, day));
 
     // Combine all three formats with priority to the most specific match
-    let date_format = choice((full_date.clone(), year_month.clone(), year_only.clone()));
+    let date_format = choice((full_date, year_month, year_only));
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
     let time_format = text::int::<char, E>(10)
@@ -452,9 +451,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .clone()
             .then(
                 // Handle is/as followed by a type name
-                choice((just("is").padded(), just("as").padded())).then(type_specifier.clone()),
+                choice((just("is").padded(), just("as").padded())).then(type_specifier.clone()).or_not(),
             )
-            .map(|(expr, (_, type_specifier))| Expression::Type(Box::new(expr), type_specifier))
+            .map(|(expr, op_type)| {
+                if let Some((_, type_specifier)) = op_type {
+                    Expression::Type(Box::new(expr), type_specifier)
+                } else {
+                    expr
+                }
+            })
             .boxed();
 
         // Union expression - handles |
