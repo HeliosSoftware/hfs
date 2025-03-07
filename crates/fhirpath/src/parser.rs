@@ -454,7 +454,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 // Handle is/as followed by a type name
                 choice((just("is").padded(), just("as").padded())).then(type_specifier.clone()),
             )
-            .map(|(expr, type_op)| Expression::Type(Box::new(expr), type_op))
+            .map(|(expr, (_, type_specifier))| Expression::Type(Box::new(expr), type_specifier))
             .boxed();
 
         // Union expression - handles |
