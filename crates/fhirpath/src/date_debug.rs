@@ -50,6 +50,29 @@ pub fn run_date_debug_tests() {
         println!("Result: {:?}", result);
     }
     
+    // Test 6b: Test specific date format parsers
+    println!("\nTest 6b: Testing specific date format parsers");
+    
+    // Year-month format
+    let year_month = text::int::<char, Simple<char>>(10)
+        .then(just::<char, Simple<char>>('-').padded())
+        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .map(|((year, _), month)| format!("{}-{}", year, month));
+    
+    let result = trace_parse("2015-01", "year_month", year_month);
+    println!("Year-month result: {:?}", result);
+    
+    // Full date format
+    let full_date = text::int::<char, Simple<char>>(10)
+        .then(just::<char, Simple<char>>('-').padded())
+        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .then(just::<char, Simple<char>>('-').padded())
+        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
+    
+    let result = trace_parse("2015-01-01", "full_date", full_date);
+    println!("Full date result: {:?}\n", result);
+    
     // Test 7: Test with different date formats followed by .is(Date)
     println!("\nTest 7: Testing different date formats with .is(Date)");
     let formats_with_is = ["@2015.is(Date)", "@2015-01.is(Date)", "@2015-01-01.is(Date)"];
