@@ -229,10 +229,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             date_str.push('-');
                             date_str.push_str(&month);
                             
-                            if let Some((_, day)) = day_opt {
-                                date_str.push('-');
-                                date_str.push_str(&day);
-                            }
+                            // day_opt is a tuple of (char, String), not an Option
+                            let (_, day) = day_opt;
+                            date_str.push('-');
+                            date_str.push_str(&day);
                         }
                     }
                     
