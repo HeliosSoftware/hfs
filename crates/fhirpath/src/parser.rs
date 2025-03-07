@@ -213,10 +213,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                 .then(
                                     just('-')
                                         .ignore_then(
-                                            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                                                .repeated()
-                                                .exactly(2)
-                                                .collect::<String>(),
+                                            filter::<_, _, Simple<char>>(|c: &char| {
+                                                c.is_ascii_digit()
+                                            })
+                                            .repeated()
+                                            .exactly(2)
+                                            .collect::<String>(),
                                         )
                                         .or_not()
                                         .map(|day_opt| day_opt),
@@ -243,6 +245,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             date_str.push_str(&day_str);
                         }
                     }
+                    // AI! Print out the date_str
 
                     Literal::Date(date_str)
                 }
