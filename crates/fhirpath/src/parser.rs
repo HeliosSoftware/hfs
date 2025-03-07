@@ -206,8 +206,35 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .exactly(4)
         .collect::<String>();
         
+    // Year and month: YYYY-MM
+    let year_month = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .map(|((year, _), month)| format!("{}-{}", year, month));
+        
+    // Full date: YYYY-MM-DD
+    let full_date = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .then(just('-'))
+        .then(text::digits(10).repeated().exactly(2).collect::<String>())
+        .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
+    
+    // Create a parser for date literals
     let date = just('@')
-        .ignore_then(year_only)
+        .ignore_then(choice((
+            // Try the more specific patterns first
+            full_date,
+            year_month,
+            // Year only pattern last
+            year_only
+        )))
         .map(|year| {
             println!("Successfully parsed date: '{}'", year);
             Literal::Date(year)
@@ -216,12 +243,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .ignore_then(
-            text::digits(10)
-                .repeated()
-                .exactly(4)
-                .collect::<String>()
-        )
+        .ignore_then(choice((
+            // Try the more specific patterns first
+            full_date.clone(),
+            year_month.clone(),
+            // Year only pattern last
+            year_only.clone()
+        )))
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
