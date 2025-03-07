@@ -131,25 +131,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Year and month: YYYY-MM
     let year_month = text::int::<char, E>(10)
-        .then(just::<char, char, E>('-').padded())
-        .then(text::digits::<char, E>(10).repeated().exactly(2).collect::<String>())
+        .then(just('-'))
+        .then(text::int::<char, E>(10))
         .map(|((year, _), month)| format!("{}-{}", year, month))
         .boxed();
 
     // Full date: YYYY-MM-DD
     let full_date = text::int::<char, E>(10)
-        .then(just::<char, char, E>('-').padded())
-        .then(text::digits::<char, E>(10).repeated().exactly(2).collect::<String>())
-        .then(just::<char, char, E>('-').padded())
-        .then(text::digits::<char, E>(10).repeated().exactly(2).collect::<String>())
+        .then(just('-'))
+        .then(text::int::<char, E>(10))
+        .then(just('-'))
+        .then(text::int::<char, E>(10))
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
         .boxed();
 
     // Combine all three formats with priority to the most specific match
     // Try the most specific formats first - order matters for proper parsing
     let date_format = choice((
-        full_date.clone().then_ignore(end()).map(|d| d),
-        year_month.clone().then_ignore(end()).map(|d| d),
+        full_date.clone(),
+        year_month.clone(),
         year_only.clone(),
     ))
     .boxed();

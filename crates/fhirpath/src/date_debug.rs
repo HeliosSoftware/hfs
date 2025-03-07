@@ -56,7 +56,7 @@ pub fn run_date_debug_tests() {
     // Year-month format
     let year_month = text::int::<char, Simple<char>>(10)
         .then(just('-'))
-        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .then(text::int::<char, Simple<char>>(10))
         .map(|((year, _), month)| format!("{}-{}", year, month));
     
     let result = trace_parse("2015-01", "year_month", year_month);
@@ -65,9 +65,9 @@ pub fn run_date_debug_tests() {
     // Full date format
     let full_date = text::int::<char, Simple<char>>(10)
         .then(just('-'))
-        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .then(text::int::<char, Simple<char>>(10))
         .then(just('-'))
-        .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
+        .then(text::int::<char, Simple<char>>(10))
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
     
     let result = trace_parse("2015-01-01", "full_date", full_date);
@@ -104,6 +104,41 @@ pub fn run_date_debug_tests() {
     
     let result = trace_parse("@2015.is(Date)", "custom_date_is_expr", is_date_expr);
     println!("Custom parser result: {:?}\n", result);
+    
+    // Test 9: Test hyphenated date formats with custom parsers
+    println!("\nTest 9: Testing hyphenated date formats with custom parsers");
+    
+    // Custom date parser for @YYYY-MM
+    let year_month_date = just('@')
+        .ignore_then(
+            text::int::<char, Simple<char>>(10)
+                .then(just('-'))
+                .then(text::int::<char, Simple<char>>(10))
+                .map(|((year, _), month)| format!("{}-{}", year, month))
+        )
+        .map(Literal::Date)
+        .map(Term::Literal)
+        .map(Expression::Term);
+    
+    let result = trace_parse("@2015-01", "custom_year_month", year_month_date);
+    println!("Custom year-month result: {:?}", result);
+    
+    // Custom date parser for @YYYY-MM-DD
+    let full_date_parser = just('@')
+        .ignore_then(
+            text::int::<char, Simple<char>>(10)
+                .then(just('-'))
+                .then(text::int::<char, Simple<char>>(10))
+                .then(just('-'))
+                .then(text::int::<char, Simple<char>>(10))
+                .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
+        )
+        .map(Literal::Date)
+        .map(Term::Literal)
+        .map(Expression::Term);
+    
+    let result = trace_parse("@2015-01-01", "custom_full_date", full_date_parser);
+    println!("Custom full date result: {:?}\n", result);
     
     println!("\n=== DATE PARSING DEBUG TESTS COMPLETE ===\n");
 }
