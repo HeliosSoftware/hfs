@@ -116,12 +116,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .padded(); // Allow whitespace around numbers
 
-    // Date format: YYYY(-MM(-DD)?)?
-    // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
-
-    // We'll use a different approach for date parsing, so we don't need these separate parsers
-    // The date parser will handle all formats directly
-
     // Time format: HH(:mm(:ss(.sss)?)?)?
     let time_format = text::digits(10)
         .repeated()
@@ -200,44 +194,35 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
-    // Create a parser for date literals using a simpler approach
+    // Date format: YYYY(-MM(-DD)?)?
+    // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
     let date = just('@')
         .ignore_then(
             // Year only: YYYY (4 digits)
-            text::digits(10)
+            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                 .repeated()
                 .exactly(4)
                 .collect::<String>()
-                .map(|year| {
-                    println!("Successfully parsed date: '{}'", year);
-                    Literal::Date(year)
-                })
+                .map(|year| Literal::Date(year)),
         )
-        .or(
-            // Fallback parser for just '@2015'
-            just('@')
-                .then(text::int(10))
-                .map(|(_, year)| {
-                    println!("Successfully parsed simple date: '{}'", year);
-                    Literal::Date(year)
-                })
+        .then(
+            just('-').then(
+                filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                    .repeated()
+                    .exactly(2)
+                    .collect::<String>()
+                    .map(|year_month| Literal::Date(year_month)),
+            ),
         )
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .ignore_then(
-            text::digits(10)
-                .repeated()
-                .exactly(4)
-                .collect::<String>()
-        )
+        .ignore_then(text::digits(10).repeated().exactly(4).collect::<String>())
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
-        .map(|(((date, _), time), timezone)| {
-            Literal::DateTime(date, time, timezone)
-        })
+        .map(|(((date, _), time), timezone)| Literal::DateTime(date, time, timezone))
         .boxed();
 
     // Create a parser for time literals
@@ -245,7 +230,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then(just('T'))
         .ignore_then(time_format.clone())
         .map(Literal::Time)
-        .padded()  // Allow whitespace after the time
+        .padded() // Allow whitespace after the time
         .boxed();
 
     let unit = text::ident().or(just('\'')
@@ -262,14 +247,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     });
 
     let literal = choice((
-        date.clone(),      // Try date first
-        datetime.clone(),  // Then datetime
-        time.clone(),      // Then time
         null,
         boolean,
         string,
         number,
         long_number,
+        date.clone(),
+        datetime.clone(),
+        time.clone(),
         quantity,
     ))
     .map(Term::Literal);
