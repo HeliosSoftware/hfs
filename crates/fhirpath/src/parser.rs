@@ -220,16 +220,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .or_not(),
         )
         .map(|date_parts| {
-            if let Some(year) = date_parts {
+            if let Some((year, month_part)) = date_parts {
                 let mut date_str = year;
-                if let Some((_, month_day)) = month_day {
-                    date_str.push('-');
-                    date_str.push_str(&month);
-                    if let Some((_, day)) = day {
+                
+                if let Some((_, month_day_part)) = month_part {
+                    if let Some(((_, month), day_part)) = month_day_part {
                         date_str.push('-');
-                        date_str.push_str(&day);
+                        date_str.push_str(&month);
+                        
+                        if let Some((_, day)) = day_part {
+                            date_str.push('-');
+                            date_str.push_str(&day);
+                        }
                     }
                 }
+                
                 Literal::Date(date_str)
             } else {
                 // This shouldn't happen with the current parser structure
