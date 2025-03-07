@@ -55,7 +55,7 @@ pub fn run_date_debug_tests() {
     
     // Year-month format
     let year_month = text::int::<char, Simple<char>>(10)
-        .then(just::<char, Simple<char>>('-').padded())
+        .then(just('-'))
         .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
         .map(|((year, _), month)| format!("{}-{}", year, month));
     
@@ -64,9 +64,9 @@ pub fn run_date_debug_tests() {
     
     // Full date format
     let full_date = text::int::<char, Simple<char>>(10)
-        .then(just::<char, Simple<char>>('-').padded())
+        .then(just('-'))
         .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
-        .then(just::<char, Simple<char>>('-').padded())
+        .then(just('-'))
         .then(text::digits::<char, Simple<char>>(10).repeated().exactly(2).collect::<String>())
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
     
