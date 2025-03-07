@@ -7,8 +7,33 @@ use std::path::PathBuf;
 
 #[test]
 fn test_date_formats() {
+    // Test just the simplest case first
+    let expr = "@2015";
+    println!("Attempting to parse: '{}'", expr);
+    let result = parser().parse(expr);
+    
+    // Print detailed error information if it fails
+    if let Err(ref err) = result {
+        println!("Error parsing '@2015': {:?}", err);
+        for e in err {
+            println!("  Span: {:?}, Reason: {:?}, Expected: {:?}, Found: {:?}", 
+                     e.span(), e.reason(), e.expected(), e.found());
+        }
+    }
+    
+    assert!(
+        result.is_ok(),
+        "Failed to parse date expression: '{}', error: {:?}",
+        expr,
+        result.err()
+    );
+    
+    if let Ok(parsed) = result {
+        println!("Successfully parsed '@2015': {:?}", parsed);
+    }
+    
+    // Now test the other date formats
     let date_expressions = vec![
-        "@2015",
         "@2015.is(Date)",
         "@2015-01",
         "@2015-01-01",
@@ -24,12 +49,6 @@ fn test_date_formats() {
             expr,
             result.err()
         );
-        
-        if expr == "@2015" {
-            if let Ok(parsed) = result {
-                println!("Successfully parsed '@2015': {:?}", parsed);
-            }
-        }
     }
 }
 
