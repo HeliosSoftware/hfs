@@ -202,27 +202,32 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a parser for date literals using a simpler approach
     let date = just('@')
-        .then(take_until(choice((
-            just('T'),
-            just('.'),
-            end(),
-            just(' '),
-        ))))
-        .map(|(_, chars)| {
-            let date_str: String = chars.into_iter().collect();
-            println!("Successfully parsed date: '{}'", date_str);
-            Literal::Date(date_str)
-        })
+        .ignore_then(
+            text::digits(10)
+                .repeated()
+                .at_least(4)
+                .at_most(4)
+                .collect::<String>()
+                .map(|year| {
+                    println!("Successfully parsed date: '{}'", year);
+                    Literal::Date(year)
+                })
+        )
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .then(take_until(just('T')))
+        .ignore_then(
+            text::digits(10)
+                .repeated()
+                .at_least(4)
+                .at_most(4)
+                .collect::<String>()
+        )
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
-        .map(|((((_, date_chars), _), time), timezone)| {
-            let date: String = date_chars.into_iter().collect();
+        .map(|(((date, _), time), timezone)| {
             Literal::DateTime(date, time, timezone)
         })
         .boxed();

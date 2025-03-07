@@ -1,8 +1,5 @@
 use crate::parser::parser;
 use chumsky::Parser;
-use chumsky::prelude::just;
-use chumsky::text;
-use chumsky::error::Simple;
 use roxmltree::{Document, Node};
 use std::fs::File;
 use std::io::Read;
