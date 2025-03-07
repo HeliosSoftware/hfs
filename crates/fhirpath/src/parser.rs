@@ -184,38 +184,37 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .collect::<String>()
         .then(
             just(':')
-                .ignore_then(
+                .then(
                     text::digits(10)
                         .repeated()
                         .at_least(2)
                         .at_most(2)
-                        .collect::<String>()
+                        .collect::<String>(),
                 )
                 .then(
                     just(':')
-                        .ignore_then(
+                        .then(
                             text::digits(10)
                                 .repeated()
                                 .at_least(2)
                                 .at_most(2)
-                                .collect::<String>()
+                                .collect::<String>(),
                         )
                         .then(
                             just('.')
-                                .ignore_then(
+                                .then(
                                     text::digits(10)
                                         .repeated()
                                         .at_least(1)
                                         .at_most(3)
-                                        .collect::<String>()
+                                        .collect::<String>(),
                                 )
-                                .or_not()
+                                .or_not(),
                         )
-                        .or_not()
+                        .or_not(),
                 )
-                .or_not()
+                .or_not(),
         )
-        .or_not()
         .map(|opt| {
             match opt {
                 Some((hours, rest)) => {
@@ -223,11 +222,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     if let Some((minutes, seconds_part)) = rest {
                         result.push(':');
                         result.push_str(&minutes);
-                        
+
                         if let Some((seconds, milliseconds)) = seconds_part {
                             result.push(':');
                             result.push_str(&seconds);
-                            
+
                             if let Some(ms) = milliseconds {
                                 result.push('.');
                                 result.push_str(&ms);
@@ -235,8 +234,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         }
                     }
                     result
-                },
-                None => "00".to_string() // Default value if no time is provided
+                }
+                None => "00".to_string(), // Default value if no time is provided
             }
         });
 
