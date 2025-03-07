@@ -201,67 +201,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
 
     // Create a parser for date literals - simplify to the most basic approach
+    let year_only = text::digits(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>();
+        
     let date = just('@')
-        .then(
-            text::digits(10)
-                .repeated()
-                .exactly(4)
-                .collect::<String>()
-                .then(
-                    just('-')
-                        .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                        .then(
-                            just('-')
-                                .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                                .or_not()
-                        )
-                        .or_not()
-                )
-        )
-        .map(|(_, (year, month_day))| {
-            let date_str = if let Some(((_, month), day_opt)) = month_day {
-                if let Some((_, day)) = day_opt {
-                    format!("{}-{}-{}", year, month, day)
-                } else {
-                    format!("{}-{}", year, month)
-                }
-            } else {
-                year
-            };
-            println!("Successfully parsed date: '{}'", date_str);
-            Literal::Date(date_str)
+        .ignore_then(year_only)
+        .map(|year| {
+            println!("Successfully parsed date: '{}'", year);
+            Literal::Date(year)
         })
         .boxed();
 
     // Create a parser for datetime literals
     let datetime = just('@')
-        .then(
+        .ignore_then(
             text::digits(10)
                 .repeated()
                 .exactly(4)
                 .collect::<String>()
-                .then(
-                    just('-')
-                        .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                        .then(
-                            just('-')
-                                .then(text::digits(10).repeated().exactly(2).collect::<String>())
-                                .or_not()
-                        )
-                        .or_not()
-                )
         )
-        .map(|(_, (year, month_day))| {
-            if let Some(((_, month), day_opt)) = month_day {
-                if let Some((_, day)) = day_opt {
-                    format!("{}-{}-{}", year, month, day)
-                } else {
-                    format!("{}-{}", year, month)
-                }
-            } else {
-                year
-            }
-        })
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
