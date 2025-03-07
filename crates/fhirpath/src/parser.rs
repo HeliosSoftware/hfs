@@ -227,12 +227,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Some((year, month_opt)) => {
                     let mut date_str = year;
 
-                    if let Some((_, month_day)) = month_opt {
-                        if let Some((month, day_opt)) = month_day {
+                    if let Some((dash, month_day_opt)) = month_opt {
+                        if let Some((month, day_opt)) = month_day_opt {
                             date_str.push('-');
                             date_str.push_str(&month);
 
-                            if let Some((_, day)) = day_opt {
+                            if let Some((dash2, day)) = day_opt {
                                 date_str.push('-');
                                 date_str.push_str(&day);
                             }
