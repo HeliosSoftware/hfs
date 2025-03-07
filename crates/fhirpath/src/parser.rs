@@ -219,7 +219,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .or_not(),
         )
-        // Add a valid map statement here AI!
+        .map(|date_parts| {
+            if let Some(year) = date_parts {
+                let mut date_str = year;
+                if let Some((_, month_day)) = month_day {
+                    date_str.push('-');
+                    date_str.push_str(&month);
+                    if let Some((_, day)) = day {
+                        date_str.push('-');
+                        date_str.push_str(&day);
+                    }
+                }
+                Literal::Date(date_str)
+            } else {
+                // This shouldn't happen with the current parser structure
+                Literal::Date("".to_string())
+            }
+        })
         .boxed();
 
     // Create a parser for datetime literals
