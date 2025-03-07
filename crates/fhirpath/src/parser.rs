@@ -451,48 +451,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let type_expr = additive_expr
             .clone()
             .then(
-                choice((
-                    // Handle is/as followed by a type name
-                    choice((just("is").padded(), just("as").padded()))
-                        .then(type_specifier.clone())
-                        .map(|(op, type_name)| (op, type_name)),
-                    // Handle is/as followed by parenthesized type name - special case
-                    just("is")
-                        .padded()
-                        .then(
-                            just('(')
-                                .padded()
-                                .ignore_then(
-                                    qualified_identifier
-                                        .clone()
-                                        .map(TypeSpecifier::QualifiedIdentifier),
-                                )
-                                .then_ignore(just(')').padded()),
-                        )
-                        .map(|(op, type_name)| (op, type_name)),
-                    just("as")
-                        .padded()
-                        .then(
-                            just('(')
-                                .padded()
-                                .ignore_then(
-                                    qualified_identifier
-                                        .clone()
-                                        .map(TypeSpecifier::QualifiedIdentifier),
-                                )
-                                .then_ignore(just(')').padded()),
-                        )
-                        .map(|(op, type_name)| (op, type_name)),
-                ))
-                .or_not(),
+                // Handle is/as followed by a type name
+                choice((just("is").padded(), just("as").padded())).then(type_specifier.clone()),
             )
-            .map(|(expr, type_op)| {
-                if let Some((_op, type_name)) = type_op {
-                    Expression::Type(Box::new(expr), type_name)
-                } else {
-                    expr
-                }
-            })
+            .map(|(expr, type_op)| Expression::Type(Box::new(expr), type_op))
             .boxed();
 
         // Union expression - handles |
