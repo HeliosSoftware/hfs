@@ -383,7 +383,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        let atom = term.clone().map(Expression::Term).or(literal.map(Expression::Term)).boxed();
+        let atom = term.clone().map(Expression::Term).or(literal.clone().map(Expression::Term)).boxed();
 
         // Invocation chain - handles expression.invocation
         // This needs to handle function calls including 'is' as a function name
