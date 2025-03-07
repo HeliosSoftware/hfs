@@ -181,37 +181,52 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .repeated()
         .at_least(2)
         .at_most(2)
+        .collect::<String>()
         .then(
             just(':')
-                .then(text::digits(10))
-                .repeated()
-                .at_least(2)
-                .at_most(2),
-        )
-        .or_not()
-        .then(just(':').then(text::digits(10)).repeated().at_least(2))
-        .or_not()
-        .then(
-            just('.')
-                .then(
+                .ignore_then(
                     text::digits(10)
                         .repeated()
-                        .at_least(1)
-                        .at_most(3)
-                        .collect::<String>(),
+                        .at_least(2)
+                        .at_most(2)
+                        .collect::<String>()
                 )
-                .or_not(),
+                .then(
+                    just(':')
+                        .ignore_then(
+                            text::digits(10)
+                                .repeated()
+                                .at_least(2)
+                                .at_most(2)
+                                .collect::<String>()
+                        )
+                        .then(
+                            just('.')
+                                .ignore_then(
+                                    text::digits(10)
+                                        .repeated()
+                                        .at_least(1)
+                                        .at_most(3)
+                                        .collect::<String>()
+                                )
+                                .or_not()
+                        )
+                        .or_not()
+                )
+                .or_not()
         )
         .or_not()
-        .map(|(hour, min_sec)| {
-            let mut result = hour;
-            if let Some((min, sec_ms)) = min_sec {
+        .map(|(hours, rest)| {
+            let mut result = hours;
+            if let Some((minutes, seconds_part)) = rest {
                 result.push(':');
-                result.push_str(&min);
-                if let Some((sec, ms)) = sec_ms {
+                result.push_str(&minutes);
+                
+                if let Some((seconds, milliseconds)) = seconds_part {
                     result.push(':');
-                    result.push_str(&sec);
-                    if let Some(ms) = ms {
+                    result.push_str(&seconds);
+                    
+                    if let Some(ms) = milliseconds {
                         result.push('.');
                         result.push_str(&ms);
                     }
