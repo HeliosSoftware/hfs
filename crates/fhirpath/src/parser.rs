@@ -125,23 +125,34 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
 
     // Year only: YYYY (4 digits)
-    let year_only = text::int::<char, E>(4)
-        .map(|s: String| s)
+    let year_only = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>()
         .boxed();
 
     // Year and month: YYYY-MM
-    let year_month = text::int::<char, E>(4)
+    let year_month = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>()
         .then(just('-'))
-        .then(text::int::<char, E>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((year, _), month)| format!("{}-{}", year, month))
         .boxed();
 
     // Full date: YYYY-MM-DD
-    let full_date = text::int::<char, E>(4)
+    let full_date = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>()
         .then(just('-'))
-        .then(text::int::<char, E>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .then(just('-'))
-        .then(text::int::<char, E>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
         .boxed();
 

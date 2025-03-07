@@ -18,7 +18,11 @@ pub fn run_date_debug_tests() {
     
     // Test 3: Test the date format parser directly
     println!("Test 3: Testing year-only date format");
-    let year_only = text::int::<char, Simple<char>>(4);
+    let year_only = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>();
     
     let result = trace_parse("2015", "year_only", year_only);
     println!("Year only result: {:?}\n", result);
@@ -54,20 +58,28 @@ pub fn run_date_debug_tests() {
     println!("\nTest 6b: Testing specific date format parsers");
     
     // Year-month format
-    let year_month = text::int::<char, Simple<char>>(4)
+    let year_month = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>()
         .then(just('-'))
-        .then(text::int::<char, Simple<char>>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((year, _), month)| format!("{}-{}", year, month));
     
     let result = trace_parse("2015-01", "year_month", year_month);
     println!("Year-month result: {:?}", result);
     
     // Full date format
-    let full_date = text::int::<char, Simple<char>>(4)
+    let full_date = text::digits(10)
+        .repeated()
+        .at_least(4)
+        .at_most(4)
+        .collect::<String>()
         .then(just('-'))
-        .then(text::int::<char, Simple<char>>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .then(just('-'))
-        .then(text::int::<char, Simple<char>>(2))
+        .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
         .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day));
     
     let result = trace_parse("2015-01-01", "full_date", full_date);
@@ -86,7 +98,7 @@ pub fn run_date_debug_tests() {
     // Test 8: Test a custom parser for the specific expression
     println!("\nTest 8: Custom parser for '@2015.is(Date)'");
     let date_literal = just('@')
-        .ignore_then(text::int::<char, Simple<char>>(4))
+        .ignore_then(text::digits(10).repeated().at_least(4).at_most(4).collect::<String>())
         .map(Literal::Date)
         .map(Term::Literal)
         .map(Expression::Term);
@@ -111,9 +123,13 @@ pub fn run_date_debug_tests() {
     // Custom date parser for @YYYY-MM
     let year_month_date = just('@')
         .ignore_then(
-            text::int::<char, Simple<char>>(4)
+            text::digits(10)
+                .repeated()
+                .at_least(4)
+                .at_most(4)
+                .collect::<String>()
                 .then(just('-'))
-                .then(text::int::<char, Simple<char>>(2))
+                .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
                 .map(|((year, _), month)| format!("{}-{}", year, month))
         )
         .map(Literal::Date)
@@ -126,11 +142,15 @@ pub fn run_date_debug_tests() {
     // Custom date parser for @YYYY-MM-DD
     let full_date_parser = just('@')
         .ignore_then(
-            text::int::<char, Simple<char>>(4)
+            text::digits(10)
+                .repeated()
+                .at_least(4)
+                .at_most(4)
+                .collect::<String>()
                 .then(just('-'))
-                .then(text::int::<char, Simple<char>>(2))
+                .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
                 .then(just('-'))
-                .then(text::int::<char, Simple<char>>(2))
+                .then(text::digits(10).repeated().at_least(2).at_most(2).collect::<String>())
                 .map(|((((year, _), month), _), day)| format!("{}-{}-{}", year, month, day))
         )
         .map(Literal::Date)
