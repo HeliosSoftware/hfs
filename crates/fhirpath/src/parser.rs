@@ -203,13 +203,22 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Create a parser for date literals using a simpler approach
     let date = just('@')
         .ignore_then(
+            // Year only: YYYY (4 digits)
             text::digits(10)
                 .repeated()
-                .at_least(4)
-                .at_most(4)
+                .exactly(4)
                 .collect::<String>()
                 .map(|year| {
                     println!("Successfully parsed date: '{}'", year);
+                    Literal::Date(year)
+                })
+        )
+        .or(
+            // Fallback parser for just '@2015'
+            just('@')
+                .then(text::int(10))
+                .map(|(_, year)| {
+                    println!("Successfully parsed simple date: '{}'", year);
                     Literal::Date(year)
                 })
         )
@@ -220,8 +229,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .ignore_then(
             text::digits(10)
                 .repeated()
-                .at_least(4)
-                .at_most(4)
+                .exactly(4)
                 .collect::<String>()
         )
         .then(just('T'))
@@ -254,14 +262,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     });
 
     let literal = choice((
+        date.clone(),      // Try date first
+        datetime.clone(),  // Then datetime
+        time.clone(),      // Then time
         null,
         boolean,
         string,
         number,
         long_number,
-        date,
-        datetime,
-        time,
         quantity,
     ))
     .map(Term::Literal);
