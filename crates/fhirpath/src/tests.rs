@@ -57,18 +57,27 @@ fn test_date_formats() {
 
 #[test]
 fn test_just_date() {
-    // Test only the date parser directly
+    // Create a very simple parser just for the year format
+    let year_digits = text::digits::<char, Simple<char>>(10)
+        .repeated()
+        .exactly(4)
+        .collect::<String>();
+        
     let date_parser = just::<char, char, Simple<char>>('@')
-        .ignore_then(
-            text::digits::<char, Simple<char>>(10)
-                .repeated()
-                .exactly(4)
-                .collect::<String>()
-        )
-        .then_ignore(end())
-        .map(|d| d);
+        .ignore_then(year_digits)
+        .then_ignore(end());
         
     let result = date_parser.parse("@2015");
+    
+    // Print detailed error information if it fails
+    if let Err(ref err) = result {
+        println!("Error parsing '@2015': {:?}", err);
+        for e in err {
+            println!("  Span: {:?}, Reason: {:?}", 
+                     e.span(), e.reason());
+        }
+    }
+    
     assert!(
         result.is_ok(),
         "Failed to parse simple date '@2015', error: {:?}",
