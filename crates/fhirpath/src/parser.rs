@@ -145,13 +145,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .padded(); // Allow whitespace around numbers
 
-    let long_number = text::int(10)
+    let long_number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .then(just('L').or_not())
         .map(|(i, l)| {
             if l.is_some() {
-                Literal::LongNumber(i.parse().unwrap())
+                Literal::LongNumber(i.to_string().parse().unwrap())
             } else {
-                Literal::LongNumber(i.parse().unwrap())
+                Literal::LongNumber(i.to_string().parse().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
