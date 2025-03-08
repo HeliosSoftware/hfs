@@ -75,7 +75,7 @@ impl fmt::Display for Literal {
                     }
                 }
                 Ok(())
-            },
+            }
             Literal::Time(t) => write!(f, "@T{}", t),
             Literal::Quantity(n, Some(u)) => write!(f, "{} '{}'", n, u),
             Literal::Quantity(n, None) => write!(f, "{}", n),
@@ -254,7 +254,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 if let Some((time_str, timezone)) = time_part {
                     Literal::DateTime(date_str, Some((time_str, timezone)))
                 } else {
-                    // If no time part is provided, treat as date only
+                    // AI! We need to return a Literal::DateTime value here
                     Literal::Date(date_str)
                 }
             } else {
