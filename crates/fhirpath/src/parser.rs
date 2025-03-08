@@ -182,7 +182,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
         .map(|c: char| c.to_string())
         .then(
-            text::digits(10)
+            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                 .repeated()
                 .at_most(2)
                 .at_least(2)
@@ -190,7 +190,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .then(just(':'))
         .then(
-            text::digits(10)
+            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                 .repeated()
                 .at_most(2)
                 .at_least(2)
@@ -242,37 +242,33 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             Literal::Date(date_str)
         })
         .boxed();
+    /*
+        let _date = just('@').ignore_then(date_format.clone());
 
-    let _date = just('@').ignore_then(date_format.clone());
-
-    // Create a parser for datetime literals
-    let _datetime = just('@')
-        .ignore_then(date_format.clone())
-        .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
-        .map(|(date, time_part)| {
-            if let Literal::Date(date_str) = date {
-                if let Some((time_str, timezone)) = time_part {
-                    Literal::DateTime(date_str, Some((time_str, timezone)))
+        // Create a parser for datetime literals
+        let _datetime = just('@')
+            .ignore_then(date_format.clone())
+            .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
+            .map(|(date, time_part)| {
+                if let Literal::Date(date_str) = date {
+                    if let Some((time_str, timezone)) = time_part {
+                        Literal::DateTime(date_str, Some((time_str, timezone)))
+                    } else {
+                        // When there's no time part, return a DateTime with None for the time part
+                        Literal::DateTime(date_str, None)
+                    }
                 } else {
-                    // When there's no time part, return a DateTime with None for the time part
-                    Literal::DateTime(date_str, None)
+                    unreachable!("Expected Date literal")
                 }
-            } else {
-                unreachable!("Expected Date literal")
-            }
-        })
-        .boxed();
+            })
+            .boxed();
 
-    // Create a parser for time literals
-    let _time = just('@')
-        .ignore_then(just('T').ignore_then(time_format.clone()))
-        .map(|time_str| Literal::Time(time_str))
-        .boxed();
-
-    let unit = text::ident().or(just('\'')
-        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-        .then_ignore(just('\''))
-        .collect::<String>());
+        // Create a parser for time literals
+        let _time = just('@')
+            .ignore_then(just('T').ignore_then(time_format.clone()))
+            .map(|time_str| Literal::Time(time_str))
+            .boxed();
+    */
 
     let quantity = number.then(unit.or_not()).map(|(n, u)| {
         if let Literal::Number(num) = n {
@@ -286,7 +282,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .ignore_then(date_format.clone().or_not())
         .then(
             just('T')
-                .ignore_then(time_format.then(timezone_format.or_not()).or_not())
+                .ignore_then(
+                    time_format
+                        .clone()
+                        .then(timezone_format.clone().or_not())
+                        .or_not(),
+                )
                 .or_not(),
         )
         .map(|(date_part, time_part)| {
@@ -307,7 +308,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     } else {
                         Literal::Time(time_str)
                     }
-                },
+                }
                 // Other cases (shouldn't happen with proper parsing)
                 _ => Literal::Null,
             }
