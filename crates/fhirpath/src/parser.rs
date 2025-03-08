@@ -11,7 +11,7 @@ pub enum Literal {
     Number(f64),
     LongNumber(i64),
     Date(String),
-    DateTime(String, Option<String>, Option<String>), // date, time, timezone
+    DateTime(String, Option<(String, Option<String>)>),
     Time(String),
     Quantity(f64, Option<String>),
 }
@@ -66,16 +66,7 @@ impl fmt::Display for Literal {
             Literal::Number(n) => write!(f, "{}", n),
             Literal::LongNumber(n) => write!(f, "{}", n),
             Literal::Date(d) => write!(f, "@{}", d),
-            Literal::DateTime(date, time, tz) => {
-                write!(f, "@{}T", date)?;
-                if let Some(time_str) = time {
-                    write!(f, "{}", time_str)?;
-                }
-                if let Some(tz) = tz {
-                    write!(f, "{}", tz)?;
-                }
-                Ok(())
-            }
+            // AI! Add Literal::DateTime
             Literal::Time(t) => write!(f, "@T{}", t),
             Literal::Quantity(n, Some(u)) => write!(f, "{} '{}'", n, u),
             Literal::Quantity(n, None) => write!(f, "{}", n),
