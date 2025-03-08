@@ -245,8 +245,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let datetime = just('@')
         .ignore_then(date_format.clone())
         .then(just('T').ignore_then(time_format).or_not())
-        //.then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
-        // AI! Add a map statement
+        .map(|(date, time_opt)| {
+            if let Literal::Date(date_str) = date {
+                if let Some(time_str) = time_opt {
+                    Literal::DateTime(date_str, time_str, None)
+                } else {
+                    Literal::Date(date_str)
+                }
+            } else {
+                unreachable!("Expected Date literal")
+            }
+        })
         .boxed();
 
     // Create a parser for time literals
@@ -306,7 +315,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         number,
         long_number,
         datetime,
-        //date_datetime_time,
+        _time,
         quantity,
     ))
     .map(Term::Literal);
