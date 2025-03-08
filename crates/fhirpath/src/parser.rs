@@ -326,10 +326,37 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
-    // AI! Add a map to Unit::
-    let unit = choice((date_time_precision, plural_date_time_precision, string));
+    let unit = choice((
+        date_time_precision.map(Unit::DateTimePrecision),
+        plural_date_time_precision.map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
+        string.map(|s| if let Literal::String(str_val) = s { Unit::UCUM(str_val) } else { unreachable!() })
+    ));
 
-    let quantity = number.then(unit.or_not());
+    // Create individual unit parsers
+    let date_time_unit = date_time_precision.map(Unit::DateTimePrecision);
+    let plural_date_time_unit = plural_date_time_precision.map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase()));
+    let string_unit = string.map(|s| if let Literal::String(str_val) = s { Unit::UCUM(str_val) } else { unreachable!() });
+    
+    // Create a parser for optional unit
+    let optional_unit = choice((
+        date_time_unit,
+        plural_date_time_unit,
+        string_unit
+    )).or(empty().to(None)).boxed();
+
+    let quantity = number.then(optional_unit).map(|(n, u)| {
+        match u {
+            Some(unit) => {
+                let unit_str = match unit {
+                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
+                    Unit::PluralDateTimePrecision(s) => s,
+                    Unit::UCUM(s) => s,
+                };
+                Literal::Quantity(n, Some(unit_str))
+            },
+            None => Literal::Quantity(n, None)
+        }
+    });
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
