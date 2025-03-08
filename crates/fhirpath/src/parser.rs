@@ -284,25 +284,24 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
-        .then(just('T').ignore_then(time_format.clone().or_not()).or_not())
+        .then(
+            just('T')
+                .ignore_then(time_format.then(timezone_format.or_not()).or_not())
+                .or_not(),
+        )
         .map(|(date_part, time_part)| {
             match (date_part, time_part) {
+                // AI! Fix the two spots below that need to handle the timezone format
                 // @2022-01-01T12:30
                 (Some(Literal::Date(date_str)), Some(Some(time_str))) => {
                     Literal::DateTime(date_str, Some((time_str, None)))
-                },
+                }
                 // @2022-01-01T
-                (Some(Literal::Date(date_str)), Some(None)) => {
-                    Literal::DateTime(date_str, None)
-                },
+                (Some(Literal::Date(date_str)), Some(None)) => Literal::DateTime(date_str, None),
                 // @2022-01-01
-                (Some(Literal::Date(date_str)), None) => {
-                    Literal::Date(date_str)
-                },
+                (Some(Literal::Date(date_str)), None) => Literal::Date(date_str),
                 // @T12:30
-                (None, Some(Some(time_str))) => {
-                    Literal::Time(time_str)
-                },
+                (None, Some(Some(time_str))) => Literal::Time(time_str),
                 // Other cases (shouldn't happen with proper parsing)
                 _ => Literal::Null,
             }
@@ -314,7 +313,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         string,
         number,
         long_number,
-date_datetime_time,
+        date_datetime_time,
         quantity,
     ))
     .map(Term::Literal);
