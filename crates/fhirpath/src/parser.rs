@@ -285,6 +285,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .or_not()
         .then(just('T').ignore_then(time_format.clone()).or_not())
         .map(|(date_opt, time_opt)| {
+            // Clone the values for debugging
+            let date_opt_clone = date_opt.clone();
+            let time_opt_clone = time_opt.clone();
+            
             match (date_opt, time_opt) {
                 (Some(Literal::Date(date_str)), Some(time_str)) => {
                     // DateTime: we have both date and time
@@ -299,7 +303,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     Literal::Time(time_str)
                 }
                 _ => {
-                    println!("Invalid date/time format: date_opt={:?}, time_opt={:?}", date_opt, time_opt);
+                    println!("Invalid date/time format: date_opt={:?}, time_opt={:?}", date_opt_clone, time_opt_clone);
                     unreachable!("Invalid date/time format")
                 },
             }
