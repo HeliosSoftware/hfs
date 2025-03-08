@@ -337,7 +337,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         date_time_precision.map(Unit::DateTimePrecision),
         plural_date_time_precision
             .map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
-        //AI! Add a choice option for string that should map to Unit::UCUM
+        string.clone().map(|s| if let Literal::String(str_val) = s {
+            Unit::UCUM(str_val)
+        } else {
+            // This shouldn't happen due to the parser structure
+            Unit::UCUM("".to_string())
+        })
     ));
 
     // Create a parser for optional unit
