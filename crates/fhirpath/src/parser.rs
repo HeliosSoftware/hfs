@@ -246,13 +246,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Create a parser for datetime literals
     let datetime = just('@')
         .ignore_then(date_format)
-        .then(
-            just('T')
-                .ignore_then(time_format.then(timezone_format.or_not()))
-                .or_not(),
-        )
+        .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not())) //??
         .map(|(date_lit, time_opt)| {
             if let Literal::Date(date_str) = date_lit {
+                //??
                 if let Some((time_str, tz_opt)) = time_opt {
                     Literal::DateTime(date_str, time_str, tz_opt)
                 } else {
