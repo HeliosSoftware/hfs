@@ -117,7 +117,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .padded(); // Allow whitespace around numbers
 
     // Time format: HH(:mm(:ss(.sss)?)?)?
-    let time_format = text::digits(10)
+    let time_format = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
         .at_least(2)
         .at_most(2)
@@ -125,7 +125,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then(
             just(':')
                 .then(
-                    text::digits(10)
+                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                         .repeated()
                         .at_least(2)
                         .at_most(2)
@@ -134,7 +134,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(
                     just(':')
                         .then(
-                            text::digits(10)
+                            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                                 .repeated()
                                 .at_least(2)
                                 .at_most(2)
@@ -143,7 +143,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .then(
                             just('.')
                                 .then(
-                                    text::digits(10)
+                                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                                         .repeated()
                                         .at_least(1)
                                         .at_most(3)
@@ -196,36 +196,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
-    let date = just('@')
-        .ignore_then(
-            // Year only: YYYY (4 digits)
-            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                .repeated()
-                .exactly(4)
-                .collect::<String>()
-                .then(
-                    just('-')
-                        .ignore_then(
-                            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                                .repeated()
-                                .exactly(2)
-                                .collect::<String>()
-                                .then(
-                                    just('-')
-                                        .ignore_then(
-                                            filter::<_, _, Simple<char>>(|c: &char| {
-                                                c.is_ascii_digit()
-                                            })
-                                            .repeated()
-                                            .exactly(2)
-                                            .collect::<String>(),
-                                        )
-                                        .or_not()
-                                        .map(|day_opt| day_opt),
-                                ),
-                        )
-                        .or_not()
-                        .map(|month_day_opt| month_day_opt),
+    let date_format = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .exactly(4)
+        .collect::<String>()
+        .then(
+            just('-')
+                .ignore_then(
+                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                        .repeated()
+                        .exactly(2)
+                        .collect::<String>()
+                        .then(
+                            just('-')
+                                .ignore_then(
+                                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                                        .repeated()
+                                        .exactly(2)
+                                        .collect::<String>(),
+                                )
+                                .or_not(),
+                        ),
                 )
                 .or_not(),
         )
@@ -245,9 +236,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             date_str.push_str(&day_str);
                         }
                     }
-                    
+
                     println!("Parsed date: {}", date_str);
-                    
+
                     Literal::Date(date_str)
                 }
                 None => Literal::Date("".to_string()), // This shouldn't happen with the current parser structure
@@ -255,13 +246,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
+    let date = just('@').ignore_then(date_format);
+
     // Create a parser for datetime literals
-    let datetime = just('@')
-        .ignore_then(text::digits(10).repeated().exactly(4).collect::<String>())
+    let datetime = date
+        .clone()
         .then(just('T'))
         .then(time_format.clone())
         .then(timezone_format.clone().or_not())
-        .map(|(((date, _), time), timezone)| Literal::DateTime(date, time, timezone))
+        .map(|(((date, _), time), timezone)| Literal::DateTime(date.to_string(), time, timezone))
         .boxed();
 
     // Create a parser for time literals
