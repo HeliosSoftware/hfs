@@ -299,6 +299,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 (Some(Literal::Date(date_str)), Some(None)) => Literal::DateTime(date_str, None),
                 // @2022-01-01
                 (Some(Literal::Date(date_str)), None) => Literal::Date(date_str),
+                // AI!  Below should also handle timezone components of the time
                 // @T12:30
                 (None, Some(Some(time_str))) => Literal::Time(time_str),
                 // Other cases (shouldn't happen with proper parsing)
