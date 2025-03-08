@@ -146,34 +146,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                     .repeated()
                                     .at_least(1)
                                     .at_most(3)
-                                    .collect::<String>(),
+                                    .collect::<String>()
+                                    .or_not(),
                             ),
                         )
                         .or_not(),
                 )
                 .or_not(),
         )
-        .or_not()
-        .map(|opt| {
-            if let Some((hours, rest_opt)) = opt {
-                let mut result = hours;
-                if let Some((minutes, seconds_part)) = rest_opt {
-                    result.push(':');
-                    result.push_str(&minutes);
-
-                    if let Some((seconds, milliseconds)) = seconds_part {
-                        result.push(':');
-                        result.push_str(&seconds);
-
-                        // milliseconds is a String, not an Option
-                        result.push('.');
-                        result.push_str(&milliseconds);
-                    }
-                }
-                result
-            } else {
-                "".to_string()
-            }
+            // AI! Add correct map
         });
 
     // Timezone format: Z | (+|-)HH:mm
