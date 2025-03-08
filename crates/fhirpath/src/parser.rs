@@ -128,13 +128,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .collect::<String>()
         .map(Literal::String);
 
-    let number = text::int(10)
-        .then(just('.').then(text::digits(10)).or_not())
+    let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .then(
+            just('.')
+                .then(filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit()))
+                .or_not(),
+        )
         .map(|(i, d)| {
             if let Some((_, d)) = d {
-                Literal::Number(format!("{}.{}", i, d).parse().unwrap())
+                // AI! Need to combine the whole number part and fractional part
+                Literal::Number(i, d).parse().unwrap())
             } else {
-                Literal::Number(i.parse().unwrap())
+                Literal::Number(i)
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -328,25 +333,30 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
         date_time_precision.map(Unit::DateTimePrecision),
-        plural_date_time_precision.map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
-        string.map(|s| if let Literal::String(str_val) = s { Unit::UCUM(str_val) } else { unreachable!() })
+        plural_date_time_precision
+            .map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
+        string.map(|s| {
+            if let Literal::String(str_val) = s {
+                Unit::UCUM(str_val)
+            } else {
+                unreachable!()
+            }
+        }),
     ));
 
     // Create a parser for optional unit
     let optional_unit = unit.or_not().boxed();
 
-    let quantity = number.then(optional_unit).map(|(n, u)| {
-        match u {
-            Some(unit) => {
-                let unit_str = match unit {
-                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
-                    Unit::PluralDateTimePrecision(s) => s,
-                    Unit::UCUM(s) => s,
-                };
-                Literal::Quantity(n, Some(unit_str))
-            },
-            None => Literal::Quantity(n, None)
+    let quantity = number.then(optional_unit).map(|(n, u)| match u {
+        Some(unit) => {
+            let unit_str = match unit {
+                Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
+                Unit::PluralDateTimePrecision(s) => s,
+                Unit::UCUM(s) => s,
+            };
+            Literal::Quantity(n, Some(unit_str))
         }
+        None => Literal::Quantity(n, None),
     });
 
     let date_datetime_time = just('@')
