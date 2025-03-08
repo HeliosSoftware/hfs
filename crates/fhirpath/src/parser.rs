@@ -138,9 +138,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             if let Some((_, d)) = d {
                 // Combine whole number and fractional part
                 let num_str = format!("{}.{}", i, d);
-                num_str.parse::<f64>().unwrap()
+                Literal::Number(num_str.parse::<f64>().unwrap())
             } else {
-                i.to_string().parse::<f64>().unwrap()
+                Literal::Number(i.to_string().parse::<f64>().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -355,6 +355,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Unit::PluralDateTimePrecision(s) => s,
                 Unit::UCUM(s) => s,
             };
+            // AI! derefernce the n value which is a Literal::Number and convert it into a f64
             Literal::Quantity(n, Some(unit_str))
         }
         None => Literal::Quantity(n, None),
@@ -396,13 +397,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             }
         });
 
-    let number_literal = number.map(Literal::Number);
-    
     let literal = choice((
         null,
         boolean,
         string,
-        number_literal,
+        number,
         long_number,
         date_datetime_time,
         quantity,
