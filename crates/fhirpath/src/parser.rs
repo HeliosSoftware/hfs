@@ -284,9 +284,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .ignore_then(date_format)
         .or_not()
         .then(just('T').ignore_then(time_format).or_not())
-        .or_not();
-    // AI! Add a map statement to the above - Should return a Literal::Date, a Literal::DateTime,
-    // or a Literal::Time
+        .map(|(date_opt, time_opt)| {
+            match (date_opt, time_opt) {
+                (Some(Literal::Date(date_str)), Some(time_str)) => {
+                    // DateTime: we have both date and time
+                    Literal::DateTime(date_str, time_str, None)
+                },
+                (Some(Literal::Date(date_str)), None) => {
+                    // Date only
+                    Literal::Date(date_str)
+                },
+                (None, Some(time_str)) => {
+                    // Time only
+                    Literal::Time(time_str)
+                },
+                _ => unreachable!("Invalid date/time format")
+            }
+        });
 
     let literal = choice((
         null,
