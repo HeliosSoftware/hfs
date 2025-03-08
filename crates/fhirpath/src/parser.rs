@@ -243,10 +243,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
-    let date = just('@').ignore_then(date_format.clone());
+    let _date = just('@').ignore_then(date_format.clone());
 
     // Create a parser for datetime literals
-    let datetime = just('@')
+    let _datetime = just('@')
         .ignore_then(date_format.clone())
         .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
         .map(|(date, time_part)| {
@@ -264,7 +264,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
     // Create a parser for time literals
-    let time = just('@')
+    let _time = just('@')
         .ignore_then(just('T').ignore_then(time_format.clone()))
         .map(|time_str| Literal::Time(time_str))
         .boxed();
@@ -281,47 +281,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             unreachable!()
         }
     });
-    /*
-        let date_datetime_time = just('@')
-            .ignore_then(date_format.clone().or_not())
-            .then(just('T').ignore_then(time_format.clone().or_not()).or_not())
-            .map(|(date_opt, time_part)| {
-                // Clone the values for debugging
-                let date_opt_clone = date_opt.clone();
-                let time_part_clone = time_part.clone();
 
-                match (date_opt, time_part) {
-                    (Some(Literal::Date(date_str)), Some(Some(time_str))) => {
-                        // DateTime: we have both date and time
-                        Literal::DateTime(date_str, time_str, None)
-                    }
-                    (Some(Literal::Date(date_str)), _) => {
-                        // Date only
-                        Literal::Date(date_str)
-                    }
-                    (None, Some(Some(time_str))) => {
-                        // Time only
-                        Literal::Time(time_str)
-                    }
-                    _ => {
-                        println!(
-                            "Invalid date/time format: date_opt={:?}, time_part={:?}",
-                            date_opt_clone, time_part_clone
-                        );
-                        Literal::Null // Return null for invalid formats
-                    }
-                }
-            });
-    */
+    let date_datetime_time = just('@')
+        .ignore_then(date_format.clone().or_not())
+        .then(just('T').ignore_then(time_format.clone().or_not()).or_not())
+        // AI! add a map statement
+        });
+
     let literal = choice((
         null,
         boolean,
         string,
         number,
         long_number,
-        date,
-        datetime,
-        time,
+date_datetime_time,
         quantity,
     ))
     .map(Term::Literal);
