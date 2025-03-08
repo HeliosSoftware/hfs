@@ -291,10 +291,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .map(|(date_part, time_part)| {
             match (date_part, time_part) {
-                // AI! Fix the two spots below that need to handle the timezone format
-                // @2022-01-01T12:30
-                (Some(Literal::Date(date_str)), Some(Some(time_str))) => {
-                    Literal::DateTime(date_str, Some((time_str, None)))
+                // @2022-01-01T12:30 or @2022-01-01T12:30Z or @2022-01-01T12:30+01:00
+                (Some(Literal::Date(date_str)), Some(Some((time_str, timezone)))) => {
+                    Literal::DateTime(date_str, Some((time_str, timezone)))
                 }
                 // @2022-01-01T
                 (Some(Literal::Date(date_str)), Some(None)) => Literal::DateTime(date_str, None),
