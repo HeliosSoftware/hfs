@@ -295,14 +295,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
-    let unit = choice((
-        date_time_precision,
-        plural_date_time_precision,
-        just('\'')
-            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('\''))
-            .collect::<String>(),
-    )).padded();
+    let unit = choice((date_time_precision, plural_date_time_precision, string));
 
     let quantity = number.then(unit.or_not()).map(|(n, u)| {
         if let Literal::Number(num) = n {
