@@ -158,16 +158,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             if let Some((hours, rest_opt)) = opt {
                 let mut result = hours;
                 if let Some((minutes, seconds_part)) = rest_opt {
-                result.push(':');
-                result.push_str(&minutes);
-
-                if let Some((seconds, milliseconds)) = seconds_part {
                     result.push(':');
-                    result.push_str(&seconds);
+                    result.push_str(&minutes);
 
-                    if let Some(ms) = milliseconds {
-                        result.push('.');
-                        result.push_str(&ms);
+                    if let Some((seconds, milliseconds)) = seconds_part {
+                        result.push(':');
+                        result.push_str(&seconds);
+
+                        if let Some(ms) = milliseconds {
+                            result.push('.');
+                            result.push_str(&ms);
+                        }
                     }
                 }
                 result
