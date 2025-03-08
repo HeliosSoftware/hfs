@@ -122,20 +122,29 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .to(Literal::Boolean(true))
         .or(text::keyword("false").to(Literal::Boolean(false)));
 
-    let string = just('\'')
-        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-        .then_ignore(just('\''))
-        .collect::<String>()
-        .map(Literal::String);
-
+    let string = none_of("\\\'")
+        .ignored()
+        .repeated()
+        .map(Literal::String)
+        .delimited_by(just('\''), just('\''))
+        .boxed();
+    /*
+        let string = just('\'')
+            .ignore_then(filter(|_| true).map(|c| c).repeated().collect())
+            .then(just('\''))
+            .collect::<String>()
+            .map(Literal::String);
+    */
     let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
+        .at_least(1)
         .collect::<String>()
         .then(
             just('.')
                 .then(
                     filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                         .repeated()
+                        .at_least(1)
                         .collect::<String>(),
                 )
                 .or_not(),
@@ -146,7 +155,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 let num_str = format!("{}.{}", i, d);
                 Literal::Number(num_str.parse::<f64>().unwrap())
             } else {
-                println!("Parsing integer: {}", i);
                 Literal::Number(i.parse::<f64>().unwrap())
             }
         })
@@ -154,6 +162,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     let long_number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
+        .at_least(1)
         .collect::<String>()
         .then(just('L').or_not())
         .map(|(i, l)| {
