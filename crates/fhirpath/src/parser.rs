@@ -241,9 +241,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
-    let date = just('@').ignore_then(date_format.clone())
-        .map(|date_lit| date_lit) // AI! need to return a Literal::Date
-    ;
+    let date = just('@').ignore_then(date_format.clone());
 
     // Create a parser for datetime literals
     let datetime = just('@')
