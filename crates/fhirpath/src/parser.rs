@@ -2,7 +2,6 @@ use chumsky::Parser;
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use std::fmt;
-use std::intrinsics::unreachable;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -130,29 +129,38 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(Literal::String);
 
     let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .collect::<String>()
         .then(
             just('.')
-                .then(filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit()))
+                .then(
+                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                        .repeated()
+                        .collect::<String>(),
+                )
                 .or_not(),
         )
         .map(|(i, d)| {
             if let Some((_, d)) = d {
                 // Combine whole number and fractional part
                 let num_str = format!("{}.{}", i, d);
-                num_str.parse::<f64>().unwrap()
+                Literal::Number(num_str.parse::<f64>().unwrap())
             } else {
-                i.to_string().parse::<f64>().unwrap()
+                // AI! print out the value of i
+                Literal::Number(i.parse::<f64>().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
 
     let long_number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .collect::<String>()
         .then(just('L').or_not())
         .map(|(i, l)| {
             if l.is_some() {
-                Literal::LongNumber(i.to_string().parse().unwrap())
+                Literal::LongNumber(i.parse().unwrap())
             } else {
-                Literal::LongNumber(i.to_string().parse().unwrap())
+                Literal::LongNumber(i.parse().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -337,27 +345,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         date_time_precision.map(Unit::DateTimePrecision),
         plural_date_time_precision
             .map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
-        string.clone().map(|s| if let Literal::String(str_val) = s {
-            Unit::UCUM(str_val)
-        } else {
-            // This shouldn't happen due to the parser structure
-            Unit::UCUM("".to_string())
-        })
+        string.clone().map(|s| {
+            if let Literal::String(str_val) = s {
+                Unit::UCUM(str_val)
+            } else {
+                // This shouldn't happen due to the parser structure
+                Unit::UCUM("".to_string())
+            }
+        }),
     ));
 
-    // Create a parser for optional unit
-    let optional_unit = unit.or_not().boxed();
-
-    let quantity = number.then(optional_unit).map(|(n, u)| match u {
+    let quantity = number.then(unit.or_not()).map(|(n, u)| match u {
         Some(unit) => {
             let unit_str = match unit {
                 Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
                 Unit::PluralDateTimePrecision(s) => s,
                 Unit::UCUM(s) => s,
             };
-            Literal::Quantity(n, Some(unit_str))
+            match n {
+                Literal::Number(value) => Literal::Quantity(value, Some(unit_str)),
+                _ => {
+                    // This shouldn't happen due to the parser structure
+                    Literal::Quantity(0.0, None)
+                }
+            }
         }
-        None => Literal::Quantity(n, None),
+        None => {
+            match n {
+                Literal::Number(value) => Literal::Quantity(value, None),
+                _ => {
+                    // This shouldn't happen due to the parser structure
+                    Literal::Quantity(0.0, None)
+                }
+            }
+        }
     });
 
     let date_datetime_time = just('@')
@@ -396,13 +417,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             }
         });
 
-    let number_literal = number.map(Literal::Number);
-
     let literal = choice((
         null,
         boolean,
         string,
-        number_literal,
+        number,
         long_number,
         date_datetime_time,
         quantity,
