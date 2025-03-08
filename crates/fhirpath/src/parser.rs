@@ -241,15 +241,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
-    let date = just('@').ignore_then(date_format);
+    let date = just('@').ignore_then(date_format.clone());
 
     // Create a parser for datetime literals
-    let datetime = date
-        .clone()
-        .then(just('T'))
-        .then(time_format.clone())
-        .then(timezone_format.clone().or_not())
-        .map(|(((date, _), time), timezone)| Literal::DateTime(date.to_string(), time, timezone))
+    let datetime = just('@')
+        .ignore_then(date_format)
+        .then(just('T').ignore_then(time_format.then(timezone_format).or_not()))
+        // AI! Add map here
         .boxed();
 
     // Create a parser for time literals
@@ -279,8 +277,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         string,
         number,
         long_number,
-        date.clone(),
-        datetime.clone(),
+        date,
+        datetime,
         time.clone(),
         quantity,
     ))
