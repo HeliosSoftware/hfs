@@ -295,9 +295,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
-    let unit = choice((date_time_precision, plural_date_time_precision, string)).boxed();
+    // We need to use a different approach since boxed() can't be called directly on Choice
+    let unit = choice((
+        date_time_precision.map(Some), 
+        plural_date_time_precision.map(Some), 
+        string.map(Some)
+    ));
 
-    let quantity = number.then(unit.or_not()).map(|(n, u)| {
+    let quantity = number.then(unit.or(empty().to(None))).map(|(n, u)| {
         if let Literal::Number(num) = n {
             Literal::Quantity(num, u)
         } else {
