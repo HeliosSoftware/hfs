@@ -57,6 +57,37 @@ pub enum Invocation {
     Total,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Unit {
+    DateTimePrecision(DateTimePrecision),
+    PluralDateTimePrecision(String),
+    UCUM(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DateTimePrecision {
+    Year,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PluralDateTimePrecision {
+    Years,
+    Months,
+    Weeks,
+    Days,
+    Hours,
+    Minutes,
+    Seconds,
+    Milliseconds,
+}
+
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -272,43 +303,33 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Date time precision units
     let date_time_precision = choice((
-        text::keyword("year").to("year"),
-        text::keyword("month").to("month"),
-        text::keyword("week").to("week"),
-        text::keyword("day").to("day"),
-        text::keyword("hour").to("hour"),
-        text::keyword("minute").to("minute"),
-        text::keyword("second").to("second"),
-        text::keyword("millisecond").to("millisecond"),
+        text::keyword("year").to(DateTimePrecision::Year),
+        text::keyword("month").to(DateTimePrecision::Month),
+        text::keyword("week").to(DateTimePrecision::Week),
+        text::keyword("day").to(DateTimePrecision::Day),
+        text::keyword("hour").to(DateTimePrecision::Hour),
+        text::keyword("minute").to(DateTimePrecision::Minute),
+        text::keyword("second").to(DateTimePrecision::Second),
+        text::keyword("millisecond").to(DateTimePrecision::Millisecond),
     ));
 
     // Plural date time precision units
     let plural_date_time_precision = choice((
-        text::keyword("years").to("years"),
-        text::keyword("months").to("months"),
-        text::keyword("weeks").to("weeks"),
-        text::keyword("days").to("days"),
-        text::keyword("hours").to("hours"),
-        text::keyword("minutes").to("minutes"),
-        text::keyword("seconds").to("seconds"),
-        text::keyword("milliseconds").to("milliseconds"),
+        text::keyword("years").to(PluralDateTimePrecision::Years),
+        text::keyword("months").to(PluralDateTimePrecision::Months),
+        text::keyword("weeks").to(PluralDateTimePrecision::Weeks),
+        text::keyword("days").to(PluralDateTimePrecision::Days),
+        text::keyword("hours").to(PluralDateTimePrecision::Hours),
+        text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
+        text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
+        text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
     ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
-    // We need to use a different approach since boxed() can't be called directly on Choice
-    let unit = choice((
-        date_time_precision.map(Some), 
-        plural_date_time_precision.map(Some), 
-        string.map(Some)
-    ));
+    // AI! Add a map to Unit::
+    let unit = choice((date_time_precision, plural_date_time_precision, string));
 
-    let quantity = number.then(unit.or(empty().to(None))).map(|(n, u)| {
-        if let Literal::Number(num) = n {
-            Literal::Quantity(num, u)
-        } else {
-            unreachable!()
-        }
-    });
+    let quantity = number.then(unit.or_not());
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
