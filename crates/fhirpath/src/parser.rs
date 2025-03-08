@@ -297,8 +297,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 (None, Some(time_str)) => {
                     // Time only
                     Literal::Time(time_str)
-                } // AI! Can you print out the invalid date/time format here?
-                _ => unreachable!("Invalid date/time format"),
+                }
+                _ => {
+                    println!("Invalid date/time format: date_opt={:?}, time_opt={:?}", date_opt, time_opt);
+                    unreachable!("Invalid date/time format")
+                },
             }
         });
 
