@@ -136,10 +136,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         )
         .map(|(i, d)| {
             if let Some((_, d)) = d {
-                // AI! Need to combine the whole number part and fractional part
-                Literal::Number(i, d).parse().unwrap())
+                // Combine whole number and fractional part
+                let num_str = format!("{}.{}", i, d);
+                Literal::Number(num_str.parse().unwrap())
             } else {
-                Literal::Number(i)
+                Literal::Number(i.to_string().parse().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
