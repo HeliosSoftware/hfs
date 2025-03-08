@@ -268,7 +268,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Create a parser for time literals
     let time = just('@')
         .then(just('T').ignore_then(time_format.clone()))
-        // AI! add map
+        .map(|(_, time_str)| Literal::Time(time_str))
         .boxed();
 
     let unit = text::ident().or(just('\'')
