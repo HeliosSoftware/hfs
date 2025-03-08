@@ -332,17 +332,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         string.map(|s| if let Literal::String(str_val) = s { Unit::UCUM(str_val) } else { unreachable!() })
     ));
 
-    // Create individual unit parsers
-    let date_time_unit = date_time_precision.map(Unit::DateTimePrecision);
-    let plural_date_time_unit = plural_date_time_precision.map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase()));
-    let string_unit = string.map(|s| if let Literal::String(str_val) = s { Unit::UCUM(str_val) } else { unreachable!() });
-    
     // Create a parser for optional unit
-    let optional_unit = choice((
-        date_time_unit,
-        plural_date_time_unit,
-        string_unit
-    )).or(empty().to(None)).boxed();
+    let optional_unit = unit.or_not().boxed();
 
     let quantity = number.then(optional_unit).map(|(n, u)| {
         match u {
