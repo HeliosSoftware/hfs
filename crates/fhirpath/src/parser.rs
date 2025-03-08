@@ -254,8 +254,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 if let Some((time_str, timezone)) = time_part {
                     Literal::DateTime(date_str, Some((time_str, timezone)))
                 } else {
-                    // AI! We need to return a Literal::DateTime value here
-                    Literal::Date(date_str)
+                    // When there's no time part, return a DateTime with None for the time part
+                    Literal::DateTime(date_str, None)
                 }
             } else {
                 unreachable!("Expected Date literal")
