@@ -124,7 +124,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .collect::<String>()
         .then(
             just(':')
-                .then(
+                .ignore_then(
                     filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                         .repeated()
                         .at_least(2)
@@ -133,7 +133,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .then(
                     just(':')
-                        .then(
+                        .ignore_then(
                             filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
                                 .repeated()
                                 .at_least(2)
@@ -141,31 +141,30 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                 .collect::<String>(),
                         )
                         .then(
-                            just('.')
-                                .then(
-                                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                                        .repeated()
-                                        .at_least(1)
-                                        .at_most(3)
-                                        .collect::<String>(),
-                                )
-                                .or_not(),
+                            just('.').ignore_then(
+                                filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                                    .repeated()
+                                    .at_least(1)
+                                    .at_most(3)
+                                    .collect::<String>(),
+                            ),
                         )
                         .or_not(),
                 )
                 .or_not(),
         )
+        .or_not()
         .map(|(hours, rest_opt)| {
             let mut result = hours;
-            if let Some(((_, minutes), seconds_part)) = rest_opt {
+            if let Some((minutes, seconds_part)) = rest_opt {
                 result.push(':');
                 result.push_str(&minutes);
 
-                if let Some(((_, seconds), milliseconds)) = seconds_part {
+                if let Some((seconds, milliseconds)) = seconds_part {
                     result.push(':');
                     result.push_str(&seconds);
 
-                    if let Some((_, ms)) = milliseconds {
+                    if let Some(ms) = milliseconds {
                         result.push('.');
                         result.push_str(&ms);
                     }
