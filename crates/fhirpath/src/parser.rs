@@ -138,9 +138,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             if let Some((_, d)) = d {
                 // Combine whole number and fractional part
                 let num_str = format!("{}.{}", i, d);
-                Literal::Number(num_str.parse().unwrap())
+                num_str.parse::<f64>().unwrap()
             } else {
-                Literal::Number(i.to_string().parse().unwrap())
+                i.to_string().parse::<f64>().unwrap()
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -396,11 +396,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             }
         });
 
+    let number_literal = number.map(Literal::Number);
+    
     let literal = choice((
         null,
         boolean,
         string,
-        number,
+        number_literal,
         long_number,
         date_datetime_time,
         quantity,
