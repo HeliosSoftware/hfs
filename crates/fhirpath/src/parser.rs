@@ -241,10 +241,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
-    let date = just('@').ignore_then(date_format.clone());
+    let _date = just('@').ignore_then(date_format.clone());
 
     // Create a parser for datetime literals
-    let datetime = just('@')
+    let _datetime = just('@')
         .ignore_then(date_format)
         .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
         .map(|(date_lit, time_opt)| {
@@ -262,7 +262,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
     // Create a parser for time literals
-    let time = just('@')
+    let _time = just('@')
         .ignore_then(just('T').ignore_then(time_format.clone()))
         .map(|time_str| Literal::Time(time_str))
         .boxed();
@@ -281,7 +281,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     });
 
     let date_datetime_time = just('@')
-        .ignore_then(date_format)
+        .ignore_then(date_format.clone())
         .or_not()
         .then(just('T').ignore_then(time_format).or_not())
         .map(|(date_opt, time_opt)| {
@@ -289,16 +289,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 (Some(Literal::Date(date_str)), Some(time_str)) => {
                     // DateTime: we have both date and time
                     Literal::DateTime(date_str, time_str, None)
-                },
+                }
                 (Some(Literal::Date(date_str)), None) => {
                     // Date only
                     Literal::Date(date_str)
-                },
+                }
                 (None, Some(time_str)) => {
                     // Time only
                     Literal::Time(time_str)
-                },
-                _ => unreachable!("Invalid date/time format")
+                }
+                _ => unreachable!("Invalid date/time format"),
             }
         });
 
