@@ -146,7 +146,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 let num_str = format!("{}.{}", i, d);
                 Literal::Number(num_str.parse::<f64>().unwrap())
             } else {
-                // AI! print out the value of i
+                println!("Parsing integer: {}", i);
                 Literal::Number(i.parse::<f64>().unwrap())
             }
         })
