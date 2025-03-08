@@ -175,25 +175,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         });
 
     // Timezone format: Z | (+|-)HH:mm
-    let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
-        .map(|c: char| c.to_string())
-        .then(
-            text::digits(10)
-                .repeated()
-                .at_most(2)
-                .at_least(2)
-                .collect::<String>(),
-        )
-        .then(just(':'))
-        .then(
-            text::digits(10)
-                .repeated()
-                .at_most(2)
-                .at_least(2)
-                .collect::<String>(),
-        )
-        .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
-
+    /*    let timezone_format = just('Z').to("Z".to_string()).or(one_of("+-")
+            .map(|c: char| c.to_string())
+            .then(
+                text::digits(10)
+                    .repeated()
+                    .at_most(2)
+                    .at_least(2)
+                    .collect::<String>(),
+            )
+            .then(just(':'))
+            .then(
+                text::digits(10)
+                    .repeated()
+                    .at_most(2)
+                    .at_least(2)
+                    .collect::<String>(),
+            )
+            .map(|(((sign, hour), _), min)| format!("{}{}:{}", sign, hour, min)));
+    */
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
     let date_format = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
@@ -244,18 +244,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Create a parser for datetime literals
     let datetime = just('@')
         .ignore_then(date_format.clone())
-        .then(just('T').ignore_then(time_format).or_not())
-        .map(|(date, time_opt)| {
-            if let Literal::Date(date_str) = date {
-                if let Some(time_str) = time_opt {
-                    Literal::DateTime(date_str, time_str, None)
-                } else {
-                    Literal::Date(date_str)
-                }
-            } else {
-                unreachable!("Expected Date literal")
-            }
-        })
+        .then(just('T').ignore_then(time_format))
+        // AI! Add a map
         .boxed();
 
     // Create a parser for time literals
@@ -277,7 +267,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         }
     });
 
-    let date_datetime_time = just('@')
+    let _date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
         .then(just('T').ignore_then(time_format.clone().or_not()).or_not())
         .map(|(date_opt, time_part)| {
@@ -315,7 +305,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         number,
         long_number,
         datetime,
-        _time,
         quantity,
     ))
     .map(Term::Literal);
