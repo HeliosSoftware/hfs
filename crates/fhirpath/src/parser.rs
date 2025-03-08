@@ -122,17 +122,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .to(Literal::Boolean(true))
         .or(text::keyword("false").to(Literal::Boolean(false)));
 
-    let string = none_of("\\\'")
-        .ignored()
-        .repeated()
+    let string = just('\'')
+        .ignore_then(none_of("\\\'").repeated().collect::<String>())
+        .then_ignore(just('\''))
         .map(Literal::String)
-        .delimited_by(just('\''), just('\''))
         .boxed();
     /*
         let string = just('\'')
-            .ignore_then(filter(|_| true).map(|c| c).repeated().collect())
-            .then(just('\''))
-            .collect::<String>()
+            .ignore_then(filter(|_| true).repeated().collect::<String>())
+            .then_ignore(just('\''))
             .map(Literal::String);
     */
     let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
@@ -475,9 +473,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
-        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
-        .then_ignore(just('\''))
-        .collect::<String>();
+        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated().collect::<String>())
+        .then_ignore(just('\''));
 
     // External constants
     let external_constant = just('%')
