@@ -285,7 +285,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
         .then(just('T').ignore_then(time_format.clone().or_not()).or_not())
-        // AI! add a map statement
+        .map(|(date_part, time_part)| {
+            match (date_part, time_part) {
+                // @2022-01-01T12:30
+                (Some(Literal::Date(date_str)), Some(Some(time_str))) => {
+                    Literal::DateTime(date_str, Some((time_str, None)))
+                },
+                // @2022-01-01T
+                (Some(Literal::Date(date_str)), Some(None)) => {
+                    Literal::DateTime(date_str, None)
+                },
+                // @2022-01-01
+                (Some(Literal::Date(date_str)), None) => {
+                    Literal::Date(date_str)
+                },
+                // @T12:30
+                (None, Some(Some(time_str))) => {
+                    Literal::Time(time_str)
+                },
+                // Other cases (shouldn't happen with proper parsing)
+                _ => Literal::Null,
+            }
         });
 
     let literal = choice((
