@@ -249,8 +249,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(date, time_part)| {
             if let Literal::Date(date_str) = date {
                 if let Some((time_str, timezone)) = time_part {
-                    // AI! Fix below - shoud use the enum type
-                    Literal::DateTime(date_str, time_str, timezone)
+                    Literal::DateTime(date_str, Some(time_str), timezone)
                 } else {
                     // If no time part is provided, treat as date only
                     Literal::Date(date_str)
