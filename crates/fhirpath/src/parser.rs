@@ -154,10 +154,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .or_not(),
         )
-        .map(|opt| {
-            if let Some((hours, rest_opt)) = opt {
-                let mut result = hours;
-                if let Some((minutes, seconds_part)) = rest_opt {
+        .map(|(hours, rest_opt)| {
+            let mut result = hours;
+            if let Some((minutes, seconds_part)) = rest_opt {
                     result.push(':');
                     result.push_str(&minutes);
 
@@ -171,9 +170,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }
                 }
                 result
-            } else {
-                "".to_string()
-            }
         });
 
     // Timezone format: Z | (+|-)HH:mm
