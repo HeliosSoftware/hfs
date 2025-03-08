@@ -157,19 +157,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(hours, rest_opt)| {
             let mut result = hours;
             if let Some((minutes, seconds_part)) = rest_opt {
+                result.push(':');
+                result.push_str(&minutes);
+
+                if let Some((seconds, milliseconds)) = seconds_part {
                     result.push(':');
-                    result.push_str(&minutes);
+                    result.push_str(&seconds);
 
-                    if let Some((seconds, milliseconds)) = seconds_part {
-                        result.push(':');
-                        result.push_str(&seconds);
-
-                        // milliseconds is a String, not an Option
-                        result.push('.');
-                        result.push_str(&milliseconds);
-                    }
+                    // milliseconds is a String, not an Option
+                    result.push('.');
+                    result.push_str(&milliseconds);
                 }
-                result
+            }
+            result
         });
 
     // Timezone format: Z | (+|-)HH:mm
