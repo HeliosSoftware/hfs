@@ -2,6 +2,7 @@ use chumsky::Parser;
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use std::fmt;
+use std::intrinsics::unreachable;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -336,13 +337,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         date_time_precision.map(Unit::DateTimePrecision),
         plural_date_time_precision
             .map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
-        string.map(|s| {
-            if let Literal::String(str_val) = s {
-                Unit::UCUM(str_val)
-            } else {
-                unreachable!()
-            }
-        }),
+        //AI! Add a choice option for string that should map to Unit::UCUM
     ));
 
     // Create a parser for optional unit
@@ -397,7 +392,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         });
 
     let number_literal = number.map(Literal::Number);
-    
+
     let literal = choice((
         null,
         boolean,
