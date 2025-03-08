@@ -165,10 +165,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         result.push(':');
                         result.push_str(&seconds);
 
-                        if let Some(ms) = milliseconds {
-                            result.push('.');
-                            result.push_str(&ms);
-                        }
+                        // milliseconds is a String, not an Option
+                        result.push('.');
+                        result.push_str(&milliseconds);
                     }
                 }
                 result
