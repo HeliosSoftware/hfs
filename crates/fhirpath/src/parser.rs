@@ -250,7 +250,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(date_lit, time_opt)| {
             if let Literal::Date(date_str) = date_lit {
                 if let Some((time_str, tz_opt)) = time_opt {
-                    Literal::DateTime(date_str, time_str, tz_opt)
+                    Literal::DateTime(date_str, time_str, Some(tz_opt))
                 } else {
                     // If no time part is provided, use empty string for time
                     Literal::DateTime(date_str, "".to_string(), None)
