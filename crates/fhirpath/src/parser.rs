@@ -270,6 +270,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .boxed();
     */
 
+    // Date time precision units
+    let date_time_precision = choice((
+        text::keyword("year").to("year"),
+        text::keyword("month").to("month"),
+        text::keyword("week").to("week"),
+        text::keyword("day").to("day"),
+        text::keyword("hour").to("hour"),
+        text::keyword("minute").to("minute"),
+        text::keyword("second").to("second"),
+        text::keyword("millisecond").to("millisecond"),
+    ));
+
+    // Plural date time precision units
+    let plural_date_time_precision = choice((
+        text::keyword("years").to("years"),
+        text::keyword("months").to("months"),
+        text::keyword("weeks").to("weeks"),
+        text::keyword("days").to("days"),
+        text::keyword("hours").to("hours"),
+        text::keyword("minutes").to("minutes"),
+        text::keyword("seconds").to("seconds"),
+        text::keyword("milliseconds").to("milliseconds"),
+    ));
+
+    // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
+    let unit = choice((
+        date_time_precision,
+        plural_date_time_precision,
+        just('\'')
+            .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated())
+            .then_ignore(just('\''))
+            .collect::<String>(),
+    )).padded();
+
     let quantity = number.then(unit.or_not()).map(|(n, u)| {
         if let Literal::Number(num) = n {
             Literal::Quantity(num, u)
