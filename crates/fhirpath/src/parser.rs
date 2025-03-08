@@ -235,8 +235,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             }
 
-            println!("Parsed date: {}", date_str);
-
             Literal::Date(date_str)
         })
         .boxed();
@@ -244,21 +242,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let _date = just('@').ignore_then(date_format.clone());
 
     // Create a parser for datetime literals
-    let _datetime = just('@')
+    let datetime = just('@')
         .ignore_then(date_format.clone())
-        .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
-        .map(|(date_lit, time_opt)| {
-            if let Literal::Date(date_str) = date_lit {
-                if let Some((time_str, tz_opt)) = time_opt {
-                    Literal::DateTime(date_str, time_str, tz_opt)
-                } else {
-                    // If no time part is provided, use empty string for time
-                    Literal::DateTime(date_str, "".to_string(), None)
-                }
-            } else {
-                unreachable!("Expected Date literal")
-            }
-        })
+        .then(just('T').ignore_then(time_format).or_not())
+        //.then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
+        // AI! Add a map statement
         .boxed();
 
     // Create a parser for time literals
@@ -287,25 +275,27 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             // Clone the values for debugging
             let date_opt_clone = date_opt.clone();
             let time_part_clone = time_part.clone();
-            
+
             match (date_opt, time_part) {
                 (Some(Literal::Date(date_str)), Some(Some(time_str))) => {
                     // DateTime: we have both date and time
                     Literal::DateTime(date_str, time_str, None)
-                },
+                }
                 (Some(Literal::Date(date_str)), _) => {
                     // Date only
                     Literal::Date(date_str)
-                },
+                }
                 (None, Some(Some(time_str))) => {
                     // Time only
                     Literal::Time(time_str)
-                },
+                }
                 _ => {
-                    println!("Invalid date/time format: date_opt={:?}, time_part={:?}", 
-                             date_opt_clone, time_part_clone);
+                    println!(
+                        "Invalid date/time format: date_opt={:?}, time_part={:?}",
+                        date_opt_clone, time_part_clone
+                    );
                     Literal::Null // Return null for invalid formats
-                },
+                }
             }
         });
 
@@ -315,7 +305,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         string,
         number,
         long_number,
-        date_datetime_time,
+        datetime,
+        //date_datetime_time,
         quantity,
     ))
     .map(Term::Literal);
