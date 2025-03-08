@@ -280,7 +280,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         }
     });
 
-    let date_datetime_time = choice((datetime, date, time));
+    let date_datetime_time = just('@')
+        .ignore_then(date_format)
+        .or_not()
+        .then(just('T').ignore_then(time_format).or_not())
+        .or_not();
+    // AI! Add a map statement to the above - Should return a Literal::Date, a Literal::DateTime,
+    // or a Literal::Time
 
     let literal = choice((
         null,
