@@ -403,8 +403,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(n, u)| match u {
             Some(unit) => {
                 let unit_str = match unit {
-                    Unit::DateTimePrecision(p) => p,
-                    Unit::PluralDateTimePrecision(s) => s,
+                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
+                    Unit::PluralDateTimePrecision(s) => format!("{:?}", s).to_lowercase(),
                     Unit::UCUM(s) => s,
                 };
                 match n {
