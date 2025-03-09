@@ -408,18 +408,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     .padded(); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
-    let quantity = number
-        .padded()
-        .then(unit)
-        .map(|(n, u)| {
-            if let Literal::Number(num) = n {
-                Literal::Quantity(num, Some(u))
-            } else {
-                // This shouldn't happen due to the parser structure
-                Literal::Quantity(0.0, Some(u))
-            }
-        })
-    ;
+    let quantity = number.then(unit).map(|(n, u)| {
+        if let Literal::Number(num) = n {
+            Literal::Quantity(num, Some(u))
+        } else {
+            // This shouldn't happen due to the parser structure
+            Literal::Quantity(0.0, Some(u))
+        }
+    });
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
@@ -462,10 +458,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         null,
         boolean,
         string,
+        quantity,
         number,
         long_number,
         date_datetime_time,
-        quantity,
     ))
     .map(Term::Literal);
 
