@@ -127,12 +127,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then_ignore(just('\''))
         .map(Literal::String)
         .boxed();
-    /*
-        let string = just('\'')
-            .ignore_then(filter(|_| true).repeated().collect::<String>())
-            .then_ignore(just('\''))
-            .map(Literal::String);
-    */
+
     let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
         .at_least(1)
@@ -473,7 +468,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
-        .ignore_then(none_of("\'\\").or(just('\\').ignore_then(any())).repeated().collect::<String>())
+        .ignore_then(
+            none_of("\'\\")
+                .or(just('\\').ignore_then(any()))
+                .repeated()
+                .collect::<String>(),
+        )
         .then_ignore(just('\''));
 
     // External constants
