@@ -410,28 +410,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Quantity needs to be a term-level construct to work in expressions
     let quantity = number
         .padded()
-        .then(unit.padded().or_not())
-        .map(|(n, u)| match u {
-            Some(unit) => {
-                match n {
-                    Literal::Number(value) => Literal::Quantity(value, Some(unit)),
-                    _ => {
-                        // This shouldn't happen due to the parser structure
-                        Literal::Quantity(0.0, None)
-                    }
-                }
-            }
-            None => {
-                match n {
-                    Literal::Number(value) => Literal::Quantity(value, None),
-                    _ => {
-                        // This shouldn't happen due to the parser structure
-                        Literal::Quantity(0.0, None)
-                    }
-                }
-            }
-        })
-        .padded();
+        .then(unit)
+// AI! Add a map
+    ;
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
