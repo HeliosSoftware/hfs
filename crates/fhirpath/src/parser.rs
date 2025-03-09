@@ -125,7 +125,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         just('n').to('\n'),
         just('r').to('\r'),
         just('t').to('\t'),
-        just('"').to('"'),  // Add support for double quote escape
+        just('"').to('"'), // Add support for double quote escape
         just('u').ignore_then(
             filter(|c: &char| c.is_ascii_hexdigit())
                 .repeated()
@@ -161,7 +161,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             none_of("\\\'")
                 .or(esc.clone())
                 .repeated()
-                .collect::<String>()
+                .collect::<String>(),
         )
         .then_ignore(just('\''))
         .map(Literal::String)
@@ -380,7 +380,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
         text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
         text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
-    )).padded();
+    ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
@@ -395,34 +395,37 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Unit::UCUM("".to_string())
             }
         }),
-    )).padded(); // Allow whitespace around units
+    )); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
-    let quantity = number.padded().then(unit.padded().or_not()).map(|(n, u)| match u {
-        Some(unit) => {
-            let unit_str = match unit {
-                Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
-                Unit::PluralDateTimePrecision(s) => s,
-                Unit::UCUM(s) => s,
-            };
-            match n {
-                Literal::Number(value) => Literal::Quantity(value, Some(unit_str)),
-                _ => {
-                    // This shouldn't happen due to the parser structure
-                    Literal::Quantity(0.0, None)
+    let quantity = number
+        .padded()
+        .then(unit.padded().or_not())
+        .map(|(n, u)| match u {
+            Some(unit) => {
+                let unit_str = match unit {
+                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
+                    Unit::PluralDateTimePrecision(s) => s,
+                    Unit::UCUM(s) => s,
+                };
+                match n {
+                    Literal::Number(value) => Literal::Quantity(value, Some(unit_str)),
+                    _ => {
+                        // This shouldn't happen due to the parser structure
+                        Literal::Quantity(0.0, None)
+                    }
                 }
             }
-        }
-        None => {
-            match n {
-                Literal::Number(value) => Literal::Quantity(value, None),
-                _ => {
-                    // This shouldn't happen due to the parser structure
-                    Literal::Quantity(0.0, None)
+            None => {
+                match n {
+                    Literal::Number(value) => Literal::Quantity(value, None),
+                    _ => {
+                        // This shouldn't happen due to the parser structure
+                        Literal::Quantity(0.0, None)
+                    }
                 }
             }
-        }
-    });
+        });
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
