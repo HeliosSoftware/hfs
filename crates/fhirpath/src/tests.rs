@@ -11,27 +11,26 @@ fn test_date_formats() {
     let expr = "@2015";
     println!("Attempting to parse: '{}'", expr);
     let result = parser().parse(expr);
-    
+
     // Print detailed error information if it fails
     if let Err(ref err) = result {
         println!("Error parsing '@2015': {:?}", err);
         for e in err {
-            println!("  Span: {:?}, Reason: {:?}", 
-                     e.span(), e.reason());
+            println!("  Span: {:?}, Reason: {:?}", e.span(), e.reason());
         }
     }
-    
+
     assert!(
         result.is_ok(),
         "Failed to parse date expression: '{}', error: {:?}",
         expr,
         result.err()
     );
-    
+
     if let Ok(parsed) = result {
         println!("Successfully parsed '@2015': {:?}", parsed);
     }
-    
+
     // Now test the other date formats
     let date_expressions = vec![
         "@2015.is(Date)",
@@ -56,22 +55,21 @@ fn test_date_formats() {
 fn test_just_date() {
     // Use the main parser directly
     let result = parser().parse("@2015");
-    
+
     // Print detailed error information if it fails
     if let Err(ref err) = result {
         println!("Error parsing '@2015': {:?}", err);
         for e in err {
-            println!("  Span: {:?}, Reason: {:?}", 
-                     e.span(), e.reason());
+            println!("  Span: {:?}, Reason: {:?}", e.span(), e.reason());
         }
     }
-    
+
     assert!(
         result.is_ok(),
         "Failed to parse simple date '@2015', error: {:?}",
         result.err()
     );
-    
+
     if let Ok(expr) = result {
         println!("Successfully parsed '@2015': {:?}", expr);
     }
@@ -86,7 +84,7 @@ fn test_simple_date_parsing() {
         "Failed to parse simple date '@2015', error: {:?}",
         result.err()
     );
-    
+
     // Test year-month format
     let result = parser().parse("@2015-01");
     assert!(
@@ -94,7 +92,7 @@ fn test_simple_date_parsing() {
         "Failed to parse date '@2015-01', error: {:?}",
         result.err()
     );
-    
+
     // Test full date format
     let result = parser().parse("@2015-01-01");
     assert!(
@@ -115,10 +113,16 @@ fn test_parse_simple_expressions() {
         "true and false",
         "Patient.name.exists()",
         "name.take(2).given",
+        "@2015-12-12T12:12:12",
+        "@2015T12:12:12",
+        "@2015T12:12:12.is(DateTime)",
         "@2015",
         "@2015.is(Date)",
         "@2015-01",
         "@2015-01-01",
+        "@2015-02-04T14:34:28+10:00",
+        "12.toQuantity()",
+        "2147483647.convertsToInteger()",
     ];
 
     for expr in test_cases {
