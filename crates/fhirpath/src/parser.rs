@@ -411,7 +411,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let quantity = number
         .padded()
         .then(unit)
-        .map(|(n, u)| Literal::Quantity(n, Some(u)))
+        .map(|(n, u)| {
+            if let Literal::Number(num) = n {
+                Literal::Quantity(num, Some(u))
+            } else {
+                // This shouldn't happen due to the parser structure
+                Literal::Quantity(0.0, Some(u))
+            }
+        })
     ;
 
     let date_datetime_time = just('@')
