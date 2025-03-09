@@ -522,20 +522,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             .validate(|digits, span, emit| {
                                 match u32::from_str_radix(&digits, 16) {
                                     Ok(code) => match char::from_u32(code) {
-                                        Some(c) => c.to_string(),
+                                        Some(c) => c,
                                         None => {
                                             emit(Simple::custom(span, "Invalid Unicode code point"));
-                                            String::new() // Empty string for invalid code point
+                                            ' ' // Placeholder for invalid code point
                                         }
                                     },
                                     Err(_) => {
                                         emit(Simple::custom(span, "Invalid hex digits"));
-                                        String::new() // Empty string for invalid hex
+                                        ' ' // Placeholder for invalid hex
                                     }
                                 }
                             }),
                     ),
-                    any().map(|c| c.to_string()), // Fallback for any other escaped character
+                    any(), // Fallback for any other escaped character
                 )))
                 .repeated()
                 .collect::<String>(),
