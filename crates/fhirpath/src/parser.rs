@@ -411,7 +411,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let quantity = number
         .padded()
         .then(unit)
-// AI! Add a map
+        .map(|(n, u)| Literal::Quantity(n, Some(u)))
     ;
 
     let date_datetime_time = just('@')
