@@ -115,6 +115,39 @@ impl fmt::Display for Literal {
 }
 
 pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
+    // Define escape sequence parser
+    let esc = just('\\').ignore_then(choice((
+        just('`').to('`'),
+        just('\'').to('\''),
+        just('\\').to('\\'),
+        just('/').to('/'),
+        just('f').to('\u{000C}'), // form feed
+        just('n').to('\n'),
+        just('r').to('\r'),
+        just('t').to('\t'),
+        just('u').ignore_then(
+            filter(|c: &char| c.is_ascii_hexdigit())
+                .repeated()
+                .exactly(4)
+                .collect::<String>()
+                .validate(|digits, span, emit| {
+                    match u32::from_str_radix(&digits, 16) {
+                        Ok(code) => match char::from_u32(code) {
+                            Some(c) => c,
+                            None => {
+                                emit(Simple::custom(span, "Invalid Unicode code point"));
+                                ' ' // Placeholder for invalid code point
+                            }
+                        },
+                        Err(_) => {
+                            emit(Simple::custom(span, "Invalid hex digits"));
+                            ' ' // Placeholder for invalid hex
+                        }
+                    }
+                }),
+        ),
+    )));
+
     // Literals
     let null = just('{').then(just('}')).to(Literal::Null);
 
@@ -125,37 +158,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let string = just('\'')
         .ignore_then(
             none_of("\\\'")
-                .or(just('\\').ignore_then(choice((
-                    just('`').to('`'),
-                    just('\'').to('\''),
-                    just('\\').to('\\'),
-                    just('/').to('/'),
-                    just('f').to('\u{000C}'), // form feed
-                    just('n').to('\n'),
-                    just('r').to('\r'),
-                    just('t').to('\t'),
-                    just('u').ignore_then(
-                        filter(|c: &char| c.is_ascii_hexdigit())
-                            .repeated()
-                            .exactly(4)
-                            .collect::<String>()
-                            .validate(|digits, span, emit| {
-                                match u32::from_str_radix(&digits, 16) {
-                                    Ok(code) => match char::from_u32(code) {
-                                        Some(c) => c,
-                                        None => {
-                                            emit(Simple::custom(span, "Invalid Unicode code point"));
-                                            ' ' // Placeholder for invalid code point
-                                        }
-                                    },
-                                    Err(_) => {
-                                        emit(Simple::custom(span, "Invalid hex digits"));
-                                        ' ' // Placeholder for invalid hex
-                                    }
-                                }
-                            }),
-                    ),
-                ))))
+                .or(esc.clone())
                 .repeated()
                 .collect::<String>()
         )
@@ -505,37 +508,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let string_for_external = just('\'')
         .ignore_then(
             none_of("\'\\")
-                .or(just('\\').ignore_then(choice((
-                    just('`').to('`'),
-                    just('\'').to('\''),
-                    just('\\').to('\\'),
-                    just('/').to('/'),
-                    just('f').to('\u{000C}'), // form feed
-                    just('n').to('\n'),
-                    just('r').to('\r'),
-                    just('t').to('\t'),
-                    just('u').ignore_then(
-                        filter(|c: &char| c.is_ascii_hexdigit())
-                            .repeated()
-                            .exactly(4)
-                            .collect::<String>()
-                            .validate(|digits, span, emit| {
-                                match u32::from_str_radix(&digits, 16) {
-                                    Ok(code) => match char::from_u32(code) {
-                                        Some(c) => c,
-                                        None => {
-                                            emit(Simple::custom(span, "Invalid Unicode code point"));
-                                            ' ' // Placeholder for invalid code point
-                                        }
-                                    },
-                                    Err(_) => {
-                                        emit(Simple::custom(span, "Invalid hex digits"));
-                                        ' ' // Placeholder for invalid hex
-                                    }
-                                }
-                            }),
-                    ),
-                ))))
+                .or(esc.clone())
                 .repeated()
                 .collect::<String>(),
         )
