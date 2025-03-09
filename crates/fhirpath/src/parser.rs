@@ -123,7 +123,42 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .or(text::keyword("false").to(Literal::Boolean(false)));
 
     let string = just('\'')
-        .ignore_then(none_of("\\\'").repeated().collect::<String>())
+        .ignore_then(
+            none_of("\\\'")
+                .or(just('\\').ignore_then(choice((
+                    just('`').to('`'),
+                    just('\'').to('\''),
+                    just('\\').to('\\'),
+                    just('/').to('/'),
+                    just('f').to('\u{000C}'), // form feed
+                    just('n').to('\n'),
+                    just('r').to('\r'),
+                    just('t').to('\t'),
+                    just('u').ignore_then(
+                        filter(|c: &char| c.is_ascii_hexdigit())
+                            .repeated()
+                            .exactly(4)
+                            .collect::<String>()
+                            .validate(|digits, span, emit| {
+                                match u32::from_str_radix(&digits, 16) {
+                                    Ok(code) => match char::from_u32(code) {
+                                        Some(c) => c,
+                                        None => {
+                                            emit(Simple::custom(span, "Invalid Unicode code point"));
+                                            ' ' // Placeholder for invalid code point
+                                        }
+                                    },
+                                    Err(_) => {
+                                        emit(Simple::custom(span, "Invalid hex digits"));
+                                        ' ' // Placeholder for invalid hex
+                                    }
+                                }
+                            }),
+                    ),
+                ))))
+                .repeated()
+                .collect::<String>()
+        )
         .then_ignore(just('\''))
         .map(Literal::String)
         .boxed();
@@ -470,7 +505,38 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let string_for_external = just('\'')
         .ignore_then(
             none_of("\'\\")
-                .or(just('\\').ignore_then(any()))
+                .or(just('\\').ignore_then(choice((
+                    just('`').to('`'),
+                    just('\'').to('\''),
+                    just('\\').to('\\'),
+                    just('/').to('/'),
+                    just('f').to('\u{000C}'), // form feed
+                    just('n').to('\n'),
+                    just('r').to('\r'),
+                    just('t').to('\t'),
+                    just('u').ignore_then(
+                        filter(|c: &char| c.is_ascii_hexdigit())
+                            .repeated()
+                            .exactly(4)
+                            .collect::<String>()
+                            .validate(|digits, span, emit| {
+                                match u32::from_str_radix(&digits, 16) {
+                                    Ok(code) => match char::from_u32(code) {
+                                        Some(c) => c.to_string(),
+                                        None => {
+                                            emit(Simple::custom(span, "Invalid Unicode code point"));
+                                            String::new() // Empty string for invalid code point
+                                        }
+                                    },
+                                    Err(_) => {
+                                        emit(Simple::custom(span, "Invalid hex digits"));
+                                        String::new() // Empty string for invalid hex
+                                    }
+                                }
+                            }),
+                    ),
+                    any().map(|c| c.to_string()), // Fallback for any other escaped character
+                )))
                 .repeated()
                 .collect::<String>(),
         )
