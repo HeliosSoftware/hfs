@@ -535,8 +535,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                 }
                             }),
                     ),
-                    any(), // Fallback for any other escaped character
-                )))
+                ))))
                 .repeated()
                 .collect::<String>(),
         )
