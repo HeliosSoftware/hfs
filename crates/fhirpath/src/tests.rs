@@ -1,4 +1,4 @@
-use crate::parser::parser;
+use crate::parser::{parser, Expression};
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use std::fs::File;
@@ -123,6 +123,10 @@ fn test_parse_simple_expressions() {
         "@2015-02-04T14:34:28+10:00",
         "12.toQuantity()",
         "2147483647.convertsToInteger()",
+        "7 days = 1 week",
+        "5 days",
+        "2.5 'mg'",
+        "1 day = 24 hours",
     ];
 
     for expr in test_cases {

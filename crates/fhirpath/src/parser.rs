@@ -379,7 +379,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
         text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
         text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
-    ));
+    )).padded(); // Allow whitespace around these keywords
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
@@ -396,7 +396,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         }),
     ));
 
-    let quantity = number.then(unit.or_not()).map(|(n, u)| match u {
+    let quantity = number.then(unit.or_not().padded()).map(|(n, u)| match u {
         Some(unit) => {
             let unit_str = match unit {
                 Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
@@ -601,7 +601,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        let atom = term.clone().map(Expression::Term);
+        let atom = term.clone().map(Expression::Term).padded();
 
         // Invocation chain - handles expression.invocation
         // This needs to handle function calls including 'is' as a function name
