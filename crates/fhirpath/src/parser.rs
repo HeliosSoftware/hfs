@@ -478,13 +478,30 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .map(Term::Literal);
 
-    // Identifiers
+    // Identifiers - following the grammar definition
+    // IDENTIFIER: ([A-Za-z] | '_')([A-Za-z0-9] | '_')*
+    let standard_identifier = filter(|c: &char| c.is_ascii_alphabetic() || *c == '_')
+        .then(filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_').repeated())
+        .map(|(first, rest)| {
+            let mut s = first.to_string();
+            s.extend(rest);
+            s
+        });
+
+    // DELIMITEDIDENTIFIER: '`' (ESC | .)*? '`'
+    let delimited_identifier = just('`')
+        .ignore_then(
+            none_of("`")
+                .or(esc.clone())
+                .repeated()
+                .collect::<String>()
+        )
+        .then_ignore(just('`'));
+
+    // Combined identifier parser
     let identifier = choice((
-        text::ident(),
-        just('`')
-            .ignore_then(none_of("`\\").or(just('\\').ignore_then(any())).repeated())
-            .then_ignore(just('`'))
-            .collect::<String>(),
+        standard_identifier,
+        delimited_identifier,
         text::keyword("as").to(String::from("as")),
         text::keyword("contains").to(String::from("contains")),
         text::keyword("in").to(String::from("in")),
