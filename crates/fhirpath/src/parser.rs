@@ -64,6 +64,16 @@ pub enum Unit {
     UCUM(String),
 }
 
+impl fmt::Display for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unit::DateTimePrecision(p) => write!(f, "{:?}", p).map(|_| ()),
+            Unit::PluralDateTimePrecision(p) => write!(f, "{:?}", p).map(|_| ()),
+            Unit::UCUM(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DateTimePrecision {
     Year,
