@@ -60,7 +60,7 @@ pub enum Invocation {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Unit {
     DateTimePrecision(DateTimePrecision),
-    PluralDateTimePrecision(String),
+    PluralDateTimePrecision(PluralDateTimePrecision),
     UCUM(String),
 }
 
@@ -385,8 +385,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
         date_time_precision.map(Unit::DateTimePrecision),
-        plural_date_time_precision
-            .map(|p| Unit::PluralDateTimePrecision(format!("{:?}", p).to_lowercase())),
+        plural_date_time_precision.map(Unit::PluralDateTimePrecision),
         string.clone().map(|s| {
             if let Literal::String(str_val) = s {
                 Unit::UCUM(str_val)
@@ -404,7 +403,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(n, u)| match u {
             Some(unit) => {
                 let unit_str = match unit {
-                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
+                    Unit::DateTimePrecision(p) => p,
                     Unit::PluralDateTimePrecision(s) => s,
                     Unit::UCUM(s) => s,
                 };
