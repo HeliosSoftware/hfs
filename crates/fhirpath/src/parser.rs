@@ -404,7 +404,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Unit::UCUM("".to_string())
             }
         }),
-    )); // Allow whitespace around units
+    ))
+    .padded(); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
     let quantity = number
@@ -429,7 +430,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }
                 }
             }
-        });
+        })
+        .padded();
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
@@ -465,7 +467,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 // Other cases (shouldn't happen with proper parsing)
                 _ => Literal::Null,
             }
-        });
+        })
+        .padded();
 
     let literal = choice((
         null,
@@ -478,7 +481,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .map(Term::Literal);
 
-    // Identifiers - following the grammar definition
     // IDENTIFIER: ([A-Za-z] | '_')([A-Za-z0-9] | '_')*
     let standard_identifier = filter(|c: &char| c.is_ascii_alphabetic() || *c == '_')
         .then(filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_').repeated())
@@ -486,17 +488,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let mut s = first.to_string();
             s.extend(rest);
             s
-        });
+        })
+        .padded();
 
     // DELIMITEDIDENTIFIER: '`' (ESC | .)*? '`'
     let delimited_identifier = just('`')
-        .ignore_then(
-            none_of("`")
-                .or(esc.clone())
-                .repeated()
-                .collect::<String>()
-        )
-        .then_ignore(just('`'));
+        .ignore_then(none_of("`").or(esc.clone()).repeated().collect::<String>())
+        .then_ignore(just('`'))
+        .padded();
 
     // Combined identifier parser
     let identifier = choice((
@@ -529,6 +528,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 result
             }
         })
+        .padded()
         .boxed(); // Box the parser to make it easier to clone
 
     // Create a separate string parser for external constants
@@ -539,16 +539,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .repeated()
                 .collect::<String>(),
         )
-        .then_ignore(just('\''));
+        .then_ignore(just('\''))
+        .padded();
 
     // External constants
     let external_constant = just('%')
         .ignore_then(choice((identifier.clone(), string_for_external)))
-        .map(Term::ExternalConstant);
+        .map(Term::ExternalConstant)
+        .padded();
 
     let type_specifier = qualified_identifier
         .clone()
-        .map(TypeSpecifier::QualifiedIdentifier);
+        .map(TypeSpecifier::QualifiedIdentifier)
+        .padded();
 
     // Define operators outside the recursive block
     let multiplicative_op = choice((
