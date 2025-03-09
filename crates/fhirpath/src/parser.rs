@@ -380,7 +380,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
         text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
         text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
-    ));
+    )).padded();
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
@@ -398,7 +398,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     )).padded(); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
-    let quantity = number.padded().then(unit.or_not().padded()).map(|(n, u)| match u {
+    let quantity = number.padded().then(unit.padded().or_not()).map(|(n, u)| match u {
         Some(unit) => {
             let unit_str = match unit {
                 Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
@@ -594,7 +594,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Term - following the grammar rule for 'term'
         let term = choice((
             member_invocation.clone().map(Term::Invocation),
-            literal,
+            literal.clone(),
             external_constant,
             expr.clone()
                 .delimited_by(just('('), just(')'))
@@ -604,7 +604,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
         // Make sure it's properly padded to handle whitespace
-        let atom = term.clone().padded().map(Expression::Term);
+        let atom = term.clone().map(Expression::Term).padded();
 
         // Invocation chain - handles expression.invocation
         // This needs to handle function calls including 'is' as a function name
