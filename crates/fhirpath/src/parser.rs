@@ -370,6 +370,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Plural date time precision units
+    // These need to be recognized as standalone keywords
     let plural_date_time_precision = choice((
         text::keyword("years").to(PluralDateTimePrecision::Years),
         text::keyword("months").to(PluralDateTimePrecision::Months),
@@ -379,7 +380,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
         text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
         text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
-    )).padded(); // Allow whitespace around these keywords
+    ));
 
     // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
@@ -394,9 +395,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 Unit::UCUM("".to_string())
             }
         }),
-    ));
+    )).padded(); // Allow whitespace around units
 
-    let quantity = number.then(unit.or_not().padded()).map(|(n, u)| match u {
+    // Quantity needs to be a term-level construct to work in expressions
+    let quantity = number.padded().then(unit.or_not().padded()).map(|(n, u)| match u {
         Some(unit) => {
             let unit_str = match unit {
                 Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
@@ -601,7 +603,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        let atom = term.clone().map(Expression::Term).padded();
+        // Make sure it's properly padded to handle whitespace
+        let atom = term.clone().padded().map(Expression::Term);
 
         // Invocation chain - handles expression.invocation
         // This needs to handle function calls including 'is' as a function name
