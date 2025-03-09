@@ -13,7 +13,7 @@ pub enum Literal {
     Date(String),
     DateTime(String, Option<(String, Option<String>)>),
     Time(String),
-    Quantity(f64, Option<String>),
+    Quantity(f64, Option<Unit>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -402,13 +402,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then(unit.padded().or_not())
         .map(|(n, u)| match u {
             Some(unit) => {
-                let unit_str = match unit {
-                    Unit::DateTimePrecision(p) => format!("{:?}", p).to_lowercase(),
-                    Unit::PluralDateTimePrecision(s) => format!("{:?}", s).to_lowercase(),
-                    Unit::UCUM(s) => s,
-                };
                 match n {
-                    Literal::Number(value) => Literal::Quantity(value, Some(unit_str)),
+                    Literal::Number(value) => Literal::Quantity(value, Some(unit)),
                     _ => {
                         // This shouldn't happen due to the parser structure
                         Literal::Quantity(0.0, None)
