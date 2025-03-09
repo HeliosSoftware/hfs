@@ -125,6 +125,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         just('n').to('\n'),
         just('r').to('\r'),
         just('t').to('\t'),
+        just('"').to('"'),  // Add support for double quote escape
         just('u').ignore_then(
             filter(|c: &char| c.is_ascii_hexdigit())
                 .repeated()
