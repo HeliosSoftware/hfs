@@ -667,18 +667,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     .padded()
                     .ignore_then(membership_expr.clone()),
             )
-            .map(|(lhs, rhs)| Expression::And(Box::new(lhs), Box::new(rhs)))
-            .boxed();
+            .map(|(lhs, rhs)| Expression::And(Box::new(lhs), Box::new(rhs)));
 
         // Or expression - handles 'or' and 'xor'
         let or_expr = and_expr
             .clone()
-            .then(or_op.then(and_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |lhs, (op, rhs)| {
-                    Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-                })
-            });
+            .then(or_op.then(and_expr.clone()))
+            .map(|(lhs, (op, rhs))| Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs)));
 
         // Implies expression - handles 'implies'
         let implies_expr = or_expr
@@ -687,14 +682,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 text::keyword("implies")
                     .padded()
                     .ignore_then(or_expr.clone())
-                    .or_not(),
-            ) // Allow whitespace around 'implies'
-            .map(|(lhs, rhs)| {
-                if let Some(rhs) = rhs {
-                    Expression::Implies(Box::new(lhs), Box::new(rhs))
-                } else {
-                    lhs
-                }
+                    // AI! add map
             });
 
         implies_expr
