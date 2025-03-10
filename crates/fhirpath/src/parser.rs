@@ -588,7 +588,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .map(|inv| {
                     let inv_clone = inv.clone();
                     Box::new(move |left: Expression| {
-                        (Expression::Invocation(Box::new(left), inv_clone.clone()), 13)
+                        (Expression::Invocation(Box::new(left), inv_clone.clone()), 13_u8)
                     }) as OpFn
                 })
                 .boxed();
@@ -601,7 +601,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .map(|idx| {
                     let idx_clone = idx.clone();
                     Box::new(move |left: Expression| {
-                        (Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())), 13)
+                        (Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())), 13_u8)
                     }) as OpFn
                 })
                 .boxed();
@@ -629,7 +629,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        11,
+                        11_u8,
                     )
                 }) as OpFn
             })
@@ -654,7 +654,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        10,
+                        10_u8,
                     )
                 }) as OpFn
             })
@@ -677,7 +677,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             type_spec_clone.clone(),
                         ),
-                        9,
+                        9_u8,
                     )
                 }) as OpFn
             })
@@ -693,7 +693,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     Box::new(move |left: Expression| {
                         (
                             Expression::Union(Box::new(left), Box::new(right_clone.clone())),
-                            8,
+                            8_u8,
                         )
                     }) as OpFn
                 })
@@ -719,7 +719,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        7,
+                        7_u8,
                     )
                 }) as OpFn
             })
@@ -745,7 +745,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        6,
+                        6_u8,
                     )
                 }) as OpFn
             })
@@ -769,7 +769,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        5,
+                        5_u8,
                     )
                 }) as OpFn
             })
@@ -785,7 +785,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     Box::new(move |left: Expression| {
                         (
                             Expression::And(Box::new(left), Box::new(right_clone.clone())),
-                            4,
+                            4_u8,
                         )
                     }) as OpFn
                 })
@@ -809,7 +809,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                             op_str.clone(),
                             Box::new(right_clone.clone()),
                         ),
-                        3,
+                        3_u8,
                     )
                 }) as OpFn
             })
@@ -825,7 +825,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     Box::new(move |left: Expression| {
                         (
                             Expression::Implies(Box::new(left), Box::new(right_clone.clone())),
-                            2,
+                            2_u8,
                         )
                     }) as OpFn
                 })
