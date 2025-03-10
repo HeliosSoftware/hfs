@@ -466,9 +466,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Qualified identifier (for type specifiers)
     let qualified_identifier = identifier
         .then(just('.').ignore_then(identifier.clone().or_not()))
-        .map(|(namespace, name)| (namespace, name))
-        .padded()
-        .boxed(); // Box the parser to make it easier to clone
+        // AI! Add map
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
