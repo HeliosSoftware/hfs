@@ -109,7 +109,6 @@ fn test_parse_simple_expressions() {
         "birthDate",
         "Patient.name.given",
         "Patient.name.where(given = 'Jim')",
-        "1 + 2 * 3",
         "true and false",
         "Patient.name.exists()",
         "name.take(2).given",
@@ -127,6 +126,7 @@ fn test_parse_simple_expressions() {
         "5 days",
         "2.5 'mg'",
         "1 day = 24 hours",
+        "1 + 2 * 3",
     ];
 
     for expr in test_cases {
