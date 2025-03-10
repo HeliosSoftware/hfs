@@ -567,7 +567,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        let atom = term.clone().map(Expression::Term).padded();
+        let atom = term.clone().repeated()
+        // AI! Add map
+        ;
 
         // Then handle any number of dot invocations that follow
         let invocation_expr = atom
