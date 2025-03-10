@@ -696,11 +696,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .boxed();
 
         // And expression - handles 'and'
+        let and_op = just("and").padded();
         let and_expr = membership_expr
             .clone()
             .then(
-                text::keyword("and")
-                    .padded()
+                and_op
                     .ignore_then(membership_expr.clone())
                     .repeated()
             )
@@ -721,11 +721,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .boxed();
 
         // Implies expression - handles 'implies'
+        let implies_op = just("implies").padded();
         let implies_expr = or_expr
             .clone()
             .then(
-                text::keyword("implies")
-                    .padded()
+                implies_op
                     .ignore_then(or_expr.clone())
                     .repeated()
             )
