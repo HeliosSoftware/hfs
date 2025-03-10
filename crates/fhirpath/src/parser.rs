@@ -581,9 +581,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Indexer expression - handles expression[expression]
         let indexer_expr = invocation_expr
-            .then(expr.clone().delimited_by(just('['), just(']')))
-            // AI! Change this map expression to handle left to right building of the expression
-            .map(|(expr, idx)| Expression::Indexer(Box::new(expr), Box::new(idx)))
+            .clone()
+            .then(expr.clone().delimited_by(just('['), just(']')).repeated())
+            .map(|(first, indices)| {
+                // Build the expression tree from left to right
+                indices.into_iter().fold(first, |acc, idx| {
+                    Expression::Indexer(Box::new(acc), Box::new(idx))
+                })
+            })
+            .or(invocation_expr.clone())
             .boxed();
 
         // Polarity expression - handles +/- expression
