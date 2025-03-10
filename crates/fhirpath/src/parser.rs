@@ -583,278 +583,269 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Start with the base term expression
         let expr_base = term.clone();
 
-        // Define a type alias for our operation function
-        type OpFn = Box<dyn Fn(Expression) -> (Expression, u8)>;
+        // Define all the operation parsers directly without the closure
+        // This avoids the lifetime issues with the previous approach
 
-        // Create a function to build operation parsers that return boxed closures
-        // Use explicit lifetime to ensure proper relationships
-        let make_operation_parser = |expr: Recursive<'_, char, Expression, Simple<char>>| {
-            // Create a vector to hold all our operation parsers
-            let mut operations = Vec::new();
+        // Create a vector to hold all our operation parsers
+        let mut operations = Vec::new();
 
-            // Invocation expression: expression '.' invocation
-            let invocation_expr = just::<_, _, Simple<char>>('.')
-                .ignore_then(invocation.clone())
-                .map(|inv| {
-                    let inv_clone = inv.clone();
-                    Box::new(move |left: Expression| {
-                        (
-                            Expression::Invocation(Box::new(left), inv_clone.clone()),
-                            13_u8,
-                        )
-                    }) as OpFn
-                })
-                .boxed();
-            operations.push(Box::new(invocation_expr));
+        // Invocation expression: expression '.' invocation
+        let invocation_expr = just::<_, _, Simple<char>>('.')
+            .ignore_then(invocation.clone())
+            .map(move |inv| {
+                let inv_clone = inv.clone();
+                move |left: Expression| {
+                    (
+                        Expression::Invocation(Box::new(left), inv_clone.clone()),
+                        13_u8,
+                    )
+                }
+            })
+            .boxed();
+        operations.push(invocation_expr);
 
-            // Indexer expression: expression '[' expression ']'
-            let indexer_expr = expr
-                .clone()
-                .delimited_by(
-                    just::<_, _, Simple<char>>('['),
-                    just::<_, _, Simple<char>>(']'),
+        // Indexer expression: expression '[' expression ']'
+        let indexer_expr = expr
+            .clone()
+            .delimited_by(
+                just::<_, _, Simple<char>>('['),
+                just::<_, _, Simple<char>>(']'),
+            )
+            .map(move |idx| {
+                let idx_clone = idx.clone();
+                move |left: Expression| {
+                    (
+                        Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())),
+                        13_u8,
+                    )
+                }
+            })
+            .boxed();
+        operations.push(indexer_expr);
+
+        // Polarity expression: ('+' | '-') expression
+        // This is handled separately as a prefix operator
+
+        // Multiplicative expression: expression ('*' | '/' | 'div' | 'mod') expression
+        let multiplicative_expr = choice((
+            just::<_, _, Simple<char>>('*').to("*"),
+            just::<_, _, Simple<char>>('/').to("/"),
+            text::keyword::<char, _, Simple<char>>("div").to("div"),
+            text::keyword::<char, _, Simple<char>>("mod").to("mod"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Multiplicative(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    11_u8,
                 )
-                .map(|idx| {
-                    let idx_clone = idx.clone();
-                    Box::new(move |left: Expression| {
-                        (
-                            Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())),
-                            13_u8,
-                        )
-                    }) as OpFn
-                })
-                .boxed();
-            operations.push(Box::new(indexer_expr));
+            }
+        })
+        .boxed();
+        operations.push(multiplicative_expr);
 
-            // Polarity expression: ('+' | '-') expression
-            // This is handled separately as a prefix operator
+        // Additive expression: expression ('+' | '-' | '&') expression
+        let additive_expr = choice((
+            just::<_, _, Simple<char>>('+').to("+"),
+            just::<_, _, Simple<char>>('-').to("-"),
+            just::<_, _, Simple<char>>('&').to("&"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Additive(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    10_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(additive_expr);
 
-            // Multiplicative expression: expression ('*' | '/' | 'div' | 'mod') expression
-            let multiplicative_expr = choice((
-                just::<_, _, Simple<char>>('*').to("*"),
-                just::<_, _, Simple<char>>('/').to("/"),
-                text::keyword::<char, _, Simple<char>>("div").to("div"),
-                text::keyword::<char, _, Simple<char>>("mod").to("mod"),
-            ))
+        // Type expression: expression ('is' | 'as') typeSpecifier
+        let type_expr = choice((
+            just::<_, _, Simple<char>>("is").padded().map(|_| "is"),
+            just::<_, _, Simple<char>>("as").padded().map(|_| "as"),
+        ))
+        .then(qualified_identifier.clone())
+        .map(move |(op, type_spec)| {
+            let op_str = op.to_string();
+            let type_spec_clone = type_spec.clone();
+            move |left: Expression| {
+                (
+                    Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone()),
+                    9_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(type_expr);
+
+        // Union expression: expression '|' expression
+        let union_expr = just::<_, _, Simple<char>>('|')
             .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
+            .ignore_then(expr.clone())
+            .map(move |right| {
                 let right_clone = right.clone();
-                Box::new(move |left: Expression| {
+                move |left: Expression| {
                     (
-                        Expression::Multiplicative(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        11_u8,
+                        Expression::Union(Box::new(left), Box::new(right_clone.clone())),
+                        8_u8,
                     )
-                }) as OpFn
+                }
             })
             .boxed();
-            operations.push(Box::new(multiplicative_expr));
+        operations.push(union_expr);
 
-            // Additive expression: expression ('+' | '-' | '&') expression
-            let additive_expr = choice((
-                just::<_, _, Simple<char>>('+').to("+"),
-                just::<_, _, Simple<char>>('-').to("-"),
-                just::<_, _, Simple<char>>('&').to("&"),
-            ))
+        // Inequality expression: expression ('<=' | '<' | '>' | '>=') expression
+        let inequality_expr = choice((
+            just::<_, _, Simple<char>>("<=").to("<="),
+            just::<_, _, Simple<char>>("<").to("<"),
+            just::<_, _, Simple<char>>(">=").to(">="),
+            just::<_, _, Simple<char>>(">").to(">"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Inequality(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    7_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(inequality_expr);
+
+        // Equality expression: expression ('=' | '~' | '!=' | '!~') expression
+        let equality_expr = choice((
+            just::<_, _, Simple<char>>("=").to("="),
+            just::<_, _, Simple<char>>("~").to("~"),
+            just::<_, _, Simple<char>>("!=").to("!="),
+            just::<_, _, Simple<char>>("!~").to("!~"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Equality(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    6_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(equality_expr);
+
+        // Membership expression: expression ('in' | 'contains') expression
+        let membership_expr = choice((
+            text::keyword::<char, _, Simple<char>>("in").to("in"),
+            text::keyword::<char, _, Simple<char>>("contains").to("contains"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Membership(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    5_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(membership_expr);
+
+        // And expression: expression 'and' expression
+        let and_expr = just::<_, _, Simple<char>>("and")
             .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
+            .ignore_then(expr.clone())
+            .map(move |right| {
                 let right_clone = right.clone();
-                Box::new(move |left: Expression| {
+                move |left: Expression| {
                     (
-                        Expression::Additive(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        10_u8,
+                        Expression::And(Box::new(left), Box::new(right_clone.clone())),
+                        4_u8,
                     )
-                }) as OpFn
+                }
             })
             .boxed();
-            operations.push(Box::new(additive_expr));
+        operations.push(and_expr);
 
-            // Type expression: expression ('is' | 'as') typeSpecifier
-            let type_expr = choice((
-                just::<_, _, Simple<char>>("is").padded().map(|_| "is"),
-                just::<_, _, Simple<char>>("as").padded().map(|_| "as"),
-            ))
-            .then(qualified_identifier.clone())
-            .map(|(op, type_spec)| {
-                let op_str = op.to_string();
-                let type_spec_clone = type_spec.clone();
-                Box::new(move |left: Expression| {
-                    (
-                        Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone()),
-                        9_u8,
-                    )
-                }) as OpFn
-            })
-            .boxed();
-            operations.push(Box::new(type_expr));
+        // Or expression: expression ('or' | 'xor') expression
+        let or_expr = choice((
+            text::keyword::<char, _, Simple<char>>("or").to("or"),
+            text::keyword::<char, _, Simple<char>>("xor").to("xor"),
+        ))
+        .padded()
+        .then(expr.clone())
+        .map(move |(op, right)| {
+            let op_str = op.to_string();
+            let right_clone = right.clone();
+            move |left: Expression| {
+                (
+                    Expression::Or(
+                        Box::new(left),
+                        op_str.clone(),
+                        Box::new(right_clone.clone()),
+                    ),
+                    3_u8,
+                )
+            }
+        })
+        .boxed();
+        operations.push(or_expr);
 
-            // Union expression: expression '|' expression
-            let union_expr = just::<_, _, Simple<char>>('|')
-                .padded()
-                .ignore_then(expr.clone())
-                .map(|right| {
-                    let right_clone = right.clone();
-                    Box::new(move |left: Expression| {
-                        (
-                            Expression::Union(Box::new(left), Box::new(right_clone.clone())),
-                            8_u8,
-                        )
-                    }) as OpFn
-                })
-                .boxed();
-            operations.push(Box::new(union_expr));
-
-            // Inequality expression: expression ('<=' | '<' | '>' | '>=') expression
-            let inequality_expr = choice((
-                just::<_, _, Simple<char>>("<=").to("<="),
-                just::<_, _, Simple<char>>("<").to("<"),
-                just::<_, _, Simple<char>>(">=").to(">="),
-                just::<_, _, Simple<char>>(">").to(">"),
-            ))
+        // Implies expression: expression 'implies' expression
+        let implies_expr = just::<_, _, Simple<char>>("implies")
             .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
+            .ignore_then(expr.clone())
+            .map(move |right| {
                 let right_clone = right.clone();
-                Box::new(move |left: Expression| {
+                move |left: Expression| {
                     (
-                        Expression::Inequality(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        7_u8,
+                        Expression::Implies(Box::new(left), Box::new(right_clone.clone())),
+                        2_u8,
                     )
-                }) as OpFn
+                }
             })
             .boxed();
-            operations.push(Box::new(inequality_expr));
+        operations.push(implies_expr);
 
-            // Equality expression: expression ('=' | '~' | '!=' | '!~') expression
-            let equality_expr = choice((
-                just::<_, _, Simple<char>>("=").to("="),
-                just::<_, _, Simple<char>>("~").to("~"),
-                just::<_, _, Simple<char>>("!=").to("!="),
-                just::<_, _, Simple<char>>("!~").to("!~"),
-            ))
-            .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    (
-                        Expression::Equality(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        6_u8,
-                    )
-                }) as OpFn
-            })
-            .boxed();
-            operations.push(Box::new(equality_expr));
-
-            // Membership expression: expression ('in' | 'contains') expression
-            let membership_expr = choice((
-                text::keyword::<char, _, Simple<char>>("in").to("in"),
-                text::keyword::<char, _, Simple<char>>("contains").to("contains"),
-            ))
-            .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    (
-                        Expression::Membership(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        5_u8,
-                    )
-                }) as OpFn
-            })
-            .boxed();
-            operations.push(Box::new(membership_expr));
-
-            // And expression: expression 'and' expression
-            let and_expr = just::<_, _, Simple<char>>("and")
-                .padded()
-                .ignore_then(expr.clone())
-                .map(|right| {
-                    let right_clone = right.clone();
-                    Box::new(move |left: Expression| {
-                        (
-                            Expression::And(Box::new(left), Box::new(right_clone.clone())),
-                            4_u8,
-                        )
-                    }) as OpFn
-                })
-                .boxed();
-            operations.push(Box::new(and_expr));
-
-            // Or expression: expression ('or' | 'xor') expression
-            let or_expr = choice((
-                text::keyword::<char, _, Simple<char>>("or").to("or"),
-                text::keyword::<char, _, Simple<char>>("xor").to("xor"),
-            ))
-            .padded()
-            .then(expr.clone())
-            .map(|(op, right)| {
-                let op_str = op.to_string();
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    (
-                        Expression::Or(
-                            Box::new(left),
-                            op_str.clone(),
-                            Box::new(right_clone.clone()),
-                        ),
-                        3_u8,
-                    )
-                }) as OpFn
-            })
-            .boxed();
-            operations.push(Box::new(or_expr));
-
-            // Implies expression: expression 'implies' expression
-            let implies_expr = just::<_, _, Simple<char>>("implies")
-                .padded()
-                .ignore_then(expr.clone())
-                .map(|right| {
-                    let right_clone = right.clone();
-                    Box::new(move |left: Expression| {
-                        (
-                            Expression::Implies(Box::new(left), Box::new(right_clone.clone())),
-                            2_u8,
-                        )
-                    }) as OpFn
-                })
-                .boxed();
-            operations.push(Box::new(implies_expr));
-
-            // Combine all operation parsers using choice
-            // Don't box here, we'll do it after applying the choice
-            choice(operations)
-        };
-
-        // Create the operation parser
-        // Box after creating the parser to ensure proper lifetime handling
-        let operation_parser = make_operation_parser(expr.clone());
+        // Combine all operation parsers using choice
+        let operation_parser = choice(operations);
 
         // Apply operations to the base expression
         let expr_with_operations =
