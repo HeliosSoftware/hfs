@@ -491,7 +491,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let _type_specifier = qualified_identifier.clone().padded();
 
     // Define operators outside the recursive block
-    let multiplicative_op = choice((
+    let _multiplicative_op = choice((
         just::<_, _, Simple<char>>('*').to("*"),
         just::<_, _, Simple<char>>('/').to("/"),
         text::keyword::<char, _, Simple<char>>("div").to("div"),
@@ -499,13 +499,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    let additive_op = choice((
+    let _additive_op = choice((
         just::<_, _, Simple<char>>('+').to("+"), 
         just::<_, _, Simple<char>>('-').to("-"), 
         just::<_, _, Simple<char>>('&').to("&")
     )).padded(); // Allow whitespace around operators
 
-    let inequality_op = choice((
+    let _inequality_op = choice((
         just::<_, _, Simple<char>>("<=").to("<="),
         just::<_, _, Simple<char>>("<").to("<"),
         just::<_, _, Simple<char>>(">=").to(">="),
@@ -513,7 +513,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    let equality_op = choice((
+    let _equality_op = choice((
         just::<_, _, Simple<char>>("=").to("="),
         just::<_, _, Simple<char>>("~").to("~"),
         just::<_, _, Simple<char>>("!=").to("!="),
@@ -521,13 +521,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Allow whitespace around operators
 
-    let membership_op = choice((
+    let _membership_op = choice((
         text::keyword::<char, _, Simple<char>>("in").to("in"),
         text::keyword::<char, _, Simple<char>>("contains").to("contains"),
     ))
     .padded(); // Allow whitespace around operators
 
-    let or_op = choice((
+    let _or_op = choice((
         text::keyword::<char, _, Simple<char>>("or").to("or"), 
         text::keyword::<char, _, Simple<char>>("xor").to("xor")
     )).padded(); // Allow whitespace around operators
@@ -585,7 +585,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         type OpFn = Box<dyn Fn(Expression) -> (Expression, u8)>;
         
         // Create a function to build operation parsers that return boxed closures
-        let make_operation_parser = |expr: Recursive<'_, char, Expression, Simple<char>>| {
+        let make_operation_parser = move |expr: Recursive<'_, char, Expression, Simple<char>>| {
             // Create a vector to hold all our operation parsers
             let mut operations: Vec<Box<dyn Parser<char, OpFn, Error = Simple<char>> + '_>> = Vec::new();
             
@@ -840,7 +840,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             operations.push(Box::new(implies_expr));
             
             // Combine all operation parsers using choice
-            choice(operations)
+            choice(operations).boxed()
         };
         
         // Create the operation parser
