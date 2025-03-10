@@ -339,33 +339,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             Literal::Date(date_str)
         })
         .boxed();
-    /*
-        let _date = just('@').ignore_then(date_format.clone());
-
-        // Create a parser for datetime literals
-        let _datetime = just('@')
-            .ignore_then(date_format.clone())
-            .then(just('T').ignore_then(time_format.then(timezone_format.or_not()).or_not()))
-            .map(|(date, time_part)| {
-                if let Literal::Date(date_str) = date {
-                    if let Some((time_str, timezone)) = time_part {
-                        Literal::DateTime(date_str, Some((time_str, timezone)))
-                    } else {
-                        // When there's no time part, return a DateTime with None for the time part
-                        Literal::DateTime(date_str, None)
-                    }
-                } else {
-                    unreachable!("Expected Date literal")
-                }
-            })
-            .boxed();
-
-        // Create a parser for time literals
-        let _time = just('@')
-            .ignore_then(just('T').ignore_then(time_format.clone()))
-            .map(|time_str| Literal::Time(time_str))
-            .boxed();
-    */
 
     // Date time precision units
     let date_time_precision = choice((
@@ -380,7 +353,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Plural date time precision units
-    // These need to be recognized as standalone keywords
     let plural_date_time_precision = choice((
         text::keyword("years").to(PluralDateTimePrecision::Years),
         text::keyword("months").to(PluralDateTimePrecision::Months),
@@ -572,7 +544,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     let or_op = choice((text::keyword("or").to("or"), text::keyword("xor").to("xor"))).padded(); // Allow whitespace around operators
 
-    // Recursive parser definition - limit recursion depth to prevent stack overflow
+    // Recursive parser definition
     let expr_parser = recursive(|expr| {
         // Function parameters - recursive definition to handle nested expressions
         let param_list = expr
@@ -614,11 +586,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .boxed();
 
         // Atom expression (basic building block) - maps directly to Term in the grammar
-        // Make sure it's properly padded to handle whitespace
         let atom = term.clone().map(Expression::Term).padded();
 
         // Invocation chain - handles expression.invocation
-        // This needs to handle function calls including 'is' as a function name
         let invocation_chain = atom
             .clone()
             .then(just('.').ignore_then(member_invocation.clone()).repeated())
