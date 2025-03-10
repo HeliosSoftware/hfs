@@ -488,7 +488,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(Term::ExternalConstant)
         .padded();
 
-    let type_specifier = qualified_identifier.clone().padded();
+    let _type_specifier = qualified_identifier.clone().padded();
 
     // Define operators outside the recursive block
     let multiplicative_op = choice((
@@ -655,9 +655,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     just("as").padded().map(|_| "as"),
                 ))
                 .then(
+                    // Handle qualified identifiers like System.Boolean
                     identifier
                         .clone()
-                        .map(|id| TypeSpecifier::QualifiedIdentifier(id, None)),
+                        .then(
+                            just('.')
+                                .ignore_then(identifier.clone())
+                                .or_not()
+                        )
+                        .map(|(namespace, name)| {
+                            TypeSpecifier::QualifiedIdentifier(namespace, name)
+                        })
                 )
                 .or_not(),
             )
