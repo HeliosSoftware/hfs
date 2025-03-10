@@ -583,12 +583,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let indexer_expr = invocation_expr
             .clone()
             .then(expr.clone().delimited_by(just('['), just(']')).repeated())
-            .map(|(first, indices)| {
-                // Build the expression tree from left to right
-                indices.into_iter().fold(first, |acc, idx| {
-                    Expression::Indexer(Box::new(acc), Box::new(idx))
-                })
-            })
+            .foldl(|expr, idx| Expression::Indexer(Box::new(expr), Box::new(idx)))
             .or(invocation_expr.clone())
             .boxed();
 
@@ -598,13 +593,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .padded() // Allow whitespace after operator
             .then(indexer_expr.clone())
             .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
+            .or(indexer_expr.clone())
             .boxed();
 
         // Multiplicative expression - handles * / div mod
         let multiplicative_expr = polarity_expr
             .clone()
-            .then(multiplicative_op.then(polarity_expr))
-            .map(|(lhs, (op, rhs))| {
+            .then(
+                multiplicative_op
+                    .then(polarity_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
                 Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
@@ -612,8 +612,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Additive expression - handles + - &
         let additive_expr = multiplicative_expr
             .clone()
-            .then(additive_op.then(multiplicative_expr.clone()))
-            .map(|(lhs, (op, rhs))| {
+            .then(
+                additive_op
+                    .then(multiplicative_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
                 Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
@@ -628,25 +632,39 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     just("is").padded().map(|_| "is"),
                     just("as").padded().map(|_| "as"),
                 ))
-                .then(type_specifier.clone()),
+                .then(type_specifier.clone())
+                .or_not()
             )
-            .map(|(expr, (isas, type_specifier))| {
-                Expression::Type(Box::new(expr), isas.to_string(), type_specifier)
+            .map(|(expr, type_op)| {
+                if let Some((op, type_spec)) = type_op {
+                    Expression::Type(Box::new(expr), op.to_string(), type_spec)
+                } else {
+                    expr
+                }
             })
             .boxed();
 
         // Union expression - handles |
         let union_expr = type_expr
             .clone()
-            .then(just('|').padded().ignore_then(type_expr.clone())) // Allow whitespace around '|'
-            .map(|(lhs, rhs)| Expression::Union(Box::new(lhs), Box::new(rhs)))
+            .then(
+                just('|')
+                    .padded() // Allow whitespace around '|'
+                    .ignore_then(type_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, rhs| Expression::Union(Box::new(lhs), Box::new(rhs)))
             .boxed();
 
         // Inequality expression - handles <= < > >=
         let inequality_expr = union_expr
             .clone()
-            .then(inequality_op.then(union_expr.clone()))
-            .map(|(lhs, (op, rhs))| {
+            .then(
+                inequality_op
+                    .then(union_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
                 Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
@@ -654,19 +672,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Equality expression - handles = ~ != !~
         let equality_expr = inequality_expr
             .clone()
-            .then(equality_op.then(inequality_expr.clone()).repeated())
-            .map(|(first, rest)| {
-                rest.into_iter().fold(first, |acc, (op, expr)| {
-                    Expression::Equality(Box::new(acc), op.to_string(), Box::new(expr))
-                })
+            .then(
+                equality_op
+                    .then(inequality_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
+                Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
 
         // Membership expression - handles 'in' and 'contains'
         let membership_expr = equality_expr
             .clone()
-            .then(membership_op.then(equality_expr.clone()))
-            .map(|(lhs, (op, rhs))| {
+            .then(
+                membership_op
+                    .then(equality_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
                 Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
             .boxed();
@@ -677,15 +701,24 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .then(
                 text::keyword("and")
                     .padded()
-                    .ignore_then(membership_expr.clone()),
+                    .ignore_then(membership_expr.clone())
+                    .repeated()
             )
-            .map(|(lhs, rhs)| Expression::And(Box::new(lhs), Box::new(rhs)));
+            .foldl(|lhs, rhs| Expression::And(Box::new(lhs), Box::new(rhs)))
+            .boxed();
 
         // Or expression - handles 'or' and 'xor'
         let or_expr = and_expr
             .clone()
-            .then(or_op.then(and_expr.clone()))
-            .map(|(lhs, (op, rhs))| Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs)));
+            .then(
+                or_op
+                    .then(and_expr.clone())
+                    .repeated()
+            )
+            .foldl(|lhs, (op, rhs)| {
+                Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
+            })
+            .boxed();
 
         // Implies expression - handles 'implies'
         let implies_expr = or_expr
@@ -693,9 +726,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .then(
                 text::keyword("implies")
                     .padded()
-                    .ignore_then(or_expr.clone()),
+                    .ignore_then(or_expr.clone())
+                    .repeated()
             )
-            .map(|(lhs, rhs)| Expression::Implies(Box::new(lhs), Box::new(rhs)));
+            .foldl(|lhs, rhs| Expression::Implies(Box::new(lhs), Box::new(rhs)))
+            .boxed();
 
         implies_expr
     });
