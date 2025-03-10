@@ -658,14 +658,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     // Handle qualified identifiers like System.Boolean
                     identifier
                         .clone()
-                        .then(
-                            just('.')
-                                .ignore_then(identifier.clone())
-                                .or_not()
-                        )
+                        .then(just('.').ignore_then(identifier.clone()).or_not())
                         .map(|(namespace, name)| {
                             TypeSpecifier::QualifiedIdentifier(namespace, name)
-                        })
+                        }),
                 )
                 .or_not(),
             )
