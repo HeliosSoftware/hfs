@@ -571,12 +571,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Invocation chain - handles expression.invocation
         let invocation_chain = atom
             .clone()
-            .then(just('.').ignore_then(member_invocation.clone()).repeated())
-            .map(|(first, invocations)| {
-                invocations.into_iter().fold(first, |expr, invocation| {
-                    Expression::Invocation(Box::new(expr), invocation)
-                })
-            })
+            .then(just('.').ignore_then(member_invocation.clone()))
+            // AI! Add map
             .boxed();
 
         // Indexer expression - handles expression[expression]
