@@ -682,8 +682,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 text::keyword("implies")
                     .padded()
                     .ignore_then(or_expr.clone())
-                    // AI! add map
-            });
+            )
+            .map(|(lhs, rhs)| Expression::Implies(Box::new(lhs), Box::new(rhs)));
 
         implies_expr
     });
