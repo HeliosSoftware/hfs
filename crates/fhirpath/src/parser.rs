@@ -594,8 +594,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Multiplicative expression - handles * / div mod
         let multiplicative_expr = polarity_expr
-            .then(multiplicative_op.then(polarity_expr))
-            // AI! Add map
+            .clone()
+            .then(multiplicative_op.then(polarity_expr.clone()).repeated())
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |lhs, (op, rhs)| {
+                    Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
+                })
+            })
             .boxed();
 
         // Additive expression - handles + - &
