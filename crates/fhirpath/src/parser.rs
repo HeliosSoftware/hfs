@@ -583,7 +583,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let atom = choice((
             parenthesized_expr.clone(),
             term.clone().map(Expression::Term),
-        )).padded();
+        ))
+        .padded();
 
         // Then handle any number of dot invocations that follow
         let invocation_expr = atom
@@ -628,11 +629,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Multiplicative expression - handles * / div mod
         let multiplicative_expr = polarity_expr
             .clone()
-            .then(
-                multiplicative_op
-                    .then(polarity_expr.clone())
-                    .repeated()
-            )
+            .then(multiplicative_op.then(polarity_expr.clone()).repeated())
             .foldl(|lhs, (op, rhs)| {
                 Expression::Multiplicative(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
@@ -641,11 +638,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Additive expression - handles + - &
         let additive_expr = multiplicative_expr
             .clone()
-            .then(
-                additive_op
-                    .then(multiplicative_expr.clone())
-                    .repeated()
-            )
+            .then(additive_op.then(multiplicative_expr.clone()).repeated())
             .foldl(|lhs, (op, rhs)| {
                 Expression::Additive(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
@@ -661,10 +654,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     just("is").padded().map(|_| "is"),
                     just("as").padded().map(|_| "as"),
                 ))
-                .then(identifier.clone().map(|id| {
-                    TypeSpecifier::QualifiedIdentifier(id, None)
-                }))
-                .or_not()
+                .then(
+                    identifier
+                        .clone()
+                        .map(|id| TypeSpecifier::QualifiedIdentifier(id, None)),
+                )
+                .or_not(),
             )
             .map(|(expr, type_op)| {
                 if let Some((op, type_spec)) = type_op {
@@ -682,7 +677,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 just('|')
                     .padded() // Allow whitespace around '|'
                     .ignore_then(type_expr.clone())
-                    .repeated()
+                    .repeated(),
             )
             .foldl(|lhs, rhs| Expression::Union(Box::new(lhs), Box::new(rhs)))
             .boxed();
@@ -690,11 +685,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Inequality expression - handles <= < > >=
         let inequality_expr = union_expr
             .clone()
-            .then(
-                inequality_op
-                    .then(union_expr.clone())
-                    .repeated()
-            )
+            .then(inequality_op.then(union_expr.clone()).repeated())
             .foldl(|lhs, (op, rhs)| {
                 Expression::Inequality(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
@@ -703,11 +694,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Equality expression - handles = ~ != !~
         let equality_expr = inequality_expr
             .clone()
-            .then(
-                equality_op
-                    .then(inequality_expr.clone())
-                    .repeated()
-            )
+            .then(equality_op.then(inequality_expr.clone()).repeated())
             .foldl(|lhs, (op, rhs)| {
                 Expression::Equality(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
@@ -716,11 +703,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Membership expression - handles 'in' and 'contains'
         let membership_expr = equality_expr
             .clone()
-            .then(
-                membership_op
-                    .then(equality_expr.clone())
-                    .repeated()
-            )
+            .then(membership_op.then(equality_expr.clone()).repeated())
             .foldl(|lhs, (op, rhs)| {
                 Expression::Membership(Box::new(lhs), op.to_string(), Box::new(rhs))
             })
@@ -730,36 +713,22 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let and_op = just("and").padded();
         let and_expr = membership_expr
             .clone()
-            .then(
-                and_op
-                    .ignore_then(membership_expr.clone())
-                    .repeated()
-            )
+            .then(and_op.ignore_then(membership_expr.clone()).repeated())
             .foldl(|lhs, rhs| Expression::And(Box::new(lhs), Box::new(rhs)))
             .boxed();
 
         // Or expression - handles 'or' and 'xor'
         let or_expr = and_expr
             .clone()
-            .then(
-                or_op
-                    .then(and_expr.clone())
-                    .repeated()
-            )
-            .foldl(|lhs, (op, rhs)| {
-                Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs))
-            })
+            .then(or_op.then(and_expr.clone()).repeated())
+            .foldl(|lhs, (op, rhs)| Expression::Or(Box::new(lhs), op.to_string(), Box::new(rhs)))
             .boxed();
 
         // Implies expression - handles 'implies'
         let implies_op = just("implies").padded();
         let implies_expr = or_expr
             .clone()
-            .then(
-                implies_op
-                    .ignore_then(or_expr.clone())
-                    .repeated()
-            )
+            .then(implies_op.ignore_then(or_expr.clone()).repeated())
             .foldl(|lhs, rhs| Expression::Implies(Box::new(lhs), Box::new(rhs)))
             .boxed();
 
