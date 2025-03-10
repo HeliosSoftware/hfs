@@ -577,8 +577,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Indexer expression - handles expression[expression]
         let indexer_expr = invocation_expr
-            .then(indexer_expr.delimited_by(just('['), just(']')))
-            // AI! add map
+            .then(expr.clone().delimited_by(just('['), just(']')))
+            .map(|(expr, idx)| Expression::Indexer(Box::new(expr), Box::new(idx)))
             .boxed();
 
         // Polarity expression - handles +/- expression
