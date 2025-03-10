@@ -587,26 +587,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .or(invocation_expr.clone())
             .boxed();
 
-        // Handle indexed path expressions like Patient.name[0].given
-        let indexed_path_expr = indexer_expr
-            .clone()
-            .then(just('.').ignore_then(invocation.clone()).repeated())
-            .map(move |(first, invocs)| {
-                // Build the expression tree from left to right
-                invocs.into_iter().fold(first, |acc, invoc| {
-                    Expression::Invocation(Box::new(acc), invoc)
-                })
-            })
-            .or(indexer_expr.clone())
-            .boxed();
-
         // Polarity expression - handles +/- expression
         let polarity_expr = just('+')
             .or(just('-'))
             .padded() // Allow whitespace after operator
-            .then(indexed_path_expr.clone())
+            .then(indexer_expr.clone())
             .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
-            .or(indexed_path_expr.clone())
+            .or(indexer_expr.clone())
             .boxed();
 
         // Multiplicative expression - handles * / div mod
