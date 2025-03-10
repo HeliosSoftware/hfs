@@ -14,8 +14,10 @@ fn test_simple_literals() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
+        println!("Parsed expression: {:?}", expr);
         let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
+        println!("Result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
@@ -54,8 +56,10 @@ fn test_boolean_operations() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
+        println!("Boolean op parsed expression: {:?}", expr);
         let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
+        println!("Boolean op result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
