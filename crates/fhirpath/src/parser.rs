@@ -500,10 +500,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     .padded(); // Allow whitespace around operators
 
     let _additive_op = choice((
-        just::<_, _, Simple<char>>('+').to("+"), 
-        just::<_, _, Simple<char>>('-').to("-"), 
-        just::<_, _, Simple<char>>('&').to("&")
-    )).padded(); // Allow whitespace around operators
+        just::<_, _, Simple<char>>('+').to("+"),
+        just::<_, _, Simple<char>>('-').to("-"),
+        just::<_, _, Simple<char>>('&').to("&"),
+    ))
+    .padded(); // Allow whitespace around operators
 
     let _inequality_op = choice((
         just::<_, _, Simple<char>>("<=").to("<="),
@@ -528,9 +529,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     .padded(); // Allow whitespace around operators
 
     let _or_op = choice((
-        text::keyword::<char, _, Simple<char>>("or").to("or"), 
-        text::keyword::<char, _, Simple<char>>("xor").to("xor")
-    )).padded(); // Allow whitespace around operators
+        text::keyword::<char, _, Simple<char>>("or").to("or"),
+        text::keyword::<char, _, Simple<char>>("xor").to("xor"),
+    ))
+    .padded(); // Allow whitespace around operators
 
     // Recursive parser definition that directly mirrors the grammar structure
     let expr_parser = recursive(|expr| {
@@ -583,41 +585,50 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Define a type alias for our operation function
         type OpFn = Box<dyn Fn(Expression) -> (Expression, u8)>;
-        
+
         // Create a function to build operation parsers that return boxed closures
         // Use explicit lifetime to ensure proper relationships
         let make_operation_parser = |expr: Recursive<'_, char, Expression, Simple<char>>| {
             // Create a vector to hold all our operation parsers
             let mut operations = Vec::new();
-            
+
             // Invocation expression: expression '.' invocation
             let invocation_expr = just::<_, _, Simple<char>>('.')
                 .ignore_then(invocation.clone())
                 .map(|inv| {
                     let inv_clone = inv.clone();
                     Box::new(move |left: Expression| {
-                        (Expression::Invocation(Box::new(left), inv_clone.clone()), 13_u8)
+                        (
+                            Expression::Invocation(Box::new(left), inv_clone.clone()),
+                            13_u8,
+                        )
                     }) as OpFn
                 })
                 .boxed();
             operations.push(Box::new(invocation_expr));
-            
+
             // Indexer expression: expression '[' expression ']'
             let indexer_expr = expr
                 .clone()
-                .delimited_by(just::<_, _, Simple<char>>('['), just::<_, _, Simple<char>>(']'))
+                .delimited_by(
+                    just::<_, _, Simple<char>>('['),
+                    just::<_, _, Simple<char>>(']'),
+                )
                 .map(|idx| {
                     let idx_clone = idx.clone();
                     Box::new(move |left: Expression| {
-                        (Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())), 13_u8)
+                        (
+                            Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())),
+                            13_u8,
+                        )
                     }) as OpFn
                 })
                 .boxed();
             operations.push(Box::new(indexer_expr));
-            
+
             // Polarity expression: ('+' | '-') expression
             // This is handled separately as a prefix operator
-            
+
             // Multiplicative expression: expression ('*' | '/' | 'div' | 'mod') expression
             let multiplicative_expr = choice((
                 just::<_, _, Simple<char>>('*').to("*"),
@@ -643,12 +654,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(multiplicative_expr));
-            
+
             // Additive expression: expression ('+' | '-' | '&') expression
             let additive_expr = choice((
-                just::<_, _, Simple<char>>('+').to("+"), 
-                just::<_, _, Simple<char>>('-').to("-"), 
-                just::<_, _, Simple<char>>('&').to("&")
+                just::<_, _, Simple<char>>('+').to("+"),
+                just::<_, _, Simple<char>>('-').to("-"),
+                just::<_, _, Simple<char>>('&').to("&"),
             ))
             .padded()
             .then(expr.clone())
@@ -668,7 +679,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(additive_expr));
-            
+
             // Type expression: expression ('is' | 'as') typeSpecifier
             let type_expr = choice((
                 just::<_, _, Simple<char>>("is").padded().map(|_| "is"),
@@ -680,18 +691,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 let type_spec_clone = type_spec.clone();
                 Box::new(move |left: Expression| {
                     (
-                        Expression::Type(
-                            Box::new(left),
-                            op_str.clone(),
-                            type_spec_clone.clone(),
-                        ),
+                        Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone()),
                         9_u8,
                     )
                 }) as OpFn
             })
             .boxed();
             operations.push(Box::new(type_expr));
-            
+
             // Union expression: expression '|' expression
             let union_expr = just::<_, _, Simple<char>>('|')
                 .padded()
@@ -707,7 +714,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 })
                 .boxed();
             operations.push(Box::new(union_expr));
-            
+
             // Inequality expression: expression ('<=' | '<' | '>' | '>=') expression
             let inequality_expr = choice((
                 just::<_, _, Simple<char>>("<=").to("<="),
@@ -733,7 +740,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(inequality_expr));
-            
+
             // Equality expression: expression ('=' | '~' | '!=' | '!~') expression
             let equality_expr = choice((
                 just::<_, _, Simple<char>>("=").to("="),
@@ -759,7 +766,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(equality_expr));
-            
+
             // Membership expression: expression ('in' | 'contains') expression
             let membership_expr = choice((
                 text::keyword::<char, _, Simple<char>>("in").to("in"),
@@ -783,7 +790,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(membership_expr));
-            
+
             // And expression: expression 'and' expression
             let and_expr = just::<_, _, Simple<char>>("and")
                 .padded()
@@ -799,11 +806,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 })
                 .boxed();
             operations.push(Box::new(and_expr));
-            
+
             // Or expression: expression ('or' | 'xor') expression
             let or_expr = choice((
-                text::keyword::<char, _, Simple<char>>("or").to("or"), 
-                text::keyword::<char, _, Simple<char>>("xor").to("xor")
+                text::keyword::<char, _, Simple<char>>("or").to("or"),
+                text::keyword::<char, _, Simple<char>>("xor").to("xor"),
             ))
             .padded()
             .then(expr.clone())
@@ -823,7 +830,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .boxed();
             operations.push(Box::new(or_expr));
-            
+
             // Implies expression: expression 'implies' expression
             let implies_expr = just::<_, _, Simple<char>>("implies")
                 .padded()
@@ -839,36 +846,37 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 })
                 .boxed();
             operations.push(Box::new(implies_expr));
-            
+
             // Combine all operation parsers using choice
             // Don't box here, we'll do it after applying the choice
             choice(operations)
         };
-        
+
         // Create the operation parser
         // Box after creating the parser to ensure proper lifetime handling
         let operation_parser = make_operation_parser(expr.clone());
-        
+
         // Apply operations to the base expression
-        let expr_with_operations = expr_base
-            .clone()
-            .then(operation_parser.repeated())
-            .map(|(base, operations)| {
-                operations.into_iter().fold(base, |acc, operation| {
-                    let (expr, _) = operation(acc);
-                    expr
-                })
-            });
+        let expr_with_operations =
+            expr_base
+                .clone()
+                .then(operation_parser.repeated())
+                .map(|(base, operations)| {
+                    operations.into_iter().fold(base, |acc, operation| {
+                        let (expr, _) = operation(acc);
+                        expr
+                    })
+                });
 
         // Handle polarity expressions separately since they're prefix operators
         let polarity_expr = choice((
-            just::<_, _, Simple<char>>('+').to('+'), 
-            just::<_, _, Simple<char>>('-').to('-')
+            just::<_, _, Simple<char>>('+').to('+'),
+            just::<_, _, Simple<char>>('-').to('-'),
         ))
-            .padded()
-            .then(expr.clone())
-            .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
-            .or(expr_with_operations);
+        .padded()
+        .then(expr.clone())
+        .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
+        .or(expr_with_operations);
 
         polarity_expr.boxed()
     });
