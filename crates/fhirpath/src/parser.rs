@@ -667,7 +667,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     .padded()
                     .ignore_then(membership_expr.clone()),
             )
-            //AI! Add map
+            .map(|(lhs, rhs)| Expression::And(Box::new(lhs), Box::new(rhs)))
             .boxed();
 
         // Or expression - handles 'or' and 'xor'
