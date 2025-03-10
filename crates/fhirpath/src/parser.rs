@@ -633,8 +633,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let multiplicative_expr = choice((
             just::<_, _, Simple<char>>('*').to("*"),
             just::<_, _, Simple<char>>('/').to("/"),
-            text::keyword::<char, _, Simple<char>>("div").to("div"),
-            text::keyword::<char, _, Simple<char>>("mod").to("mod"),
+            just::<_, _, Simple<char>>("div").padded().to("div"),
+            just::<_, _, Simple<char>>("mod").padded().to("mod"),
         ))
         .padded()
         .then(expr.clone())
@@ -769,8 +769,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Membership expression: expression ('in' | 'contains') expression
         let membership_expr = choice((
-            text::keyword::<char, _, Simple<char>>("in").to("in"),
-            text::keyword::<char, _, Simple<char>>("contains").to("contains"),
+            just::<_, _, Simple<char>>("in").padded().to("in"),
+            just::<_, _, Simple<char>>("contains").padded().to("contains"),
         ))
         .padded()
         .then(expr.clone())
@@ -809,8 +809,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Or expression: expression ('or' | 'xor') expression
         let or_expr = choice((
-            text::keyword::<char, _, Simple<char>>("or").to("or"),
-            text::keyword::<char, _, Simple<char>>("xor").to("xor"),
+            just::<_, _, Simple<char>>("or").padded().to("or"),
+            just::<_, _, Simple<char>>("xor").padded().to("xor"),
         ))
         .padded()
         .then(expr.clone())
