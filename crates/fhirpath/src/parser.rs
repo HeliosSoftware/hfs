@@ -569,26 +569,16 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let atom = term.clone().map(Expression::Term).padded();
 
         // Invocation chain - handles expression.invocation
-        let invocation_chain = atom
+        let invocation_expr = atom
             .clone()
             .then(just('.').ignore_then(member_invocation.clone()))
             .map(|(expr, invoc)| Expression::Invocation(Box::new(expr), invoc))
             .boxed();
 
         // Indexer expression - handles expression[expression]
-        let indexer_expr = invocation_chain
-            .clone()
-            .then(
-                expr.clone()
-                    .delimited_by(just('['), just(']'))
-                    .map(|idx| idx)
-                    .repeated(),
-            )
-            .map(|(first, indices)| {
-                indices.into_iter().fold(first, |expr, idx| {
-                    Expression::Indexer(Box::new(expr), Box::new(idx))
-                })
-            })
+        let indexer_expr = invocation_expr
+            .then(indexer_expr.delimited_by(just('['), just(']')))
+            // AI! add map
             .boxed();
 
         // Polarity expression - handles +/- expression
