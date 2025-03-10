@@ -585,9 +585,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         type OpFn = Box<dyn Fn(Expression) -> (Expression, u8)>;
         
         // Create a function to build operation parsers that return boxed closures
-        let make_operation_parser = move |expr: Recursive<'_, char, Expression, Simple<char>>| {
+        // Use explicit lifetime to ensure proper relationships
+        let make_operation_parser = |expr: Recursive<'_, char, Expression, Simple<char>>| {
             // Create a vector to hold all our operation parsers
-            let mut operations: Vec<Box<dyn Parser<char, OpFn, Error = Simple<char>> + '_>> = Vec::new();
+            let mut operations = Vec::new();
             
             // Invocation expression: expression '.' invocation
             let invocation_expr = just::<_, _, Simple<char>>('.')
@@ -840,11 +841,13 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             operations.push(Box::new(implies_expr));
             
             // Combine all operation parsers using choice
-            choice(operations).boxed()
+            // Don't box here, we'll do it after applying the choice
+            choice(operations)
         };
         
         // Create the operation parser
-        let operation_parser = make_operation_parser(expr.clone()).boxed();
+        // Box after creating the parser to ensure proper lifetime handling
+        let operation_parser = make_operation_parser(expr.clone());
         
         // Apply operations to the base expression
         let expr_with_operations = expr_base
