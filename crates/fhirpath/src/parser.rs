@@ -162,9 +162,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Literals
     let null = just('{').then(just('}')).to(Literal::Null);
 
-    let boolean = text::keyword("true")
+    let boolean = just::<_, _, Simple<char>>("true").padded()
         .to(Literal::Boolean(true))
-        .or(text::keyword("false").to(Literal::Boolean(false)));
+        .or(just::<_, _, Simple<char>>("false").padded().to(Literal::Boolean(false)));
 
     let string = just('\'')
         .ignore_then(

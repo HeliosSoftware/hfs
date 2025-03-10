@@ -16,7 +16,7 @@ fn test_simple_literals() {
         let expr = parser().parse(input).unwrap();
         let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
-        assert_eq!(result, expected);
+        assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
 
@@ -56,7 +56,7 @@ fn test_boolean_operations() {
         let expr = parser().parse(input).unwrap();
         let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
-        assert_eq!(result, expected);
+        assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
 
