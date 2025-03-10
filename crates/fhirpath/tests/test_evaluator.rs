@@ -1,6 +1,7 @@
 use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult};
 use fhirpath::parser::parser;
 use std::collections::HashMap;
+use chumsky::Parser;
 
 #[test]
 fn test_simple_literals() {
