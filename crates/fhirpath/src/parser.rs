@@ -466,7 +466,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Qualified identifier (for type specifiers)
     let qualified_identifier = identifier
         .then(just('.').ignore_then(identifier.clone().or_not()))
-        .map(|(namespace, name)| (namespace, name)) // AI! Should return a QualifiedIdentifier
+        .map(|(namespace, name)| TypeSpecifier::QualifiedIdentifier(namespace, name))
         .padded()
         .boxed(); // Box the parser to make it easier to clone
 
@@ -487,10 +487,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(Term::ExternalConstant)
         .padded();
 
-    let type_specifier = qualified_identifier
-        .clone()
-        .map(TypeSpecifier::QualifiedIdentifier)
-        .padded();
+    let type_specifier = qualified_identifier.clone().padded();
 
     // Define operators outside the recursive block
     let multiplicative_op = choice((
