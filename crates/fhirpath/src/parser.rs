@@ -651,7 +651,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let equality_expr = invocation_expr
             .clone()
             .then(equality_op.then(invocation_expr.clone()).repeated())
-            //AI! add map
+            .map(|(first, rest)| {
+                rest.into_iter().fold(first, |acc, (op, expr)| {
+                    Expression::Equality(Box::new(acc), op.to_string(), Box::new(expr))
+                })
+            })
             .boxed();
 
         equality_expr
