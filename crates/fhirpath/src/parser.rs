@@ -592,7 +592,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }) as OpFn
                 })
                 .boxed();
-            operations.push(invocation_expr);
+            operations.push(Box::new(invocation_expr));
             
             // Indexer expression: expression '[' expression ']'
             let indexer_expr = expr
@@ -605,7 +605,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }) as OpFn
                 })
                 .boxed();
-            operations.push(indexer_expr);
+            operations.push(Box::new(indexer_expr));
             
             // Polarity expression: ('+' | '-') expression
             // This is handled separately as a prefix operator
@@ -634,7 +634,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(multiplicative_expr);
+            operations.push(Box::new(multiplicative_expr));
             
             // Additive expression: expression ('+' | '-' | '&') expression
             let additive_expr = choice((
@@ -659,7 +659,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(additive_expr);
+            operations.push(Box::new(additive_expr));
             
             // Type expression: expression ('is' | 'as') typeSpecifier
             let type_expr = choice((
@@ -682,7 +682,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(type_expr);
+            operations.push(Box::new(type_expr));
             
             // Union expression: expression '|' expression
             let union_expr = just('|')
@@ -698,7 +698,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }) as OpFn
                 })
                 .boxed();
-            operations.push(union_expr);
+            operations.push(Box::new(union_expr));
             
             // Inequality expression: expression ('<=' | '<' | '>' | '>=') expression
             let inequality_expr = choice((
@@ -724,7 +724,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(inequality_expr);
+            operations.push(Box::new(inequality_expr));
             
             // Equality expression: expression ('=' | '~' | '!=' | '!~') expression
             let equality_expr = choice((
@@ -750,7 +750,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(equality_expr);
+            operations.push(Box::new(equality_expr));
             
             // Membership expression: expression ('in' | 'contains') expression
             let membership_expr = choice((
@@ -774,7 +774,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(membership_expr);
+            operations.push(Box::new(membership_expr));
             
             // And expression: expression 'and' expression
             let and_expr = just("and")
@@ -790,7 +790,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }) as OpFn
                 })
                 .boxed();
-            operations.push(and_expr);
+            operations.push(Box::new(and_expr));
             
             // Or expression: expression ('or' | 'xor') expression
             let or_expr = choice((
@@ -814,7 +814,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }) as OpFn
             })
             .boxed();
-            operations.push(or_expr);
+            operations.push(Box::new(or_expr));
             
             // Implies expression: expression 'implies' expression
             let implies_expr = just("implies")
@@ -830,7 +830,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     }) as OpFn
                 })
                 .boxed();
-            operations.push(implies_expr);
+            operations.push(Box::new(implies_expr));
             
             // Combine all operation parsers using choice
             choice(operations)
