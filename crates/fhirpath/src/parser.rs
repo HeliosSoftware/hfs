@@ -37,7 +37,7 @@ pub enum Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSpecifier {
-    QualifiedIdentifier(String),
+    QualifiedIdentifier(String, Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -465,25 +465,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Qualified identifier (for type specifiers)
     let qualified_identifier = identifier
-        .clone()
-        .then(
-            just('.')
-                .ignore_then(identifier.clone())
-                .repeated()
-                .collect::<Vec<_>>(),
-        )
-        .map(|(first, rest)| {
-            if rest.is_empty() {
-                first
-            } else {
-                let mut result = first;
-                for part in rest {
-                    result.push_str(".");
-                    result.push_str(&part);
-                }
-                result
-            }
-        })
+        .then(just('.').ignore_then(identifier.clone().or_not()))
+        //AI! Add map
         .padded()
         .boxed(); // Box the parser to make it easier to clone
 
@@ -566,8 +549,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Member invocation
         let member_invocation = choice((
-            function.clone(),
             identifier.clone().map(Invocation::Member),
+            function.clone(),
             just("$this").to(Invocation::This),
             just("$index").to(Invocation::Index),
             just("$total").to(Invocation::Total),
