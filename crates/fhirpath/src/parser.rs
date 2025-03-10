@@ -466,7 +466,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Qualified identifier (for type specifiers)
     let qualified_identifier = identifier
         .then(just('.').ignore_then(identifier.clone().or_not()))
-        //AI! Add map
+        .map(|(namespace, name)| (namespace, name))
         .padded()
         .boxed(); // Box the parser to make it easier to clone
 
