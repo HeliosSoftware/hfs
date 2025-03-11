@@ -182,26 +182,11 @@ fn test_multiple_expressions_from_file() {
     assert!(!expressions.is_empty(), "No test expressions found");
     println!("Found {} test expressions", expressions.len());
 
-    // Known expressions that our parser doesn't handle yet
-    let known_failures = [
-        "(Observation.value as Quantity).unit",
-        "(Observation.value as Period).unit",
-        "1 > 2 is Boolean",
-        "1 | 1 is Integer",
-        "true is Boolean",
-    ];
-
     // Try to parse each expression
     let mut success_count = 0;
     let mut failure_count = 0;
 
     for expr in expressions.iter() {
-        // Skip known failures
-        if known_failures.contains(&expr.as_str()) {
-            success_count += 1;
-            continue;
-        }
-
         let result = parser().parse(expr.clone());
         if result.is_ok() {
             success_count += 1;
