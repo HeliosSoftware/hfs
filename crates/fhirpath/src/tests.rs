@@ -187,7 +187,8 @@ fn test_multiple_expressions_from_file() {
         "(Observation.value as Quantity).unit",
         "(Observation.value as Period).unit",
         "1 > 2 is Boolean",
-        "1 | 1 is Integer"
+        "1 | 1 is Integer",
+        "true is Boolean"
     ];
 
     // Try to parse each expression
