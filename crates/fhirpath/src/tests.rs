@@ -127,6 +127,7 @@ fn test_parse_simple_expressions() {
         "2.5 'mg'",
         "1 day = 24 hours",
         "1 + 2 * 3",
+        "1 + 2 * --3",
         "Observation.value is Quantity",
     ];
 

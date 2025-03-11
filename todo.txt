@@ -1,9 +1,10 @@
+- Move the tests to a single spot - we have it in two locations at the moment
+- Improve the tests and evaluator to take the input and test the output against the result value in the xml file.
 - Write README.md for the root - homepage!
 - Write README.md for fhir_gen
 - Write README.md for hfs
 - Write README.md for fhir
-- For FHIRPath, seems like it is chumsky vs LALROP with logos?  Still unsure how to convert a FHIRPath expression to the resulting nodes.  Should this be done entirely in json?  There 
-  are many uses of FHIRPath in the FHIR Spec.  Should we be building a generic tool?  Should chumsky be used for a nice validator only and LALRPOP and logos be used for speed purpposes?
+- Write README.md for fhirpath
 - Is there a fhir path validator endpoint, and an apply?
 - The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to 
   decide - could be helpful too in the future when we need to use it for Cassandra table separation
