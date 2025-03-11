@@ -453,9 +453,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then_ignore(just('`'))
         .padded();
 
-    // Combined identifier parser
+    // Combined identifier parser - exclude true/false as they are boolean literals
     let identifier = choice((
-        standard_identifier,
+        standard_identifier.clone().validate(|id, span, emit| {
+            // Reject "true" and "false" as identifiers
+            if id == "true" || id == "false" {
+                emit(Simple::custom(span, "Reserved keyword"));
+                String::new() // Return empty string for invalid identifier
+            } else {
+                id
+            }
+        }),
         delimited_identifier,
         text::keyword("as").to(String::from("as")),
         text::keyword("contains").to(String::from("contains")),

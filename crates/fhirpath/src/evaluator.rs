@@ -221,6 +221,13 @@ fn evaluate_invocation(
 ) -> EvaluationResult {
     match invocation {
         Invocation::Member(name) => {
+            // Special handling for boolean literals that might be parsed as identifiers
+            if name == "true" {
+                return EvaluationResult::Boolean(true);
+            } else if name == "false" {
+                return EvaluationResult::Boolean(false);
+            }
+            
             // Access a member of the value
             match value {
                 EvaluationResult::Object(obj) => {
