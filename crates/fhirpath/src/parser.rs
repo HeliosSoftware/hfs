@@ -491,52 +491,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(Term::ExternalConstant)
         .padded();
 
-    let _type_specifier = qualified_identifier.clone().padded();
-
-    // Define operators outside the recursive block
-    let _multiplicative_op = choice((
-        just::<_, _, Simple<char>>('*').to("*"),
-        just::<_, _, Simple<char>>('/').to("/"),
-        text::keyword::<char, _, Simple<char>>("div").to("div"),
-        text::keyword::<char, _, Simple<char>>("mod").to("mod"),
-    ))
-    .padded(); // Allow whitespace around operators
-
-    let _additive_op = choice((
-        just::<_, _, Simple<char>>('+').to("+"),
-        just::<_, _, Simple<char>>('-').to("-"),
-        just::<_, _, Simple<char>>('&').to("&"),
-    ))
-    .padded(); // Allow whitespace around operators
-
-    let _inequality_op = choice((
-        just::<_, _, Simple<char>>("<=").to("<="),
-        just::<_, _, Simple<char>>("<").to("<"),
-        just::<_, _, Simple<char>>(">=").to(">="),
-        just::<_, _, Simple<char>>(">").to(">"),
-    ))
-    .padded(); // Allow whitespace around operators
-
-    let _equality_op = choice((
-        just::<_, _, Simple<char>>("=").to("="),
-        just::<_, _, Simple<char>>("~").to("~"),
-        just::<_, _, Simple<char>>("!=").to("!="),
-        just::<_, _, Simple<char>>("!~").to("!~"),
-    ))
-    .padded(); // Allow whitespace around operators
-
-    let _membership_op = choice((
-        text::keyword::<char, _, Simple<char>>("in").to("in"),
-        text::keyword::<char, _, Simple<char>>("contains").to("contains"),
-    ))
-    .padded(); // Allow whitespace around operators
-
-    let _or_op = choice((
-        text::keyword::<char, _, Simple<char>>("or").to("or"),
-        text::keyword::<char, _, Simple<char>>("xor").to("xor"),
-    ))
-    .padded(); // Allow whitespace around operators
-
     // Recursive parser definition that directly mirrors the grammar structure
     let expr_parser = recursive(|expr| {
         // Function parameters
