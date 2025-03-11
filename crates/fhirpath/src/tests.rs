@@ -183,12 +183,12 @@ fn test_multiple_expressions_from_file() {
 
     // Known expressions that our parser doesn't handle yet
     let known_failures = [
-        "Observation.value is Quantity",
+        // "Observation.value is Quantity",
         "(Observation.value as Quantity).unit",
         "(Observation.value as Period).unit",
         "1 > 2 is Boolean",
         "1 | 1 is Integer",
-        "true is Boolean"
+        "true is Boolean",
     ];
 
     // Try to parse each expression
@@ -201,7 +201,7 @@ fn test_multiple_expressions_from_file() {
             success_count += 1;
             continue;
         }
-        
+
         let result = parser().parse(expr.clone());
         if result.is_ok() {
             success_count += 1;
