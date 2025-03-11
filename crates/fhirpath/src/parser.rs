@@ -162,10 +162,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Literals
     let null = just('{').then(just('}')).to(Literal::Null);
 
-    let boolean = just::<_, _, Simple<char>>("true")
+    let boolean = text::keyword("true")
         .to(Literal::Boolean(true))
-        .or(just::<_, _, Simple<char>>("false").to(Literal::Boolean(false)))
-        .padded();
+        .or(text::keyword("false").to(Literal::Boolean(false)));
 
     let string = just('\'')
         .ignore_then(
@@ -771,7 +770,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Membership expression: expression ('in' | 'contains') expression
         let membership_expr = choice((
             just::<_, _, Simple<char>>("in").padded().to("in"),
-            just::<_, _, Simple<char>>("contains").padded().to("contains"),
+            just::<_, _, Simple<char>>("contains")
+                .padded()
+                .to("contains"),
         ))
         .padded()
         .then(expr.clone())
