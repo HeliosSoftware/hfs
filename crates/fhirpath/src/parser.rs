@@ -162,10 +162,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Literals
     let null = just('{').then(just('}')).to(Literal::Null);
 
-    let boolean = text::keyword::<char, _, Simple<char>>("true")
-        .map(|_| Literal::Boolean(true))
-        .or(text::keyword::<char, _, Simple<char>>("false").map(|_| Literal::Boolean(false)))
-        .boxed();
+    // Make sure boolean literals are parsed before identifiers
+    let boolean = choice((
+        text::keyword::<char, _, Simple<char>>("true").to(Literal::Boolean(true)),
+        text::keyword::<char, _, Simple<char>>("false").to(Literal::Boolean(false)),
+    ))
+    .boxed();
 
     let string = just('\'')
         .ignore_then(
@@ -454,17 +456,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then_ignore(just('`'))
         .padded();
 
-    // Combined identifier parser - exclude true/false as they are boolean literals
+    // Combined identifier parser - allow true/false as identifiers
     let identifier = choice((
-        standard_identifier.clone().validate(|id, span, emit| {
-            // Reject "true" and "false" as identifiers
-            if id == "true" || id == "false" {
-                emit(Simple::custom(span, "Reserved keyword"));
-                String::new() // Return empty string for invalid identifier
-            } else {
-                id
-            }
-        }),
+        standard_identifier.clone(),
         delimited_identifier,
         text::keyword("as").to(String::from("as")),
         text::keyword("contains").to(String::from("contains")),
