@@ -127,6 +127,7 @@ fn test_parse_simple_expressions() {
         "2.5 'mg'",
         "1 day = 24 hours",
         "1 + 2 * 3",
+        "Observation.value is Quantity",
     ];
 
     for expr in test_cases {
@@ -183,7 +184,6 @@ fn test_multiple_expressions_from_file() {
 
     // Known expressions that our parser doesn't handle yet
     let known_failures = [
-        // "Observation.value is Quantity",
         "(Observation.value as Quantity).unit",
         "(Observation.value as Period).unit",
         "1 > 2 is Boolean",

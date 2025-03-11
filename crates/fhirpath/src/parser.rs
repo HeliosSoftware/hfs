@@ -469,7 +469,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // Qualified identifier (for type specifiers)
     let qualified_identifier = identifier
         .clone()
-        .then(just('.').ignore_then(identifier.clone().or_not()))
+        .then(just('.').ignore_then(identifier.clone()).or_not())
         .map(|(namespace, name)| TypeSpecifier::QualifiedIdentifier(namespace, name))
         .padded()
         .boxed(); // Box the parser to make it easier to clone
