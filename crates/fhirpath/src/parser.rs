@@ -543,11 +543,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Define all the operation parsers directly without the closure
         // This avoids the lifetime issues with the previous approach
 
-        // Define a type alias for our operation function
-        type OpFn = Box<dyn Fn(Expression) -> (Expression, u8)>;
-
         // Create a vector to hold all our operation parsers
-        let mut operations = Vec::<BoxedParser<'_, char, OpFn, Simple<char>>>::new();
+        let mut operations = Vec::<BoxedParser<'_, char, Box<dyn Fn(Expression) -> Expression>, Simple<char>>>::new();
 
         // Invocation expression: expression '.' invocation
         let invocation_expr = just::<_, _, Simple<char>>('.')
@@ -555,11 +552,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .map(move |inv| {
                 let inv_clone = inv.clone();
                 Box::new(move |left: Expression| {
-                    (
-                        Expression::Invocation(Box::new(left), inv_clone.clone()),
-                        13_u8,
-                    )
-                }) as OpFn
+                    Expression::Invocation(Box::new(left), inv_clone.clone())
+                })
             })
             .boxed();
         operations.push(invocation_expr);
@@ -574,11 +568,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .map(move |idx| {
                 let idx_clone = idx.clone();
                 Box::new(move |left: Expression| {
-                    (
-                        Expression::Indexer(Box::new(left), Box::new(idx_clone.clone())),
-                        13_u8,
-                    )
-                }) as OpFn
+                    Expression::Indexer(Box::new(left), Box::new(idx_clone.clone()))
+                })
             })
             .boxed();
         operations.push(indexer_expr);
@@ -599,15 +590,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Multiplicative(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    11_u8,
+                Expression::Multiplicative(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(multiplicative_expr);
@@ -624,15 +612,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Additive(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    10_u8,
+                Expression::Additive(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(additive_expr);
@@ -647,11 +632,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let type_spec_clone = type_spec.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone()),
-                    9_u8,
-                )
-            }) as OpFn
+                Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone())
+            })
         })
         .boxed();
         operations.push(type_expr);
@@ -663,11 +645,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .map(move |right| {
                 let right_clone = right.clone();
                 Box::new(move |left: Expression| {
-                    (
-                        Expression::Union(Box::new(left), Box::new(right_clone.clone())),
-                        8_u8,
-                    )
-                }) as OpFn
+                    Expression::Union(Box::new(left), Box::new(right_clone.clone()))
+                })
             })
             .boxed();
         operations.push(union_expr);
@@ -685,15 +664,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Inequality(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    7_u8,
+                Expression::Inequality(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(inequality_expr);
@@ -711,15 +687,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Equality(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    6_u8,
+                Expression::Equality(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(equality_expr);
@@ -737,15 +710,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Membership(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    5_u8,
+                Expression::Membership(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(membership_expr);
@@ -757,11 +727,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .map(move |right| {
                 let right_clone = right.clone();
                 Box::new(move |left: Expression| {
-                    (
-                        Expression::And(Box::new(left), Box::new(right_clone.clone())),
-                        4_u8,
-                    )
-                }) as OpFn
+                    Expression::And(Box::new(left), Box::new(right_clone.clone()))
+                })
             })
             .boxed();
         operations.push(and_expr);
@@ -777,15 +744,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             let op_str = op.to_string();
             let right_clone = right.clone();
             Box::new(move |left: Expression| {
-                (
-                    Expression::Or(
-                        Box::new(left),
-                        op_str.clone(),
-                        Box::new(right_clone.clone()),
-                    ),
-                    3_u8,
+                Expression::Or(
+                    Box::new(left),
+                    op_str.clone(),
+                    Box::new(right_clone.clone()),
                 )
-            }) as OpFn
+            })
         })
         .boxed();
         operations.push(or_expr);
@@ -797,11 +761,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .map(move |right| {
                 let right_clone = right.clone();
                 Box::new(move |left: Expression| {
-                    (
-                        Expression::Implies(Box::new(left), Box::new(right_clone.clone())),
-                        2_u8,
-                    )
-                }) as OpFn
+                    Expression::Implies(Box::new(left), Box::new(right_clone.clone()))
+                })
             })
             .boxed();
         operations.push(implies_expr);
@@ -816,8 +777,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 .then(operation_parser.repeated())
                 .map(|(base, operations)| {
                     operations.into_iter().fold(base, |acc, operation| {
-                        let (expr, _) = operation(acc);
-                        expr
+                        operation(acc)
                     })
                 });
 
