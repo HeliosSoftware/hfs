@@ -1,7 +1,5 @@
-pub mod parser;
 pub mod evaluator;
-#[cfg(test)]
-mod tests;
+pub mod parser;
 
+pub use evaluator::{EvaluationContext, EvaluationResult, evaluate};
 pub use parser::{Expression, Invocation, Literal, Term, parser};
-pub use evaluator::{evaluate, EvaluationContext, EvaluationResult};

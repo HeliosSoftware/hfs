@@ -1,5 +1,5 @@
-- Move the tests to a single spot - we have it in two locations at the moment
 - Improve the tests and evaluator to take the input and test the output against the result value in the xml file.
+- Investigate the tests in https://github.com/FHIR/fhir-test-cases - are the fhirpath tests different for each FHIR version?
 - Write README.md for the root - homepage!
 - Write README.md for fhir_gen
 - Write README.md for hfs
