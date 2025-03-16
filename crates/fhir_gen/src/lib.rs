@@ -2,6 +2,7 @@ pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
 use clap::ValueEnum;
+use fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
@@ -11,42 +12,31 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, ValueEnum)]
-pub enum FhirVersion {
-    R4,
-    R4B,
-    R5,
-    R6,
-    All,
-}
-
-impl Default for FhirVersion {
-    fn default() -> Self {
-        FhirVersion::R4
+// Add ValueEnum implementation for FhirVersion to support clap
+impl ValueEnum for FhirVersion {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            FhirVersion::R4,
+            FhirVersion::R4B,
+            FhirVersion::R5,
+            FhirVersion::R6,
+        ]
     }
-}
 
-impl ToString for FhirVersion {
-    fn to_string(&self) -> String {
-        match self {
-            FhirVersion::R4 => "r4".to_string(),
-            FhirVersion::R4B => "r4b".to_string(),
-            FhirVersion::R5 => "r5".to_string(),
-            FhirVersion::R6 => "r6".to_string(),
-            FhirVersion::All => "all".to_string(),
-        }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
     }
 }
 
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    let version_dir = resources_dir.join(version.to_string());
+    let version_dir = resources_dir.join(version.as_str());
     // Create output directory if it doesn't exist
     std::fs::create_dir_all(output_path.as_ref())?;
 
     let version_path = output_path
         .as_ref()
-        .join(&format!("{}.rs", version.to_string()));
+        .join(&format!("{}.rs", version.as_str()));
 
     // Create the version-specific output file with initial content
     std::fs::write(&version_path, "use serde::{Serialize, Deserialize};\n\n")?;
@@ -67,12 +57,12 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     Ok(())
 }
 
-pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
+pub fn process_fhir_version(version: Option<FhirVersion>, output_path: impl AsRef<Path>) -> io::Result<()> {
     let mut lib_content = String::new();
 
     match version {
-        FhirVersion::All => {
-            // Process each version separately
+        None => {
+            // Process all versions
             for ver in [
                 FhirVersion::R4,
                 FhirVersion::R4B,
@@ -82,13 +72,13 @@ pub fn process_fhir_version(version: FhirVersion, output_path: impl AsRef<Path>)
                 if let Err(e) = process_single_version(&ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
-                lib_content.push_str(&format!("pub mod {};\n", ver.to_string()));
+                lib_content.push_str(&format!("pub mod {};\n", ver.as_str()));
             }
             std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
             Ok(())
         }
-        specific_version => {
-            lib_content.push_str(&format!("pub mod {};\n", specific_version.to_string()));
+        Some(specific_version) => {
+            lib_content.push_str(&format!("pub mod {};\n", specific_version.as_str()));
             std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
             process_single_version(&specific_version, output_path)
         }
@@ -578,7 +568,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("Failed to create temp directory");
 
         // Test processing R4 version
-        assert!(process_fhir_version(FhirVersion::R4, &temp_dir).is_ok());
+        assert!(process_fhir_version(Some(FhirVersion::R4), &temp_dir).is_ok());
 
         // Verify files were created
         assert!(temp_dir.join("r4.rs").exists());
