@@ -39,3 +39,19 @@ impl Default for FhirVersion {
         FhirVersion::R4
     }
 }
+
+// Implement ValueEnum for FhirVersion to support clap
+impl clap::ValueEnum for FhirVersion {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            FhirVersion::R4,
+            FhirVersion::R4B,
+            FhirVersion::R5,
+            FhirVersion::R6,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
