@@ -1,7 +1,6 @@
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
-use clap::ValueEnum;
 use fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
