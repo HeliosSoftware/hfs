@@ -17,3 +17,19 @@ serde_json = "1.0"
 [build-dependencies]
 reqwest = { version = "0.11", features = ["blocking"] }
 zip = "0.6"
+[package]
+name = "fhir"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+
+[features]
+default = ["R4"]
+R4 = []
+R4B = []
+R5 = []
+R6 = []
