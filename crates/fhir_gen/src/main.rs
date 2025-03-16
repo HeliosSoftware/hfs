@@ -1,12 +1,13 @@
 use clap::Parser;
 use fhir::FhirVersion;
+use fhir_gen::FhirVersionArg;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, disable_version_flag = true)]
 struct Args {
     /// FHIR version to process
     #[arg(value_enum)]
-    version: Option<FhirVersion>,
+    version: Option<FhirVersionArg>,
 
     /// Process all versions
     #[arg(long, short, conflicts_with = "version")]
@@ -37,7 +38,7 @@ fn main() {
     let version = if args.all || args.version.is_none() {
         None
     } else {
-        args.version
+        args.version.map(|v| v.into())
     };
 
     if let Err(e) = fhir_gen::process_fhir_version(version, &output_dir) {

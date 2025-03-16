@@ -12,19 +12,36 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-// Add ValueEnum implementation for FhirVersion to support clap
-impl ValueEnum for FhirVersion {
+/// A wrapper around FhirVersion that can implement ValueEnum
+#[derive(Debug, Clone, Copy)]
+pub struct FhirVersionArg(pub FhirVersion);
+
+impl From<FhirVersionArg> for FhirVersion {
+    fn from(arg: FhirVersionArg) -> Self {
+        arg.0
+    }
+}
+
+impl From<FhirVersion> for FhirVersionArg {
+    fn from(version: FhirVersion) -> Self {
+        FhirVersionArg(version)
+    }
+}
+
+// Implement ValueEnum for our wrapper type
+impl ValueEnum for FhirVersionArg {
     fn value_variants<'a>() -> &'a [Self] {
-        &[
-            FhirVersion::R4,
-            FhirVersion::R4B,
-            FhirVersion::R5,
-            FhirVersion::R6,
-        ]
+        static VARIANTS: [FhirVersionArg; 4] = [
+            FhirVersionArg(FhirVersion::R4),
+            FhirVersionArg(FhirVersion::R4B),
+            FhirVersionArg(FhirVersion::R5),
+            FhirVersionArg(FhirVersion::R6),
+        ];
+        &VARIANTS
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        Some(clap::builder::PossibleValue::new(self.as_str()))
+        Some(clap::builder::PossibleValue::new(self.0.as_str()))
     }
 }
 
