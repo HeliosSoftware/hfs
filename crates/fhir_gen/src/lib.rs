@@ -11,6 +11,22 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
+// Implement ValueEnum for FhirVersion to support clap
+impl clap::ValueEnum for FhirVersion {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            FhirVersion::R4,
+            FhirVersion::R4B,
+            FhirVersion::R5,
+            FhirVersion::R6,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
+
 
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
