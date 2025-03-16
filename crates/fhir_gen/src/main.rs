@@ -1,12 +1,13 @@
 use clap::Parser;
-use fhir_gen::FhirVersion;
+use fhir::FhirVersion;
+use fhir_gen::GeneratorVersion;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, disable_version_flag = true)]
 struct Args {
     /// FHIR version to process
-    #[arg(value_enum, default_value_t = FhirVersion::default())]
-    version: FhirVersion,
+    #[arg(value_enum, default_value_t = GeneratorVersion::default())]
+    version: GeneratorVersion,
 }
 
 fn main() {
