@@ -1,3 +1,4 @@
+- Change the form of the evaluator to:  expr:Expression, base:Expression, env_variables (HashMap(String, String), model (r4) ??, options (struct 
 - Improve the tests and evaluator to take the input and test the output against the result value in the xml file.
 - Investigate the tests in https://github.com/FHIR/fhir-test-cases - are the fhirpath tests different for each FHIR version?
 - Write README.md for the root - homepage!

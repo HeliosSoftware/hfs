@@ -32,7 +32,7 @@ fn main() {
     };
 
     let output_dir = std::path::PathBuf::from("crates/fhir/src");
-    
+
     // If --all flag is used or no version is specified, process all versions
     let version = if args.all || args.version.is_none() {
         None

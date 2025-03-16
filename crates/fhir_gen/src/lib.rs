@@ -11,8 +11,6 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
-
-
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.as_str());
@@ -42,7 +40,10 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     Ok(())
 }
 
-pub fn process_fhir_version(version: Option<FhirVersion>, output_path: impl AsRef<Path>) -> io::Result<()> {
+pub fn process_fhir_version(
+    version: Option<FhirVersion>,
+    output_path: impl AsRef<Path>,
+) -> io::Result<()> {
     match version {
         None => {
             // Process all versions
@@ -58,9 +59,7 @@ pub fn process_fhir_version(version: Option<FhirVersion>, output_path: impl AsRe
             }
             Ok(())
         }
-        Some(specific_version) => {
-            process_single_version(&specific_version, output_path)
-        }
+        Some(specific_version) => process_single_version(&specific_version, output_path),
     }
 }
 
