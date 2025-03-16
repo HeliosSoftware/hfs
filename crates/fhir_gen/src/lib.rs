@@ -42,8 +42,6 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
 }
 
 pub fn process_fhir_version(version: Option<FhirVersion>, output_path: impl AsRef<Path>) -> io::Result<()> {
-    let mut lib_content = String::new();
-
     match version {
         None => {
             // Process all versions
@@ -56,14 +54,10 @@ pub fn process_fhir_version(version: Option<FhirVersion>, output_path: impl AsRe
                 if let Err(e) = process_single_version(&ver, &output_path) {
                     eprintln!("Warning: Failed to process {:?}: {}", ver, e);
                 }
-                lib_content.push_str(&format!("pub mod {};\n", ver.as_str()));
             }
-            std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
             Ok(())
         }
         Some(specific_version) => {
-            lib_content.push_str(&format!("pub mod {};\n", specific_version.as_str()));
-            std::fs::write(output_path.as_ref().join("lib.rs"), lib_content)?;
             process_single_version(&specific_version, output_path)
         }
     }
