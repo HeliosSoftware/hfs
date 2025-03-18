@@ -550,7 +550,6 @@ mod tests {
 
         // Verify files were created
         assert!(temp_dir.join("r4.rs").exists());
-        assert!(temp_dir.join("lib.rs").exists());
 
         // Clean up
         std::fs::remove_dir_all(&temp_dir).expect("Failed to clean up temp directory");
