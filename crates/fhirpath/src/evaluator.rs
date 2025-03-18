@@ -45,7 +45,13 @@ impl EvaluationResult {
                 if c.len() == 1 {
                     c[0].to_string_value()
                 } else {
-                    format!("[{}]", c.iter().map(|r| r.to_string_value()).collect::<Vec<_>>().join(", "))
+                    format!(
+                        "[{}]",
+                        c.iter()
+                            .map(|r| r.to_string_value())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 }
             }
             EvaluationResult::Object(_) => "[object]".to_string(),
@@ -176,13 +182,14 @@ pub fn evaluate(expr: &Expression, context: &EvaluationContext) -> EvaluationRes
 /// Evaluates a term in the given context
 fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     match term {
-        Term::Invocation(invocation) => {
-            evaluate_invocation(&context.resource, invocation, context)
-        }
+        Term::Invocation(invocation) => evaluate_invocation(&context.resource, invocation, context),
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
-            context.get_variable(name).cloned().unwrap_or(EvaluationResult::Empty)
+            context
+                .get_variable(name)
+                .cloned()
+                .unwrap_or(EvaluationResult::Empty)
         }
         Term::Parenthesized(expr) => evaluate(expr, context),
     }
@@ -227,7 +234,7 @@ fn evaluate_invocation(
             } else if name == "false" {
                 return EvaluationResult::Boolean(false);
             }
-            
+
             // Access a member of the value
             match value {
                 EvaluationResult::Object(obj) => {
@@ -245,7 +252,7 @@ fn evaluate_invocation(
                             }
                         })
                         .collect();
-                    
+
                     if results.is_empty() {
                         EvaluationResult::Empty
                     } else {
@@ -257,11 +264,9 @@ fn evaluate_invocation(
         }
         Invocation::Function(name, args) => {
             // Evaluate function arguments
-            let evaluated_args: Vec<EvaluationResult> = args
-                .iter()
-                .map(|arg| evaluate(arg, context))
-                .collect();
-            
+            let evaluated_args: Vec<EvaluationResult> =
+                args.iter().map(|arg| evaluate(arg, context)).collect();
+
             // Call the appropriate function
             call_function(name, value, &evaluated_args)
         }
@@ -343,7 +348,7 @@ fn call_function(
             if args.is_empty() {
                 return EvaluationResult::Empty;
             }
-            
+
             // For now, we'll just return the original collection
             // In a full implementation, we would evaluate the predicate for each item
             context.clone()
@@ -354,7 +359,7 @@ fn call_function(
             if args.is_empty() {
                 return EvaluationResult::Empty;
             }
-            
+
             // For now, we'll just return the original collection
             // In a full implementation, we would apply the projection to each item
             context.clone()
@@ -365,17 +370,14 @@ fn call_function(
 }
 
 /// Evaluates an indexer expression
-fn evaluate_indexer(
-    collection: &EvaluationResult,
-    index: &EvaluationResult,
-) -> EvaluationResult {
+fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> EvaluationResult {
     // Get the index as an integer
     let idx = match index {
         EvaluationResult::Number(n) => *n as usize,
         EvaluationResult::Integer(i) => *i as usize,
         _ => return EvaluationResult::Empty,
     };
-    
+
     // Access the item at the given index
     match collection {
         EvaluationResult::Collection(items) => {
@@ -408,96 +410,84 @@ fn apply_multiplicative(
     right: &EvaluationResult,
 ) -> EvaluationResult {
     match (left, right) {
-        (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-            match op {
-                "*" => EvaluationResult::Number(l * r),
-                "/" => {
-                    if *r == 0.0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Number(l / r)
-                    }
+        (EvaluationResult::Number(l), EvaluationResult::Number(r)) => match op {
+            "*" => EvaluationResult::Number(l * r),
+            "/" => {
+                if *r == 0.0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Number(l / r)
                 }
-                "div" => {
-                    if *r == 0.0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Integer((l / r).floor() as i64)
-                    }
-                }
-                "mod" => {
-                    if *r == 0.0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Number(l % r)
-                    }
-                }
-                _ => EvaluationResult::Empty,
             }
-        }
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-            match op {
-                "*" => EvaluationResult::Integer(l * r),
-                "/" => {
-                    if *r == 0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Number(*l as f64 / *r as f64)
-                    }
+            "div" => {
+                if *r == 0.0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Integer((l / r).floor() as i64)
                 }
-                "div" => {
-                    if *r == 0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Integer(l / r)
-                    }
-                }
-                "mod" => {
-                    if *r == 0 {
-                        EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Integer(l % r)
-                    }
-                }
-                _ => EvaluationResult::Empty,
             }
-        }
+            "mod" => {
+                if *r == 0.0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Number(l % r)
+                }
+            }
+            _ => EvaluationResult::Empty,
+        },
+        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => match op {
+            "*" => EvaluationResult::Integer(l * r),
+            "/" => {
+                if *r == 0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Number(*l as f64 / *r as f64)
+                }
+            }
+            "div" => {
+                if *r == 0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Integer(l / r)
+                }
+            }
+            "mod" => {
+                if *r == 0 {
+                    EvaluationResult::Empty
+                } else {
+                    EvaluationResult::Integer(l % r)
+                }
+            }
+            _ => EvaluationResult::Empty,
+        },
         _ => EvaluationResult::Empty,
     }
 }
 
 /// Applies an additive operator to two values
-fn apply_additive(
-    left: &EvaluationResult,
-    op: &str,
-    right: &EvaluationResult,
-) -> EvaluationResult {
+fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
     match op {
-        "+" => {
-            match (left, right) {
-                (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-                    EvaluationResult::Number(l + r)
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                    EvaluationResult::Integer(l + r)
-                }
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => {
-                    EvaluationResult::String(format!("{}{}", l, r))
-                }
-                _ => EvaluationResult::Empty,
+        "+" => match (left, right) {
+            (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
+                EvaluationResult::Number(l + r)
             }
-        }
-        "-" => {
-            match (left, right) {
-                (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-                    EvaluationResult::Number(l - r)
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                    EvaluationResult::Integer(l - r)
-                }
-                _ => EvaluationResult::Empty,
+            (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                EvaluationResult::Integer(l + r)
             }
-        }
+            (EvaluationResult::String(l), EvaluationResult::String(r)) => {
+                EvaluationResult::String(format!("{}{}", l, r))
+            }
+            _ => EvaluationResult::Empty,
+        },
+        "-" => match (left, right) {
+            (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
+                EvaluationResult::Number(l - r)
+            }
+            (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                EvaluationResult::Integer(l - r)
+            }
+            _ => EvaluationResult::Empty,
+        },
         "&" => {
             // String concatenation
             let left_str = left.to_string_value();
@@ -520,7 +510,7 @@ fn apply_type_operation(
             let type_name = match type_spec {
                 TypeSpecifier::QualifiedIdentifier(name, _) => name,
             };
-            
+
             let is_type = match (type_name.as_str(), value) {
                 ("Boolean", EvaluationResult::Boolean(_)) => true,
                 ("String", EvaluationResult::String(_)) => true,
@@ -532,7 +522,7 @@ fn apply_type_operation(
                 // Add more type checks as needed
                 _ => false,
             };
-            
+
             EvaluationResult::Boolean(is_type)
         }
         "as" => {
@@ -540,7 +530,7 @@ fn apply_type_operation(
             let type_name = match type_spec {
                 TypeSpecifier::QualifiedIdentifier(name, _) => name,
             };
-            
+
             match (type_name.as_str(), value) {
                 // For now, we just return the value if it's already of the right type
                 // In a full implementation, we would attempt to convert between types
@@ -560,25 +550,22 @@ fn apply_type_operation(
 }
 
 /// Combines two collections into a union
-fn union_collections(
-    left: &EvaluationResult,
-    right: &EvaluationResult,
-) -> EvaluationResult {
+fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> EvaluationResult {
     let left_items = match left {
         EvaluationResult::Collection(items) => items.clone(),
         EvaluationResult::Empty => vec![],
         _ => vec![left.clone()],
     };
-    
+
     let right_items = match right {
         EvaluationResult::Collection(items) => items.clone(),
         EvaluationResult::Empty => vec![],
         _ => vec![right.clone()],
     };
-    
+
     let mut result = left_items;
     result.extend(right_items);
-    
+
     if result.is_empty() {
         EvaluationResult::Empty
     } else {
@@ -726,11 +713,11 @@ fn check_membership(
                 EvaluationResult::Collection(items) => items,
                 _ => return EvaluationResult::Boolean(false),
             };
-            
-            let is_in = right_items.iter().any(|item| {
-                compare_equality(left, "=", item).to_boolean()
-            });
-            
+
+            let is_in = right_items
+                .iter()
+                .any(|item| compare_equality(left, "=", item).to_boolean());
+
             EvaluationResult::Boolean(is_in)
         }
         "contains" => {
@@ -739,11 +726,11 @@ fn check_membership(
                 EvaluationResult::Collection(items) => items,
                 _ => return EvaluationResult::Boolean(false),
             };
-            
-            let contains = left_items.iter().any(|item| {
-                compare_equality(item, "=", right).to_boolean()
-            });
-            
+
+            let contains = left_items
+                .iter()
+                .any(|item| compare_equality(item, "=", right).to_boolean());
+
             EvaluationResult::Boolean(contains)
         }
         _ => EvaluationResult::Empty,
