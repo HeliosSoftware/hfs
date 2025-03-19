@@ -2,7 +2,6 @@ use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult, FhirRes
 use fhirpath::parser::parser;
 use std::collections::HashMap;
 use chumsky::Parser;
-use fhir::r4;
 
 #[test]
 fn test_simple_literals() {
@@ -13,14 +12,8 @@ fn test_simple_literals() {
         ("'hello'", EvaluationResult::String("hello".to_string())),
     ];
 
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // For simple literals, we don't need any resources
+    let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
@@ -42,14 +35,8 @@ fn test_arithmetic_operations() {
         ("7 mod 2", EvaluationResult::Number(1.0)),
     ];
 
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // For arithmetic operations, we don't need any resources
+    let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
@@ -71,14 +58,8 @@ fn test_boolean_operations() {
         ("true implies false", EvaluationResult::Boolean(false)),
     ];
 
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // For boolean operations, we don't need any resources
+    let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
@@ -102,14 +83,8 @@ fn test_comparison_operations() {
         ("'abc' !~ 'def'", EvaluationResult::Boolean(true)),
     ];
 
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // For comparison operations, we don't need any resources
+    let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
@@ -120,15 +95,8 @@ fn test_comparison_operations() {
 
 #[test]
 fn test_object_access() {
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    // We'll set up the context with our resource
-    let mut context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // We'll set up the context without any resources
+    let mut context = EvaluationContext::new_empty();
     
     // For testing property access, we'll add some variables to the context
     let mut patient = HashMap::new();
@@ -159,15 +127,8 @@ fn test_object_access() {
 
 #[test]
 fn test_functions() {
-    // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
-        meta: None,
-        implicitly_included: false,
-    });
-    
-    // We'll set up the context with our resource
-    let mut context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    // We'll set up the context without any resources
+    let mut context = EvaluationContext::new_empty();
     
     // For testing collection functions, we'll add a collection variable to the context
     let mut items = Vec::new();
@@ -190,4 +151,25 @@ fn test_functions() {
         let result = evaluate(&expr, &context);
         assert_eq!(result, expected);
     }
+}
+#[test]
+fn test_resource_access() {
+    use fhir::r4;
+    
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    // Create a context with a resource
+    let mut resources = Vec::new();
+    resources.push(FhirResource::R4(Box::new(dummy_resource)));
+    let context = EvaluationContext::new(resources);
+    
+    // Test accessing the resource type
+    let expr = parser().parse("resourceType").unwrap();
+    let result = evaluate(&expr, &context);
+    assert_eq!(result, EvaluationResult::String("R4Resource".to_string()));
 }

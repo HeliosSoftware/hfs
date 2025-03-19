@@ -87,19 +87,32 @@ impl FhirResource {
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
-    /// The current FHIR resource being evaluated
-    pub resource: FhirResource,
+    /// The FHIR resources being evaluated
+    pub resources: Vec<FhirResource>,
     /// Variables defined in the context
     pub variables: HashMap<String, EvaluationResult>,
 }
 
 impl EvaluationContext {
-    /// Creates a new evaluation context with the given FHIR resource
-    pub fn new(resource: FhirResource) -> Self {
+    /// Creates a new evaluation context with the given FHIR resources
+    pub fn new(resources: Vec<FhirResource>) -> Self {
         Self {
-            resource,
+            resources,
             variables: HashMap::new(),
         }
+    }
+
+    /// Creates a new empty evaluation context with no resources
+    pub fn new_empty() -> Self {
+        Self {
+            resources: Vec::new(),
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Adds a resource to the context
+    pub fn add_resource(&mut self, resource: FhirResource) {
+        self.resources.push(resource);
     }
 
     /// Sets a variable in the context
@@ -209,9 +222,15 @@ pub fn evaluate(expr: &Expression, context: &EvaluationContext) -> EvaluationRes
 fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     match term {
         Term::Invocation(invocation) => {
-            // Convert the FHIR resource to an EvaluationResult for processing
-            let resource_result = convert_resource_to_result(&context.resource);
-            evaluate_invocation(&resource_result, invocation, context)
+            if context.resources.is_empty() {
+                // If there are no resources, return Empty for resource-based invocations
+                evaluate_invocation(&EvaluationResult::Empty, invocation, context)
+            } else {
+                // Convert the first FHIR resource to an EvaluationResult for processing
+                // In a more complete implementation, we might need to handle multiple resources
+                let resource_result = convert_resource_to_result(&context.resources[0]);
+                evaluate_invocation(&resource_result, invocation, context)
+            }
         },
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
