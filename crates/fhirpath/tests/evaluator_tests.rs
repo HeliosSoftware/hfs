@@ -1,4 +1,5 @@
-use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult, FhirResource};
+use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult};
+use fhir::FhirResource;
 use fhirpath::parser::parser;
 use std::collections::HashMap;
 use chumsky::Parser;

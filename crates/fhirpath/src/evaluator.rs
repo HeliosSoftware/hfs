@@ -1,10 +1,6 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use std::collections::HashMap;
-use fhir::FhirVersion;
-use fhir::r4;
-use fhir::r4b;
-use fhir::r5;
-use fhir::r6;
+use fhir::{FhirResource, FhirVersion};
 
 /// Result of evaluating a FHIRPath expression
 #[derive(Debug, Clone, PartialEq)]
@@ -64,26 +60,6 @@ impl EvaluationResult {
     }
 }
 
-/// Enum representing a FHIR resource from any supported version
-#[derive(Debug, Clone)]
-pub enum FhirResource {
-    R4(Box<r4::Resource>),
-    R4B(Box<r4b::Resource>),
-    R5(Box<r5::Resource>),
-    R6(Box<r6::Resource>),
-}
-
-impl FhirResource {
-    /// Returns the FHIR version of the resource
-    pub fn version(&self) -> FhirVersion {
-        match self {
-            FhirResource::R4(_) => FhirVersion::R4,
-            FhirResource::R4B(_) => FhirVersion::R4B,
-            FhirResource::R5(_) => FhirVersion::R5,
-            FhirResource::R6(_) => FhirVersion::R6,
-        }
-    }
-}
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {

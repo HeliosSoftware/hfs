@@ -3,6 +3,27 @@ pub mod r4b;
 pub mod r5;
 pub mod r6;
 
+/// Enum representing a FHIR resource from any supported version
+#[derive(Debug, Clone)]
+pub enum FhirResource {
+    R4(Box<r4::Resource>),
+    R4B(Box<r4b::Resource>),
+    R5(Box<r5::Resource>),
+    R6(Box<r6::Resource>),
+}
+
+impl FhirResource {
+    /// Returns the FHIR version of the resource
+    pub fn version(&self) -> FhirVersion {
+        match self {
+            FhirResource::R4(_) => FhirVersion::R4,
+            FhirResource::R4B(_) => FhirVersion::R4B,
+            FhirResource::R5(_) => FhirVersion::R5,
+            FhirResource::R6(_) => FhirVersion::R6,
+        }
+    }
+}
+
 /// Represents a FHIR specification version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FhirVersion {
