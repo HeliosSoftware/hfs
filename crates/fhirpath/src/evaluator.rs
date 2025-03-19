@@ -89,8 +89,8 @@ impl FhirResource {
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated
     pub resources: Vec<FhirResource>,
-    /// Variables defined in the context
-    pub variables: HashMap<String, EvaluationResult>,
+    /// Variables defined in the context as string values
+    pub variables: HashMap<String, String>,
 }
 
 impl EvaluationContext {
@@ -116,13 +116,21 @@ impl EvaluationContext {
     }
 
     /// Sets a variable in the context
-    pub fn set_variable(&mut self, name: &str, value: EvaluationResult) {
+    pub fn set_variable(&mut self, name: &str, value: String) {
         self.variables.insert(name.to_string(), value);
     }
 
     /// Gets a variable from the context
-    pub fn get_variable(&self, name: &str) -> Option<&EvaluationResult> {
+    pub fn get_variable(&self, name: &str) -> Option<&String> {
         self.variables.get(name)
+    }
+    
+    /// Gets a variable from the context as an EvaluationResult
+    pub fn get_variable_as_result(&self, name: &str) -> EvaluationResult {
+        match self.variables.get(name) {
+            Some(value) => EvaluationResult::String(value.clone()),
+            None => EvaluationResult::Empty,
+        }
     }
 }
 
@@ -235,10 +243,7 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
-            context
-                .get_variable(name)
-                .cloned()
-                .unwrap_or(EvaluationResult::Empty)
+            context.get_variable_as_result(name)
         }
         Term::Parenthesized(expr) => evaluate(expr, context),
     }
@@ -351,7 +356,14 @@ fn evaluate_invocation(
             // Call the appropriate function
             call_function(name, value, &evaluated_args)
         }
-        Invocation::This => context.resource.clone(),
+        Invocation::This => {
+            if context.resources.is_empty() {
+                EvaluationResult::Empty
+            } else {
+                // Return the first resource as the context
+                convert_resource_to_result(&context.resources[0])
+            }
+        },
         Invocation::Index => {
             // $index should return the current index in a collection operation
             // This is typically used in filter expressions

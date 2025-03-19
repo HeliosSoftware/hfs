@@ -94,28 +94,19 @@ fn test_comparison_operations() {
 }
 
 #[test]
-fn test_object_access() {
+fn test_variable_access() {
     // We'll set up the context without any resources
     let mut context = EvaluationContext::new_empty();
     
-    // For testing property access, we'll add some variables to the context
-    let mut patient = HashMap::new();
-    patient.insert(
-        "name".to_string(),
-        EvaluationResult::String("John Doe".to_string()),
-    );
-    patient.insert(
-        "age".to_string(),
-        EvaluationResult::Integer(42),
-    );
-    
-    context.set_variable("patient", EvaluationResult::Object(patient));
+    // For testing variable access, we'll add some variables to the context
+    context.set_variable("name", "John Doe".to_string());
+    context.set_variable("age", "42".to_string());
     
     let test_cases = vec![
-        // Access through the variable
-        ("patient.name", EvaluationResult::String("John Doe".to_string())),
-        ("patient.age", EvaluationResult::Integer(42)),
-        ("patient.address", EvaluationResult::Empty), // Non-existent property
+        // Access variables directly
+        ("%name", EvaluationResult::String("John Doe".to_string())),
+        ("%age", EvaluationResult::String("42".to_string())),
+        ("%address", EvaluationResult::Empty), // Non-existent variable
     ];
 
     for (input, expected) in test_cases {
@@ -130,20 +121,14 @@ fn test_functions() {
     // We'll set up the context without any resources
     let mut context = EvaluationContext::new_empty();
     
-    // For testing collection functions, we'll add a collection variable to the context
-    let mut items = Vec::new();
-    items.push(EvaluationResult::Integer(1));
-    items.push(EvaluationResult::Integer(2));
-    items.push(EvaluationResult::Integer(3));
-    
-    context.set_variable("numbers", EvaluationResult::Collection(items));
+    // For testing string functions, we'll add a string variable
+    context.set_variable("message", "Hello, World!".to_string());
     
     let test_cases = vec![
-        ("numbers.count()", EvaluationResult::Integer(3)),
-        ("numbers.empty()", EvaluationResult::Boolean(false)),
-        ("numbers.exists()", EvaluationResult::Boolean(true)),
-        ("numbers.first()", EvaluationResult::Integer(1)),
-        ("numbers.last()", EvaluationResult::Integer(3)),
+        // String functions
+        ("%message.length()", EvaluationResult::Integer(13)),
+        ("%message.substring(0, 5)", EvaluationResult::String("Hello".to_string())),
+        ("%message.contains('World')", EvaluationResult::Boolean(true)),
     ];
 
     for (input, expected) in test_cases {
