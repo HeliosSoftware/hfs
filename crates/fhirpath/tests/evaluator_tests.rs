@@ -150,6 +150,23 @@ fn test_resource_access() {
     let dummy_resource = r4::Resource::Account(r4::Account {
         id: None,
         meta: None,
+        implicit_rules: None,
+        language: None,
+        text: None,
+        contained: None,
+        extension: None,
+        modifier_extension: None,
+        identifier: None,
+        status: None,
+        type_: None,
+        name: None,
+        subject: None,
+        servicePeriod: None,
+        coverage: None,
+        owner: None,
+        description: None,
+        guarantor: None,
+        part_of: None,
     });
 
     // Create a context with a resource
