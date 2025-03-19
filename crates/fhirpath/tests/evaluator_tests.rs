@@ -1,8 +1,7 @@
-use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult};
-use fhir::FhirResource;
-use fhirpath::parser::parser;
-use std::collections::HashMap;
 use chumsky::Parser;
+use fhir::FhirResource;
+use fhirpath::evaluator::{EvaluationContext, EvaluationResult, evaluate};
+use fhirpath::parser::parser;
 
 #[test]
 fn test_simple_literals() {
@@ -98,11 +97,11 @@ fn test_comparison_operations() {
 fn test_variable_access() {
     // We'll set up the context without any resources
     let mut context = EvaluationContext::new_empty();
-    
+
     // For testing variable access, we'll add some variables to the context
     context.set_variable("name", "John Doe".to_string());
     context.set_variable("age", "42".to_string());
-    
+
     let test_cases = vec![
         // Access variables directly
         ("%name", EvaluationResult::String("John Doe".to_string())),
@@ -121,15 +120,21 @@ fn test_variable_access() {
 fn test_functions() {
     // We'll set up the context without any resources
     let mut context = EvaluationContext::new_empty();
-    
+
     // For testing string functions, we'll add a string variable
     context.set_variable("message", "Hello, World!".to_string());
-    
+
     let test_cases = vec![
         // String functions
         ("%message.length()", EvaluationResult::Integer(13)),
-        ("%message.substring(0, 5)", EvaluationResult::String("Hello".to_string())),
-        ("%message.contains('World')", EvaluationResult::Boolean(true)),
+        (
+            "%message.substring(0, 5)",
+            EvaluationResult::String("Hello".to_string()),
+        ),
+        (
+            "%message.contains('World')",
+            EvaluationResult::Boolean(true),
+        ),
     ];
 
     for (input, expected) in test_cases {
@@ -141,19 +146,16 @@ fn test_functions() {
 #[test]
 fn test_resource_access() {
     use fhir::r4;
-    
     // Create a dummy R4 resource for testing
     let dummy_resource = r4::Resource::Account(r4::Account {
         id: None,
         meta: None,
-        implicitly_included: false,
     });
-    
+
     // Create a context with a resource
     let mut resources = Vec::new();
     resources.push(FhirResource::R4(Box::new(dummy_resource)));
     let context = EvaluationContext::new(resources);
-    
     // Test accessing the resource type
     let expr = parser().parse("resourceType").unwrap();
     let result = evaluate(&expr, &context);
