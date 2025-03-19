@@ -162,7 +162,7 @@ fn test_resource_access() {
             extension: None,
             value: None,
         },
-        type: None,
+        r#type: None,
         name: None,
         subject: None,
         service_period: None,
