@@ -1,7 +1,8 @@
-use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult};
+use fhirpath::evaluator::{evaluate, EvaluationContext, EvaluationResult, FhirResource};
 use fhirpath::parser::parser;
 use std::collections::HashMap;
 use chumsky::Parser;
+use fhir::r4;
 
 #[test]
 fn test_simple_literals() {
@@ -12,10 +13,18 @@ fn test_simple_literals() {
         ("'hello'", EvaluationResult::String("hello".to_string())),
     ];
 
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
         println!("Parsed expression: {:?}", expr);
-        let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
         println!("Result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", input);
@@ -33,9 +42,17 @@ fn test_arithmetic_operations() {
         ("7 mod 2", EvaluationResult::Number(1.0)),
     ];
 
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
-        let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
         assert_eq!(result, expected);
     }
@@ -54,10 +71,18 @@ fn test_boolean_operations() {
         ("true implies false", EvaluationResult::Boolean(false)),
     ];
 
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
         println!("Boolean op parsed expression: {:?}", expr);
-        let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
         println!("Boolean op result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", input);
@@ -77,9 +102,17 @@ fn test_comparison_operations() {
         ("'abc' !~ 'def'", EvaluationResult::Boolean(true)),
     ];
 
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    let context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
-        let context = EvaluationContext::new(EvaluationResult::Empty);
         let result = evaluate(&expr, &context);
         assert_eq!(result, expected);
     }
@@ -87,7 +120,17 @@ fn test_comparison_operations() {
 
 #[test]
 fn test_object_access() {
-    // Create a simple object to test property access
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    // We'll set up the context with our resource
+    let mut context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    
+    // For testing property access, we'll add some variables to the context
     let mut patient = HashMap::new();
     patient.insert(
         "name".to_string(),
@@ -98,12 +141,13 @@ fn test_object_access() {
         EvaluationResult::Integer(42),
     );
     
-    let context = EvaluationContext::new(EvaluationResult::Object(patient));
+    context.set_variable("patient", EvaluationResult::Object(patient));
     
     let test_cases = vec![
-        ("name", EvaluationResult::String("John Doe".to_string())),
-        ("age", EvaluationResult::Integer(42)),
-        ("address", EvaluationResult::Empty), // Non-existent property
+        // Access through the variable
+        ("patient.name", EvaluationResult::String("John Doe".to_string())),
+        ("patient.age", EvaluationResult::Integer(42)),
+        ("patient.address", EvaluationResult::Empty), // Non-existent property
     ];
 
     for (input, expected) in test_cases {
@@ -115,20 +159,30 @@ fn test_object_access() {
 
 #[test]
 fn test_functions() {
-    // Test collection functions
+    // Create a dummy R4 resource for testing
+    let dummy_resource = r4::Resource::Account(r4::Account {
+        id: None,
+        meta: None,
+        implicitly_included: false,
+    });
+    
+    // We'll set up the context with our resource
+    let mut context = EvaluationContext::new(FhirResource::R4(Box::new(dummy_resource)));
+    
+    // For testing collection functions, we'll add a collection variable to the context
     let mut items = Vec::new();
     items.push(EvaluationResult::Integer(1));
     items.push(EvaluationResult::Integer(2));
     items.push(EvaluationResult::Integer(3));
     
-    let context = EvaluationContext::new(EvaluationResult::Collection(items));
+    context.set_variable("numbers", EvaluationResult::Collection(items));
     
     let test_cases = vec![
-        ("count()", EvaluationResult::Integer(3)),
-        ("empty()", EvaluationResult::Boolean(false)),
-        ("exists()", EvaluationResult::Boolean(true)),
-        ("first()", EvaluationResult::Integer(1)),
-        ("last()", EvaluationResult::Integer(3)),
+        ("numbers.count()", EvaluationResult::Integer(3)),
+        ("numbers.empty()", EvaluationResult::Boolean(false)),
+        ("numbers.exists()", EvaluationResult::Boolean(true)),
+        ("numbers.first()", EvaluationResult::Integer(1)),
+        ("numbers.last()", EvaluationResult::Integer(3)),
     ];
 
     for (input, expected) in test_cases {

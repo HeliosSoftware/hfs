@@ -1,5 +1,10 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use std::collections::HashMap;
+use fhir::FhirVersion;
+use fhir::r4;
+use fhir::r4b;
+use fhir::r5;
+use fhir::r6;
 
 /// Result of evaluating a FHIRPath expression
 #[derive(Debug, Clone, PartialEq)]
@@ -59,17 +64,38 @@ impl EvaluationResult {
     }
 }
 
+/// Enum representing a FHIR resource from any supported version
+#[derive(Debug, Clone)]
+pub enum FhirResource {
+    R4(Box<r4::Resource>),
+    R4B(Box<r4b::Resource>),
+    R5(Box<r5::Resource>),
+    R6(Box<r6::Resource>),
+}
+
+impl FhirResource {
+    /// Returns the FHIR version of the resource
+    pub fn version(&self) -> FhirVersion {
+        match self {
+            FhirResource::R4(_) => FhirVersion::R4,
+            FhirResource::R4B(_) => FhirVersion::R4B,
+            FhirResource::R5(_) => FhirVersion::R5,
+            FhirResource::R6(_) => FhirVersion::R6,
+        }
+    }
+}
+
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
-    /// The current resource or object being evaluated
-    pub resource: EvaluationResult,
+    /// The current FHIR resource being evaluated
+    pub resource: FhirResource,
     /// Variables defined in the context
     pub variables: HashMap<String, EvaluationResult>,
 }
 
 impl EvaluationContext {
-    /// Creates a new evaluation context with the given resource
-    pub fn new(resource: EvaluationResult) -> Self {
+    /// Creates a new evaluation context with the given FHIR resource
+    pub fn new(resource: FhirResource) -> Self {
         Self {
             resource,
             variables: HashMap::new(),
@@ -182,7 +208,11 @@ pub fn evaluate(expr: &Expression, context: &EvaluationContext) -> EvaluationRes
 /// Evaluates a term in the given context
 fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     match term {
-        Term::Invocation(invocation) => evaluate_invocation(&context.resource, invocation, context),
+        Term::Invocation(invocation) => {
+            // Convert the FHIR resource to an EvaluationResult for processing
+            let resource_result = convert_resource_to_result(&context.resource);
+            evaluate_invocation(&resource_result, invocation, context)
+        },
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
@@ -192,6 +222,38 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
                 .unwrap_or(EvaluationResult::Empty)
         }
         Term::Parenthesized(expr) => evaluate(expr, context),
+    }
+}
+
+/// Converts a FHIR resource to an EvaluationResult
+fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
+    // This is a simplified conversion - in a real implementation,
+    // you would convert the resource to a proper object representation
+    // that can be navigated with FHIRPath
+    match resource {
+        FhirResource::R4(r) => {
+            // Convert R4 resource to an object representation
+            let mut obj = HashMap::new();
+            // Add resource properties to the object
+            // This is a placeholder - actual implementation would extract real properties
+            obj.insert("resourceType".to_string(), EvaluationResult::String("R4Resource".to_string()));
+            EvaluationResult::Object(obj)
+        },
+        FhirResource::R4B(r) => {
+            let mut obj = HashMap::new();
+            obj.insert("resourceType".to_string(), EvaluationResult::String("R4BResource".to_string()));
+            EvaluationResult::Object(obj)
+        },
+        FhirResource::R5(r) => {
+            let mut obj = HashMap::new();
+            obj.insert("resourceType".to_string(), EvaluationResult::String("R5Resource".to_string()));
+            EvaluationResult::Object(obj)
+        },
+        FhirResource::R6(r) => {
+            let mut obj = HashMap::new();
+            obj.insert("resourceType".to_string(), EvaluationResult::String("R6Resource".to_string()));
+            EvaluationResult::Object(obj)
+        },
     }
 }
 
