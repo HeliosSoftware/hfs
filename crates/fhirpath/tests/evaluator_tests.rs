@@ -96,7 +96,7 @@ fn test_comparison_operations() {
 #[test]
 fn test_variable_access() {
     // We'll set up the context without any resources
-    let context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty();
 
     // For testing variable access, we'll add some variables to the context
     context.set_variable("name", "John Doe".to_string());
@@ -121,7 +121,7 @@ fn test_variable_access() {
 #[test]
 fn test_string_operations() {
     // We'll set up the context without any resources
-    let mut context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty();
 
     // For testing string operations, we'll add a string variable
     context.set_variable("message", "Hello, World!".to_string());
