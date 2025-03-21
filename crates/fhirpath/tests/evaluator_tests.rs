@@ -150,6 +150,45 @@ fn test_string_operations() {
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
+
+#[test]
+fn test_functions() {
+    // We'll set up the context without any resources
+    let mut context = EvaluationContext::new_empty();
+    
+    // Test collection functions
+    let test_cases = vec![
+        // Empty collection
+        ("{}".to_string(), "count()", EvaluationResult::Integer(0)),
+        ("{}".to_string(), "empty()", EvaluationResult::Boolean(true)),
+        ("{}".to_string(), "exists()", EvaluationResult::Boolean(false)),
+        
+        // Single item
+        ("'test'", "count()", EvaluationResult::Integer(1)),
+        ("'test'", "empty()", EvaluationResult::Boolean(false)),
+        ("'test'", "exists()", EvaluationResult::Boolean(true)),
+        
+        // String functions
+        ("'Hello'", "count()", EvaluationResult::Integer(1)),
+        ("'Hello'", "length()", EvaluationResult::Integer(5)),
+        ("'Hello, World!'", "contains('World')", EvaluationResult::Boolean(true)),
+        ("'Hello, World!'", "contains('Goodbye')", EvaluationResult::Boolean(false)),
+    ];
+    
+    for (base, func, expected) in test_cases {
+        let full_expr = if base == "{}" {
+            func.clone()
+        } else {
+            format!("{}.{}", base, func)
+        };
+        
+        println!("Testing expression: {}", full_expr);
+        let expr = parser().parse(&full_expr).unwrap();
+        let result = evaluate(&expr, &context);
+        println!("Function result: {:?}, Expected: {:?}", result, expected);
+        assert_eq!(result, expected, "Failed for input: {}", full_expr);
+    }
+}
 #[test]
 fn test_resource_access() {
     use fhir::r4;

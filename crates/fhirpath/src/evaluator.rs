@@ -340,6 +340,11 @@ fn evaluate_invocation(
                         EvaluationResult::Collection(results)
                     }
                 }
+                // Special handling for empty values
+                EvaluationResult::Empty => {
+                    // Empty values return empty for any member access
+                    EvaluationResult::Empty
+                }
                 _ => EvaluationResult::Empty,
             }
         }
@@ -429,6 +434,36 @@ fn call_function(
         "not" => {
             // Logical negation
             EvaluationResult::Boolean(!context.to_boolean())
+        }
+        "contains" => {
+            // Check if the context contains the argument
+            if args.is_empty() {
+                return EvaluationResult::Empty;
+            }
+            
+            match context {
+                EvaluationResult::String(s) => {
+                    if let EvaluationResult::String(arg) = &args[0] {
+                        EvaluationResult::Boolean(s.contains(arg))
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                },
+                EvaluationResult::Collection(items) => {
+                    let contains = items.iter().any(|item| {
+                        compare_equality(item, "=", &args[0]).to_boolean()
+                    });
+                    EvaluationResult::Boolean(contains)
+                },
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
+        "length" => {
+            // Returns the length of a string
+            match context {
+                EvaluationResult::String(s) => EvaluationResult::Integer(s.len() as i64),
+                _ => EvaluationResult::Empty,
+            }
         }
         "where" => {
             // Filter the collection based on a predicate
