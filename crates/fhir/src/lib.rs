@@ -4,7 +4,7 @@ pub mod r5;
 pub mod r6;
 
 /// Enum representing a FHIR resource from any supported version
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum FhirResource {
     R4(Box<r4::Resource>),
     R4B(Box<r4b::Resource>),

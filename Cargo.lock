@@ -418,6 +418,7 @@ name = "fhirpath"
 version = "0.1.0"
 dependencies = [
  "chumsky",
+ "fhir",
  "roxmltree",
 ]
 

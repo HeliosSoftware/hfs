@@ -347,6 +347,14 @@ pub struct DataRequirement {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct DataRequirementSort {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    pub path: String,
+    pub direction: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DataRequirementCodeFilter {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -356,14 +364,6 @@ pub struct DataRequirementCodeFilter {
     #[serde(rename = "valueSet")]
     pub value_set: Option<Canonical>,
     pub code: Option<Vec<Coding>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DataRequirementSort {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub direction: Code,
 }
 
 
@@ -463,25 +463,22 @@ pub struct Duration {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionType {
+pub struct ElementDefinitionSlicingDiscriminator {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
-    pub code: Uri,
-    pub profile: Option<Vec<Canonical>>,
-    #[serde(rename = "targetProfile")]
-    pub target_profile: Option<Vec<Canonical>>,
-    pub aggregation: Option<Vec<Code>>,
-    pub versioning: Option<Code>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionBinding {
+pub struct ElementDefinitionMapping {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    pub description: Option<String>,
-    #[serde(rename = "valueSet")]
-    pub value_set: Option<Canonical>,
+    pub identity: Id,
+    pub language: Option<Code>,
+    pub map: String,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -647,12 +644,32 @@ pub struct ElementDefinitionExample {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionSlicingDiscriminator {
+pub struct ElementDefinitionBinding {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
+    pub strength: Code,
+    pub description: Option<String>,
+    #[serde(rename = "valueSet")]
+    pub value_set: Option<Canonical>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElementDefinitionSlicing {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
+    pub description: Option<String>,
+    pub ordered: Option<Boolean>,
+    pub rules: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElementDefinitionBase {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
     pub path: String,
+    pub min: UnsignedInt,
+    pub max: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -666,25 +683,6 @@ pub struct ElementDefinitionConstraint {
     pub expression: Option<String>,
     pub xpath: Option<String>,
     pub source: Option<Canonical>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionBase {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub min: UnsignedInt,
-    pub max: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionSlicing {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
-    pub description: Option<String>,
-    pub ordered: Option<Boolean>,
-    pub rules: Code,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1265,13 +1263,15 @@ pub struct ElementDefinition {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ElementDefinitionMapping {
+pub struct ElementDefinitionType {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
-    pub identity: Id,
-    pub language: Option<Code>,
-    pub map: String,
-    pub comment: Option<String>,
+    pub code: Uri,
+    pub profile: Option<Vec<Canonical>>,
+    #[serde(rename = "targetProfile")]
+    pub target_profile: Option<Vec<Canonical>>,
+    pub aggregation: Option<Vec<Code>>,
+    pub versioning: Option<Code>,
 }
 
 
@@ -1854,6 +1854,28 @@ pub struct UsageContext {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AccountCoverage {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub coverage: Reference,
+    pub priority: Option<PositiveInt>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountGuarantor {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub party: Reference,
+    #[serde(rename = "onHold")]
+    pub on_hold: Option<Boolean>,
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Account {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -1881,38 +1903,6 @@ pub struct Account {
     pub part_of: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountGuarantor {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub party: Reference,
-    #[serde(rename = "onHold")]
-    pub on_hold: Option<Boolean>,
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountCoverage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub coverage: Reference,
-    pub priority: Option<PositiveInt>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ActivityDefinitionDynamicValue {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub expression: Expression,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2038,16 +2028,16 @@ pub struct ActivityDefinitionParticipant {
     pub role: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AdverseEventSuspectEntity {
+pub struct ActivityDefinitionDynamicValue {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub instance: Reference,
-    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
+    pub path: String,
+    pub expression: Expression,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AdverseEvent {
@@ -2101,22 +2091,16 @@ pub struct AdverseEventSuspectEntityCausality {
     pub method: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AllergyIntoleranceReaction {
+pub struct AdverseEventSuspectEntity {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub substance: Option<CodeableConcept>,
-    pub manifestation: Option<Vec<CodeableConcept>>,
-    pub description: Option<String>,
-    pub onset: Option<DateTime>,
-    pub severity: Option<Code>,
-    #[serde(rename = "exposureRoute")]
-    pub exposure_route: Option<CodeableConcept>,
-    pub note: Option<Vec<Annotation>>,
+    pub instance: Reference,
+    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2172,20 +2156,22 @@ pub struct AllergyIntolerance {
     pub reaction: Option<Vec<AllergyIntoleranceReaction>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AppointmentParticipant {
+pub struct AllergyIntoleranceReaction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub actor: Option<Reference>,
-    pub required: Option<Code>,
-    pub status: Code,
-    pub period: Option<Period>,
+    pub substance: Option<CodeableConcept>,
+    pub manifestation: Option<Vec<CodeableConcept>>,
+    pub description: Option<String>,
+    pub onset: Option<DateTime>,
+    pub severity: Option<Code>,
+    #[serde(rename = "exposureRoute")]
+    pub exposure_route: Option<CodeableConcept>,
+    pub note: Option<Vec<Annotation>>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Appointment {
@@ -2234,6 +2220,20 @@ pub struct Appointment {
     pub requested_period: Option<Vec<Period>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppointmentParticipant {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub actor: Option<Reference>,
+    pub required: Option<Code>,
+    pub status: Code,
+    pub period: Option<Period>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppointmentResponse {
@@ -2259,6 +2259,17 @@ pub struct AppointmentResponse {
     pub comment: Option<String>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditEventAgentNetwork {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub address: Option<String>,
+    #[serde(rename = "type")]
+    pub r#type: Option<Code>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -2289,14 +2300,15 @@ pub struct AuditEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AuditEventAgentNetwork {
+pub struct AuditEventSource {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub address: Option<String>,
+    pub site: Option<String>,
+    pub observer: Reference,
     #[serde(rename = "type")]
-    pub r#type: Option<Code>,
+    pub r#type: Option<Vec<Coding>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2319,15 +2331,24 @@ pub struct AuditEventEntity {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AuditEventSource {
+#[serde(rename_all = "camelCase")]
+pub enum AuditEventEntityDetailValue {
+    String(String),
+    Base64Binary(Base64Binary),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuditEventEntityDetail {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub site: Option<String>,
-    pub observer: Reference,
     #[serde(rename = "type")]
-    pub r#type: Option<Vec<Coding>>,
+    pub r#type: String,
+    #[serde(rename = "valueString")]
+    pub value_string: String,
+    #[serde(rename = "valueBase64Binary")]
+    pub value_base64_binary: Base64Binary,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2350,27 +2371,6 @@ pub struct AuditEventAgent {
     pub network: Option<AuditEventAgentNetwork>,
     #[serde(rename = "purposeOfUse")]
     pub purpose_of_use: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AuditEventEntityDetailValue {
-    String(String),
-    Base64Binary(Base64Binary),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AuditEventEntityDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: String,
-    #[serde(rename = "valueString")]
-    pub value_string: String,
-    #[serde(rename = "valueBase64Binary")]
-    pub value_base64_binary: Base64Binary,
 }
 
 
@@ -2410,59 +2410,6 @@ pub struct Binary {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BiologicallyDerivedProductCollectionCollected {
-    DateTime(DateTime),
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BiologicallyDerivedProductCollection {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub collector: Option<Reference>,
-    pub source: Option<Reference>,
-    #[serde(rename = "collectedDateTime")]
-    pub collected_date_time: Option<DateTime>,
-    #[serde(rename = "collectedPeriod")]
-    pub collected_period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BiologicallyDerivedProductStorage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub temperature: Option<Decimal>,
-    pub scale: Option<Code>,
-    pub duration: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BiologicallyDerivedProductManipulationTime {
-    DateTime(DateTime),
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BiologicallyDerivedProductManipulation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    #[serde(rename = "timeDateTime")]
-    pub time_date_time: Option<DateTime>,
-    #[serde(rename = "timePeriod")]
-    pub time_period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct BiologicallyDerivedProduct {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -2491,6 +2438,38 @@ pub struct BiologicallyDerivedProduct {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum BiologicallyDerivedProductManipulationTime {
+    DateTime(DateTime),
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BiologicallyDerivedProductManipulation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    #[serde(rename = "timeDateTime")]
+    pub time_date_time: Option<DateTime>,
+    #[serde(rename = "timePeriod")]
+    pub time_period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BiologicallyDerivedProductStorage {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    pub temperature: Option<Decimal>,
+    pub scale: Option<Code>,
+    pub duration: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum BiologicallyDerivedProductProcessingTime {
     DateTime(DateTime),
     Period(Period),
@@ -2509,6 +2488,27 @@ pub struct BiologicallyDerivedProductProcessing {
     pub time_date_time: Option<DateTime>,
     #[serde(rename = "timePeriod")]
     pub time_period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BiologicallyDerivedProductCollectionCollected {
+    DateTime(DateTime),
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BiologicallyDerivedProductCollection {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub collector: Option<Reference>,
+    pub source: Option<Reference>,
+    #[serde(rename = "collectedDateTime")]
+    pub collected_date_time: Option<DateTime>,
+    #[serde(rename = "collectedPeriod")]
+    pub collected_period: Option<Period>,
 }
 
 
@@ -2554,6 +2554,20 @@ pub struct Bundle {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct BundleEntryResponse {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub status: String,
+    pub location: Option<Uri>,
+    pub etag: Option<String>,
+    #[serde(rename = "lastModified")]
+    pub last_modified: Option<Instant>,
+    pub outcome: Option<Resource>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleEntrySearch {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -2561,6 +2575,16 @@ pub struct BundleEntrySearch {
     pub modifier_extension: Option<Vec<Extension>>,
     pub mode: Option<Code>,
     pub score: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BundleLink {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub relation: String,
+    pub url: Uri,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2582,20 +2606,6 @@ pub struct BundleEntryRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BundleEntryResponse {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: String,
-    pub location: Option<Uri>,
-    pub etag: Option<String>,
-    #[serde(rename = "lastModified")]
-    pub last_modified: Option<Instant>,
-    pub outcome: Option<Resource>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct BundleEntry {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -2610,37 +2620,39 @@ pub struct BundleEntry {
     pub response: Option<BundleEntryResponse>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BundleLink {
+pub struct CapabilityStatementMessagingEndpoint {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub relation: String,
-    pub url: Uri,
+    pub protocol: Coding,
+    pub address: Url,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementRestResourceInteraction {
+pub struct CapabilityStatementMessaging {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
+    pub endpoint: Option<Vec<CapabilityStatementMessagingEndpoint>>,
+    #[serde(rename = "reliableCache")]
+    pub reliable_cache: Option<UnsignedInt>,
     pub documentation: Option<Markdown>,
+    #[serde(rename = "supportedMessage")]
+    pub supported_message: Option<Vec<CapabilityStatementMessagingSupportedMessage>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementSoftware {
+pub struct CapabilityStatementMessagingSupportedMessage {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub version: Option<String>,
-    #[serde(rename = "releaseDate")]
-    pub release_date: Option<DateTime>,
+    pub mode: Code,
+    pub definition: Canonical,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2668,44 +2680,14 @@ pub struct CapabilityStatementRestResourceOperation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementRestInteraction {
+pub struct CapabilityStatementImplementation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub documentation: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementMessaging {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub endpoint: Option<Vec<CapabilityStatementMessagingEndpoint>>,
-    #[serde(rename = "reliableCache")]
-    pub reliable_cache: Option<UnsignedInt>,
-    pub documentation: Option<Markdown>,
-    #[serde(rename = "supportedMessage")]
-    pub supported_message: Option<Vec<CapabilityStatementMessagingSupportedMessage>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementRest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub documentation: Option<Markdown>,
-    pub security: Option<CapabilityStatementRestSecurity>,
-    pub resource: Option<Vec<CapabilityStatementRestResource>>,
-    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
-    #[serde(rename = "searchParam")]
-    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
-    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
-    pub compartment: Option<Vec<Canonical>>,
+    pub description: String,
+    pub url: Option<Url>,
+    pub custodian: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2753,24 +2735,20 @@ pub struct CapabilityStatement {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementMessagingSupportedMessage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub definition: Canonical,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementDocument {
+pub struct CapabilityStatementRest {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub mode: Code,
     pub documentation: Option<Markdown>,
-    pub profile: Canonical,
+    pub security: Option<CapabilityStatementRestSecurity>,
+    pub resource: Option<Vec<CapabilityStatementRestResource>>,
+    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
+    #[serde(rename = "searchParam")]
+    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
+    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
+    pub compartment: Option<Vec<Canonical>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2811,13 +2789,25 @@ pub struct CapabilityStatementRestResource {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementMessagingEndpoint {
+pub struct CapabilityStatementRestResourceInteraction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub protocol: Coding,
-    pub address: Url,
+    pub code: Code,
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityStatementSoftware {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub version: Option<String>,
+    #[serde(rename = "releaseDate")]
+    pub release_date: Option<DateTime>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2832,14 +2822,24 @@ pub struct CapabilityStatementRestSecurity {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CapabilityStatementImplementation {
+pub struct CapabilityStatementRestInteraction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub url: Option<Url>,
-    pub custodian: Option<Reference>,
+    pub code: Code,
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CapabilityStatementDocument {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub documentation: Option<Markdown>,
+    pub profile: Canonical,
 }
 
 
@@ -2958,19 +2958,6 @@ pub struct CarePlanActivityDetail {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CareTeamParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Option<Vec<CodeableConcept>>,
-    pub member: Option<Reference>,
-    #[serde(rename = "onBehalfOf")]
-    pub on_behalf_of: Option<Reference>,
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct CareTeam {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -3000,16 +2987,19 @@ pub struct CareTeam {
     pub note: Option<Vec<Annotation>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CatalogEntryRelatedEntry {
+pub struct CareTeamParticipant {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub relationtype: Code,
-    pub item: Reference,
+    pub role: Option<Vec<CodeableConcept>>,
+    pub member: Option<Reference>,
+    #[serde(rename = "onBehalfOf")]
+    pub on_behalf_of: Option<Reference>,
+    pub period: Option<Period>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CatalogEntry {
@@ -3045,6 +3035,16 @@ pub struct CatalogEntry {
     pub additional_classification: Option<Vec<CodeableConcept>>,
     #[serde(rename = "relatedEntry")]
     pub related_entry: Option<Vec<CatalogEntryRelatedEntry>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CatalogEntryRelatedEntry {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub relationtype: Code,
+    pub item: Reference,
 }
 
 
@@ -3147,17 +3147,6 @@ pub struct ChargeItemDefinitionPropertyGroupPriceComponent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ChargeItemDefinitionApplicability {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub language: Option<String>,
-    pub expression: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ChargeItemDefinitionPropertyGroup {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -3212,23 +3201,86 @@ pub struct ChargeItemDefinition {
     pub property_group: Option<Vec<ChargeItemDefinitionPropertyGroup>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChargeItemDefinitionApplicability {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub expression: Option<String>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimInsurance {
+pub struct ClaimItemDetailSubDetail {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
-    pub focal: Boolean,
-    pub identifier: Option<Identifier>,
-    pub coverage: Reference,
-    #[serde(rename = "businessArrangement")]
-    pub business_arrangement: Option<String>,
-    #[serde(rename = "preAuthRef")]
-    pub pre_auth_ref: Option<Vec<String>>,
-    #[serde(rename = "claimResponse")]
-    pub claim_response: Option<Reference>,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimAccidentLocation {
+    Address(Address),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimAccident {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub date: Date,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "locationAddress")]
+    pub location_address: Option<Address>,
+    #[serde(rename = "locationReference")]
+    pub location_reference: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimDiagnosisDiagnosis {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimDiagnosis {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(rename = "diagnosisCodeableConcept")]
+    pub diagnosis_codeable_concept: CodeableConcept,
+    #[serde(rename = "diagnosisReference")]
+    pub diagnosis_reference: Reference,
+    #[serde(rename = "type")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "onAdmission")]
+    pub on_admission: Option<CodeableConcept>,
+    #[serde(rename = "packageCode")]
+    pub package_code: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3256,25 +3308,14 @@ pub struct ClaimProcedure {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimAccidentLocation {
-    Address(Address),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimAccident {
+pub struct ClaimPayee {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub date: Date,
     #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "locationAddress")]
-    pub location_address: Option<Address>,
-    #[serde(rename = "locationReference")]
-    pub location_reference: Option<Reference>,
+    pub r#type: CodeableConcept,
+    pub party: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3318,6 +3359,121 @@ pub struct ClaimSupportingInfo {
     #[serde(rename = "valueReference")]
     pub value_reference: Option<Reference>,
     pub reason: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimItemDetail {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "subDetail")]
+    pub sub_detail: Option<Vec<ClaimItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimRelated {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub claim: Option<Reference>,
+    pub relationship: Option<CodeableConcept>,
+    pub reference: Option<Identifier>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Claim {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub status: Code,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(rename = "subType")]
+    pub sub_type: Option<CodeableConcept>,
+    #[serde(rename = "use")]
+    pub r#use: Code,
+    pub patient: Reference,
+    #[serde(rename = "billablePeriod")]
+    pub billable_period: Option<Period>,
+    pub created: DateTime,
+    pub enterer: Option<Reference>,
+    pub insurer: Option<Reference>,
+    pub provider: Reference,
+    pub priority: CodeableConcept,
+    #[serde(rename = "fundsReserve")]
+    pub funds_reserve: Option<CodeableConcept>,
+    pub related: Option<Vec<ClaimRelated>>,
+    pub prescription: Option<Reference>,
+    #[serde(rename = "originalPrescription")]
+    pub original_prescription: Option<Reference>,
+    pub payee: Option<ClaimPayee>,
+    pub referral: Option<Reference>,
+    pub facility: Option<Reference>,
+    #[serde(rename = "careTeam")]
+    pub care_team: Option<Vec<ClaimCareTeam>>,
+    #[serde(rename = "supportingInfo")]
+    pub supporting_info: Option<Vec<ClaimSupportingInfo>>,
+    pub diagnosis: Option<Vec<ClaimDiagnosis>>,
+    pub procedure: Option<Vec<ClaimProcedure>>,
+    pub insurance: Option<Vec<ClaimInsurance>>,
+    pub accident: Option<ClaimAccident>,
+    pub item: Option<Vec<ClaimItem>>,
+    pub total: Option<Money>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimCareTeam {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    pub responsible: Option<Boolean>,
+    pub role: Option<CodeableConcept>,
+    pub qualification: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimInsurance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub focal: Boolean,
+    pub identifier: Option<Identifier>,
+    pub coverage: Reference,
+    #[serde(rename = "businessArrangement")]
+    pub business_arrangement: Option<String>,
+    #[serde(rename = "preAuthRef")]
+    pub pre_auth_ref: Option<Vec<String>>,
+    #[serde(rename = "claimResponse")]
+    pub claim_response: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3381,177 +3537,6 @@ pub struct ClaimItem {
     pub detail: Option<Vec<ClaimItemDetail>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimPayee {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub party: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimItemDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "subDetail")]
-    pub sub_detail: Option<Vec<ClaimItemDetailSubDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimDiagnosisDiagnosis {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimDiagnosis {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "diagnosisCodeableConcept")]
-    pub diagnosis_codeable_concept: CodeableConcept,
-    #[serde(rename = "diagnosisReference")]
-    pub diagnosis_reference: Reference,
-    #[serde(rename = "type")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "onAdmission")]
-    pub on_admission: Option<CodeableConcept>,
-    #[serde(rename = "packageCode")]
-    pub package_code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Claim {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub status: Code,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "subType")]
-    pub sub_type: Option<CodeableConcept>,
-    #[serde(rename = "use")]
-    pub r#use: Code,
-    pub patient: Reference,
-    #[serde(rename = "billablePeriod")]
-    pub billable_period: Option<Period>,
-    pub created: DateTime,
-    pub enterer: Option<Reference>,
-    pub insurer: Option<Reference>,
-    pub provider: Reference,
-    pub priority: CodeableConcept,
-    #[serde(rename = "fundsReserve")]
-    pub funds_reserve: Option<CodeableConcept>,
-    pub related: Option<Vec<ClaimRelated>>,
-    pub prescription: Option<Reference>,
-    #[serde(rename = "originalPrescription")]
-    pub original_prescription: Option<Reference>,
-    pub payee: Option<ClaimPayee>,
-    pub referral: Option<Reference>,
-    pub facility: Option<Reference>,
-    #[serde(rename = "careTeam")]
-    pub care_team: Option<Vec<ClaimCareTeam>>,
-    #[serde(rename = "supportingInfo")]
-    pub supporting_info: Option<Vec<ClaimSupportingInfo>>,
-    pub diagnosis: Option<Vec<ClaimDiagnosis>>,
-    pub procedure: Option<Vec<ClaimProcedure>>,
-    pub insurance: Option<Vec<ClaimInsurance>>,
-    pub accident: Option<ClaimAccident>,
-    pub item: Option<Vec<ClaimItem>>,
-    pub total: Option<Money>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimRelated {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub claim: Option<Reference>,
-    pub relationship: Option<CodeableConcept>,
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimCareTeam {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub provider: Reference,
-    pub responsible: Option<Boolean>,
-    pub role: Option<CodeableConcept>,
-    pub qualification: Option<CodeableConcept>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseError {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemSequence")]
-    pub item_sequence: Option<PositiveInt>,
-    #[serde(rename = "detailSequence")]
-    pub detail_sequence: Option<PositiveInt>,
-    #[serde(rename = "subDetailSequence")]
-    pub sub_detail_sequence: Option<PositiveInt>,
-    pub code: CodeableConcept,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaimResponseProcessNote {
@@ -3564,6 +3549,20 @@ pub struct ClaimResponseProcessNote {
     pub r#type: Option<Code>,
     pub text: String,
     pub language: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimResponseItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemSequence")]
+    pub item_sequence: PositiveInt,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    pub detail: Option<Vec<ClaimResponseItemDetail>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3588,16 +3587,18 @@ pub struct ClaimResponseAddItemDetail {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseItemDetailSubDetail {
+pub struct ClaimResponseInsurance {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "subDetailSequence")]
-    pub sub_detail_sequence: PositiveInt,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    pub sequence: PositiveInt,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    #[serde(rename = "businessArrangement")]
+    pub business_arrangement: Option<String>,
+    #[serde(rename = "claimResponse")]
+    pub claim_response: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3659,29 +3660,18 @@ pub struct ClaimResponseAddItem {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseItem {
+pub struct ClaimResponseError {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "itemSequence")]
-    pub item_sequence: PositiveInt,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    pub detail: Option<Vec<ClaimResponseItemDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseItemAdjudication {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub reason: Option<CodeableConcept>,
-    pub amount: Option<Money>,
-    pub value: Option<Decimal>,
+    pub item_sequence: Option<PositiveInt>,
+    #[serde(rename = "detailSequence")]
+    pub detail_sequence: Option<PositiveInt>,
+    #[serde(rename = "subDetailSequence")]
+    pub sub_detail_sequence: Option<PositiveInt>,
+    pub code: CodeableConcept,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3697,6 +3687,19 @@ pub struct ClaimResponseItemDetail {
     pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
     #[serde(rename = "subDetail")]
     pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimResponseItemDetailSubDetail {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "subDetailSequence")]
+    pub sub_detail_sequence: PositiveInt,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3719,16 +3722,6 @@ pub struct ClaimResponseAddItemDetailSubDetail {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseTotal {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub amount: Money,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ClaimResponsePayment {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -3742,6 +3735,28 @@ pub struct ClaimResponsePayment {
     pub date: Option<Date>,
     pub amount: Money,
     pub identifier: Option<Identifier>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimResponseItemAdjudication {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub reason: Option<CodeableConcept>,
+    pub amount: Option<Money>,
+    pub value: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClaimResponseTotal {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub amount: Money,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3794,21 +3809,6 @@ pub struct ClaimResponse {
     pub communication_request: Option<Vec<Reference>>,
     pub insurance: Option<Vec<ClaimResponseInsurance>>,
     pub error: Option<Vec<ClaimResponseError>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClaimResponseInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    #[serde(rename = "businessArrangement")]
-    pub business_arrangement: Option<String>,
-    #[serde(rename = "claimResponse")]
-    pub claim_response: Option<Reference>,
 }
 
 
@@ -3885,15 +3885,17 @@ pub struct ClinicalImpressionFinding {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CodeSystemFilter {
+pub struct CodeSystemConcept {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
-    pub description: Option<String>,
-    pub operator: Option<Vec<Code>>,
-    pub value: String,
+    pub display: Option<String>,
+    pub definition: Option<String>,
+    pub designation: Option<Vec<CodeSystemConceptDesignation>>,
+    pub property: Option<Vec<CodeSystemConceptProperty>>,
+    pub concept: Option<Vec<CodeSystemConcept>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3907,6 +3909,18 @@ pub struct CodeSystemProperty {
     pub description: Option<String>,
     #[serde(rename = "type")]
     pub r#type: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodeSystemConceptDesignation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub language: Option<Code>,
+    #[serde(rename = "use")]
+    pub r#use: Option<Coding>,
+    pub value: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3955,20 +3969,6 @@ pub struct CodeSystem {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CodeSystemConcept {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub display: Option<String>,
-    pub definition: Option<String>,
-    pub designation: Option<Vec<CodeSystemConceptDesignation>>,
-    pub property: Option<Vec<CodeSystemConceptProperty>>,
-    pub concept: Option<Vec<CodeSystemConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CodeSystemConceptPropertyValue {
     Code(Code),
@@ -4004,14 +4004,14 @@ pub struct CodeSystemConceptProperty {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CodeSystemConceptDesignation {
+pub struct CodeSystemFilter {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub language: Option<Code>,
-    #[serde(rename = "use")]
-    pub r#use: Option<Coding>,
+    pub code: Code,
+    pub description: Option<String>,
+    pub operator: Option<Vec<Code>>,
     pub value: String,
 }
 
@@ -4086,6 +4086,28 @@ pub struct CommunicationPayload {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum CommunicationRequestPayloadContent {
+    String(String),
+    Attachment(Attachment),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommunicationRequestPayload {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "contentString")]
+    pub content_string: String,
+    #[serde(rename = "contentAttachment")]
+    pub content_attachment: Attachment,
+    #[serde(rename = "contentReference")]
+    pub content_reference: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum CommunicationRequestOccurrence {
     DateTime(DateTime),
     Period(Period),
@@ -4137,39 +4159,6 @@ pub struct CommunicationRequest {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CommunicationRequestPayloadContent {
-    String(String),
-    Attachment(Attachment),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CommunicationRequestPayload {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "contentString")]
-    pub content_string: String,
-    #[serde(rename = "contentAttachment")]
-    pub content_attachment: Attachment,
-    #[serde(rename = "contentReference")]
-    pub content_reference: Reference,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CompartmentDefinitionResource {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub param: Option<Vec<String>>,
-    pub documentation: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompartmentDefinition {
@@ -4200,6 +4189,37 @@ pub struct CompartmentDefinition {
     pub resource: Option<Vec<CompartmentDefinitionResource>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompartmentDefinitionResource {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub param: Option<Vec<String>>,
+    pub documentation: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompositionSection {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub title: Option<String>,
+    pub code: Option<CodeableConcept>,
+    pub author: Option<Vec<Reference>>,
+    pub focus: Option<Reference>,
+    pub text: Option<Narrative>,
+    pub mode: Option<Code>,
+    #[serde(rename = "orderedBy")]
+    pub ordered_by: Option<CodeableConcept>,
+    pub entry: Option<Vec<Reference>>,
+    #[serde(rename = "emptyReason")]
+    pub empty_reason: Option<CodeableConcept>,
+    pub section: Option<Vec<CompositionSection>>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4230,17 +4250,6 @@ pub struct CompositionEvent {
     pub code: Option<Vec<CodeableConcept>>,
     pub period: Option<Period>,
     pub detail: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CompositionAttester {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub time: Option<DateTime>,
-    pub party: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4275,37 +4284,16 @@ pub struct Composition {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CompositionSection {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub title: Option<String>,
-    pub code: Option<CodeableConcept>,
-    pub author: Option<Vec<Reference>>,
-    pub focus: Option<Reference>,
-    pub text: Option<Narrative>,
-    pub mode: Option<Code>,
-    #[serde(rename = "orderedBy")]
-    pub ordered_by: Option<CodeableConcept>,
-    pub entry: Option<Vec<Reference>>,
-    #[serde(rename = "emptyReason")]
-    pub empty_reason: Option<CodeableConcept>,
-    pub section: Option<Vec<CompositionSection>>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConceptMapGroupUnmapped {
+pub struct CompositionAttester {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub mode: Code,
-    pub code: Option<Code>,
-    pub display: Option<String>,
-    pub url: Option<Canonical>,
+    pub time: Option<DateTime>,
+    pub party: Option<Reference>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4361,34 +4349,6 @@ pub struct ConceptMap {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ConceptMapGroupElementTargetDependsOn {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub property: Uri,
-    pub system: Option<Canonical>,
-    pub value: String,
-    pub display: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConceptMapGroup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub source: Option<Uri>,
-    #[serde(rename = "sourceVersion")]
-    pub source_version: Option<String>,
-    pub target: Option<Uri>,
-    #[serde(rename = "targetVersion")]
-    pub target_version: Option<String>,
-    pub element: Option<Vec<ConceptMapGroupElement>>,
-    pub unmapped: Option<ConceptMapGroupUnmapped>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ConceptMapGroupElement {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -4412,6 +4372,46 @@ pub struct ConceptMapGroupElementTarget {
     #[serde(rename = "dependsOn")]
     pub depends_on: Option<Vec<ConceptMapGroupElementTargetDependsOn>>,
     pub product: Option<Vec<ConceptMapGroupElementTargetDependsOn>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConceptMapGroupUnmapped {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub code: Option<Code>,
+    pub display: Option<String>,
+    pub url: Option<Canonical>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConceptMapGroup {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub source: Option<Uri>,
+    #[serde(rename = "sourceVersion")]
+    pub source_version: Option<String>,
+    pub target: Option<Uri>,
+    #[serde(rename = "targetVersion")]
+    pub target_version: Option<String>,
+    pub element: Option<Vec<ConceptMapGroupElement>>,
+    pub unmapped: Option<ConceptMapGroupUnmapped>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConceptMapGroupElementTargetDependsOn {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub property: Uri,
+    pub system: Option<Canonical>,
+    pub value: String,
+    pub display: Option<String>,
 }
 
 
@@ -4512,6 +4512,29 @@ pub struct ConditionEvidence {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ConsentVerification {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub verified: Boolean,
+    #[serde(rename = "verifiedWith")]
+    pub verified_with: Option<Reference>,
+    #[serde(rename = "verificationDate")]
+    pub verification_date: Option<DateTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConsentProvisionData {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub meaning: Code,
+    pub reference: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ConsentSource {
     Attachment(Attachment),
@@ -4551,16 +4574,23 @@ pub struct Consent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ConsentVerification {
+pub struct ConsentProvisionActor {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub verified: Boolean,
-    #[serde(rename = "verifiedWith")]
-    pub verified_with: Option<Reference>,
-    #[serde(rename = "verificationDate")]
-    pub verification_date: Option<DateTime>,
+    pub role: CodeableConcept,
+    pub reference: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConsentPolicy {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub authority: Option<Uri>,
+    pub uri: Option<Uri>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4585,54 +4615,6 @@ pub struct ConsentProvision {
     pub provision: Option<Vec<ConsentProvision>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConsentPolicy {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub authority: Option<Uri>,
-    pub uri: Option<Uri>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConsentProvisionActor {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: CodeableConcept,
-    pub reference: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConsentProvisionData {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub meaning: Code,
-    pub reference: Reference,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractContentDefinition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "subType")]
-    pub sub_type: Option<CodeableConcept>,
-    pub publisher: Option<Reference>,
-    #[serde(rename = "publicationDate")]
-    pub publication_date: Option<DateTime>,
-    #[serde(rename = "publicationStatus")]
-    pub publication_status: Code,
-    pub copyright: Option<Markdown>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4654,15 +4636,60 @@ pub struct ContractRule {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ContractSigner {
+pub struct ContractTermOfferParty {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Option<Vec<Reference>>,
+    pub role: CodeableConcept,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTermActionSubject {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Option<Vec<Reference>>,
+    pub role: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractContentDefinition {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: Coding,
-    pub party: Reference,
-    pub signature: Option<Vec<Signature>>,
+    pub r#type: CodeableConcept,
+    #[serde(rename = "subType")]
+    pub sub_type: Option<CodeableConcept>,
+    pub publisher: Option<Reference>,
+    #[serde(rename = "publicationDate")]
+    pub publication_date: Option<DateTime>,
+    #[serde(rename = "publicationStatus")]
+    pub publication_status: Code,
+    pub copyright: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractFriendlyContent {
+    Attachment(Attachment),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractFriendly {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "contentAttachment")]
+    pub content_attachment: Attachment,
+    #[serde(rename = "contentReference")]
+    pub content_reference: Reference,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4744,6 +4771,39 @@ pub struct Contract {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub enum ContractTermTopic {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTerm {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub issued: Option<DateTime>,
+    pub applies: Option<Period>,
+    #[serde(rename = "topicCodeableConcept")]
+    pub topic_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "topicReference")]
+    pub topic_reference: Option<Reference>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "subType")]
+    pub sub_type: Option<CodeableConcept>,
+    pub text: Option<String>,
+    #[serde(rename = "securityLabel")]
+    pub security_label: Option<Vec<ContractTermSecurityLabel>>,
+    pub offer: ContractTermOffer,
+    pub asset: Option<Vec<ContractTermAsset>>,
+    pub action: Option<Vec<ContractTermAction>>,
+    pub group: Option<Vec<ContractTerm>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ContractTermActionOccurrence {
     DateTime(DateTime),
     Period(Period),
@@ -4794,6 +4854,119 @@ pub struct ContractTermAction {
     pub note: Option<Vec<Annotation>>,
     #[serde(rename = "securityLabelNumber")]
     pub security_label_number: Option<Vec<UnsignedInt>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTermOffer {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub party: Option<Vec<ContractTermOfferParty>>,
+    pub topic: Option<Reference>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub decision: Option<CodeableConcept>,
+    #[serde(rename = "decisionMode")]
+    pub decision_mode: Option<Vec<CodeableConcept>>,
+    pub answer: Option<Vec<ContractTermOfferAnswer>>,
+    pub text: Option<String>,
+    #[serde(rename = "linkId")]
+    pub link_id: Option<Vec<String>>,
+    #[serde(rename = "securityLabelNumber")]
+    pub security_label_number: Option<Vec<UnsignedInt>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractTermAssetValuedItemEntity {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTermAssetValuedItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "entityCodeableConcept")]
+    pub entity_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "entityReference")]
+    pub entity_reference: Option<Reference>,
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "effectiveTime")]
+    pub effective_time: Option<DateTime>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub points: Option<Decimal>,
+    pub net: Option<Money>,
+    pub payment: Option<String>,
+    #[serde(rename = "paymentDate")]
+    pub payment_date: Option<DateTime>,
+    pub responsible: Option<Reference>,
+    pub recipient: Option<Reference>,
+    #[serde(rename = "linkId")]
+    pub link_id: Option<Vec<String>>,
+    #[serde(rename = "securityLabelNumber")]
+    pub security_label_number: Option<Vec<UnsignedInt>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractSigner {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Coding,
+    pub party: Reference,
+    pub signature: Option<Vec<Signature>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTermAssetContext {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Option<Reference>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractTermSecurityLabel {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number: Option<Vec<UnsignedInt>>,
+    pub classification: Coding,
+    pub category: Option<Vec<Coding>>,
+    pub control: Option<Vec<Coding>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractLegalContent {
+    Attachment(Attachment),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContractLegal {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "contentAttachment")]
+    pub content_attachment: Attachment,
+    #[serde(rename = "contentReference")]
+    pub content_reference: Reference,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -4875,179 +5048,40 @@ pub struct ContractTermAsset {
     pub valued_item: Option<Vec<ContractTermAssetValuedItem>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermSecurityLabel {
+pub struct CoverageClass {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub number: Option<Vec<UnsignedInt>>,
-    pub classification: Coding,
-    pub category: Option<Vec<Coding>>,
-    pub control: Option<Vec<Coding>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub value: String,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ContractFriendlyContent {
-    Attachment(Attachment),
-    Reference(Reference),
+pub enum CoverageCostToBeneficiaryValue {
+    Quantity(Quantity),
+    Money(Money),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ContractFriendly {
+pub struct CoverageCostToBeneficiary {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "contentAttachment")]
-    pub content_attachment: Attachment,
-    #[serde(rename = "contentReference")]
-    pub content_reference: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermAssetContext {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Option<Reference>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub text: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermOfferParty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Option<Vec<Reference>>,
-    pub role: CodeableConcept,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractTermAssetValuedItemEntity {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermAssetValuedItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "entityCodeableConcept")]
-    pub entity_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "entityReference")]
-    pub entity_reference: Option<Reference>,
-    pub identifier: Option<Identifier>,
-    #[serde(rename = "effectiveTime")]
-    pub effective_time: Option<DateTime>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub points: Option<Decimal>,
-    pub net: Option<Money>,
-    pub payment: Option<String>,
-    #[serde(rename = "paymentDate")]
-    pub payment_date: Option<DateTime>,
-    pub responsible: Option<Reference>,
-    pub recipient: Option<Reference>,
-    #[serde(rename = "linkId")]
-    pub link_id: Option<Vec<String>>,
-    #[serde(rename = "securityLabelNumber")]
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractTermTopic {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTerm {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub issued: Option<DateTime>,
-    pub applies: Option<Period>,
-    #[serde(rename = "topicCodeableConcept")]
-    pub topic_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "topicReference")]
-    pub topic_reference: Option<Reference>,
     #[serde(rename = "type")]
     pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "subType")]
-    pub sub_type: Option<CodeableConcept>,
-    pub text: Option<String>,
-    #[serde(rename = "securityLabel")]
-    pub security_label: Option<Vec<ContractTermSecurityLabel>>,
-    pub offer: ContractTermOffer,
-    pub asset: Option<Vec<ContractTermAsset>>,
-    pub action: Option<Vec<ContractTermAction>>,
-    pub group: Option<Vec<ContractTerm>>,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Quantity,
+    #[serde(rename = "valueMoney")]
+    pub value_money: Money,
+    pub exception: Option<Vec<CoverageCostToBeneficiaryException>>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractLegalContent {
-    Attachment(Attachment),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractLegal {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "contentAttachment")]
-    pub content_attachment: Attachment,
-    #[serde(rename = "contentReference")]
-    pub content_reference: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermOffer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub party: Option<Vec<ContractTermOfferParty>>,
-    pub topic: Option<Reference>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub decision: Option<CodeableConcept>,
-    #[serde(rename = "decisionMode")]
-    pub decision_mode: Option<Vec<CodeableConcept>>,
-    pub answer: Option<Vec<ContractTermOfferAnswer>>,
-    pub text: Option<String>,
-    #[serde(rename = "linkId")]
-    pub link_id: Option<Vec<String>>,
-    #[serde(rename = "securityLabelNumber")]
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ContractTermActionSubject {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Option<Vec<Reference>>,
-    pub role: Option<CodeableConcept>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Coverage {
@@ -5095,59 +5129,6 @@ pub struct CoverageCostToBeneficiaryException {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageClass {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub value: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CoverageCostToBeneficiaryValue {
-    Quantity(Quantity),
-    Money(Money),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageCostToBeneficiary {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Quantity,
-    #[serde(rename = "valueMoney")]
-    pub value_money: Money,
-    pub exception: Option<Vec<CoverageCostToBeneficiaryException>>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CoverageEligibilityRequestItemDiagnosisDiagnosis {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageEligibilityRequestItemDiagnosis {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "diagnosisCodeableConcept")]
-    pub diagnosis_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "diagnosisReference")]
-    pub diagnosis_reference: Option<Reference>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5189,6 +5170,18 @@ pub struct CoverageEligibilityRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct CoverageEligibilityRequestInsurance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub focal: Option<Boolean>,
+    pub coverage: Reference,
+    #[serde(rename = "businessArrangement")]
+    pub business_arrangement: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CoverageEligibilityRequestSupportingInfo {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -5222,42 +5215,36 @@ pub struct CoverageEligibilityRequestItem {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageEligibilityRequestInsurance {
+#[serde(rename_all = "camelCase")]
+pub enum CoverageEligibilityRequestItemDiagnosisDiagnosis {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CoverageEligibilityRequestItemDiagnosis {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub focal: Option<Boolean>,
-    pub coverage: Reference,
-    #[serde(rename = "businessArrangement")]
-    pub business_arrangement: Option<String>,
+    #[serde(rename = "diagnosisCodeableConcept")]
+    pub diagnosis_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "diagnosisReference")]
+    pub diagnosis_reference: Option<Reference>,
 }
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageEligibilityResponseInsuranceItem {
+pub struct CoverageEligibilityResponseInsurance {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: Option<CodeableConcept>,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub provider: Option<Reference>,
-    pub excluded: Option<Boolean>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub network: Option<CodeableConcept>,
-    pub unit: Option<CodeableConcept>,
-    pub term: Option<CodeableConcept>,
-    pub benefit: Option<Vec<CoverageEligibilityResponseInsuranceItemBenefit>>,
-    #[serde(rename = "authorizationRequired")]
-    pub authorization_required: Option<Boolean>,
-    #[serde(rename = "authorizationSupporting")]
-    pub authorization_supporting: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "authorizationUrl")]
-    pub authorization_url: Option<Uri>,
+    pub coverage: Reference,
+    pub inforce: Option<Boolean>,
+    #[serde(rename = "benefitPeriod")]
+    pub benefit_period: Option<Period>,
+    pub item: Option<Vec<CoverageEligibilityResponseInsuranceItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5301,12 +5288,29 @@ pub struct CoverageEligibilityResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageEligibilityResponseError {
+pub struct CoverageEligibilityResponseInsuranceItem {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: Option<CodeableConcept>,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub provider: Option<Reference>,
+    pub excluded: Option<Boolean>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub network: Option<CodeableConcept>,
+    pub unit: Option<CodeableConcept>,
+    pub term: Option<CodeableConcept>,
+    pub benefit: Option<Vec<CoverageEligibilityResponseInsuranceItemBenefit>>,
+    #[serde(rename = "authorizationRequired")]
+    pub authorization_required: Option<Boolean>,
+    #[serde(rename = "authorizationSupporting")]
+    pub authorization_supporting: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "authorizationUrl")]
+    pub authorization_url: Option<Uri>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5348,18 +5352,35 @@ pub struct CoverageEligibilityResponseInsuranceItemBenefit {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CoverageEligibilityResponseInsurance {
+pub struct CoverageEligibilityResponseError {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub coverage: Reference,
-    pub inforce: Option<Boolean>,
-    #[serde(rename = "benefitPeriod")]
-    pub benefit_period: Option<Period>,
-    pub item: Option<Vec<CoverageEligibilityResponseInsuranceItem>>,
+    pub code: CodeableConcept,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DetectedIssueEvidence {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub detail: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DetectedIssueMitigation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: CodeableConcept,
+    pub date: Option<DateTime>,
+    pub author: Option<Reference>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5397,64 +5418,6 @@ pub struct DetectedIssue {
     pub mitigation: Option<Vec<DetectedIssueMitigation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DetectedIssueEvidence {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub detail: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DetectedIssueMitigation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: CodeableConcept,
-    pub date: Option<DateTime>,
-    pub author: Option<Reference>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceSpecialization {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "systemType")]
-    pub system_type: CodeableConcept,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceVersion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub component: Option<Identifier>,
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceProperty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Option<Vec<Quantity>>,
-    #[serde(rename = "valueCode")]
-    pub value_code: Option<Vec<CodeableConcept>>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceUdiCarrier {
@@ -5472,17 +5435,6 @@ pub struct DeviceUdiCarrier {
     pub carrier_h_r_f: Option<String>,
     #[serde(rename = "entryType")]
     pub entry_type: Option<Code>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceDeviceName {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub r#type: Code,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5536,9 +5488,31 @@ pub struct Device {
     pub parent: Option<Reference>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceSpecialization {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "systemType")]
+    pub system_type: CodeableConcept,
+    pub version: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceDefinitionDeviceName {
+pub struct DeviceVersion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub component: Option<Identifier>,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceDeviceName {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
@@ -5549,18 +5523,7 @@ pub struct DeviceDefinitionDeviceName {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceDefinitionCapability {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub description: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceDefinitionProperty {
+pub struct DeviceProperty {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
@@ -5573,6 +5536,7 @@ pub struct DeviceDefinitionProperty {
     pub value_code: Option<Vec<CodeableConcept>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceDefinitionMaterial {
     pub id: Option<std::string::String>,
@@ -5583,17 +5547,6 @@ pub struct DeviceDefinitionMaterial {
     pub alternate: Option<Boolean>,
     #[serde(rename = "allergenicIndicator")]
     pub allergenic_indicator: Option<Boolean>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DeviceDefinitionSpecialization {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "systemType")]
-    pub system_type: String,
-    pub version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5649,6 +5602,53 @@ pub struct DeviceDefinition {
     #[serde(rename = "parentDevice")]
     pub parent_device: Option<Reference>,
     pub material: Option<Vec<DeviceDefinitionMaterial>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceDefinitionCapability {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub description: Option<Vec<CodeableConcept>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceDefinitionDeviceName {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceDefinitionSpecialization {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "systemType")]
+    pub system_type: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeviceDefinitionProperty {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Option<Vec<Quantity>>,
+    #[serde(rename = "valueCode")]
+    pub value_code: Option<Vec<CodeableConcept>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -5909,6 +5909,17 @@ pub struct DiagnosticReportMedia {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct DocumentManifestRelated {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "ref")]
+    pub r#ref: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DocumentManifest {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -5936,17 +5947,26 @@ pub struct DocumentManifest {
     pub related: Option<Vec<DocumentManifestRelated>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DocumentManifestRelated {
+pub struct DocumentReferenceContent {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    #[serde(rename = "ref")]
-    pub r#ref: Option<Reference>,
+    pub attachment: Attachment,
+    pub format: Option<Coding>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DocumentReferenceRelatesTo {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub target: Reference,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DocumentReference {
@@ -5984,26 +6004,6 @@ pub struct DocumentReference {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DocumentReferenceRelatesTo {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub target: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DocumentReferenceContent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub attachment: Attachment,
-    pub format: Option<Coding>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct DocumentReferenceContext {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6021,6 +6021,34 @@ pub struct DocumentReferenceContext {
     pub related: Option<Vec<Reference>>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EffectEvidenceSynthesisSampleSize {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    #[serde(rename = "numberOfStudies")]
+    pub number_of_studies: Option<Integer>,
+    #[serde(rename = "numberOfParticipants")]
+    pub number_of_participants: Option<Integer>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EffectEvidenceSynthesisResultsByExposure {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    #[serde(rename = "exposureState")]
+    pub exposure_state: Option<Code>,
+    #[serde(rename = "variantState")]
+    pub variant_state: Option<CodeableConcept>,
+    #[serde(rename = "riskEvidenceSynthesis")]
+    pub risk_evidence_synthesis: Reference,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EffectEvidenceSynthesis {
@@ -6081,18 +6109,28 @@ pub struct EffectEvidenceSynthesis {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct EffectEvidenceSynthesisResultsByExposure {
+pub struct EffectEvidenceSynthesisCertainty {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    #[serde(rename = "exposureState")]
-    pub exposure_state: Option<Code>,
-    #[serde(rename = "variantState")]
-    pub variant_state: Option<CodeableConcept>,
-    #[serde(rename = "riskEvidenceSynthesis")]
-    pub risk_evidence_synthesis: Reference,
+    pub rating: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "certaintySubcomponent")]
+    pub certainty_subcomponent: Option<Vec<EffectEvidenceSynthesisCertaintyCertaintySubcomponent>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub level: Option<Decimal>,
+    pub from: Option<Decimal>,
+    pub to: Option<Decimal>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6114,44 +6152,6 @@ pub struct EffectEvidenceSynthesisEffectEstimate {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct EffectEvidenceSynthesisSampleSize {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    #[serde(rename = "numberOfStudies")]
-    pub number_of_studies: Option<Integer>,
-    #[serde(rename = "numberOfParticipants")]
-    pub number_of_participants: Option<Integer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub level: Option<Decimal>,
-    pub from: Option<Decimal>,
-    pub to: Option<Decimal>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EffectEvidenceSynthesisCertainty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub rating: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
-    #[serde(rename = "certaintySubcomponent")]
-    pub certainty_subcomponent: Option<Vec<EffectEvidenceSynthesisCertaintyCertaintySubcomponent>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6163,67 +6163,6 @@ pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
     pub note: Option<Vec<Annotation>>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncounterParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub period: Option<Period>,
-    pub individual: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncounterDiagnosis {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub condition: Reference,
-    #[serde(rename = "use")]
-    pub r#use: Option<CodeableConcept>,
-    pub rank: Option<PositiveInt>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncounterHospitalization {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "preAdmissionIdentifier")]
-    pub pre_admission_identifier: Option<Identifier>,
-    pub origin: Option<Reference>,
-    #[serde(rename = "admitSource")]
-    pub admit_source: Option<CodeableConcept>,
-    #[serde(rename = "reAdmission")]
-    pub re_admission: Option<CodeableConcept>,
-    #[serde(rename = "dietPreference")]
-    pub diet_preference: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "specialCourtesy")]
-    pub special_courtesy: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "specialArrangement")]
-    pub special_arrangement: Option<Vec<CodeableConcept>>,
-    pub destination: Option<Reference>,
-    #[serde(rename = "dischargeDisposition")]
-    pub discharge_disposition: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EncounterLocation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub location: Reference,
-    pub status: Option<Code>,
-    #[serde(rename = "physicalType")]
-    pub physical_type: Option<CodeableConcept>,
-    pub period: Option<Period>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EncounterStatusHistory {
@@ -6283,6 +6222,18 @@ pub struct Encounter {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct EncounterParticipant {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub period: Option<Period>,
+    pub individual: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncounterClassHistory {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6290,6 +6241,55 @@ pub struct EncounterClassHistory {
     pub modifier_extension: Option<Vec<Extension>>,
     pub class: Coding,
     pub period: Period,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncounterHospitalization {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "preAdmissionIdentifier")]
+    pub pre_admission_identifier: Option<Identifier>,
+    pub origin: Option<Reference>,
+    #[serde(rename = "admitSource")]
+    pub admit_source: Option<CodeableConcept>,
+    #[serde(rename = "reAdmission")]
+    pub re_admission: Option<CodeableConcept>,
+    #[serde(rename = "dietPreference")]
+    pub diet_preference: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "specialCourtesy")]
+    pub special_courtesy: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "specialArrangement")]
+    pub special_arrangement: Option<Vec<CodeableConcept>>,
+    pub destination: Option<Reference>,
+    #[serde(rename = "dischargeDisposition")]
+    pub discharge_disposition: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncounterDiagnosis {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub condition: Reference,
+    #[serde(rename = "use")]
+    pub r#use: Option<CodeableConcept>,
+    pub rank: Option<PositiveInt>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EncounterLocation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub location: Reference,
+    pub status: Option<Code>,
+    #[serde(rename = "physicalType")]
+    pub physical_type: Option<CodeableConcept>,
+    pub period: Option<Period>,
 }
 
 
@@ -6370,16 +6370,6 @@ pub struct EnrollmentResponse {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct EpisodeOfCareStatusHistory {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: Code,
-    pub period: Period,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct EpisodeOfCareDiagnosis {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6419,6 +6409,16 @@ pub struct EpisodeOfCare {
     pub care_manager: Option<Reference>,
     pub team: Option<Vec<Reference>>,
     pub account: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EpisodeOfCareStatusHistory {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub status: Code,
+    pub period: Period,
 }
 
 
@@ -6637,6 +6637,38 @@ pub struct EvidenceVariableCharacteristic {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ExampleScenarioInstanceVersion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    pub description: Markdown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExampleScenarioProcessStepOperation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number: String,
+    #[serde(rename = "type")]
+    pub r#type: Option<String>,
+    pub name: Option<String>,
+    pub initiator: Option<String>,
+    pub receiver: Option<String>,
+    pub description: Option<Markdown>,
+    #[serde(rename = "initiatorActive")]
+    pub initiator_active: Option<Boolean>,
+    #[serde(rename = "receiverActive")]
+    pub receiver_active: Option<Boolean>,
+    pub request: Option<ExampleScenarioInstanceContainedInstance>,
+    pub response: Option<ExampleScenarioInstanceContainedInstance>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExampleScenarioInstanceContainedInstance {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6646,17 +6678,6 @@ pub struct ExampleScenarioInstanceContainedInstance {
     pub resource_id: String,
     #[serde(rename = "versionId")]
     pub version_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExampleScenarioProcessStepAlternative {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub title: String,
-    pub description: Option<Markdown>,
-    pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6674,26 +6695,31 @@ pub struct ExampleScenarioActor {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExampleScenarioProcessStep {
+pub struct ExampleScenarioInstance {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub process: Option<Vec<ExampleScenarioProcess>>,
-    pub pause: Option<Boolean>,
-    pub operation: Option<ExampleScenarioProcessStepOperation>,
-    pub alternative: Option<Vec<ExampleScenarioProcessStepAlternative>>,
+    #[serde(rename = "resourceId")]
+    pub resource_id: String,
+    #[serde(rename = "resourceType")]
+    pub resource_type: Code,
+    pub name: Option<String>,
+    pub description: Option<Markdown>,
+    pub version: Option<Vec<ExampleScenarioInstanceVersion>>,
+    #[serde(rename = "containedInstance")]
+    pub contained_instance: Option<Vec<ExampleScenarioInstanceContainedInstance>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExampleScenarioInstanceVersion {
+pub struct ExampleScenarioProcessStepAlternative {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "versionId")]
-    pub version_id: String,
-    pub description: Markdown,
+    pub title: String,
+    pub description: Option<Markdown>,
+    pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6729,44 +6755,6 @@ pub struct ExampleScenario {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExampleScenarioInstance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "resourceId")]
-    pub resource_id: String,
-    #[serde(rename = "resourceType")]
-    pub resource_type: Code,
-    pub name: Option<String>,
-    pub description: Option<Markdown>,
-    pub version: Option<Vec<ExampleScenarioInstanceVersion>>,
-    #[serde(rename = "containedInstance")]
-    pub contained_instance: Option<Vec<ExampleScenarioInstanceContainedInstance>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExampleScenarioProcessStepOperation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub number: String,
-    #[serde(rename = "type")]
-    pub r#type: Option<String>,
-    pub name: Option<String>,
-    pub initiator: Option<String>,
-    pub receiver: Option<String>,
-    pub description: Option<Markdown>,
-    #[serde(rename = "initiatorActive")]
-    pub initiator_active: Option<Boolean>,
-    #[serde(rename = "receiverActive")]
-    pub receiver_active: Option<Boolean>,
-    pub request: Option<ExampleScenarioInstanceContainedInstance>,
-    pub response: Option<ExampleScenarioInstanceContainedInstance>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ExampleScenarioProcess {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -6781,60 +6769,94 @@ pub struct ExampleScenarioProcess {
     pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExampleScenarioProcessStep {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub process: Option<Vec<ExampleScenarioProcess>>,
+    pub pause: Option<Boolean>,
+    pub operation: Option<ExampleScenarioProcessStepOperation>,
+    pub alternative: Option<Vec<ExampleScenarioProcessStepAlternative>>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitSupportingInfoTiming {
+pub enum ExplanationOfBenefitItemServiced {
     Date(Date),
     Period(Period),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitSupportingInfoValue {
-    Boolean(Boolean),
-    String(String),
-    Quantity(Quantity),
-    Attachment(Attachment),
+pub enum ExplanationOfBenefitItemLocation {
+    CodeableConcept(CodeableConcept),
+    Address(Address),
     Reference(Reference),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitSupportingInfo {
+pub struct ExplanationOfBenefitItem {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
-    pub category: CodeableConcept,
-    pub code: Option<CodeableConcept>,
-    #[serde(rename = "timingDate")]
-    pub timing_date: Option<Date>,
-    #[serde(rename = "timingPeriod")]
-    pub timing_period: Option<Period>,
-    #[serde(rename = "valueBoolean")]
-    pub value_boolean: Option<Boolean>,
-    #[serde(rename = "valueString")]
-    pub value_string: Option<String>,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Option<Quantity>,
-    #[serde(rename = "valueAttachment")]
-    pub value_attachment: Option<Attachment>,
-    #[serde(rename = "valueReference")]
-    pub value_reference: Option<Reference>,
-    pub reason: Option<Coding>,
+    #[serde(rename = "careTeamSequence")]
+    pub care_team_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "diagnosisSequence")]
+    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "procedureSequence")]
+    pub procedure_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "informationSequence")]
+    pub information_sequence: Option<Vec<PositiveInt>>,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "servicedDate")]
+    pub serviced_date: Option<Date>,
+    #[serde(rename = "servicedPeriod")]
+    pub serviced_period: Option<Period>,
+    #[serde(rename = "locationCodeableConcept")]
+    pub location_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "locationAddress")]
+    pub location_address: Option<Address>,
+    #[serde(rename = "locationReference")]
+    pub location_reference: Option<Reference>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "bodySite")]
+    pub body_site: Option<CodeableConcept>,
+    #[serde(rename = "subSite")]
+    pub sub_site: Option<Vec<CodeableConcept>>,
+    pub encounter: Option<Vec<Reference>>,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+    pub detail: Option<Vec<ExplanationOfBenefitItemDetail>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitItemAdjudication {
+pub struct ExplanationOfBenefitCareTeam {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub reason: Option<CodeableConcept>,
-    pub amount: Option<Money>,
-    pub value: Option<Decimal>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    pub responsible: Option<Boolean>,
+    pub role: Option<CodeableConcept>,
+    pub qualification: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6849,16 +6871,188 @@ pub struct ExplanationOfBenefitPayee {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitCareTeam {
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
+    UnsignedInt(UnsignedInt),
+    String(String),
+    Money(Money),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
+    UnsignedInt(UnsignedInt),
+    Money(Money),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitBenefitBalanceFinancial {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(rename = "allowedUnsignedInt")]
+    pub allowed_unsigned_int: Option<UnsignedInt>,
+    #[serde(rename = "allowedString")]
+    pub allowed_string: Option<String>,
+    #[serde(rename = "allowedMoney")]
+    pub allowed_money: Option<Money>,
+    #[serde(rename = "usedUnsignedInt")]
+    pub used_unsigned_int: Option<UnsignedInt>,
+    #[serde(rename = "usedMoney")]
+    pub used_money: Option<Money>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitProcedureProcedure {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitProcedure {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
-    pub provider: Reference,
-    pub responsible: Option<Boolean>,
-    pub role: Option<CodeableConcept>,
-    pub qualification: Option<CodeableConcept>,
+    #[serde(rename = "type")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub date: Option<DateTime>,
+    #[serde(rename = "procedureCodeableConcept")]
+    pub procedure_codeable_concept: CodeableConcept,
+    #[serde(rename = "procedureReference")]
+    pub procedure_reference: Reference,
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitAccidentLocation {
+    Address(Address),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitAccident {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub date: Option<Date>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "locationAddress")]
+    pub location_address: Option<Address>,
+    #[serde(rename = "locationReference")]
+    pub location_reference: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitAddItemDetail {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+    #[serde(rename = "subDetail")]
+    pub sub_detail: Option<Vec<ExplanationOfBenefitAddItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitAddItemServiced {
+    Date(Date),
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitAddItemLocation {
+    CodeableConcept(CodeableConcept),
+    Address(Address),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitAddItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemSequence")]
+    pub item_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "detailSequence")]
+    pub detail_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "subDetailSequence")]
+    pub sub_detail_sequence: Option<Vec<PositiveInt>>,
+    pub provider: Option<Vec<Reference>>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "servicedDate")]
+    pub serviced_date: Option<Date>,
+    #[serde(rename = "servicedPeriod")]
+    pub serviced_period: Option<Period>,
+    #[serde(rename = "locationCodeableConcept")]
+    pub location_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "locationAddress")]
+    pub location_address: Option<Address>,
+    #[serde(rename = "locationReference")]
+    pub location_reference: Option<Reference>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    #[serde(rename = "bodySite")]
+    pub body_site: Option<CodeableConcept>,
+    #[serde(rename = "subSite")]
+    pub sub_site: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+    pub detail: Option<Vec<ExplanationOfBenefitAddItemDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitItemDetailSubDetail {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice")]
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "noteNumber")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -6936,109 +7130,6 @@ pub struct ExplanationOfBenefit {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitAddItemServiced {
-    Date(Date),
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitAddItemLocation {
-    CodeableConcept(CodeableConcept),
-    Address(Address),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitAddItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemSequence")]
-    pub item_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "detailSequence")]
-    pub detail_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "subDetailSequence")]
-    pub sub_detail_sequence: Option<Vec<PositiveInt>>,
-    pub provider: Option<Vec<Reference>>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "servicedDate")]
-    pub serviced_date: Option<Date>,
-    #[serde(rename = "servicedPeriod")]
-    pub serviced_period: Option<Period>,
-    #[serde(rename = "locationCodeableConcept")]
-    pub location_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "locationAddress")]
-    pub location_address: Option<Address>,
-    #[serde(rename = "locationReference")]
-    pub location_reference: Option<Reference>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    #[serde(rename = "bodySite")]
-    pub body_site: Option<CodeableConcept>,
-    #[serde(rename = "subSite")]
-    pub sub_site: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    pub detail: Option<Vec<ExplanationOfBenefitAddItemDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    #[serde(rename = "preAuthRef")]
-    pub pre_auth_ref: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitAccidentLocation {
-    Address(Address),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitAccident {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub date: Option<Date>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "locationAddress")]
-    pub location_address: Option<Address>,
-    #[serde(rename = "locationReference")]
-    pub location_reference: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitRelated {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub claim: Option<Reference>,
-    pub relationship: Option<CodeableConcept>,
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ExplanationOfBenefitTotal {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -7049,91 +7140,71 @@ pub struct ExplanationOfBenefitTotal {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
-    UnsignedInt(UnsignedInt),
-    String(String),
-    Money(Money),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
-    UnsignedInt(UnsignedInt),
-    Money(Money),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitBenefitBalanceFinancial {
+pub struct ExplanationOfBenefitBenefitBalance {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "allowedUnsignedInt")]
-    pub allowed_unsigned_int: Option<UnsignedInt>,
-    #[serde(rename = "allowedString")]
-    pub allowed_string: Option<String>,
-    #[serde(rename = "allowedMoney")]
-    pub allowed_money: Option<Money>,
-    #[serde(rename = "usedUnsignedInt")]
-    pub used_unsigned_int: Option<UnsignedInt>,
-    #[serde(rename = "usedMoney")]
-    pub used_money: Option<Money>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitAddItemDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    #[serde(rename = "subDetail")]
-    pub sub_detail: Option<Vec<ExplanationOfBenefitAddItemDetailSubDetail>>,
+    pub category: CodeableConcept,
+    pub excluded: Option<Boolean>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub network: Option<CodeableConcept>,
+    pub unit: Option<CodeableConcept>,
+    pub term: Option<CodeableConcept>,
+    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitItemServiced {
+pub enum ExplanationOfBenefitSupportingInfoTiming {
     Date(Date),
     Period(Period),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitItemLocation {
-    CodeableConcept(CodeableConcept),
-    Address(Address),
+pub enum ExplanationOfBenefitSupportingInfoValue {
+    Boolean(Boolean),
+    String(String),
+    Quantity(Quantity),
+    Attachment(Attachment),
     Reference(Reference),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitItem {
+pub struct ExplanationOfBenefitSupportingInfo {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
-    #[serde(rename = "careTeamSequence")]
-    pub care_team_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "diagnosisSequence")]
-    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "procedureSequence")]
-    pub procedure_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "informationSequence")]
-    pub information_sequence: Option<Vec<PositiveInt>>,
+    pub category: CodeableConcept,
+    pub code: Option<CodeableConcept>,
+    #[serde(rename = "timingDate")]
+    pub timing_date: Option<Date>,
+    #[serde(rename = "timingPeriod")]
+    pub timing_period: Option<Period>,
+    #[serde(rename = "valueBoolean")]
+    pub value_boolean: Option<Boolean>,
+    #[serde(rename = "valueString")]
+    pub value_string: Option<String>,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Option<Quantity>,
+    #[serde(rename = "valueAttachment")]
+    pub value_attachment: Option<Attachment>,
+    #[serde(rename = "valueReference")]
+    pub value_reference: Option<Reference>,
+    pub reason: Option<Coding>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitItemDetail {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
     pub revenue: Option<CodeableConcept>,
     pub category: Option<CodeableConcept>,
     #[serde(rename = "productOrService")]
@@ -7141,31 +7212,29 @@ pub struct ExplanationOfBenefitItem {
     pub modifier: Option<Vec<CodeableConcept>>,
     #[serde(rename = "programCode")]
     pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "servicedDate")]
-    pub serviced_date: Option<Date>,
-    #[serde(rename = "servicedPeriod")]
-    pub serviced_period: Option<Period>,
-    #[serde(rename = "locationCodeableConcept")]
-    pub location_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "locationAddress")]
-    pub location_address: Option<Address>,
-    #[serde(rename = "locationReference")]
-    pub location_reference: Option<Reference>,
     pub quantity: Option<Quantity>,
     #[serde(rename = "unitPrice")]
     pub unit_price: Option<Money>,
     pub factor: Option<Decimal>,
     pub net: Option<Money>,
     pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "bodySite")]
-    pub body_site: Option<CodeableConcept>,
-    #[serde(rename = "subSite")]
-    pub sub_site: Option<Vec<CodeableConcept>>,
-    pub encounter: Option<Vec<Reference>>,
     #[serde(rename = "noteNumber")]
     pub note_number: Option<Vec<PositiveInt>>,
     pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    pub detail: Option<Vec<ExplanationOfBenefitItemDetail>>,
+    #[serde(rename = "subDetail")]
+    pub sub_detail: Option<Vec<ExplanationOfBenefitItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitItemAdjudication {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub reason: Option<CodeableConcept>,
+    pub amount: Option<Money>,
+    pub value: Option<Decimal>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7192,31 +7261,6 @@ pub struct ExplanationOfBenefitDiagnosis {
     pub on_admission: Option<CodeableConcept>,
     #[serde(rename = "packageCode")]
     pub package_code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7268,72 +7312,58 @@ pub struct ExplanationOfBenefitProcessNote {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitBenefitBalance {
+pub struct ExplanationOfBenefitRelated {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub excluded: Option<Boolean>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub network: Option<CodeableConcept>,
-    pub unit: Option<CodeableConcept>,
-    pub term: Option<CodeableConcept>,
-    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
+    pub claim: Option<Reference>,
+    pub relationship: Option<CodeableConcept>,
+    pub reference: Option<Identifier>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExplanationOfBenefitInsurance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    #[serde(rename = "preAuthRef")]
+    pub pre_auth_ref: Option<Vec<String>>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitProcedureProcedure {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
+pub enum FamilyMemberHistoryConditionOnset {
+    Age(Age),
+    Range(Range),
+    Period(Period),
+    String(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitProcedure {
+pub struct FamilyMemberHistoryCondition {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "type")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub date: Option<DateTime>,
-    #[serde(rename = "procedureCodeableConcept")]
-    pub procedure_codeable_concept: CodeableConcept,
-    #[serde(rename = "procedureReference")]
-    pub procedure_reference: Reference,
-    pub udi: Option<Vec<Reference>>,
+    pub code: CodeableConcept,
+    pub outcome: Option<CodeableConcept>,
+    #[serde(rename = "contributedToDeath")]
+    pub contributed_to_death: Option<Boolean>,
+    #[serde(rename = "onsetAge")]
+    pub onset_age: Option<Age>,
+    #[serde(rename = "onsetRange")]
+    pub onset_range: Option<Range>,
+    #[serde(rename = "onsetPeriod")]
+    pub onset_period: Option<Period>,
+    #[serde(rename = "onsetString")]
+    pub onset_string: Option<String>,
+    pub note: Option<Vec<Annotation>>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ExplanationOfBenefitItemDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice")]
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "noteNumber")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    #[serde(rename = "subDetail")]
-    pub sub_detail: Option<Vec<ExplanationOfBenefitItemDetailSubDetail>>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -7418,36 +7448,6 @@ pub struct FamilyMemberHistory {
     pub condition: Option<Vec<FamilyMemberHistoryCondition>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum FamilyMemberHistoryConditionOnset {
-    Age(Age),
-    Range(Range),
-    Period(Period),
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FamilyMemberHistoryCondition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub outcome: Option<CodeableConcept>,
-    #[serde(rename = "contributedToDeath")]
-    pub contributed_to_death: Option<Boolean>,
-    #[serde(rename = "onsetAge")]
-    pub onset_age: Option<Age>,
-    #[serde(rename = "onsetRange")]
-    pub onset_range: Option<Range>,
-    #[serde(rename = "onsetPeriod")]
-    pub onset_period: Option<Period>,
-    #[serde(rename = "onsetString")]
-    pub onset_string: Option<String>,
-    pub note: Option<Vec<Annotation>>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Flag {
@@ -7471,52 +7471,6 @@ pub struct Flag {
     pub author: Option<Reference>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum GoalTargetDetail {
-    Quantity(Quantity),
-    Range(Range),
-    CodeableConcept(CodeableConcept),
-    String(String),
-    Boolean(Boolean),
-    Integer(Integer),
-    Ratio(Ratio),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum GoalTargetDue {
-    Date(Date),
-    Duration(Duration),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GoalTarget {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub measure: Option<CodeableConcept>,
-    #[serde(rename = "detailQuantity")]
-    pub detail_quantity: Option<Quantity>,
-    #[serde(rename = "detailRange")]
-    pub detail_range: Option<Range>,
-    #[serde(rename = "detailCodeableConcept")]
-    pub detail_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "detailString")]
-    pub detail_string: Option<String>,
-    #[serde(rename = "detailBoolean")]
-    pub detail_boolean: Option<Boolean>,
-    #[serde(rename = "detailInteger")]
-    pub detail_integer: Option<Integer>,
-    #[serde(rename = "detailRatio")]
-    pub detail_ratio: Option<Ratio>,
-    #[serde(rename = "dueDate")]
-    pub due_date: Option<Date>,
-    #[serde(rename = "dueDuration")]
-    pub due_duration: Option<Duration>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -7565,6 +7519,66 @@ pub struct Goal {
     pub outcome_reference: Option<Vec<Reference>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalTargetDetail {
+    Quantity(Quantity),
+    Range(Range),
+    CodeableConcept(CodeableConcept),
+    String(String),
+    Boolean(Boolean),
+    Integer(Integer),
+    Ratio(Ratio),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalTargetDue {
+    Date(Date),
+    Duration(Duration),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GoalTarget {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub measure: Option<CodeableConcept>,
+    #[serde(rename = "detailQuantity")]
+    pub detail_quantity: Option<Quantity>,
+    #[serde(rename = "detailRange")]
+    pub detail_range: Option<Range>,
+    #[serde(rename = "detailCodeableConcept")]
+    pub detail_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "detailString")]
+    pub detail_string: Option<String>,
+    #[serde(rename = "detailBoolean")]
+    pub detail_boolean: Option<Boolean>,
+    #[serde(rename = "detailInteger")]
+    pub detail_integer: Option<Integer>,
+    #[serde(rename = "detailRatio")]
+    pub detail_ratio: Option<Ratio>,
+    #[serde(rename = "dueDate")]
+    pub due_date: Option<Date>,
+    #[serde(rename = "dueDuration")]
+    pub due_duration: Option<Duration>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GraphDefinitionLinkTargetCompartment {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "use")]
+    pub r#use: Code,
+    pub code: Code,
+    pub rule: Code,
+    pub expression: Option<String>,
+    pub description: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GraphDefinitionLinkTarget {
@@ -7578,21 +7592,6 @@ pub struct GraphDefinitionLinkTarget {
     pub profile: Option<Canonical>,
     pub compartment: Option<Vec<GraphDefinitionLinkTargetCompartment>>,
     pub link: Option<Vec<GraphDefinitionLink>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GraphDefinitionLink {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub path: Option<String>,
-    #[serde(rename = "sliceName")]
-    pub slice_name: Option<String>,
-    pub min: Option<Integer>,
-    pub max: Option<String>,
-    pub description: Option<String>,
-    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7626,45 +7625,20 @@ pub struct GraphDefinition {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct GraphDefinitionLinkTargetCompartment {
+pub struct GraphDefinitionLink {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "use")]
-    pub r#use: Code,
-    pub code: Code,
-    pub rule: Code,
-    pub expression: Option<String>,
+    pub path: Option<String>,
+    #[serde(rename = "sliceName")]
+    pub slice_name: Option<String>,
+    pub min: Option<Integer>,
+    pub max: Option<String>,
     pub description: Option<String>,
+    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Group {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub active: Option<Boolean>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub actual: Boolean,
-    pub code: Option<CodeableConcept>,
-    pub name: Option<String>,
-    pub quantity: Option<UnsignedInt>,
-    #[serde(rename = "managingEntity")]
-    pub managing_entity: Option<Reference>,
-    pub characteristic: Option<Vec<GroupCharacteristic>>,
-    pub member: Option<Vec<GroupMember>>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -7706,6 +7680,32 @@ pub struct GroupMember {
     pub entity: Reference,
     pub period: Option<Period>,
     pub inactive: Option<Boolean>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Group {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub active: Option<Boolean>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub actual: Boolean,
+    pub code: Option<CodeableConcept>,
+    pub name: Option<String>,
+    pub quantity: Option<UnsignedInt>,
+    #[serde(rename = "managingEntity")]
+    pub managing_entity: Option<Reference>,
+    pub characteristic: Option<Vec<GroupCharacteristic>>,
+    pub member: Option<Vec<GroupMember>>,
 }
 
 
@@ -7760,13 +7760,13 @@ pub struct GuidanceResponse {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HealthcareServiceEligibility {
+pub struct HealthcareServiceNotAvailable {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub comment: Option<Markdown>,
+    pub description: String,
+    pub during: Option<Period>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -7834,15 +7834,60 @@ pub struct HealthcareServiceAvailableTime {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HealthcareServiceNotAvailable {
+pub struct HealthcareServiceEligibility {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub during: Option<Period>,
+    pub code: Option<CodeableConcept>,
+    pub comment: Option<Markdown>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImagingStudySeriesInstance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uid: Id,
+    #[serde(rename = "sopClass")]
+    pub sop_class: Coding,
+    pub number: Option<UnsignedInt>,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImagingStudySeriesPerformer {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImagingStudySeries {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uid: Id,
+    pub number: Option<UnsignedInt>,
+    pub modality: Coding,
+    pub description: Option<String>,
+    #[serde(rename = "numberOfInstances")]
+    pub number_of_instances: Option<UnsignedInt>,
+    pub endpoint: Option<Vec<Reference>>,
+    #[serde(rename = "bodySite")]
+    pub body_site: Option<Coding>,
+    pub laterality: Option<Coding>,
+    pub specimen: Option<Vec<Reference>>,
+    pub started: Option<DateTime>,
+    pub performer: Option<Vec<ImagingStudySeriesPerformer>>,
+    pub instance: Option<Vec<ImagingStudySeriesInstance>>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImagingStudy {
@@ -7885,95 +7930,6 @@ pub struct ImagingStudy {
     pub series: Option<Vec<ImagingStudySeries>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImagingStudySeries {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uid: Id,
-    pub number: Option<UnsignedInt>,
-    pub modality: Coding,
-    pub description: Option<String>,
-    #[serde(rename = "numberOfInstances")]
-    pub number_of_instances: Option<UnsignedInt>,
-    pub endpoint: Option<Vec<Reference>>,
-    #[serde(rename = "bodySite")]
-    pub body_site: Option<Coding>,
-    pub laterality: Option<Coding>,
-    pub specimen: Option<Vec<Reference>>,
-    pub started: Option<DateTime>,
-    pub performer: Option<Vec<ImagingStudySeriesPerformer>>,
-    pub instance: Option<Vec<ImagingStudySeriesInstance>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImagingStudySeriesPerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImagingStudySeriesInstance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uid: Id,
-    #[serde(rename = "sopClass")]
-    pub sop_class: Coding,
-    pub number: Option<UnsignedInt>,
-    pub title: Option<String>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImmunizationPerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedDoseNumber {
-    PositiveInt(PositiveInt),
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedSeriesDoses {
-    PositiveInt(PositiveInt),
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImmunizationProtocolApplied {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub series: Option<String>,
-    pub authority: Option<Reference>,
-    #[serde(rename = "targetDisease")]
-    pub target_disease: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "doseNumberPositiveInt")]
-    pub dose_number_positive_int: PositiveInt,
-    #[serde(rename = "doseNumberString")]
-    pub dose_number_string: String,
-    #[serde(rename = "seriesDosesPositiveInt")]
-    pub series_doses_positive_int: Option<PositiveInt>,
-    #[serde(rename = "seriesDosesString")]
-    pub series_doses_string: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImmunizationEducation {
@@ -8057,6 +8013,16 @@ pub struct Immunization {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ImmunizationPerformer {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ImmunizationReaction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -8065,6 +8031,40 @@ pub struct ImmunizationReaction {
     pub date: Option<DateTime>,
     pub detail: Option<Reference>,
     pub reported: Option<Boolean>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedDoseNumber {
+    PositiveInt(PositiveInt),
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedSeriesDoses {
+    PositiveInt(PositiveInt),
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImmunizationProtocolApplied {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub series: Option<String>,
+    pub authority: Option<Reference>,
+    #[serde(rename = "targetDisease")]
+    pub target_disease: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "doseNumberPositiveInt")]
+    pub dose_number_positive_int: PositiveInt,
+    #[serde(rename = "doseNumberString")]
+    pub dose_number_string: String,
+    #[serde(rename = "seriesDosesPositiveInt")]
+    pub series_doses_positive_int: Option<PositiveInt>,
+    #[serde(rename = "seriesDosesString")]
+    pub series_doses_string: Option<String>,
 }
 
 
@@ -8121,35 +8121,6 @@ pub struct ImmunizationEvaluation {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ImmunizationRecommendation {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub patient: Reference,
-    pub date: DateTime,
-    pub authority: Option<Reference>,
-    pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImmunizationRecommendationRecommendationDateCriterion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub value: DateTime,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationRecommendationRecommendationDoseNumber {
     PositiveInt(PositiveInt),
@@ -8197,6 +8168,46 @@ pub struct ImmunizationRecommendationRecommendation {
     pub supporting_patient_information: Option<Vec<Reference>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImmunizationRecommendationRecommendationDateCriterion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub value: DateTime,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImmunizationRecommendation {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub patient: Reference,
+    pub date: DateTime,
+    pub authority: Option<Reference>,
+    pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideManifestPage {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub title: Option<String>,
+    pub anchor: Option<Vec<String>>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImplementationGuideDefinitionTemplate {
@@ -8220,6 +8231,132 @@ pub struct ImplementationGuideManifest {
     pub page: Option<Vec<ImplementationGuideManifestPage>>,
     pub image: Option<Vec<String>>,
     pub other: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImplementationGuideDefinitionPageName {
+    Url(Url),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDefinitionPage {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "nameUrl")]
+    pub name_url: Url,
+    #[serde(rename = "nameReference")]
+    pub name_reference: Reference,
+    pub title: String,
+    pub generation: Code,
+    pub page: Option<Vec<ImplementationGuideDefinitionPage>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideGlobal {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub profile: Canonical,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDefinitionGrouping {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDependsOn {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uri: Canonical,
+    #[serde(rename = "packageId")]
+    pub package_id: Option<Id>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImplementationGuideDefinitionResourceExample {
+    Boolean(Boolean),
+    Canonical(Canonical),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDefinitionResource {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Reference,
+    #[serde(rename = "fhirVersion")]
+    pub fhir_version: Option<Vec<Code>>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(rename = "exampleBoolean")]
+    pub example_boolean: Option<Boolean>,
+    #[serde(rename = "exampleCanonical")]
+    pub example_canonical: Option<Canonical>,
+    #[serde(rename = "groupingId")]
+    pub grouping_id: Option<Id>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ImplementationGuideManifestResourceExample {
+    Boolean(Boolean),
+    Canonical(Canonical),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideManifestResource {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Reference,
+    #[serde(rename = "exampleBoolean")]
+    pub example_boolean: Option<Boolean>,
+    #[serde(rename = "exampleCanonical")]
+    pub example_canonical: Option<Canonical>,
+    #[serde(rename = "relativePath")]
+    pub relative_path: Option<Url>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDefinitionParameter {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImplementationGuideDefinition {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
+    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
+    pub page: Option<ImplementationGuideDefinitionPage>,
+    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
+    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8260,143 +8397,50 @@ pub struct ImplementationGuide {
     pub manifest: Option<ImplementationGuideManifest>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideGlobal {
+pub struct InsurancePlanPlan {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "coverageArea")]
+    pub coverage_area: Option<Vec<Reference>>,
+    pub network: Option<Vec<Reference>>,
+    #[serde(rename = "generalCost")]
+    pub general_cost: Option<Vec<InsurancePlanPlanGeneralCost>>,
+    #[serde(rename = "specificCost")]
+    pub specific_cost: Option<Vec<InsurancePlanPlanSpecificCost>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InsurancePlanCoverageBenefit {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: Code,
-    pub profile: Canonical,
+    pub r#type: CodeableConcept,
+    pub requirement: Option<String>,
+    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImplementationGuideManifestResourceExample {
-    Boolean(Boolean),
-    Canonical(Canonical),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideManifestResource {
+pub struct InsurancePlanPlanGeneralCost {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Reference,
-    #[serde(rename = "exampleBoolean")]
-    pub example_boolean: Option<Boolean>,
-    #[serde(rename = "exampleCanonical")]
-    pub example_canonical: Option<Canonical>,
-    #[serde(rename = "relativePath")]
-    pub relative_path: Option<Url>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "groupSize")]
+    pub group_size: Option<PositiveInt>,
+    pub cost: Option<Money>,
+    pub comment: Option<String>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideManifestPage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub title: Option<String>,
-    pub anchor: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDefinitionGrouping {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImplementationGuideDefinitionPageName {
-    Url(Url),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDefinitionPage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "nameUrl")]
-    pub name_url: Url,
-    #[serde(rename = "nameReference")]
-    pub name_reference: Reference,
-    pub title: String,
-    pub generation: Code,
-    pub page: Option<Vec<ImplementationGuideDefinitionPage>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDefinition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
-    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
-    pub page: Option<ImplementationGuideDefinitionPage>,
-    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
-    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImplementationGuideDefinitionResourceExample {
-    Boolean(Boolean),
-    Canonical(Canonical),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDefinitionResource {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Reference,
-    #[serde(rename = "fhirVersion")]
-    pub fhir_version: Option<Vec<Code>>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    #[serde(rename = "exampleBoolean")]
-    pub example_boolean: Option<Boolean>,
-    #[serde(rename = "exampleCanonical")]
-    pub example_canonical: Option<Canonical>,
-    #[serde(rename = "groupingId")]
-    pub grouping_id: Option<Id>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDependsOn {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uri: Canonical,
-    #[serde(rename = "packageId")]
-    pub package_id: Option<Id>,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ImplementationGuideDefinitionParameter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub value: String,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InsurancePlanPlanSpecificCost {
@@ -8406,6 +8450,41 @@ pub struct InsurancePlanPlanSpecificCost {
     pub modifier_extension: Option<Vec<Extension>>,
     pub category: CodeableConcept,
     pub benefit: Option<Vec<InsurancePlanPlanSpecificCostBenefit>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InsurancePlanPlanSpecificCostBenefitCost {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub applicability: Option<CodeableConcept>,
+    pub qualifiers: Option<Vec<CodeableConcept>>,
+    pub value: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InsurancePlanContact {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub purpose: Option<CodeableConcept>,
+    pub name: Option<HumanName>,
+    pub telecom: Option<Vec<ContactPoint>>,
+    pub address: Option<Address>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InsurancePlanCoverageBenefitLimit {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub value: Option<Quantity>,
+    pub code: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8441,46 +8520,6 @@ pub struct InsurancePlan {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanContact {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub purpose: Option<CodeableConcept>,
-    pub name: Option<HumanName>,
-    pub telecom: Option<Vec<ContactPoint>>,
-    pub address: Option<Address>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanPlan {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "coverageArea")]
-    pub coverage_area: Option<Vec<Reference>>,
-    pub network: Option<Vec<Reference>>,
-    #[serde(rename = "generalCost")]
-    pub general_cost: Option<Vec<InsurancePlanPlanGeneralCost>>,
-    #[serde(rename = "specificCost")]
-    pub specific_cost: Option<Vec<InsurancePlanPlanSpecificCost>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanCoverageBenefitLimit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub value: Option<Quantity>,
-    pub code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct InsurancePlanPlanSpecificCostBenefit {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -8489,45 +8528,6 @@ pub struct InsurancePlanPlanSpecificCostBenefit {
     #[serde(rename = "type")]
     pub r#type: CodeableConcept,
     pub cost: Option<Vec<InsurancePlanPlanSpecificCostBenefitCost>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanPlanSpecificCostBenefitCost {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub applicability: Option<CodeableConcept>,
-    pub qualifiers: Option<Vec<CodeableConcept>>,
-    pub value: Option<Quantity>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanCoverageBenefit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub requirement: Option<String>,
-    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InsurancePlanPlanGeneralCost {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "groupSize")]
-    pub group_size: Option<PositiveInt>,
-    pub cost: Option<Money>,
-    pub comment: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8544,6 +8544,16 @@ pub struct InsurancePlanCoverage {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct InvoiceParticipant {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub role: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InvoiceLineItemPriceComponent {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -8554,6 +8564,28 @@ pub struct InvoiceLineItemPriceComponent {
     pub code: Option<CodeableConcept>,
     pub factor: Option<Decimal>,
     pub amount: Option<Money>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InvoiceLineItemChargeItem {
+    Reference(Reference),
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvoiceLineItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: Option<PositiveInt>,
+    #[serde(rename = "chargeItemReference")]
+    pub charge_item_reference: Reference,
+    #[serde(rename = "chargeItemCodeableConcept")]
+    pub charge_item_codeable_concept: CodeableConcept,
+    #[serde(rename = "priceComponent")]
+    pub price_component: Option<Vec<InvoiceLineItemPriceComponent>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8591,38 +8623,6 @@ pub struct Invoice {
     #[serde(rename = "paymentTerms")]
     pub payment_terms: Option<Markdown>,
     pub note: Option<Vec<Annotation>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum InvoiceLineItemChargeItem {
-    Reference(Reference),
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InvoiceLineItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: Option<PositiveInt>,
-    #[serde(rename = "chargeItemReference")]
-    pub charge_item_reference: Reference,
-    #[serde(rename = "chargeItemCodeableConcept")]
-    pub charge_item_codeable_concept: CodeableConcept,
-    #[serde(rename = "priceComponent")]
-    pub price_component: Option<Vec<InvoiceLineItemPriceComponent>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct InvoiceParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Option<CodeableConcept>,
-    pub actor: Reference,
 }
 
 
@@ -8761,6 +8761,17 @@ pub struct List {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct LocationPosition {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub longitude: Decimal,
+    pub latitude: Decimal,
+    pub altitude: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LocationHoursOfOperation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -8814,17 +8825,6 @@ pub struct Location {
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LocationPosition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub longitude: Decimal,
-    pub latitude: Decimal,
-    pub altitude: Option<Decimal>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeasureGroup {
@@ -8836,6 +8836,29 @@ pub struct MeasureGroup {
     pub description: Option<String>,
     pub population: Option<Vec<MeasureGroupPopulation>>,
     pub stratifier: Option<Vec<MeasureGroupStratifier>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasureSupplementalData {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub usage: Option<Vec<CodeableConcept>>,
+    pub description: Option<String>,
+    pub criteria: Expression,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasureGroupPopulation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub criteria: Expression,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -8927,17 +8950,6 @@ pub struct MeasureGroupStratifierComponent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureGroupPopulation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub description: Option<String>,
-    pub criteria: Expression,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct MeasureGroupStratifier {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -8949,29 +8961,51 @@ pub struct MeasureGroupStratifier {
     pub component: Option<Vec<MeasureGroupStratifierComponent>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureSupplementalData {
+pub struct MeasureReportGroup {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
-    pub usage: Option<Vec<CodeableConcept>>,
-    pub description: Option<String>,
-    pub criteria: Expression,
+    pub population: Option<Vec<MeasureReportGroupPopulation>>,
+    #[serde(rename = "measureScore")]
+    pub measure_score: Option<Quantity>,
+    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroupStratifierStratumPopulation {
+pub struct MeasureReportGroupStratifier {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub count: Option<Integer>,
-    #[serde(rename = "subjectResults")]
-    pub subject_results: Option<Reference>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasureReportGroupStratifierStratum {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub value: Option<CodeableConcept>,
+    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
+    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
+    #[serde(rename = "measureScore")]
+    pub measure_score: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MeasureReportGroupStratifierStratumComponent {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub value: CodeableConcept,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9003,7 +9037,7 @@ pub struct MeasureReport {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroupPopulation {
+pub struct MeasureReportGroupStratifierStratumPopulation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
@@ -9015,49 +9049,15 @@ pub struct MeasureReportGroupPopulation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroup {
+pub struct MeasureReportGroupPopulation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
-    pub population: Option<Vec<MeasureReportGroupPopulation>>,
-    #[serde(rename = "measureScore")]
-    pub measure_score: Option<Quantity>,
-    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroupStratifierStratum {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub value: Option<CodeableConcept>,
-    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
-    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
-    #[serde(rename = "measureScore")]
-    pub measure_score: Option<Quantity>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroupStratifier {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MeasureReportGroupStratifierStratumComponent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub value: CodeableConcept,
+    pub count: Option<Integer>,
+    #[serde(rename = "subjectResults")]
+    pub subject_results: Option<Reference>,
 }
 
 
@@ -9115,6 +9115,28 @@ pub struct Media {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Medication {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub code: Option<CodeableConcept>,
+    pub status: Option<Code>,
+    pub manufacturer: Option<Reference>,
+    pub form: Option<CodeableConcept>,
+    pub amount: Option<Ratio>,
+    pub ingredient: Option<Vec<MedicationIngredient>>,
+    pub batch: Option<MedicationBatch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationIngredientItem {
     CodeableConcept(CodeableConcept),
@@ -9146,28 +9168,6 @@ pub struct MedicationBatch {
     pub lot_number: Option<String>,
     #[serde(rename = "expirationDate")]
     pub expiration_date: Option<DateTime>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Medication {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub code: Option<CodeableConcept>,
-    pub status: Option<Code>,
-    pub manufacturer: Option<Reference>,
-    pub form: Option<CodeableConcept>,
-    pub amount: Option<Ratio>,
-    pub ingredient: Option<Vec<MedicationIngredient>>,
-    pub batch: Option<MedicationBatch>,
 }
 
 
@@ -9266,31 +9266,6 @@ pub struct MedicationAdministration {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationDispenseSubstitution {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "wasSubstituted")]
-    pub was_substituted: Boolean,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub reason: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "responsibleParty")]
-    pub responsible_party: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationDispensePerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationDispenseStatusReason {
     CodeableConcept(CodeableConcept),
@@ -9358,42 +9333,99 @@ pub struct MedicationDispense {
     pub event_history: Option<Vec<Reference>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeRegulatory {
+pub struct MedicationDispensePerformer {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "regulatoryAuthority")]
-    pub regulatory_authority: Reference,
-    pub substitution: Option<Vec<MedicationKnowledgeRegulatorySubstitution>>,
-    pub schedule: Option<Vec<MedicationKnowledgeRegulatorySchedule>>,
-    #[serde(rename = "maxDispense")]
-    pub max_dispense: Option<MedicationKnowledgeRegulatoryMaxDispense>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeCost {
+pub struct MedicationDispenseSubstitution {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "wasSubstituted")]
+    pub was_substituted: Boolean,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub reason: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "responsibleParty")]
+    pub responsible_party: Option<Vec<Reference>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
     pub r#type: CodeableConcept,
-    pub source: Option<String>,
-    pub cost: Money,
+    pub dosage: Option<Vec<Dosage>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeMonograph {
+pub struct MedicationKnowledgeRelatedMedicationKnowledge {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub source: Option<Reference>,
+    pub r#type: CodeableConcept,
+    pub reference: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationKnowledgeIngredientItem {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeIngredient {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemCodeableConcept")]
+    pub item_codeable_concept: CodeableConcept,
+    #[serde(rename = "itemReference")]
+    pub item_reference: Reference,
+    #[serde(rename = "isActive")]
+    pub is_active: Option<Boolean>,
+    pub strength: Option<Ratio>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeKinetics {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "areaUnderCurve")]
+    pub area_under_curve: Option<Vec<Quantity>>,
+    #[serde(rename = "lethalDose50")]
+    pub lethal_dose50: Option<Vec<Quantity>>,
+    #[serde(rename = "halfLifePeriod")]
+    pub half_life_period: Option<Duration>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeRegulatorySubstitution {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub allowed: Boolean,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9443,59 +9475,6 @@ pub struct MedicationKnowledge {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub dosage: Option<Vec<Dosage>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeMonitoringProgram {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeRelatedMedicationKnowledge {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub reference: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic {
-    CodeableConcept(CodeableConcept),
-    Quantity(Quantity),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "characteristicCodeableConcept")]
-    pub characteristic_codeable_concept: CodeableConcept,
-    #[serde(rename = "characteristicQuantity")]
-    pub characteristic_quantity: Quantity,
-    pub value: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationKnowledgeDrugCharacteristicValue {
     CodeableConcept(CodeableConcept),
@@ -9523,25 +9502,37 @@ pub struct MedicationKnowledgeDrugCharacteristic {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationKnowledgeIngredientItem {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeIngredient {
+pub struct MedicationKnowledgeRegulatory {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemCodeableConcept")]
-    pub item_codeable_concept: CodeableConcept,
-    #[serde(rename = "itemReference")]
-    pub item_reference: Reference,
-    #[serde(rename = "isActive")]
-    pub is_active: Option<Boolean>,
-    pub strength: Option<Ratio>,
+    #[serde(rename = "regulatoryAuthority")]
+    pub regulatory_authority: Reference,
+    pub substitution: Option<Vec<MedicationKnowledgeRegulatorySubstitution>>,
+    pub schedule: Option<Vec<MedicationKnowledgeRegulatorySchedule>>,
+    #[serde(rename = "maxDispense")]
+    pub max_dispense: Option<MedicationKnowledgeRegulatoryMaxDispense>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic {
+    CodeableConcept(CodeableConcept),
+    Quantity(Quantity),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "characteristicCodeableConcept")]
+    pub characteristic_codeable_concept: CodeableConcept,
+    #[serde(rename = "characteristicQuantity")]
+    pub characteristic_quantity: Quantity,
+    pub value: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9554,20 +9545,6 @@ pub struct MedicationKnowledgeRegulatorySchedule {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeKinetics {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "areaUnderCurve")]
-    pub area_under_curve: Option<Vec<Quantity>>,
-    #[serde(rename = "lethalDose50")]
-    pub lethal_dose50: Option<Vec<Quantity>>,
-    #[serde(rename = "halfLifePeriod")]
-    pub half_life_period: Option<Duration>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct MedicationKnowledgeRegulatoryMaxDispense {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -9575,6 +9552,29 @@ pub struct MedicationKnowledgeRegulatoryMaxDispense {
     pub modifier_extension: Option<Vec<Extension>>,
     pub quantity: Quantity,
     pub period: Option<Duration>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeMedicineClassification {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub classification: Option<Vec<CodeableConcept>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationKnowledgeCost {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub source: Option<String>,
+    pub cost: Money,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9600,25 +9600,25 @@ pub struct MedicationKnowledgeAdministrationGuidelines {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeRegulatorySubstitution {
+pub struct MedicationKnowledgeMonograph {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub allowed: Boolean,
+    pub r#type: Option<CodeableConcept>,
+    pub source: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationKnowledgeMedicineClassification {
+pub struct MedicationKnowledgeMonitoringProgram {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub classification: Option<Vec<CodeableConcept>>,
+    pub r#type: Option<CodeableConcept>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9727,26 +9727,6 @@ pub struct MedicationRequestDispenseRequestInitialFill {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicationRequestDispenseRequest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "initialFill")]
-    pub initial_fill: Option<MedicationRequestDispenseRequestInitialFill>,
-    #[serde(rename = "dispenseInterval")]
-    pub dispense_interval: Option<Duration>,
-    #[serde(rename = "validityPeriod")]
-    pub validity_period: Option<Period>,
-    #[serde(rename = "numberOfRepeatsAllowed")]
-    pub number_of_repeats_allowed: Option<UnsignedInt>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "expectedSupplyDuration")]
-    pub expected_supply_duration: Option<Duration>,
-    pub performer: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationRequestSubstitutionAllowed {
     Boolean(Boolean),
@@ -9764,6 +9744,26 @@ pub struct MedicationRequestSubstitution {
     #[serde(rename = "allowedCodeableConcept")]
     pub allowed_codeable_concept: CodeableConcept,
     pub reason: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicationRequestDispenseRequest {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "initialFill")]
+    pub initial_fill: Option<MedicationRequestDispenseRequestInitialFill>,
+    #[serde(rename = "dispenseInterval")]
+    pub dispense_interval: Option<Duration>,
+    #[serde(rename = "validityPeriod")]
+    pub validity_period: Option<Period>,
+    #[serde(rename = "numberOfRepeatsAllowed")]
+    pub number_of_repeats_allowed: Option<UnsignedInt>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "expectedSupplyDuration")]
+    pub expected_supply_duration: Option<Duration>,
+    pub performer: Option<Reference>,
 }
 
 
@@ -9828,21 +9828,17 @@ pub struct MedicationStatement {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductManufacturingBusinessOperation {
+pub struct MedicinalProductName {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "operationType")]
-    pub operation_type: Option<CodeableConcept>,
-    #[serde(rename = "authorisationReferenceNumber")]
-    pub authorisation_reference_number: Option<Identifier>,
-    #[serde(rename = "effectiveDate")]
-    pub effective_date: Option<DateTime>,
-    #[serde(rename = "confidentialityIndicator")]
-    pub confidentiality_indicator: Option<CodeableConcept>,
-    pub manufacturer: Option<Vec<Reference>>,
-    pub regulator: Option<Reference>,
+    #[serde(rename = "productName")]
+    pub product_name: String,
+    #[serde(rename = "namePart")]
+    pub name_part: Option<Vec<MedicinalProductNameNamePart>>,
+    #[serde(rename = "countryLanguage")]
+    pub country_language: Option<Vec<MedicinalProductNameCountryLanguage>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9907,6 +9903,35 @@ pub struct MedicinalProductNameCountryLanguage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductNameNamePart {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub part: String,
+    #[serde(rename = "type")]
+    pub r#type: Coding,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductManufacturingBusinessOperation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "operationType")]
+    pub operation_type: Option<CodeableConcept>,
+    #[serde(rename = "authorisationReferenceNumber")]
+    pub authorisation_reference_number: Option<Identifier>,
+    #[serde(rename = "effectiveDate")]
+    pub effective_date: Option<DateTime>,
+    #[serde(rename = "confidentialityIndicator")]
+    pub confidentiality_indicator: Option<CodeableConcept>,
+    pub manufacturer: Option<Vec<Reference>>,
+    pub regulator: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicinalProductSpecialDesignationIndication {
     CodeableConcept(CodeableConcept),
@@ -9931,31 +9956,6 @@ pub struct MedicinalProductSpecialDesignation {
     pub status: Option<CodeableConcept>,
     pub date: Option<DateTime>,
     pub species: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductName {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "productName")]
-    pub product_name: String,
-    #[serde(rename = "namePart")]
-    pub name_part: Option<Vec<MedicinalProductNameNamePart>>,
-    #[serde(rename = "countryLanguage")]
-    pub country_language: Option<Vec<MedicinalProductNameCountryLanguage>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductNameNamePart {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub part: String,
-    #[serde(rename = "type")]
-    pub r#type: Coding,
 }
 
 
@@ -10083,27 +10083,6 @@ pub struct MedicinalProductContraindicationOtherTherapy {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductIndicationOtherTherapyMedication {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductIndicationOtherTherapy {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "therapyRelationshipType")]
-    pub therapy_relationship_type: CodeableConcept,
-    #[serde(rename = "medicationCodeableConcept")]
-    pub medication_codeable_concept: CodeableConcept,
-    #[serde(rename = "medicationReference")]
-    pub medication_reference: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct MedicinalProductIndication {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -10131,17 +10110,45 @@ pub struct MedicinalProductIndication {
     pub population: Option<Vec<Population>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductIndicationOtherTherapyMedication {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductIngredientSpecifiedSubstance {
+pub struct MedicinalProductIndicationOtherTherapy {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub group: CodeableConcept,
-    pub confidentiality: Option<CodeableConcept>,
-    pub strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrength>>,
+    #[serde(rename = "therapyRelationshipType")]
+    pub therapy_relationship_type: CodeableConcept,
+    #[serde(rename = "medicationCodeableConcept")]
+    pub medication_codeable_concept: CodeableConcept,
+    #[serde(rename = "medicationReference")]
+    pub medication_reference: Reference,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub presentation: Ratio,
+    #[serde(rename = "presentationLowLimit")]
+    pub presentation_low_limit: Option<Ratio>,
+    pub concentration: Option<Ratio>,
+    #[serde(rename = "concentrationLowLimit")]
+    pub concentration_low_limit: Option<Ratio>,
+    #[serde(rename = "measurementPoint")]
+    pub measurement_point: Option<String>,
+    pub country: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "referenceStrength")]
+    pub reference_strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10167,6 +10174,18 @@ pub struct MedicinalProductIngredient {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductIngredientSpecifiedSubstance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub group: CodeableConcept,
+    pub confidentiality: Option<CodeableConcept>,
+    pub strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrength>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -10179,25 +10198,6 @@ pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength
     #[serde(rename = "measurementPoint")]
     pub measurement_point: Option<String>,
     pub country: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub presentation: Ratio,
-    #[serde(rename = "presentationLowLimit")]
-    pub presentation_low_limit: Option<Ratio>,
-    pub concentration: Option<Ratio>,
-    #[serde(rename = "concentrationLowLimit")]
-    pub concentration_low_limit: Option<Ratio>,
-    #[serde(rename = "measurementPoint")]
-    pub measurement_point: Option<String>,
-    pub country: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "referenceStrength")]
-    pub reference_strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10348,6 +10348,37 @@ pub struct MedicinalProductPackagedPackageItem {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    #[serde(rename = "firstDose")]
+    pub first_dose: Option<Quantity>,
+    #[serde(rename = "maxSingleDose")]
+    pub max_single_dose: Option<Quantity>,
+    #[serde(rename = "maxDosePerDay")]
+    pub max_dose_per_day: Option<Quantity>,
+    #[serde(rename = "maxDosePerTreatmentPeriod")]
+    pub max_dose_per_treatment_period: Option<Ratio>,
+    #[serde(rename = "maxTreatmentPeriod")]
+    pub max_treatment_period: Option<Duration>,
+    #[serde(rename = "targetSpecies")]
+    pub target_species: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MedicinalProductPharmaceuticalCharacteristics {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub status: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MedicinalProductPharmaceutical {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -10372,13 +10403,14 @@ pub struct MedicinalProductPharmaceutical {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductPharmaceuticalCharacteristics {
+pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
-    pub status: Option<CodeableConcept>,
+    #[serde(rename = "withdrawalPeriod")]
+    pub withdrawal_period: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10391,38 +10423,6 @@ pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithd
     pub value: Quantity,
     #[serde(rename = "supportingInformation")]
     pub supporting_information: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(rename = "firstDose")]
-    pub first_dose: Option<Quantity>,
-    #[serde(rename = "maxSingleDose")]
-    pub max_single_dose: Option<Quantity>,
-    #[serde(rename = "maxDosePerDay")]
-    pub max_dose_per_day: Option<Quantity>,
-    #[serde(rename = "maxDosePerTreatmentPeriod")]
-    pub max_dose_per_treatment_period: Option<Ratio>,
-    #[serde(rename = "maxTreatmentPeriod")]
-    pub max_treatment_period: Option<Duration>,
-    #[serde(rename = "targetSpecies")]
-    pub target_species: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(rename = "withdrawalPeriod")]
-    pub withdrawal_period: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>>,
 }
 
 
@@ -10456,6 +10456,18 @@ pub struct MessageDefinitionAllowedResponse {
     pub modifier_extension: Option<Vec<Extension>>,
     pub message: Canonical,
     pub situation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MessageDefinitionFocus {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub profile: Option<Canonical>,
+    pub min: UnsignedInt,
+    pub max: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10509,29 +10521,16 @@ pub struct MessageDefinition {
     pub graph: Option<Vec<Canonical>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MessageDefinitionFocus {
+pub struct MessageHeaderResponse {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Id,
     pub code: Code,
-    pub profile: Option<Canonical>,
-    pub min: UnsignedInt,
-    pub max: Option<String>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MessageHeaderDestination {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<String>,
-    pub target: Option<Reference>,
-    pub endpoint: Url,
-    pub receiver: Option<Reference>,
+    pub details: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10545,6 +10544,18 @@ pub struct MessageHeaderSource {
     pub version: Option<String>,
     pub contact: Option<ContactPoint>,
     pub endpoint: Url,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MessageHeaderDestination {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Option<String>,
+    pub target: Option<Reference>,
+    pub endpoint: Url,
+    pub receiver: Option<Reference>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10582,76 +10593,6 @@ pub struct MessageHeader {
     pub definition: Option<Canonical>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MessageHeaderResponse {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Id,
-    pub code: Code,
-    pub details: Option<Reference>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MolecularSequenceReferenceSeq {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub chromosome: Option<CodeableConcept>,
-    #[serde(rename = "genomeBuild")]
-    pub genome_build: Option<String>,
-    pub orientation: Option<Code>,
-    #[serde(rename = "referenceSeqId")]
-    pub reference_seq_id: Option<CodeableConcept>,
-    #[serde(rename = "referenceSeqPointer")]
-    pub reference_seq_pointer: Option<Reference>,
-    #[serde(rename = "referenceSeqString")]
-    pub reference_seq_string: Option<String>,
-    pub strand: Option<Code>,
-    #[serde(rename = "windowStart")]
-    pub window_start: Option<Integer>,
-    #[serde(rename = "windowEnd")]
-    pub window_end: Option<Integer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MolecularSequenceVariant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub start: Option<Integer>,
-    pub end: Option<Integer>,
-    #[serde(rename = "observedAllele")]
-    pub observed_allele: Option<String>,
-    #[serde(rename = "referenceAllele")]
-    pub reference_allele: Option<String>,
-    pub cigar: Option<String>,
-    #[serde(rename = "variantPointer")]
-    pub variant_pointer: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MolecularSequenceQualityRoc {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub score: Option<Vec<Integer>>,
-    #[serde(rename = "numTP")]
-    pub num_t_p: Option<Vec<Integer>>,
-    #[serde(rename = "numFP")]
-    pub num_f_p: Option<Vec<Integer>>,
-    #[serde(rename = "numFN")]
-    pub num_f_n: Option<Vec<Integer>>,
-    pub precision: Option<Vec<Decimal>>,
-    pub sensitivity: Option<Vec<Decimal>>,
-    #[serde(rename = "fMeasure")]
-    pub f_measure: Option<Vec<Decimal>>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MolecularSequenceRepository {
@@ -10669,42 +10610,6 @@ pub struct MolecularSequenceRepository {
     pub variantset_id: Option<String>,
     #[serde(rename = "readsetId")]
     pub readset_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MolecularSequence {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<Code>,
-    #[serde(rename = "coordinateSystem")]
-    pub coordinate_system: Integer,
-    pub patient: Option<Reference>,
-    pub specimen: Option<Reference>,
-    pub device: Option<Reference>,
-    pub performer: Option<Reference>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "referenceSeq")]
-    pub reference_seq: Option<MolecularSequenceReferenceSeq>,
-    pub variant: Option<Vec<MolecularSequenceVariant>>,
-    #[serde(rename = "observedSeq")]
-    pub observed_seq: Option<String>,
-    pub quality: Option<Vec<MolecularSequenceQuality>>,
-    #[serde(rename = "readCoverage")]
-    pub read_coverage: Option<Integer>,
-    pub repository: Option<Vec<MolecularSequenceRepository>>,
-    pub pointer: Option<Vec<Reference>>,
-    #[serde(rename = "structureVariant")]
-    pub structure_variant: Option<Vec<MolecularSequenceStructureVariant>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10749,6 +10654,59 @@ pub struct MolecularSequenceStructureVariantOuter {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MolecularSequence {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<Code>,
+    #[serde(rename = "coordinateSystem")]
+    pub coordinate_system: Integer,
+    pub patient: Option<Reference>,
+    pub specimen: Option<Reference>,
+    pub device: Option<Reference>,
+    pub performer: Option<Reference>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "referenceSeq")]
+    pub reference_seq: Option<MolecularSequenceReferenceSeq>,
+    pub variant: Option<Vec<MolecularSequenceVariant>>,
+    #[serde(rename = "observedSeq")]
+    pub observed_seq: Option<String>,
+    pub quality: Option<Vec<MolecularSequenceQuality>>,
+    #[serde(rename = "readCoverage")]
+    pub read_coverage: Option<Integer>,
+    pub repository: Option<Vec<MolecularSequenceRepository>>,
+    pub pointer: Option<Vec<Reference>>,
+    #[serde(rename = "structureVariant")]
+    pub structure_variant: Option<Vec<MolecularSequenceStructureVariant>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MolecularSequenceVariant {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub start: Option<Integer>,
+    pub end: Option<Integer>,
+    #[serde(rename = "observedAllele")]
+    pub observed_allele: Option<String>,
+    #[serde(rename = "referenceAllele")]
+    pub reference_allele: Option<String>,
+    pub cigar: Option<String>,
+    #[serde(rename = "variantPointer")]
+    pub variant_pointer: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MolecularSequenceStructureVariant {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -10763,6 +10721,48 @@ pub struct MolecularSequenceStructureVariant {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct MolecularSequenceReferenceSeq {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub chromosome: Option<CodeableConcept>,
+    #[serde(rename = "genomeBuild")]
+    pub genome_build: Option<String>,
+    pub orientation: Option<Code>,
+    #[serde(rename = "referenceSeqId")]
+    pub reference_seq_id: Option<CodeableConcept>,
+    #[serde(rename = "referenceSeqPointer")]
+    pub reference_seq_pointer: Option<Reference>,
+    #[serde(rename = "referenceSeqString")]
+    pub reference_seq_string: Option<String>,
+    pub strand: Option<Code>,
+    #[serde(rename = "windowStart")]
+    pub window_start: Option<Integer>,
+    #[serde(rename = "windowEnd")]
+    pub window_end: Option<Integer>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MolecularSequenceQualityRoc {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub score: Option<Vec<Integer>>,
+    #[serde(rename = "numTP")]
+    pub num_t_p: Option<Vec<Integer>>,
+    #[serde(rename = "numFP")]
+    pub num_f_p: Option<Vec<Integer>>,
+    #[serde(rename = "numFN")]
+    pub num_f_n: Option<Vec<Integer>>,
+    pub precision: Option<Vec<Decimal>>,
+    pub sensitivity: Option<Vec<Decimal>>,
+    #[serde(rename = "fMeasure")]
+    pub f_measure: Option<Vec<Decimal>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MolecularSequenceStructureVariantInner {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -10772,6 +10772,20 @@ pub struct MolecularSequenceStructureVariantInner {
     pub end: Option<Integer>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NamingSystemUniqueId {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub value: String,
+    pub preferred: Option<Boolean>,
+    pub comment: Option<String>,
+    pub period: Option<Period>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NamingSystem {
@@ -10803,20 +10817,21 @@ pub struct NamingSystem {
     pub unique_id: Option<Vec<NamingSystemUniqueId>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NamingSystemUniqueId {
+pub struct NutritionOrderSupplement {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(rename = "type")]
-    pub r#type: Code,
-    pub value: String,
-    pub preferred: Option<Boolean>,
-    pub comment: Option<String>,
-    pub period: Option<Period>,
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "productName")]
+    pub product_name: Option<String>,
+    pub schedule: Option<Vec<Timing>>,
+    pub quantity: Option<Quantity>,
+    pub instruction: Option<String>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NutritionOrderOralDiet {
@@ -10835,38 +10850,35 @@ pub struct NutritionOrderOralDiet {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NutritionOrderEnteralFormula {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "baseFormulaType")]
-    pub base_formula_type: Option<CodeableConcept>,
-    #[serde(rename = "baseFormulaProductName")]
-    pub base_formula_product_name: Option<String>,
-    #[serde(rename = "additiveType")]
-    pub additive_type: Option<CodeableConcept>,
-    #[serde(rename = "additiveProductName")]
-    pub additive_product_name: Option<String>,
-    #[serde(rename = "caloricDensity")]
-    pub caloric_density: Option<Quantity>,
-    #[serde(rename = "routeofAdministration")]
-    pub routeof_administration: Option<CodeableConcept>,
-    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
-    #[serde(rename = "maxVolumeToDeliver")]
-    pub max_volume_to_deliver: Option<Quantity>,
-    #[serde(rename = "administrationInstruction")]
-    pub administration_instruction: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NutritionOrderOralDietNutrient {
+pub struct NutritionOrderOralDietTexture {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub modifier: Option<CodeableConcept>,
-    pub amount: Option<Quantity>,
+    #[serde(rename = "foodType")]
+    pub food_type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NutritionOrderEnteralFormulaAdministrationRate {
+    Quantity(Quantity),
+    Ratio(Ratio),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NutritionOrderEnteralFormulaAdministration {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub schedule: Option<Timing>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "rateQuantity")]
+    pub rate_quantity: Option<Quantity>,
+    #[serde(rename = "rateRatio")]
+    pub rate_ratio: Option<Ratio>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -10909,52 +10921,92 @@ pub struct NutritionOrder {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NutritionOrderOralDietTexture {
+pub struct NutritionOrderEnteralFormula {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "baseFormulaType")]
+    pub base_formula_type: Option<CodeableConcept>,
+    #[serde(rename = "baseFormulaProductName")]
+    pub base_formula_product_name: Option<String>,
+    #[serde(rename = "additiveType")]
+    pub additive_type: Option<CodeableConcept>,
+    #[serde(rename = "additiveProductName")]
+    pub additive_product_name: Option<String>,
+    #[serde(rename = "caloricDensity")]
+    pub caloric_density: Option<Quantity>,
+    #[serde(rename = "routeofAdministration")]
+    pub routeof_administration: Option<CodeableConcept>,
+    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
+    #[serde(rename = "maxVolumeToDeliver")]
+    pub max_volume_to_deliver: Option<Quantity>,
+    #[serde(rename = "administrationInstruction")]
+    pub administration_instruction: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NutritionOrderOralDietNutrient {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub modifier: Option<CodeableConcept>,
-    #[serde(rename = "foodType")]
-    pub food_type: Option<CodeableConcept>,
+    pub amount: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct NutritionOrderSupplement {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "productName")]
-    pub product_name: Option<String>,
-    pub schedule: Option<Vec<Timing>>,
-    pub quantity: Option<Quantity>,
-    pub instruction: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum NutritionOrderEnteralFormulaAdministrationRate {
+pub enum ObservationComponentValue {
     Quantity(Quantity),
+    CodeableConcept(CodeableConcept),
+    String(String),
+    Boolean(Boolean),
+    Integer(Integer),
+    Range(Range),
     Ratio(Ratio),
+    SampledData(SampledData),
+    Time(Time),
+    DateTime(DateTime),
+    Period(Period),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct NutritionOrderEnteralFormulaAdministration {
+pub struct ObservationComponent {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub schedule: Option<Timing>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "rateQuantity")]
-    pub rate_quantity: Option<Quantity>,
-    #[serde(rename = "rateRatio")]
-    pub rate_ratio: Option<Ratio>,
+    pub code: CodeableConcept,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Option<Quantity>,
+    #[serde(rename = "valueCodeableConcept")]
+    pub value_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "valueString")]
+    pub value_string: Option<String>,
+    #[serde(rename = "valueBoolean")]
+    pub value_boolean: Option<Boolean>,
+    #[serde(rename = "valueInteger")]
+    pub value_integer: Option<Integer>,
+    #[serde(rename = "valueRange")]
+    pub value_range: Option<Range>,
+    #[serde(rename = "valueRatio")]
+    pub value_ratio: Option<Ratio>,
+    #[serde(rename = "valueSampledData")]
+    pub value_sampled_data: Option<SampledData>,
+    #[serde(rename = "valueTime")]
+    pub value_time: Option<Time>,
+    #[serde(rename = "valueDateTime")]
+    pub value_date_time: Option<DateTime>,
+    #[serde(rename = "valuePeriod")]
+    pub value_period: Option<Period>,
+    #[serde(rename = "dataAbsentReason")]
+    pub data_absent_reason: Option<CodeableConcept>,
+    pub interpretation: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "referenceRange")]
+    pub reference_range: Option<Vec<ObservationReferenceRange>>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -11055,58 +11107,6 @@ pub struct Observation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ObservationComponentValue {
-    Quantity(Quantity),
-    CodeableConcept(CodeableConcept),
-    String(String),
-    Boolean(Boolean),
-    Integer(Integer),
-    Range(Range),
-    Ratio(Ratio),
-    SampledData(SampledData),
-    Time(Time),
-    DateTime(DateTime),
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ObservationComponent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Option<Quantity>,
-    #[serde(rename = "valueCodeableConcept")]
-    pub value_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "valueString")]
-    pub value_string: Option<String>,
-    #[serde(rename = "valueBoolean")]
-    pub value_boolean: Option<Boolean>,
-    #[serde(rename = "valueInteger")]
-    pub value_integer: Option<Integer>,
-    #[serde(rename = "valueRange")]
-    pub value_range: Option<Range>,
-    #[serde(rename = "valueRatio")]
-    pub value_ratio: Option<Ratio>,
-    #[serde(rename = "valueSampledData")]
-    pub value_sampled_data: Option<SampledData>,
-    #[serde(rename = "valueTime")]
-    pub value_time: Option<Time>,
-    #[serde(rename = "valueDateTime")]
-    pub value_date_time: Option<DateTime>,
-    #[serde(rename = "valuePeriod")]
-    pub value_period: Option<Period>,
-    #[serde(rename = "dataAbsentReason")]
-    pub data_absent_reason: Option<CodeableConcept>,
-    pub interpretation: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "referenceRange")]
-    pub reference_range: Option<Vec<ObservationReferenceRange>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ObservationReferenceRange {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -11122,6 +11122,24 @@ pub struct ObservationReferenceRange {
     pub text: Option<String>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ObservationDefinitionQualifiedInterval {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: Option<Code>,
+    pub range: Option<Range>,
+    pub context: Option<CodeableConcept>,
+    #[serde(rename = "appliesTo")]
+    pub applies_to: Option<Vec<CodeableConcept>>,
+    pub gender: Option<Code>,
+    pub age: Option<Range>,
+    #[serde(rename = "gestationalAge")]
+    pub gestational_age: Option<Range>,
+    pub condition: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObservationDefinitionQuantitativeDetails {
@@ -11174,46 +11192,6 @@ pub struct ObservationDefinition {
     pub critical_coded_value_set: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ObservationDefinitionQualifiedInterval {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: Option<Code>,
-    pub range: Option<Range>,
-    pub context: Option<CodeableConcept>,
-    #[serde(rename = "appliesTo")]
-    pub applies_to: Option<Vec<CodeableConcept>>,
-    pub gender: Option<Code>,
-    pub age: Option<Range>,
-    #[serde(rename = "gestationalAge")]
-    pub gestational_age: Option<Range>,
-    pub condition: Option<String>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OperationDefinitionParameterReferencedFrom {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub source: String,
-    #[serde(rename = "sourceId")]
-    pub source_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OperationDefinitionParameterBinding {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    #[serde(rename = "valueSet")]
-    pub value_set: Canonical,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperationDefinitionParameter {
@@ -11240,14 +11218,14 @@ pub struct OperationDefinitionParameter {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OperationDefinitionOverload {
+pub struct OperationDefinitionParameterBinding {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "parameterName")]
-    pub parameter_name: Option<Vec<String>>,
-    pub comment: Option<String>,
+    pub strength: Code,
+    #[serde(rename = "valueSet")]
+    pub value_set: Canonical,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -11293,6 +11271,28 @@ pub struct OperationDefinition {
     pub output_profile: Option<Canonical>,
     pub parameter: Option<Vec<OperationDefinitionParameter>>,
     pub overload: Option<Vec<OperationDefinitionOverload>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OperationDefinitionOverload {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "parameterName")]
+    pub parameter_name: Option<Vec<String>>,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OperationDefinitionParameterReferencedFrom {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub source: String,
+    #[serde(rename = "sourceId")]
+    pub source_id: Option<String>,
 }
 
 
@@ -11796,134 +11796,6 @@ pub struct PersonLink {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionSubject {
-    CodeableConcept(CodeableConcept),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinition {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Option<Uri>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub version: Option<String>,
-    pub name: Option<String>,
-    pub title: Option<String>,
-    pub subtitle: Option<String>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub status: Code,
-    pub experimental: Option<Boolean>,
-    #[serde(rename = "subjectCodeableConcept")]
-    pub subject_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "subjectReference")]
-    pub subject_reference: Option<Reference>,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    #[serde(rename = "useContext")]
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub purpose: Option<Markdown>,
-    pub usage: Option<String>,
-    pub copyright: Option<Markdown>,
-    #[serde(rename = "approvalDate")]
-    pub approval_date: Option<Date>,
-    #[serde(rename = "lastReviewDate")]
-    pub last_review_date: Option<Date>,
-    #[serde(rename = "effectivePeriod")]
-    pub effective_period: Option<Period>,
-    pub topic: Option<Vec<CodeableConcept>>,
-    pub author: Option<Vec<ContactDetail>>,
-    pub editor: Option<Vec<ContactDetail>>,
-    pub reviewer: Option<Vec<ContactDetail>>,
-    pub endorser: Option<Vec<ContactDetail>>,
-    #[serde(rename = "relatedArtifact")]
-    pub related_artifact: Option<Vec<RelatedArtifact>>,
-    pub library: Option<Vec<Canonical>>,
-    pub goal: Option<Vec<PlanDefinitionGoal>>,
-    pub action: Option<Vec<PlanDefinitionAction>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionRelatedActionOffset {
-    Duration(Duration),
-    Range(Range),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinitionActionRelatedAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "actionId")]
-    pub action_id: Id,
-    pub relationship: Code,
-    #[serde(rename = "offsetDuration")]
-    pub offset_duration: Option<Duration>,
-    #[serde(rename = "offsetRange")]
-    pub offset_range: Option<Range>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinitionActionParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub role: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionGoalTargetDetail {
-    Quantity(Quantity),
-    Range(Range),
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinitionGoalTarget {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub measure: Option<CodeableConcept>,
-    #[serde(rename = "detailQuantity")]
-    pub detail_quantity: Option<Quantity>,
-    #[serde(rename = "detailRange")]
-    pub detail_range: Option<Range>,
-    #[serde(rename = "detailCodeableConcept")]
-    pub detail_codeable_concept: Option<CodeableConcept>,
-    pub due: Option<Duration>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinitionActionCondition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub kind: Code,
-    pub expression: Option<Expression>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum PlanDefinitionActionSubject {
     CodeableConcept(CodeableConcept),
     Reference(Reference),
@@ -12010,13 +11882,25 @@ pub struct PlanDefinitionAction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PlanDefinitionActionDynamicValue {
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionRelatedActionOffset {
+    Duration(Duration),
+    Range(Range),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanDefinitionActionRelatedAction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub path: Option<String>,
-    pub expression: Option<Expression>,
+    #[serde(rename = "actionId")]
+    pub action_id: Id,
+    pub relationship: Code,
+    #[serde(rename = "offsetDuration")]
+    pub offset_duration: Option<Duration>,
+    #[serde(rename = "offsetRange")]
+    pub offset_range: Option<Range>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -12034,18 +11918,122 @@ pub struct PlanDefinitionGoal {
     pub target: Option<Vec<PlanDefinitionGoalTarget>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionSubject {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PractitionerQualification {
+pub struct PlanDefinition {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Option<Uri>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub status: Code,
+    pub experimental: Option<Boolean>,
+    #[serde(rename = "subjectCodeableConcept")]
+    pub subject_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "subjectReference")]
+    pub subject_reference: Option<Reference>,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    #[serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<Markdown>,
+    pub usage: Option<String>,
+    pub copyright: Option<Markdown>,
+    #[serde(rename = "approvalDate")]
+    pub approval_date: Option<Date>,
+    #[serde(rename = "lastReviewDate")]
+    pub last_review_date: Option<Date>,
+    #[serde(rename = "effectivePeriod")]
+    pub effective_period: Option<Period>,
+    pub topic: Option<Vec<CodeableConcept>>,
+    pub author: Option<Vec<ContactDetail>>,
+    pub editor: Option<Vec<ContactDetail>>,
+    pub reviewer: Option<Vec<ContactDetail>>,
+    pub endorser: Option<Vec<ContactDetail>>,
+    #[serde(rename = "relatedArtifact")]
+    pub related_artifact: Option<Vec<RelatedArtifact>>,
+    pub library: Option<Vec<Canonical>>,
+    pub goal: Option<Vec<PlanDefinitionGoal>>,
+    pub action: Option<Vec<PlanDefinitionAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanDefinitionActionCondition {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub code: CodeableConcept,
-    pub period: Option<Period>,
-    pub issuer: Option<Reference>,
+    pub kind: Code,
+    pub expression: Option<Expression>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanDefinitionActionParticipant {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub role: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionGoalTargetDetail {
+    Quantity(Quantity),
+    Range(Range),
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanDefinitionGoalTarget {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub measure: Option<CodeableConcept>,
+    #[serde(rename = "detailQuantity")]
+    pub detail_quantity: Option<Quantity>,
+    #[serde(rename = "detailRange")]
+    pub detail_range: Option<Range>,
+    #[serde(rename = "detailCodeableConcept")]
+    pub detail_codeable_concept: Option<CodeableConcept>,
+    pub due: Option<Duration>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanDefinitionActionDynamicValue {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub path: Option<String>,
+    pub expression: Option<Expression>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Practitioner {
@@ -12072,6 +12060,44 @@ pub struct Practitioner {
     pub communication: Option<Vec<CodeableConcept>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PractitionerQualification {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub code: CodeableConcept,
+    pub period: Option<Period>,
+    pub issuer: Option<Reference>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PractitionerRoleAvailableTime {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "daysOfWeek")]
+    pub days_of_week: Option<Vec<Code>>,
+    #[serde(rename = "allDay")]
+    pub all_day: Option<Boolean>,
+    #[serde(rename = "availableStartTime")]
+    pub available_start_time: Option<Time>,
+    #[serde(rename = "availableEndTime")]
+    pub available_end_time: Option<Time>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PractitionerRoleNotAvailable {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: String,
+    pub during: Option<Period>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PractitionerRole {
@@ -12105,32 +12131,18 @@ pub struct PractitionerRole {
     pub endpoint: Option<Vec<Reference>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct PractitionerRoleAvailableTime {
+pub struct ProcedurePerformer {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "daysOfWeek")]
-    pub days_of_week: Option<Vec<Code>>,
-    #[serde(rename = "allDay")]
-    pub all_day: Option<Boolean>,
-    #[serde(rename = "availableStartTime")]
-    pub available_start_time: Option<Time>,
-    #[serde(rename = "availableEndTime")]
-    pub available_end_time: Option<Time>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+    #[serde(rename = "onBehalfOf")]
+    pub on_behalf_of: Option<Reference>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PractitionerRoleNotAvailable {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub during: Option<Period>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProcedureFocalDevice {
@@ -12216,18 +12228,20 @@ pub struct Procedure {
     pub used_code: Option<Vec<CodeableConcept>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ProcedurePerformer {
+pub struct ProvenanceAgent {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub role: Option<Vec<CodeableConcept>>,
+    pub who: Reference,
     #[serde(rename = "onBehalfOf")]
     pub on_behalf_of: Option<Reference>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12264,20 +12278,6 @@ pub struct Provenance {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ProvenanceAgent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub role: Option<Vec<CodeableConcept>>,
-    pub who: Reference,
-    #[serde(rename = "onBehalfOf")]
-    pub on_behalf_of: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ProvenanceEntity {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -12288,6 +12288,39 @@ pub struct ProvenanceEntity {
     pub agent: Option<Vec<ProvenanceAgent>>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionnaireItemAnswerOptionValue {
+    Integer(Integer),
+    Date(Date),
+    Time(Time),
+    String(String),
+    Coding(Coding),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuestionnaireItemAnswerOption {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "valueInteger")]
+    pub value_integer: Integer,
+    #[serde(rename = "valueDate")]
+    pub value_date: Date,
+    #[serde(rename = "valueTime")]
+    pub value_time: Time,
+    #[serde(rename = "valueString")]
+    pub value_string: String,
+    #[serde(rename = "valueCoding")]
+    pub value_coding: Coding,
+    #[serde(rename = "valueReference")]
+    pub value_reference: Reference,
+    #[serde(rename = "initialSelected")]
+    pub initial_selected: Option<Boolean>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12339,48 +12372,6 @@ pub struct QuestionnaireItemInitial {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Questionnaire {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Option<Uri>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub version: Option<String>,
-    pub name: Option<String>,
-    pub title: Option<String>,
-    #[serde(rename = "derivedFrom")]
-    pub derived_from: Option<Vec<Canonical>>,
-    pub status: Code,
-    pub experimental: Option<Boolean>,
-    #[serde(rename = "subjectType")]
-    pub subject_type: Option<Vec<Code>>,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    #[serde(rename = "useContext")]
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub purpose: Option<Markdown>,
-    pub copyright: Option<Markdown>,
-    #[serde(rename = "approvalDate")]
-    pub approval_date: Option<Date>,
-    #[serde(rename = "lastReviewDate")]
-    pub last_review_date: Option<Date>,
-    #[serde(rename = "effectivePeriod")]
-    pub effective_period: Option<Period>,
-    pub code: Option<Vec<Coding>>,
-    pub item: Option<Vec<QuestionnaireItem>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QuestionnaireItemEnableWhenAnswer {
     Boolean(Boolean),
@@ -12426,36 +12417,45 @@ pub struct QuestionnaireItemEnableWhen {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum QuestionnaireItemAnswerOptionValue {
-    Integer(Integer),
-    Date(Date),
-    Time(Time),
-    String(String),
-    Coding(Coding),
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QuestionnaireItemAnswerOption {
+pub struct Questionnaire {
     pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "valueInteger")]
-    pub value_integer: Integer,
-    #[serde(rename = "valueDate")]
-    pub value_date: Date,
-    #[serde(rename = "valueTime")]
-    pub value_time: Time,
-    #[serde(rename = "valueString")]
-    pub value_string: String,
-    #[serde(rename = "valueCoding")]
-    pub value_coding: Coding,
-    #[serde(rename = "valueReference")]
-    pub value_reference: Reference,
-    #[serde(rename = "initialSelected")]
-    pub initial_selected: Option<Boolean>,
+    pub url: Option<Uri>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    #[serde(rename = "derivedFrom")]
+    pub derived_from: Option<Vec<Canonical>>,
+    pub status: Code,
+    pub experimental: Option<Boolean>,
+    #[serde(rename = "subjectType")]
+    pub subject_type: Option<Vec<Code>>,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    #[serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<Markdown>,
+    pub copyright: Option<Markdown>,
+    #[serde(rename = "approvalDate")]
+    pub approval_date: Option<Date>,
+    #[serde(rename = "lastReviewDate")]
+    pub last_review_date: Option<Date>,
+    #[serde(rename = "effectivePeriod")]
+    pub effective_period: Option<Period>,
+    pub code: Option<Vec<Coding>>,
+    pub item: Option<Vec<QuestionnaireItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -12490,6 +12490,47 @@ pub struct QuestionnaireItem {
     pub item: Option<Vec<QuestionnaireItem>>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuestionnaireResponseItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "linkId")]
+    pub link_id: String,
+    pub definition: Option<Uri>,
+    pub text: Option<String>,
+    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
+    pub item: Option<Vec<QuestionnaireResponseItem>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QuestionnaireResponse {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "basedOn")]
+    pub based_on: Option<Vec<Reference>>,
+    #[serde(rename = "partOf")]
+    pub part_of: Option<Vec<Reference>>,
+    pub questionnaire: Option<Canonical>,
+    pub status: Code,
+    pub subject: Option<Reference>,
+    pub encounter: Option<Reference>,
+    pub authored: Option<DateTime>,
+    pub author: Option<Reference>,
+    pub source: Option<Reference>,
+    pub item: Option<Vec<QuestionnaireResponseItem>>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12538,47 +12579,6 @@ pub struct QuestionnaireResponseItemAnswer {
     pub value_quantity: Option<Quantity>,
     #[serde(rename = "valueReference")]
     pub value_reference: Option<Reference>,
-    pub item: Option<Vec<QuestionnaireResponseItem>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QuestionnaireResponse {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    #[serde(rename = "basedOn")]
-    pub based_on: Option<Vec<Reference>>,
-    #[serde(rename = "partOf")]
-    pub part_of: Option<Vec<Reference>>,
-    pub questionnaire: Option<Canonical>,
-    pub status: Code,
-    pub subject: Option<Reference>,
-    pub encounter: Option<Reference>,
-    pub authored: Option<DateTime>,
-    pub author: Option<Reference>,
-    pub source: Option<Reference>,
-    pub item: Option<Vec<QuestionnaireResponseItem>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct QuestionnaireResponseItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "linkId")]
-    pub link_id: String,
-    pub definition: Option<Uri>,
-    pub text: Option<String>,
-    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
@@ -12959,6 +12959,18 @@ pub struct ResearchElementDefinitionCharacteristic {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ResearchStudyArm {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ResearchStudy {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -13002,18 +13014,6 @@ pub struct ResearchStudy {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ResearchStudyArm {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct ResearchStudyObjective {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -13049,42 +13049,6 @@ pub struct ResearchSubject {
     pub consent: Option<Reference>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RiskAssessmentPredictionProbability {
-    Decimal(Decimal),
-    Range(Range),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RiskAssessmentPredictionWhen {
-    Period(Period),
-    Range(Range),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RiskAssessmentPrediction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub outcome: Option<CodeableConcept>,
-    #[serde(rename = "probabilityDecimal")]
-    pub probability_decimal: Option<Decimal>,
-    #[serde(rename = "probabilityRange")]
-    pub probability_range: Option<Range>,
-    #[serde(rename = "qualitativeRisk")]
-    pub qualitative_risk: Option<CodeableConcept>,
-    #[serde(rename = "relativeRisk")]
-    pub relative_risk: Option<Decimal>,
-    #[serde(rename = "whenPeriod")]
-    pub when_period: Option<Period>,
-    #[serde(rename = "whenRange")]
-    pub when_range: Option<Range>,
-    pub rationale: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -13130,6 +13094,80 @@ pub struct RiskAssessment {
     pub note: Option<Vec<Annotation>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RiskAssessmentPredictionProbability {
+    Decimal(Decimal),
+    Range(Range),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RiskAssessmentPredictionWhen {
+    Period(Period),
+    Range(Range),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RiskAssessmentPrediction {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub outcome: Option<CodeableConcept>,
+    #[serde(rename = "probabilityDecimal")]
+    pub probability_decimal: Option<Decimal>,
+    #[serde(rename = "probabilityRange")]
+    pub probability_range: Option<Range>,
+    #[serde(rename = "qualitativeRisk")]
+    pub qualitative_risk: Option<CodeableConcept>,
+    #[serde(rename = "relativeRisk")]
+    pub relative_risk: Option<Decimal>,
+    #[serde(rename = "whenPeriod")]
+    pub when_period: Option<Period>,
+    #[serde(rename = "whenRange")]
+    pub when_range: Option<Range>,
+    pub rationale: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub level: Option<Decimal>,
+    pub from: Option<Decimal>,
+    pub to: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub rating: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RiskEvidenceSynthesisSampleSize {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    #[serde(rename = "numberOfStudies")]
+    pub number_of_studies: Option<Integer>,
+    #[serde(rename = "numberOfParticipants")]
+    pub number_of_participants: Option<Integer>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RiskEvidenceSynthesisRiskEstimate {
@@ -13149,18 +13187,6 @@ pub struct RiskEvidenceSynthesisRiskEstimate {
     pub numerator_count: Option<Integer>,
     #[serde(rename = "precisionEstimate")]
     pub precision_estimate: Option<Vec<RiskEvidenceSynthesisRiskEstimatePrecisionEstimate>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RiskEvidenceSynthesisCertainty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub rating: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
-    #[serde(rename = "certaintySubcomponent")]
-    pub certainty_subcomponent: Option<Vec<RiskEvidenceSynthesisCertaintyCertaintySubcomponent>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -13218,41 +13244,15 @@ pub struct RiskEvidenceSynthesis {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
+pub struct RiskEvidenceSynthesisCertainty {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub level: Option<Decimal>,
-    pub from: Option<Decimal>,
-    pub to: Option<Decimal>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
     pub rating: Option<Vec<CodeableConcept>>,
     pub note: Option<Vec<Annotation>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RiskEvidenceSynthesisSampleSize {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    #[serde(rename = "numberOfStudies")]
-    pub number_of_studies: Option<Integer>,
-    #[serde(rename = "numberOfParticipants")]
-    pub number_of_participants: Option<Integer>,
+    #[serde(rename = "certaintySubcomponent")]
+    pub certainty_subcomponent: Option<Vec<RiskEvidenceSynthesisCertaintyCertaintySubcomponent>>,
 }
 
 
@@ -13468,36 +13468,6 @@ pub struct Slot {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Specimen {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(rename = "accessionIdentifier")]
-    pub accession_identifier: Option<Identifier>,
-    pub status: Option<Code>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub subject: Option<Reference>,
-    #[serde(rename = "receivedTime")]
-    pub received_time: Option<DateTime>,
-    pub parent: Option<Vec<Reference>>,
-    pub request: Option<Vec<Reference>>,
-    pub collection: Option<SpecimenCollection>,
-    pub processing: Option<Vec<SpecimenProcessing>>,
-    pub container: Option<Vec<SpecimenContainer>>,
-    pub condition: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SpecimenCollectionCollected {
     DateTime(DateTime),
@@ -13531,6 +13501,36 @@ pub struct SpecimenCollection {
     pub fasting_status_codeable_concept: Option<CodeableConcept>,
     #[serde(rename = "fastingStatusDuration")]
     pub fasting_status_duration: Option<Duration>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Specimen {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "accessionIdentifier")]
+    pub accession_identifier: Option<Identifier>,
+    pub status: Option<Code>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub subject: Option<Reference>,
+    #[serde(rename = "receivedTime")]
+    pub received_time: Option<DateTime>,
+    pub parent: Option<Vec<Reference>>,
+    pub request: Option<Vec<Reference>>,
+    pub collection: Option<SpecimenCollection>,
+    pub processing: Option<Vec<SpecimenProcessing>>,
+    pub container: Option<Vec<SpecimenContainer>>,
+    pub condition: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -13583,6 +13583,30 @@ pub struct SpecimenContainer {
 
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SpecimenDefinition {
+    pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "typeCollected")]
+    pub type_collected: Option<CodeableConcept>,
+    #[serde(rename = "patientPreparation")]
+    pub patient_preparation: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "timeAspect")]
+    pub time_aspect: Option<String>,
+    pub collection: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "typeTested")]
+    pub type_tested: Option<Vec<SpecimenDefinitionTypeTested>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SpecimenDefinitionTypeTested {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -13615,30 +13639,6 @@ pub struct SpecimenDefinitionTypeTestedHandling {
     #[serde(rename = "maxDuration")]
     pub max_duration: Option<Duration>,
     pub instruction: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SpecimenDefinition {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    #[serde(rename = "typeCollected")]
-    pub type_collected: Option<CodeableConcept>,
-    #[serde(rename = "patientPreparation")]
-    pub patient_preparation: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "timeAspect")]
-    pub time_aspect: Option<String>,
-    pub collection: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "typeTested")]
-    pub type_tested: Option<Vec<SpecimenDefinitionTypeTested>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -13689,47 +13689,6 @@ pub struct SpecimenDefinitionTypeTestedContainerAdditive {
 
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct StructureDefinitionMapping {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identity: Id,
-    pub uri: Option<Uri>,
-    pub name: Option<String>,
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureDefinitionSnapshot {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub element: Option<Vec<ElementDefinition>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureDefinitionContext {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub expression: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureDefinitionDifferential {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub element: Option<Vec<ElementDefinition>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct StructureDefinition {
     pub id: Option<std::string::String>,
     pub meta: Option<Meta>,
@@ -13776,6 +13735,47 @@ pub struct StructureDefinition {
     pub differential: Option<StructureDefinitionDifferential>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureDefinitionMapping {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identity: Id,
+    pub uri: Option<Uri>,
+    pub name: Option<String>,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureDefinitionSnapshot {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub element: Option<Vec<ElementDefinition>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureDefinitionContext {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub expression: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureDefinitionDifferential {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub element: Option<Vec<ElementDefinition>>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StructureMap {
@@ -13811,29 +13811,14 @@ pub struct StructureMap {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapGroupInput {
+pub struct StructureMapStructure {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    #[serde(rename = "type")]
-    pub r#type: Option<String>,
+    pub url: Canonical,
     pub mode: Code,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapGroupRule {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    pub source: Option<Vec<StructureMapGroupRuleSource>>,
-    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
-    pub rule: Option<Vec<StructureMapGroupRule>>,
-    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
+    pub alias: Option<String>,
     pub documentation: Option<String>,
 }
 
@@ -13863,6 +13848,77 @@ pub struct StructureMapGroupRuleTargetParameter {
     pub value_integer: Integer,
     #[serde(rename = "valueDecimal")]
     pub value_decimal: Decimal,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureMapGroupInput {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    #[serde(rename = "type")]
+    pub r#type: Option<String>,
+    pub mode: Code,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureMapGroupRuleTarget {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub context: Option<Id>,
+    #[serde(rename = "contextType")]
+    pub context_type: Option<Code>,
+    pub element: Option<String>,
+    pub variable: Option<Id>,
+    #[serde(rename = "listMode")]
+    pub list_mode: Option<Vec<Code>>,
+    #[serde(rename = "listRuleId")]
+    pub list_rule_id: Option<Id>,
+    pub transform: Option<Code>,
+    pub parameter: Option<Vec<StructureMapGroupRuleTargetParameter>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureMapGroupRuleDependent {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    pub variable: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureMapGroupRule {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    pub source: Option<Vec<StructureMapGroupRuleSource>>,
+    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
+    pub rule: Option<Vec<StructureMapGroupRule>>,
+    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StructureMapGroup {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    pub extends: Option<Id>,
+    #[serde(rename = "typeMode")]
+    pub type_mode: Code,
+    pub documentation: Option<String>,
+    pub input: Option<Vec<StructureMapGroupInput>>,
+    pub rule: Option<Vec<StructureMapGroupRule>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14041,62 +14097,19 @@ pub struct StructureMapGroupRuleSource {
     pub log_message: Option<String>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapGroup {
+pub struct SubscriptionChannel {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    pub extends: Option<Id>,
-    #[serde(rename = "typeMode")]
-    pub type_mode: Code,
-    pub documentation: Option<String>,
-    pub input: Option<Vec<StructureMapGroupInput>>,
-    pub rule: Option<Vec<StructureMapGroupRule>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub endpoint: Option<Url>,
+    pub payload: Option<Code>,
+    pub header: Option<Vec<String>>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapStructure {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Canonical,
-    pub mode: Code,
-    pub alias: Option<String>,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapGroupRuleTarget {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub context: Option<Id>,
-    #[serde(rename = "contextType")]
-    pub context_type: Option<Code>,
-    pub element: Option<String>,
-    pub variable: Option<Id>,
-    #[serde(rename = "listMode")]
-    pub list_mode: Option<Vec<Code>>,
-    #[serde(rename = "listRuleId")]
-    pub list_rule_id: Option<Id>,
-    pub transform: Option<Code>,
-    pub parameter: Option<Vec<StructureMapGroupRuleTargetParameter>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StructureMapGroupRuleDependent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    pub variable: Option<Vec<String>>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subscription {
@@ -14117,19 +14130,6 @@ pub struct Subscription {
     pub criteria: String,
     pub error: Option<String>,
     pub channel: SubscriptionChannel,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubscriptionChannel {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub endpoint: Option<Url>,
-    pub payload: Option<Code>,
-    pub header: Option<Vec<String>>,
 }
 
 
@@ -14155,6 +14155,17 @@ pub struct Substance {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceInstance {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub expiry: Option<DateTime>,
+    pub quantity: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubstanceIngredientSubstance {
     CodeableConcept(CodeableConcept),
@@ -14174,42 +14185,6 @@ pub struct SubstanceIngredient {
     pub substance_reference: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceInstance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub expiry: Option<DateTime>,
-    pub quantity: Option<Quantity>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceNucleicAcidSubunitSugar {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub name: Option<String>,
-    #[serde(rename = "residueSite")]
-    pub residue_site: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceNucleicAcidSubunitLinkage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub connectivity: Option<String>,
-    pub identifier: Option<Identifier>,
-    pub name: Option<String>,
-    #[serde(rename = "residueSite")]
-    pub residue_site: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubstanceNucleicAcid {
@@ -14253,35 +14228,31 @@ pub struct SubstanceNucleicAcidSubunit {
     pub sugar: Option<Vec<SubstanceNucleicAcidSubunitSugar>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
+pub struct SubstanceNucleicAcidSubunitSugar {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub representation: Option<String>,
-    pub attachment: Option<Attachment>,
+    pub identifier: Option<Identifier>,
+    pub name: Option<String>,
+    #[serde(rename = "residueSite")]
+    pub residue_site: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstancePolymerRepeatRepeatUnit {
+pub struct SubstanceNucleicAcidSubunitLinkage {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "orientationOfPolymerisation")]
-    pub orientation_of_polymerisation: Option<CodeableConcept>,
-    #[serde(rename = "repeatUnit")]
-    pub repeat_unit: Option<String>,
-    pub amount: Option<SubstanceAmount>,
-    #[serde(rename = "degreeOfPolymerisation")]
-    pub degree_of_polymerisation: Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
-    #[serde(rename = "structuralRepresentation")]
-    pub structural_representation: Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
+    pub connectivity: Option<String>,
+    pub identifier: Option<Identifier>,
+    pub name: Option<String>,
+    #[serde(rename = "residueSite")]
+    pub residue_site: Option<String>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubstancePolymerMonomerSet {
@@ -14357,27 +14328,35 @@ pub struct SubstancePolymer {
     pub repeat: Option<Vec<SubstancePolymerRepeat>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceProtein {
+pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
     pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "sequenceType")]
-    pub sequence_type: Option<CodeableConcept>,
-    #[serde(rename = "numberOfSubunits")]
-    pub number_of_subunits: Option<Integer>,
-    #[serde(rename = "disulfideLinkage")]
-    pub disulfide_linkage: Option<Vec<String>>,
-    pub subunit: Option<Vec<SubstanceProteinSubunit>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub representation: Option<String>,
+    pub attachment: Option<Attachment>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstancePolymerRepeatRepeatUnit {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "orientationOfPolymerisation")]
+    pub orientation_of_polymerisation: Option<CodeableConcept>,
+    #[serde(rename = "repeatUnit")]
+    pub repeat_unit: Option<String>,
+    pub amount: Option<SubstanceAmount>,
+    #[serde(rename = "degreeOfPolymerisation")]
+    pub degree_of_polymerisation: Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
+    #[serde(rename = "structuralRepresentation")]
+    pub structural_representation: Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubstanceProteinSubunit {
@@ -14400,18 +14379,27 @@ pub struct SubstanceProteinSubunit {
     pub c_terminal_modification: Option<String>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceReferenceInformationGeneElement {
+pub struct SubstanceProtein {
     pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub element: Option<Identifier>,
-    pub source: Option<Vec<Reference>>,
+    #[serde(rename = "sequenceType")]
+    pub sequence_type: Option<CodeableConcept>,
+    #[serde(rename = "numberOfSubunits")]
+    pub number_of_subunits: Option<Integer>,
+    #[serde(rename = "disulfideLinkage")]
+    pub disulfide_linkage: Option<Vec<String>>,
+    pub subunit: Option<Vec<SubstanceProteinSubunit>>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubstanceReferenceInformation {
@@ -14431,6 +14419,30 @@ pub struct SubstanceReferenceInformation {
     pub gene_element: Option<Vec<SubstanceReferenceInformationGeneElement>>,
     pub classification: Option<Vec<SubstanceReferenceInformationClassification>>,
     pub target: Option<Vec<SubstanceReferenceInformationTarget>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceReferenceInformationGene {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "geneSequenceOrigin")]
+    pub gene_sequence_origin: Option<CodeableConcept>,
+    pub gene: Option<CodeableConcept>,
+    pub source: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceReferenceInformationGeneElement {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub element: Option<Identifier>,
+    pub source: Option<Vec<Reference>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14477,18 +14489,6 @@ pub struct SubstanceReferenceInformationTarget {
     pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceReferenceInformationGene {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "geneSequenceOrigin")]
-    pub gene_sequence_origin: Option<CodeableConcept>,
-    pub gene: Option<CodeableConcept>,
-    pub source: Option<Vec<Reference>>,
-}
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubstanceSourceMaterialPartDescription {
@@ -14502,15 +14502,45 @@ pub struct SubstanceSourceMaterialPartDescription {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSourceMaterialOrganismAuthor {
+pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "authorType")]
-    pub author_type: Option<CodeableConcept>,
-    #[serde(rename = "authorDescription")]
-    pub author_description: Option<String>,
+    pub kingdom: Option<CodeableConcept>,
+    pub phylum: Option<CodeableConcept>,
+    pub class: Option<CodeableConcept>,
+    pub order: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSourceMaterialOrganism {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub family: Option<CodeableConcept>,
+    pub genus: Option<CodeableConcept>,
+    pub species: Option<CodeableConcept>,
+    #[serde(rename = "intraspecificType")]
+    pub intraspecific_type: Option<CodeableConcept>,
+    #[serde(rename = "intraspecificDescription")]
+    pub intraspecific_description: Option<String>,
+    pub author: Option<Vec<SubstanceSourceMaterialOrganismAuthor>>,
+    pub hybrid: Option<SubstanceSourceMaterialOrganismHybrid>,
+    #[serde(rename = "organismGeneral")]
+    pub organism_general: Option<SubstanceSourceMaterialOrganismOrganismGeneral>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSourceMaterialFractionDescription {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub fraction: Option<String>,
+    #[serde(rename = "materialType")]
+    pub material_type: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14529,29 +14559,6 @@ pub struct SubstanceSourceMaterialOrganismHybrid {
     pub paternal_organism_name: Option<String>,
     #[serde(rename = "hybridType")]
     pub hybrid_type: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub kingdom: Option<CodeableConcept>,
-    pub phylum: Option<CodeableConcept>,
-    pub class: Option<CodeableConcept>,
-    pub order: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSourceMaterialFractionDescription {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub fraction: Option<String>,
-    #[serde(rename = "materialType")]
-    pub material_type: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14594,38 +14601,17 @@ pub struct SubstanceSourceMaterial {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSourceMaterialOrganism {
+pub struct SubstanceSourceMaterialOrganismAuthor {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub family: Option<CodeableConcept>,
-    pub genus: Option<CodeableConcept>,
-    pub species: Option<CodeableConcept>,
-    #[serde(rename = "intraspecificType")]
-    pub intraspecific_type: Option<CodeableConcept>,
-    #[serde(rename = "intraspecificDescription")]
-    pub intraspecific_description: Option<String>,
-    pub author: Option<Vec<SubstanceSourceMaterialOrganismAuthor>>,
-    pub hybrid: Option<SubstanceSourceMaterialOrganismHybrid>,
-    #[serde(rename = "organismGeneral")]
-    pub organism_general: Option<SubstanceSourceMaterialOrganismOrganismGeneral>,
+    #[serde(rename = "authorType")]
+    pub author_type: Option<CodeableConcept>,
+    #[serde(rename = "authorDescription")]
+    pub author_description: Option<String>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationCode {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub status: Option<CodeableConcept>,
-    #[serde(rename = "statusDate")]
-    pub status_date: Option<DateTime>,
-    pub comment: Option<String>,
-    pub source: Option<Vec<Reference>>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14672,69 +14658,6 @@ pub struct SubstanceSpecificationRelationship {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationNameOfficial {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub authority: Option<CodeableConcept>,
-    pub status: Option<CodeableConcept>,
-    pub date: Option<DateTime>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationName {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub status: Option<CodeableConcept>,
-    pub preferred: Option<Boolean>,
-    pub language: Option<Vec<CodeableConcept>>,
-    pub domain: Option<Vec<CodeableConcept>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub synonym: Option<Vec<SubstanceSpecificationName>>,
-    pub translation: Option<Vec<SubstanceSpecificationName>>,
-    pub official: Option<Vec<SubstanceSpecificationNameOfficial>>,
-    pub source: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationStructure {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub stereochemistry: Option<CodeableConcept>,
-    #[serde(rename = "opticalActivity")]
-    pub optical_activity: Option<CodeableConcept>,
-    #[serde(rename = "molecularFormula")]
-    pub molecular_formula: Option<String>,
-    #[serde(rename = "molecularFormulaByMoiety")]
-    pub molecular_formula_by_moiety: Option<String>,
-    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
-    #[serde(rename = "molecularWeight")]
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
-    pub source: Option<Vec<Reference>>,
-    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub method: Option<CodeableConcept>,
-    #[serde(rename = "type")]
-    pub r#type: Option<CodeableConcept>,
-    pub amount: Option<Quantity>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct SubstanceSpecificationStructureRepresentation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -14744,6 +14667,21 @@ pub struct SubstanceSpecificationStructureRepresentation {
     pub r#type: Option<CodeableConcept>,
     pub representation: Option<String>,
     pub attachment: Option<Attachment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationStructureIsotope {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub name: Option<CodeableConcept>,
+    pub substitution: Option<CodeableConcept>,
+    #[serde(rename = "halfLife")]
+    pub half_life: Option<Quantity>,
+    #[serde(rename = "molecularWeight")]
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14771,21 +14709,6 @@ pub struct SubstanceSpecificationMoiety {
     pub amount_quantity: Option<Quantity>,
     #[serde(rename = "amountString")]
     pub amount_string: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SubstanceSpecificationStructureIsotope {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub name: Option<CodeableConcept>,
-    pub substitution: Option<CodeableConcept>,
-    #[serde(rename = "halfLife")]
-    pub half_life: Option<Quantity>,
-    #[serde(rename = "molecularWeight")]
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14859,6 +14782,103 @@ pub struct SubstanceSpecificationProperty {
     pub amount_string: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationStructure {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub stereochemistry: Option<CodeableConcept>,
+    #[serde(rename = "opticalActivity")]
+    pub optical_activity: Option<CodeableConcept>,
+    #[serde(rename = "molecularFormula")]
+    pub molecular_formula: Option<String>,
+    #[serde(rename = "molecularFormulaByMoiety")]
+    pub molecular_formula_by_moiety: Option<String>,
+    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
+    #[serde(rename = "molecularWeight")]
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
+    pub source: Option<Vec<Reference>>,
+    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub method: Option<CodeableConcept>,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub amount: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationName {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
+    pub preferred: Option<Boolean>,
+    pub language: Option<Vec<CodeableConcept>>,
+    pub domain: Option<Vec<CodeableConcept>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub synonym: Option<Vec<SubstanceSpecificationName>>,
+    pub translation: Option<Vec<SubstanceSpecificationName>>,
+    pub official: Option<Vec<SubstanceSpecificationNameOfficial>>,
+    pub source: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationNameOfficial {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub authority: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
+    pub date: Option<DateTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubstanceSpecificationCode {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
+    #[serde(rename = "statusDate")]
+    pub status_date: Option<DateTime>,
+    pub comment: Option<String>,
+    pub source: Option<Vec<Reference>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SupplyDeliverySuppliedItemItem {
+    CodeableConcept(CodeableConcept),
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SupplyDeliverySuppliedItem {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "itemCodeableConcept")]
+    pub item_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "itemReference")]
+    pub item_reference: Option<Reference>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14902,26 +14922,32 @@ pub struct SupplyDelivery {
     pub receiver: Option<Vec<Reference>>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum SupplyDeliverySuppliedItemItem {
+pub enum SupplyRequestParameterValue {
     CodeableConcept(CodeableConcept),
-    Reference(Reference),
+    Quantity(Quantity),
+    Range(Range),
+    Boolean(Boolean),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SupplyDeliverySuppliedItem {
+pub struct SupplyRequestParameter {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "itemCodeableConcept")]
-    pub item_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "itemReference")]
-    pub item_reference: Option<Reference>,
+    pub code: Option<CodeableConcept>,
+    #[serde(rename = "valueCodeableConcept")]
+    pub value_codeable_concept: Option<CodeableConcept>,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Option<Quantity>,
+    #[serde(rename = "valueRange")]
+    pub value_range: Option<Range>,
+    #[serde(rename = "valueBoolean")]
+    pub value_boolean: Option<Boolean>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -14980,32 +15006,66 @@ pub struct SupplyRequest {
     pub deliver_to: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SupplyRequestParameterValue {
-    CodeableConcept(CodeableConcept),
-    Quantity(Quantity),
-    Range(Range),
-    Boolean(Boolean),
-}
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct SupplyRequestParameter {
+pub struct Task {
     pub id: Option<std::string::String>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "instantiatesCanonical")]
+    pub instantiates_canonical: Option<Canonical>,
+    #[serde(rename = "instantiatesUri")]
+    pub instantiates_uri: Option<Uri>,
+    #[serde(rename = "basedOn")]
+    pub based_on: Option<Vec<Reference>>,
+    #[serde(rename = "groupIdentifier")]
+    pub group_identifier: Option<Identifier>,
+    #[serde(rename = "partOf")]
+    pub part_of: Option<Vec<Reference>>,
+    pub status: Code,
+    #[serde(rename = "statusReason")]
+    pub status_reason: Option<CodeableConcept>,
+    #[serde(rename = "businessStatus")]
+    pub business_status: Option<CodeableConcept>,
+    pub intent: Code,
+    pub priority: Option<Code>,
     pub code: Option<CodeableConcept>,
-    #[serde(rename = "valueCodeableConcept")]
-    pub value_codeable_concept: Option<CodeableConcept>,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Option<Quantity>,
-    #[serde(rename = "valueRange")]
-    pub value_range: Option<Range>,
-    #[serde(rename = "valueBoolean")]
-    pub value_boolean: Option<Boolean>,
+    pub description: Option<String>,
+    pub focus: Option<Reference>,
+    #[serde(rename = "for")]
+    pub r#for: Option<Reference>,
+    pub encounter: Option<Reference>,
+    #[serde(rename = "executionPeriod")]
+    pub execution_period: Option<Period>,
+    #[serde(rename = "authoredOn")]
+    pub authored_on: Option<DateTime>,
+    #[serde(rename = "lastModified")]
+    pub last_modified: Option<DateTime>,
+    pub requester: Option<Reference>,
+    #[serde(rename = "performerType")]
+    pub performer_type: Option<Vec<CodeableConcept>>,
+    pub owner: Option<Reference>,
+    pub location: Option<Reference>,
+    #[serde(rename = "reasonCode")]
+    pub reason_code: Option<CodeableConcept>,
+    #[serde(rename = "reasonReference")]
+    pub reason_reference: Option<Reference>,
+    pub insurance: Option<Vec<Reference>>,
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "relevantHistory")]
+    pub relevant_history: Option<Vec<Reference>>,
+    pub restriction: Option<TaskRestriction>,
+    pub input: Option<Vec<TaskInput>>,
+    pub output: Option<Vec<TaskOutput>>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TaskRestriction {
@@ -15016,171 +15076,6 @@ pub struct TaskRestriction {
     pub repetitions: Option<PositiveInt>,
     pub period: Option<Period>,
     pub recipient: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum TaskOutputValue {
-    Base64Binary(Base64Binary),
-    Boolean(Boolean),
-    Canonical(Canonical),
-    Code(Code),
-    Date(Date),
-    DateTime(DateTime),
-    Decimal(Decimal),
-    Id(Id),
-    Instant(Instant),
-    Integer(Integer),
-    Markdown(Markdown),
-    Oid(Oid),
-    PositiveInt(PositiveInt),
-    String(String),
-    Time(Time),
-    UnsignedInt(UnsignedInt),
-    Uri(Uri),
-    Url(Url),
-    Uuid(Uuid),
-    Address(Address),
-    Age(Age),
-    Annotation(Annotation),
-    Attachment(Attachment),
-    CodeableConcept(CodeableConcept),
-    Coding(Coding),
-    ContactPoint(ContactPoint),
-    Count(Count),
-    Distance(Distance),
-    Duration(Duration),
-    HumanName(HumanName),
-    Identifier(Identifier),
-    Money(Money),
-    Period(Period),
-    Quantity(Quantity),
-    Range(Range),
-    Ratio(Ratio),
-    Reference(Reference),
-    SampledData(SampledData),
-    Signature(Signature),
-    Timing(Timing),
-    ContactDetail(ContactDetail),
-    Contributor(Contributor),
-    DataRequirement(DataRequirement),
-    Expression(Expression),
-    ParameterDefinition(ParameterDefinition),
-    RelatedArtifact(RelatedArtifact),
-    TriggerDefinition(TriggerDefinition),
-    UsageContext(UsageContext),
-    Dosage(Dosage),
-    Meta(Meta),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TaskOutput {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "valueBase64Binary")]
-    pub value_base64_binary: Base64Binary,
-    #[serde(rename = "valueBoolean")]
-    pub value_boolean: Boolean,
-    #[serde(rename = "valueCanonical")]
-    pub value_canonical: Canonical,
-    #[serde(rename = "valueCode")]
-    pub value_code: Code,
-    #[serde(rename = "valueDate")]
-    pub value_date: Date,
-    #[serde(rename = "valueDateTime")]
-    pub value_date_time: DateTime,
-    #[serde(rename = "valueDecimal")]
-    pub value_decimal: Decimal,
-    #[serde(rename = "valueId")]
-    pub value_id: Id,
-    #[serde(rename = "valueInstant")]
-    pub value_instant: Instant,
-    #[serde(rename = "valueInteger")]
-    pub value_integer: Integer,
-    #[serde(rename = "valueMarkdown")]
-    pub value_markdown: Markdown,
-    #[serde(rename = "valueOid")]
-    pub value_oid: Oid,
-    #[serde(rename = "valuePositiveInt")]
-    pub value_positive_int: PositiveInt,
-    #[serde(rename = "valueString")]
-    pub value_string: String,
-    #[serde(rename = "valueTime")]
-    pub value_time: Time,
-    #[serde(rename = "valueUnsignedInt")]
-    pub value_unsigned_int: UnsignedInt,
-    #[serde(rename = "valueUri")]
-    pub value_uri: Uri,
-    #[serde(rename = "valueUrl")]
-    pub value_url: Url,
-    #[serde(rename = "valueUuid")]
-    pub value_uuid: Uuid,
-    #[serde(rename = "valueAddress")]
-    pub value_address: Address,
-    #[serde(rename = "valueAge")]
-    pub value_age: Age,
-    #[serde(rename = "valueAnnotation")]
-    pub value_annotation: Annotation,
-    #[serde(rename = "valueAttachment")]
-    pub value_attachment: Attachment,
-    #[serde(rename = "valueCodeableConcept")]
-    pub value_codeable_concept: CodeableConcept,
-    #[serde(rename = "valueCoding")]
-    pub value_coding: Coding,
-    #[serde(rename = "valueContactPoint")]
-    pub value_contact_point: ContactPoint,
-    #[serde(rename = "valueCount")]
-    pub value_count: Count,
-    #[serde(rename = "valueDistance")]
-    pub value_distance: Distance,
-    #[serde(rename = "valueDuration")]
-    pub value_duration: Duration,
-    #[serde(rename = "valueHumanName")]
-    pub value_human_name: HumanName,
-    #[serde(rename = "valueIdentifier")]
-    pub value_identifier: Identifier,
-    #[serde(rename = "valueMoney")]
-    pub value_money: Money,
-    #[serde(rename = "valuePeriod")]
-    pub value_period: Period,
-    #[serde(rename = "valueQuantity")]
-    pub value_quantity: Quantity,
-    #[serde(rename = "valueRange")]
-    pub value_range: Range,
-    #[serde(rename = "valueRatio")]
-    pub value_ratio: Ratio,
-    #[serde(rename = "valueReference")]
-    pub value_reference: Reference,
-    #[serde(rename = "valueSampledData")]
-    pub value_sampled_data: SampledData,
-    #[serde(rename = "valueSignature")]
-    pub value_signature: Signature,
-    #[serde(rename = "valueTiming")]
-    pub value_timing: Timing,
-    #[serde(rename = "valueContactDetail")]
-    pub value_contact_detail: ContactDetail,
-    #[serde(rename = "valueContributor")]
-    pub value_contributor: Contributor,
-    #[serde(rename = "valueDataRequirement")]
-    pub value_data_requirement: DataRequirement,
-    #[serde(rename = "valueExpression")]
-    pub value_expression: Expression,
-    #[serde(rename = "valueParameterDefinition")]
-    pub value_parameter_definition: ParameterDefinition,
-    #[serde(rename = "valueRelatedArtifact")]
-    pub value_related_artifact: RelatedArtifact,
-    #[serde(rename = "valueTriggerDefinition")]
-    pub value_trigger_definition: TriggerDefinition,
-    #[serde(rename = "valueUsageContext")]
-    pub value_usage_context: UsageContext,
-    #[serde(rename = "valueDosage")]
-    pub value_dosage: Dosage,
-    #[serde(rename = "valueMeta")]
-    pub value_meta: Meta,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15349,65 +15244,248 @@ pub struct TaskInput {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Task {
+#[serde(rename_all = "camelCase")]
+pub enum TaskOutputValue {
+    Base64Binary(Base64Binary),
+    Boolean(Boolean),
+    Canonical(Canonical),
+    Code(Code),
+    Date(Date),
+    DateTime(DateTime),
+    Decimal(Decimal),
+    Id(Id),
+    Instant(Instant),
+    Integer(Integer),
+    Markdown(Markdown),
+    Oid(Oid),
+    PositiveInt(PositiveInt),
+    String(String),
+    Time(Time),
+    UnsignedInt(UnsignedInt),
+    Uri(Uri),
+    Url(Url),
+    Uuid(Uuid),
+    Address(Address),
+    Age(Age),
+    Annotation(Annotation),
+    Attachment(Attachment),
+    CodeableConcept(CodeableConcept),
+    Coding(Coding),
+    ContactPoint(ContactPoint),
+    Count(Count),
+    Distance(Distance),
+    Duration(Duration),
+    HumanName(HumanName),
+    Identifier(Identifier),
+    Money(Money),
+    Period(Period),
+    Quantity(Quantity),
+    Range(Range),
+    Ratio(Ratio),
+    Reference(Reference),
+    SampledData(SampledData),
+    Signature(Signature),
+    Timing(Timing),
+    ContactDetail(ContactDetail),
+    Contributor(Contributor),
+    DataRequirement(DataRequirement),
+    Expression(Expression),
+    ParameterDefinition(ParameterDefinition),
+    RelatedArtifact(RelatedArtifact),
+    TriggerDefinition(TriggerDefinition),
+    UsageContext(UsageContext),
+    Dosage(Dosage),
+    Meta(Meta),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskOutput {
     pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(rename = "instantiatesCanonical")]
-    pub instantiates_canonical: Option<Canonical>,
-    #[serde(rename = "instantiatesUri")]
-    pub instantiates_uri: Option<Uri>,
-    #[serde(rename = "basedOn")]
-    pub based_on: Option<Vec<Reference>>,
-    #[serde(rename = "groupIdentifier")]
-    pub group_identifier: Option<Identifier>,
-    #[serde(rename = "partOf")]
-    pub part_of: Option<Vec<Reference>>,
-    pub status: Code,
-    #[serde(rename = "statusReason")]
-    pub status_reason: Option<CodeableConcept>,
-    #[serde(rename = "businessStatus")]
-    pub business_status: Option<CodeableConcept>,
-    pub intent: Code,
-    pub priority: Option<Code>,
-    pub code: Option<CodeableConcept>,
-    pub description: Option<String>,
-    pub focus: Option<Reference>,
-    #[serde(rename = "for")]
-    pub r#for: Option<Reference>,
-    pub encounter: Option<Reference>,
-    #[serde(rename = "executionPeriod")]
-    pub execution_period: Option<Period>,
-    #[serde(rename = "authoredOn")]
-    pub authored_on: Option<DateTime>,
-    #[serde(rename = "lastModified")]
-    pub last_modified: Option<DateTime>,
-    pub requester: Option<Reference>,
-    #[serde(rename = "performerType")]
-    pub performer_type: Option<Vec<CodeableConcept>>,
-    pub owner: Option<Reference>,
-    pub location: Option<Reference>,
-    #[serde(rename = "reasonCode")]
-    pub reason_code: Option<CodeableConcept>,
-    #[serde(rename = "reasonReference")]
-    pub reason_reference: Option<Reference>,
-    pub insurance: Option<Vec<Reference>>,
-    pub note: Option<Vec<Annotation>>,
-    #[serde(rename = "relevantHistory")]
-    pub relevant_history: Option<Vec<Reference>>,
-    pub restriction: Option<TaskRestriction>,
-    pub input: Option<Vec<TaskInput>>,
-    pub output: Option<Vec<TaskOutput>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(rename = "valueBase64Binary")]
+    pub value_base64_binary: Base64Binary,
+    #[serde(rename = "valueBoolean")]
+    pub value_boolean: Boolean,
+    #[serde(rename = "valueCanonical")]
+    pub value_canonical: Canonical,
+    #[serde(rename = "valueCode")]
+    pub value_code: Code,
+    #[serde(rename = "valueDate")]
+    pub value_date: Date,
+    #[serde(rename = "valueDateTime")]
+    pub value_date_time: DateTime,
+    #[serde(rename = "valueDecimal")]
+    pub value_decimal: Decimal,
+    #[serde(rename = "valueId")]
+    pub value_id: Id,
+    #[serde(rename = "valueInstant")]
+    pub value_instant: Instant,
+    #[serde(rename = "valueInteger")]
+    pub value_integer: Integer,
+    #[serde(rename = "valueMarkdown")]
+    pub value_markdown: Markdown,
+    #[serde(rename = "valueOid")]
+    pub value_oid: Oid,
+    #[serde(rename = "valuePositiveInt")]
+    pub value_positive_int: PositiveInt,
+    #[serde(rename = "valueString")]
+    pub value_string: String,
+    #[serde(rename = "valueTime")]
+    pub value_time: Time,
+    #[serde(rename = "valueUnsignedInt")]
+    pub value_unsigned_int: UnsignedInt,
+    #[serde(rename = "valueUri")]
+    pub value_uri: Uri,
+    #[serde(rename = "valueUrl")]
+    pub value_url: Url,
+    #[serde(rename = "valueUuid")]
+    pub value_uuid: Uuid,
+    #[serde(rename = "valueAddress")]
+    pub value_address: Address,
+    #[serde(rename = "valueAge")]
+    pub value_age: Age,
+    #[serde(rename = "valueAnnotation")]
+    pub value_annotation: Annotation,
+    #[serde(rename = "valueAttachment")]
+    pub value_attachment: Attachment,
+    #[serde(rename = "valueCodeableConcept")]
+    pub value_codeable_concept: CodeableConcept,
+    #[serde(rename = "valueCoding")]
+    pub value_coding: Coding,
+    #[serde(rename = "valueContactPoint")]
+    pub value_contact_point: ContactPoint,
+    #[serde(rename = "valueCount")]
+    pub value_count: Count,
+    #[serde(rename = "valueDistance")]
+    pub value_distance: Distance,
+    #[serde(rename = "valueDuration")]
+    pub value_duration: Duration,
+    #[serde(rename = "valueHumanName")]
+    pub value_human_name: HumanName,
+    #[serde(rename = "valueIdentifier")]
+    pub value_identifier: Identifier,
+    #[serde(rename = "valueMoney")]
+    pub value_money: Money,
+    #[serde(rename = "valuePeriod")]
+    pub value_period: Period,
+    #[serde(rename = "valueQuantity")]
+    pub value_quantity: Quantity,
+    #[serde(rename = "valueRange")]
+    pub value_range: Range,
+    #[serde(rename = "valueRatio")]
+    pub value_ratio: Ratio,
+    #[serde(rename = "valueReference")]
+    pub value_reference: Reference,
+    #[serde(rename = "valueSampledData")]
+    pub value_sampled_data: SampledData,
+    #[serde(rename = "valueSignature")]
+    pub value_signature: Signature,
+    #[serde(rename = "valueTiming")]
+    pub value_timing: Timing,
+    #[serde(rename = "valueContactDetail")]
+    pub value_contact_detail: ContactDetail,
+    #[serde(rename = "valueContributor")]
+    pub value_contributor: Contributor,
+    #[serde(rename = "valueDataRequirement")]
+    pub value_data_requirement: DataRequirement,
+    #[serde(rename = "valueExpression")]
+    pub value_expression: Expression,
+    #[serde(rename = "valueParameterDefinition")]
+    pub value_parameter_definition: ParameterDefinition,
+    #[serde(rename = "valueRelatedArtifact")]
+    pub value_related_artifact: RelatedArtifact,
+    #[serde(rename = "valueTriggerDefinition")]
+    pub value_trigger_definition: TriggerDefinition,
+    #[serde(rename = "valueUsageContext")]
+    pub value_usage_context: UsageContext,
+    #[serde(rename = "valueDosage")]
+    pub value_dosage: Dosage,
+    #[serde(rename = "valueMeta")]
+    pub value_meta: Meta,
 }
 
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesValidateCode {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub translations: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesCodeSystemVersion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<String>,
+    #[serde(rename = "isDefault")]
+    pub is_default: Option<Boolean>,
+    pub compositional: Option<Boolean>,
+    pub language: Option<Vec<Code>>,
+    pub filter: Option<Vec<TerminologyCapabilitiesCodeSystemVersionFilter>>,
+    pub property: Option<Vec<Code>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesTranslation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "needsMap")]
+    pub needs_map: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesExpansionParameter {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Code,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesImplementation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: String,
+    pub url: Option<Url>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesExpansion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub hierarchical: Option<Boolean>,
+    pub paging: Option<Boolean>,
+    pub incomplete: Option<Boolean>,
+    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
+    #[serde(rename = "textFilter")]
+    pub text_filter: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TerminologyCapabilitiesSoftware {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub version: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TerminologyCapabilities {
@@ -15453,37 +15531,13 @@ pub struct TerminologyCapabilities {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesCodeSystemVersion {
+pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<String>,
-    #[serde(rename = "isDefault")]
-    pub is_default: Option<Boolean>,
-    pub compositional: Option<Boolean>,
-    pub language: Option<Vec<Code>>,
-    pub filter: Option<Vec<TerminologyCapabilitiesCodeSystemVersionFilter>>,
-    pub property: Option<Vec<Code>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesExpansionParameter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Code,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesValidateCode {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub translations: Boolean,
+    pub code: Code,
+    pub op: Option<Vec<Code>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15493,30 +15547,6 @@ pub struct TerminologyCapabilitiesClosure {
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub translation: Option<Boolean>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesImplementation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub url: Option<Url>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesExpansion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub hierarchical: Option<Boolean>,
-    pub paging: Option<Boolean>,
-    pub incomplete: Option<Boolean>,
-    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
-    #[serde(rename = "textFilter")]
-    pub text_filter: Option<Markdown>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15530,46 +15560,24 @@ pub struct TerminologyCapabilitiesCodeSystem {
     pub subsumption: Option<Boolean>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesSoftware {
+pub struct TestReportSetupAction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub version: Option<String>,
+    pub operation: Option<TestReportSetupActionOperation>,
+    pub assert: Option<TestReportSetupActionAssert>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
+pub struct TestReportSetup {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub op: Option<Vec<Code>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TerminologyCapabilitiesTranslation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "needsMap")]
-    pub needs_map: Boolean,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportTest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub action: Option<Vec<TestReportTestAction>>,
+    pub action: Option<Vec<TestReportSetupAction>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15600,35 +15608,6 @@ pub struct TestReport {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportTestAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestReportSetupActionOperation>,
-    pub assert: Option<TestReportSetupActionAssert>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportTeardownAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: TestReportSetupActionOperation,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportSetupAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestReportSetupActionOperation>,
-    pub assert: Option<TestReportSetupActionAssert>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct TestReportSetupActionOperation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -15637,17 +15616,6 @@ pub struct TestReportSetupActionOperation {
     pub result: Code,
     pub message: Option<Markdown>,
     pub detail: Option<Uri>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportSetupActionAssert {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub result: Code,
-    pub message: Option<Markdown>,
-    pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15672,35 +15640,46 @@ pub struct TestReportParticipant {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestReportSetup {
+pub struct TestReportTest {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestReportSetupAction>>,
-}
-
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptDestination {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub index: Integer,
-    pub profile: Coding,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub action: Option<Vec<TestReportTestAction>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptFixture {
+pub struct TestReportTestAction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub autocreate: Boolean,
-    pub autodelete: Boolean,
-    pub resource: Option<Reference>,
+    pub operation: Option<TestReportSetupActionOperation>,
+    pub assert: Option<TestReportSetupActionAssert>,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestReportTeardownAction {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: TestReportSetupActionOperation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestReportSetupActionAssert {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub result: Code,
+    pub message: Option<Markdown>,
+    pub detail: Option<String>,
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestScriptSetupActionOperation {
@@ -15736,88 +15715,6 @@ pub struct TestScriptSetupActionOperation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestScript {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules")]
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Uri,
-    pub identifier: Option<Identifier>,
-    pub version: Option<String>,
-    pub name: String,
-    pub title: Option<String>,
-    pub status: Code,
-    pub experimental: Option<Boolean>,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    #[serde(rename = "useContext")]
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub purpose: Option<Markdown>,
-    pub copyright: Option<Markdown>,
-    pub origin: Option<Vec<TestScriptOrigin>>,
-    pub destination: Option<Vec<TestScriptDestination>>,
-    pub metadata: Option<TestScriptMetadata>,
-    pub fixture: Option<Vec<TestScriptFixture>>,
-    pub profile: Option<Vec<Reference>>,
-    pub variable: Option<Vec<TestScriptVariable>>,
-    pub setup: Option<TestScriptSetup>,
-    pub test: Option<Vec<TestScriptTest>>,
-    pub teardown: Option<TestScriptTeardown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptMetadataCapability {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub required: Boolean,
-    pub validated: Boolean,
-    pub description: Option<String>,
-    pub origin: Option<Vec<Integer>>,
-    pub destination: Option<Integer>,
-    pub link: Option<Vec<Uri>>,
-    pub capabilities: Canonical,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptVariable {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "defaultValue")]
-    pub default_value: Option<String>,
-    pub description: Option<String>,
-    pub expression: Option<String>,
-    #[serde(rename = "headerField")]
-    pub header_field: Option<String>,
-    pub hint: Option<String>,
-    pub path: Option<String>,
-    #[serde(rename = "sourceId")]
-    pub source_id: Option<Id>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptSetup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestScriptSetupAction>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct TestScriptOrigin {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -15825,26 +15722,6 @@ pub struct TestScriptOrigin {
     pub modifier_extension: Option<Vec<Extension>>,
     pub index: Integer,
     pub profile: Coding,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptSetupActionOperationRequestHeader {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub field: String,
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptMetadata {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub link: Option<Vec<TestScriptMetadataLink>>,
-    pub capability: Option<Vec<TestScriptMetadataCapability>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15891,13 +15768,13 @@ pub struct TestScriptSetupActionAssert {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptTestAction {
+pub struct TestScriptSetupActionOperationRequestHeader {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestScriptSetupActionOperation>,
-    pub assert: Option<TestScriptSetupActionAssert>,
+    pub field: String,
+    pub value: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15911,31 +15788,37 @@ pub struct TestScriptMetadataLink {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptTeardownAction {
+pub struct TestScriptMetadataCapability {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: TestScriptSetupActionOperation,
+    pub required: Boolean,
+    pub validated: Boolean,
+    pub description: Option<String>,
+    pub origin: Option<Vec<Integer>>,
+    pub destination: Option<Integer>,
+    pub link: Option<Vec<Uri>>,
+    pub capabilities: Canonical,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptTeardown {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestScriptTeardownAction>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TestScriptSetupAction {
+pub struct TestScriptTestAction {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
     pub operation: Option<TestScriptSetupActionOperation>,
     pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptTeardownAction {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: TestScriptSetupActionOperation,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -15949,59 +15832,149 @@ pub struct TestScriptTest {
     pub action: Option<Vec<TestScriptTestAction>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetComposeIncludeConceptDesignation {
+pub struct TestScript {
     pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules")]
+    pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
-    #[serde(rename = "use")]
-    pub r#use: Option<Coding>,
-    pub value: String,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Uri,
+    pub identifier: Option<Identifier>,
+    pub version: Option<String>,
+    pub name: String,
+    pub title: Option<String>,
+    pub status: Code,
+    pub experimental: Option<Boolean>,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    #[serde(rename = "useContext")]
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<Markdown>,
+    pub copyright: Option<Markdown>,
+    pub origin: Option<Vec<TestScriptOrigin>>,
+    pub destination: Option<Vec<TestScriptDestination>>,
+    pub metadata: Option<TestScriptMetadata>,
+    pub fixture: Option<Vec<TestScriptFixture>>,
+    pub profile: Option<Vec<Reference>>,
+    pub variable: Option<Vec<TestScriptVariable>>,
+    pub setup: Option<TestScriptSetup>,
+    pub test: Option<Vec<TestScriptTest>>,
+    pub teardown: Option<TestScriptTeardown>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetExpansionContains {
+pub struct TestScriptDestination {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub system: Option<Uri>,
-    #[serde(rename = "abstract")]
-    pub r#abstract: Option<Boolean>,
+    pub index: Integer,
+    pub profile: Coding,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptSetup {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestScriptSetupAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptSetupAction {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: Option<TestScriptSetupActionOperation>,
+    pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptVariable {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "defaultValue")]
+    pub default_value: Option<String>,
+    pub description: Option<String>,
+    pub expression: Option<String>,
+    #[serde(rename = "headerField")]
+    pub header_field: Option<String>,
+    pub hint: Option<String>,
+    pub path: Option<String>,
+    #[serde(rename = "sourceId")]
+    pub source_id: Option<Id>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptTeardown {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestScriptTeardownAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptMetadata {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub link: Option<Vec<TestScriptMetadataLink>>,
+    pub capability: Option<Vec<TestScriptMetadataCapability>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestScriptFixture {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub autocreate: Boolean,
+    pub autodelete: Boolean,
+    pub resource: Option<Reference>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetCompose {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "lockedDate")]
+    pub locked_date: Option<Date>,
     pub inactive: Option<Boolean>,
-    pub version: Option<String>,
-    pub code: Option<Code>,
-    pub display: Option<String>,
-    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
+    pub include: Option<Vec<ValueSetComposeInclude>>,
+    pub exclude: Option<Vec<ValueSetComposeInclude>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetExpansion {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Uri>,
+    pub timestamp: DateTime,
+    pub total: Option<Integer>,
+    pub offset: Option<Integer>,
+    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
     pub contains: Option<Vec<ValueSetExpansionContains>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetComposeInclude {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub system: Option<Uri>,
-    pub version: Option<String>,
-    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
-    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
-    #[serde(rename = "valueSet")]
-    pub value_set: Option<Vec<Canonical>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetComposeIncludeConcept {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub display: Option<String>,
-    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -16040,17 +16013,68 @@ pub struct ValueSetExpansionParameter {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetExpansion {
+pub struct ValueSetComposeIncludeFilter {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Uri>,
-    pub timestamp: DateTime,
-    pub total: Option<Integer>,
-    pub offset: Option<Integer>,
-    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
+    pub property: Code,
+    pub op: Code,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetComposeIncludeConceptDesignation {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub language: Option<Code>,
+    #[serde(rename = "use")]
+    pub r#use: Option<Coding>,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetExpansionContains {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub system: Option<Uri>,
+    #[serde(rename = "abstract")]
+    pub r#abstract: Option<Boolean>,
+    pub inactive: Option<Boolean>,
+    pub version: Option<String>,
+    pub code: Option<Code>,
+    pub display: Option<String>,
+    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
     pub contains: Option<Vec<ValueSetExpansionContains>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetComposeIncludeConcept {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub display: Option<String>,
+    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ValueSetComposeInclude {
+    pub id: Option<std::string::String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub system: Option<Uri>,
+    pub version: Option<String>,
+    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
+    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
+    #[serde(rename = "valueSet")]
+    pub value_set: Option<Vec<Canonical>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -16086,30 +16110,41 @@ pub struct ValueSet {
     pub expansion: Option<ValueSetExpansion>,
 }
 
+
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetCompose {
+pub struct VerificationResultAttestation {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "lockedDate")]
-    pub locked_date: Option<Date>,
-    pub inactive: Option<Boolean>,
-    pub include: Option<Vec<ValueSetComposeInclude>>,
-    pub exclude: Option<Vec<ValueSetComposeInclude>>,
+    pub who: Option<Reference>,
+    #[serde(rename = "onBehalfOf")]
+    pub on_behalf_of: Option<Reference>,
+    #[serde(rename = "communicationMethod")]
+    pub communication_method: Option<CodeableConcept>,
+    pub date: Option<Date>,
+    #[serde(rename = "sourceIdentityCertificate")]
+    pub source_identity_certificate: Option<String>,
+    #[serde(rename = "proxyIdentityCertificate")]
+    pub proxy_identity_certificate: Option<String>,
+    #[serde(rename = "proxySignature")]
+    pub proxy_signature: Option<Signature>,
+    #[serde(rename = "sourceSignature")]
+    pub source_signature: Option<Signature>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ValueSetComposeIncludeFilter {
+pub struct VerificationResultValidator {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub property: Code,
-    pub op: Code,
-    pub value: String,
+    pub organization: Reference,
+    #[serde(rename = "identityCertificate")]
+    pub identity_certificate: Option<String>,
+    #[serde(rename = "attestationSignature")]
+    pub attestation_signature: Option<Signature>,
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VerificationResult {
@@ -16148,28 +16183,6 @@ pub struct VerificationResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct VerificationResultAttestation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub who: Option<Reference>,
-    #[serde(rename = "onBehalfOf")]
-    pub on_behalf_of: Option<Reference>,
-    #[serde(rename = "communicationMethod")]
-    pub communication_method: Option<CodeableConcept>,
-    pub date: Option<Date>,
-    #[serde(rename = "sourceIdentityCertificate")]
-    pub source_identity_certificate: Option<String>,
-    #[serde(rename = "proxyIdentityCertificate")]
-    pub proxy_identity_certificate: Option<String>,
-    #[serde(rename = "proxySignature")]
-    pub proxy_signature: Option<Signature>,
-    #[serde(rename = "sourceSignature")]
-    pub source_signature: Option<Signature>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct VerificationResultPrimarySource {
     pub id: Option<std::string::String>,
     pub extension: Option<Vec<Extension>>,
@@ -16188,19 +16201,6 @@ pub struct VerificationResultPrimarySource {
     pub can_push_updates: Option<CodeableConcept>,
     #[serde(rename = "pushTypeAvailable")]
     pub push_type_available: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VerificationResultValidator {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub organization: Reference,
-    #[serde(rename = "identityCertificate")]
-    pub identity_certificate: Option<String>,
-    #[serde(rename = "attestationSignature")]
-    pub attestation_signature: Option<Signature>,
 }
 
 
