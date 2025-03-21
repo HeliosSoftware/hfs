@@ -159,20 +159,20 @@ fn test_functions() {
     // Test collection functions
     let test_cases = vec![
         // Empty collection
-        ("{}".to_string(), "count()", EvaluationResult::Integer(0)),
-        ("{}".to_string(), "empty()", EvaluationResult::Boolean(true)),
-        ("{}".to_string(), "exists()", EvaluationResult::Boolean(false)),
+        ("{}".to_string(), "count()".to_string(), EvaluationResult::Integer(0)),
+        ("{}".to_string(), "empty()".to_string(), EvaluationResult::Boolean(true)),
+        ("{}".to_string(), "exists()".to_string(), EvaluationResult::Boolean(false)),
         
         // Single item
-        ("'test'", "count()", EvaluationResult::Integer(1)),
-        ("'test'", "empty()", EvaluationResult::Boolean(false)),
-        ("'test'", "exists()", EvaluationResult::Boolean(true)),
+        ("'test'".to_string(), "count()".to_string(), EvaluationResult::Integer(1)),
+        ("'test'".to_string(), "empty()".to_string(), EvaluationResult::Boolean(false)),
+        ("'test'".to_string(), "exists()".to_string(), EvaluationResult::Boolean(true)),
         
         // String functions
-        ("'Hello'", "count()", EvaluationResult::Integer(1)),
-        ("'Hello'", "length()", EvaluationResult::Integer(5)),
-        ("'Hello, World!'", "contains('World')", EvaluationResult::Boolean(true)),
-        ("'Hello, World!'", "contains('Goodbye')", EvaluationResult::Boolean(false)),
+        ("'Hello'".to_string(), "count()".to_string(), EvaluationResult::Integer(1)),
+        ("'Hello'".to_string(), "length()".to_string(), EvaluationResult::Integer(5)),
+        ("'Hello, World!'".to_string(), "contains('World')".to_string(), EvaluationResult::Boolean(true)),
+        ("'Hello, World!'".to_string(), "contains('Goodbye')".to_string(), EvaluationResult::Boolean(false)),
     ];
     
     for (base, func, expected) in test_cases {
@@ -194,17 +194,14 @@ fn test_direct_string_operations() {
     // We'll set up the context without any resources
     let context = EvaluationContext::new_empty();
 
-    // Test direct string operations without using the parser
-    let string_value = EvaluationResult::String("Hello, World!".to_string());
-    let arg = EvaluationResult::String("World".to_string());
-    
-    // Test the contains function directly
-    let result = call_function("contains", &string_value, &[arg]);
+    // Test string operations through the parser instead of direct function calls
+    let expr = parser().parse("'Hello, World!'.contains('World')").unwrap();
+    let result = evaluate(&expr, &context);
     assert_eq!(result, EvaluationResult::Boolean(true));
     
-    // Test the contains operation directly
-    let result = check_membership(&string_value, "contains", &EvaluationResult::String("World".to_string()));
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    let expr = parser().parse("'Hello, World!'.contains('Goodbye')").unwrap();
+    let result = evaluate(&expr, &context);
+    assert_eq!(result, EvaluationResult::Boolean(false));
 }
 
 #[test]
