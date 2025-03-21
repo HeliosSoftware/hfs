@@ -801,17 +801,27 @@ fn check_membership(
             EvaluationResult::Boolean(is_in)
         }
         "contains" => {
-            // Check if right is in left
-            let left_items = match left {
-                EvaluationResult::Collection(items) => items,
-                _ => return EvaluationResult::Boolean(false),
-            };
-
-            let contains = left_items
-                .iter()
-                .any(|item| compare_equality(item, "=", right).to_boolean());
-
-            EvaluationResult::Boolean(contains)
+            match left {
+                // For collections, check if any item equals the right value
+                EvaluationResult::Collection(items) => {
+                    let contains = items
+                        .iter()
+                        .any(|item| compare_equality(item, "=", right).to_boolean());
+                    
+                    EvaluationResult::Boolean(contains)
+                },
+                // For strings, check if the string contains the substring
+                EvaluationResult::String(s) => {
+                    match right {
+                        EvaluationResult::String(substr) => {
+                            EvaluationResult::Boolean(s.contains(substr))
+                        },
+                        _ => EvaluationResult::Boolean(false),
+                    }
+                },
+                // For other types, return false
+                _ => EvaluationResult::Boolean(false),
+            }
         }
         _ => EvaluationResult::Empty,
     }
