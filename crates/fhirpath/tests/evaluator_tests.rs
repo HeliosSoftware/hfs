@@ -111,26 +111,31 @@ fn test_variable_access() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
+        println!("Variable access parsed expression: {:?}", expr);
         let result = evaluate(&expr, &context);
-        assert_eq!(result, expected);
+        println!("Variable access result: {:?}, Expected: {:?}", result, expected);
+        assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
 
 #[test]
-fn test_functions() {
+fn test_string_operations() {
     // We'll set up the context without any resources
     let mut context = EvaluationContext::new_empty();
 
-    // For testing string functions, we'll add a string variable
+    // For testing string operations, we'll add a string variable
     context.set_variable("message", "Hello, World!".to_string());
 
     let test_cases = vec![
-        // String functions
-        /* ("%message.length()", EvaluationResult::Integer(13)),
+        // String contains operation
         (
-            "%message.substring(0, 5)",
-            EvaluationResult::String("Hello".to_string()),
-        ),*/
+            "'Hello, World!'.contains('World')",
+            EvaluationResult::Boolean(true),
+        ),
+        (
+            "'Hello, World!'.contains('Goodbye')",
+            EvaluationResult::Boolean(false),
+        ),
         (
             "%message.contains('World')",
             EvaluationResult::Boolean(true),
@@ -139,8 +144,10 @@ fn test_functions() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
+        println!("String operation parsed expression: {:?}", expr);
         let result = evaluate(&expr, &context);
-        assert_eq!(result, expected);
+        println!("String operation result: {:?}, Expected: {:?}", result, expected);
+        assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
 #[test]

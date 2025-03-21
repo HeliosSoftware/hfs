@@ -205,6 +205,14 @@ pub fn evaluate(expr: &Expression, context: &EvaluationContext) -> EvaluationRes
 fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     match term {
         Term::Invocation(invocation) => {
+            // Check if this is a variable reference (starting with %)
+            if let Invocation::Member(name) = invocation {
+                if name.starts_with('%') {
+                    let var_name = &name[1..]; // Remove the % prefix
+                    return context.get_variable_as_result(var_name);
+                }
+            }
+            
             if context.resources.is_empty() {
                 // If there are no resources, return Empty for resource-based invocations
                 evaluate_invocation(&EvaluationResult::Empty, invocation, context)
