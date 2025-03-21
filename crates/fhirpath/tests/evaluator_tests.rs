@@ -127,7 +127,7 @@ fn test_string_operations() {
     context.set_variable("message", "Hello, World!".to_string());
 
     let test_cases = vec![
-        // String contains operation
+        // String contains operation with function call syntax
         (
             "'Hello, World!'.contains('World')",
             EvaluationResult::Boolean(true),
@@ -189,6 +189,24 @@ fn test_functions() {
         assert_eq!(result, expected, "Failed for input: {}", full_expr);
     }
 }
+#[test]
+fn test_direct_string_operations() {
+    // We'll set up the context without any resources
+    let context = EvaluationContext::new_empty();
+
+    // Test direct string operations without using the parser
+    let string_value = EvaluationResult::String("Hello, World!".to_string());
+    let arg = EvaluationResult::String("World".to_string());
+    
+    // Test the contains function directly
+    let result = call_function("contains", &string_value, &[arg]);
+    assert_eq!(result, EvaluationResult::Boolean(true));
+    
+    // Test the contains operation directly
+    let result = check_membership(&string_value, "contains", &EvaluationResult::String("World".to_string()));
+    assert_eq!(result, EvaluationResult::Boolean(true));
+}
+
 #[test]
 fn test_resource_access() {
     use fhir::r4;

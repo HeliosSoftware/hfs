@@ -316,6 +316,13 @@ fn evaluate_invocation(
                 return EvaluationResult::Boolean(false);
             }
 
+            // Check if this is a function call without parentheses (e.g., "string.contains")
+            if name == "contains" {
+                // For string contains without arguments, we need to handle it specially
+                // This is a workaround for the parser not handling method calls without parentheses
+                return call_function(name, value, &[]);
+            }
+
             // Access a member of the value
             match value {
                 EvaluationResult::Object(obj) => {
