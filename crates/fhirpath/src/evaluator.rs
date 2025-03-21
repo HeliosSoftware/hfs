@@ -1,6 +1,6 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+use fhir::FhirResource;
 use std::collections::HashMap;
-use fhir::{FhirResource, FhirVersion};
 
 /// Result of evaluating a FHIRPath expression
 #[derive(Debug, Clone, PartialEq)]
@@ -60,7 +60,6 @@ impl EvaluationResult {
     }
 }
 
-
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated
@@ -100,7 +99,7 @@ impl EvaluationContext {
     pub fn get_variable(&self, name: &str) -> Option<&String> {
         self.variables.get(name)
     }
-    
+
     /// Gets a variable from the context as an EvaluationResult
     pub fn get_variable_as_result(&self, name: &str) -> EvaluationResult {
         match self.variables.get(name) {
@@ -215,7 +214,7 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
                 let resource_result = convert_resource_to_result(&context.resources[0]);
                 evaluate_invocation(&resource_result, invocation, context)
             }
-        },
+        }
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
@@ -231,29 +230,41 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     // you would convert the resource to a proper object representation
     // that can be navigated with FHIRPath
     match resource {
-        FhirResource::R4(r) => {
+        FhirResource::R4(_r) => {
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
             // Add resource properties to the object
             // This is a placeholder - actual implementation would extract real properties
-            obj.insert("resourceType".to_string(), EvaluationResult::String("R4Resource".to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                EvaluationResult::String("R4Resource".to_string()),
+            );
             EvaluationResult::Object(obj)
-        },
-        FhirResource::R4B(r) => {
+        }
+        FhirResource::R4B(_r) => {
             let mut obj = HashMap::new();
-            obj.insert("resourceType".to_string(), EvaluationResult::String("R4BResource".to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                EvaluationResult::String("R4BResource".to_string()),
+            );
             EvaluationResult::Object(obj)
-        },
-        FhirResource::R5(r) => {
+        }
+        FhirResource::R5(_r) => {
             let mut obj = HashMap::new();
-            obj.insert("resourceType".to_string(), EvaluationResult::String("R5Resource".to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                EvaluationResult::String("R5Resource".to_string()),
+            );
             EvaluationResult::Object(obj)
-        },
-        FhirResource::R6(r) => {
+        }
+        FhirResource::R6(_r) => {
             let mut obj = HashMap::new();
-            obj.insert("resourceType".to_string(), EvaluationResult::String("R6Resource".to_string()));
+            obj.insert(
+                "resourceType".to_string(),
+                EvaluationResult::String("R6Resource".to_string()),
+            );
             EvaluationResult::Object(obj)
-        },
+        }
     }
 }
 
@@ -339,7 +350,7 @@ fn evaluate_invocation(
                 // Return the first resource as the context
                 convert_resource_to_result(&context.resources[0])
             }
-        },
+        }
         Invocation::Index => {
             // $index should return the current index in a collection operation
             // This is typically used in filter expressions
