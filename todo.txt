@@ -1,3 +1,4 @@
+- Need to add resourceType as an attribute to all resources
 - I can use a Custom Derive Macro, but I'm unsure what output it should have to send to the evaluator?
 - Change the form of the evaluator to:  expr:Expression, fhir_resources: Array(Resources), base:Expression, env_variables (HashMap(String, String), model (r4) ??, options (struct 
 - Improve the tests and evaluator to take the input and test the output against the result value in the xml file.
