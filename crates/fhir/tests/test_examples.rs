@@ -2,15 +2,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-// Import the Measure type from the appropriate FHIR version module
-#[cfg(feature = "R4")]
-use fhir::r4::Measure;
-#[cfg(feature = "R4B")]
-use fhir::r4b::Measure;
-#[cfg(feature = "R5")]
-use fhir::r5::Measure;
-#[cfg(feature = "R6")]
-use fhir::r6::Measure;
+use fhir::r4::Patient;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -124,7 +116,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
             // Only process the specific file
-            if path.file_name().unwrap().to_string_lossy() != "measure-hiv-indicators.json" {
+            if path.file_name().unwrap().to_string_lossy() != "patient-example-mom.json" {
                 continue;
             }
 
@@ -138,7 +130,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
             // Output the original JSON value
             println!("Original JSON: {}", original);
 
-            match serde_json::from_value::<Measure>(original.clone()) {
+            match serde_json::from_value::<Patient>(original.clone()) {
                 Ok(measure) => {
                     println!("Successfully converted to Measure: {:?}", measure);
                     // Process your Measure object
@@ -173,3 +165,5 @@ fn test_examples_in_dir(dir: &PathBuf) {
         }
     }
 }
+
+// AI! Add a test function that initiates a Boolean value of true
