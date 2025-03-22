@@ -117,13 +117,15 @@ fn test_examples_in_dir(dir: &PathBuf) {
             if path.file_name().unwrap().to_string_lossy() != "measure-hiv-indicators.json" {
                 continue;
             }
-            
+
             println!("Processing file: {}", path.display());
 
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
             let original: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+            // AI! output original here
 
             // Serialize back to string with maximum precision
             let serialized = {
