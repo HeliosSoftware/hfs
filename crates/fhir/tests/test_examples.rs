@@ -2,6 +2,16 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
+// Import the Measure type from the appropriate FHIR version module
+#[cfg(feature = "R4")]
+use fhir::r4::Measure;
+#[cfg(feature = "R4B")]
+use fhir::r4b::Measure;
+#[cfg(feature = "R5")]
+use fhir::r5::Measure;
+#[cfg(feature = "R6")]
+use fhir::r6::Measure;
+
 #[cfg(feature = "R4")]
 #[test]
 fn test_r4_examples() {
@@ -129,12 +139,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
             println!("Original JSON: {}", original);
 
             match serde_json::from_value::<Measure>(original.clone()) {
-                Ok(person) => {
-                    println!("Successfully converted to Person: {:?}", person);
-                    // Process your Person object
+                Ok(measure) => {
+                    println!("Successfully converted to Measure: {:?}", measure);
+                    // Process your Measure object
                 }
                 Err(e) => {
-                    println!("This Value is not a Person: {}", e);
+                    println!("This Value is not a Measure: {}", e);
                     // Handle the error or try a different struct type
                 }
             }
