@@ -112,10 +112,11 @@ fn test_examples_in_dir(dir: &PathBuf) {
         let entry = entry.unwrap();
         let path = entry.path();
 
+        // AI! Limit this code to only process the file named: measure-hiv-indicators.json
+
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
             println!("Processing file: {}", path.display());
-            // Force flush stdout to ensure the filename is displayed immediately
-            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
