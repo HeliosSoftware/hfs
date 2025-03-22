@@ -169,13 +169,15 @@ fn test_examples_in_dir(dir: &PathBuf) {
 #[cfg(feature = "R4")]
 #[test]
 fn test_boolean_initialization() {
-    use fhir::r4::{Boolean, PrimitiveElement};
-    
+    use fhir::r4::Boolean;
+
     // Create a Boolean with value true
-    let primitive_element = PrimitiveElement::new(true);
-    let boolean = Boolean(primitive_element);
-    
+    let boolean = Boolean::new(true);
+
     // Verify the value is true
-    assert_eq!(boolean.0.value, true);
-    println!("Successfully created Boolean with value: {:?}", boolean.0.value);
+    assert_eq!(boolean.value, true);
+    println!(
+        "Successfully created Boolean with value: {:?}",
+        boolean.value
+    );
 }
