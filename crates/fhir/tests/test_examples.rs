@@ -112,9 +112,8 @@ fn test_examples_in_dir(dir: &PathBuf) {
         let entry = entry.unwrap();
         let path = entry.path();
 
-        // AI! Output the filename that is being processed
-
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
+            println!("Processing file: {}", path.display());
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
