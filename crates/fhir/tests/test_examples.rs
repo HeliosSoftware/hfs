@@ -166,4 +166,19 @@ fn test_examples_in_dir(dir: &PathBuf) {
     }
 }
 
-// AI! Add a test function that initiates a Boolean value of true
+#[cfg(feature = "R4")]
+#[test]
+fn test_boolean_initialization() {
+    use fhir::r4::Boolean;
+    
+    // Create a Boolean with value true
+    let boolean = Boolean {
+        id: None,
+        extension: None,
+        value: Some(true),
+    };
+    
+    // Verify the value is true
+    assert_eq!(boolean.value, Some(true));
+    println!("Successfully created Boolean with value: {:?}", boolean.value);
+}
