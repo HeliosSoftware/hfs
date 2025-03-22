@@ -112,9 +112,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
         let entry = entry.unwrap();
         let path = entry.path();
 
-        // AI! Limit this code to only process the file named: measure-hiv-indicators.json
-
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
+            // Only process the specific file
+            if path.file_name().unwrap().to_string_lossy() != "measure-hiv-indicators.json" {
+                continue;
+            }
+            
             println!("Processing file: {}", path.display());
 
             let content = fs::read_to_string(&path).unwrap();
