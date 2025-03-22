@@ -125,7 +125,8 @@ fn test_examples_in_dir(dir: &PathBuf) {
             // Parse the JSON into serde_json::Value
             let original: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-            // AI! output original here
+            // Output the original JSON value
+            println!("Original JSON: {}", original);
 
             // Serialize back to string with maximum precision
             let serialized = {
