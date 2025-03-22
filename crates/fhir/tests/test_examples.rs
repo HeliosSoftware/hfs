@@ -128,6 +128,17 @@ fn test_examples_in_dir(dir: &PathBuf) {
             // Output the original JSON value
             println!("Original JSON: {}", original);
 
+            match serde_json::from_value::<Measure>(original.clone()) {
+                Ok(person) => {
+                    println!("Successfully converted to Person: {:?}", person);
+                    // Process your Person object
+                }
+                Err(e) => {
+                    println!("This Value is not a Person: {}", e);
+                    // Handle the error or try a different struct type
+                }
+            }
+
             // Serialize back to string with maximum precision
             let serialized = {
                 let mut serializer = serde_json::Serializer::with_formatter(
