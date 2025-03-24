@@ -45,6 +45,30 @@ fn test_r6_examples() {
     test_examples_in_dir(&examples_dir);
 }
 
+// Helper function to filter out null values from a JSON value
+fn filter_null_values(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                if !v.is_null() {
+                    new_map.insert(k.clone(), filter_null_values(v));
+                }
+            }
+            serde_json::Value::Object(new_map)
+        },
+        serde_json::Value::Array(arr) => {
+            let new_arr: Vec<serde_json::Value> = arr
+                .iter()
+                .filter(|v| !v.is_null())
+                .map(filter_null_values)
+                .collect();
+            serde_json::Value::Array(new_arr)
+        },
+        _ => value.clone(),
+    }
+}
+
 fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> Result<(), String> {
     match (left, right) {
         (serde_json::Value::Number(l), serde_json::Value::Number(r)) => {
@@ -126,10 +150,10 @@ fn test_examples_in_dir(dir: &PathBuf) {
             println!("Content JSON: {}", content);
 
             // Parse the JSON into serde_json::Value
-            let mut deserializer = serde_json::Deserializer::from_str(&content);
-            deserializer.options_mut().set_ignore_null(true);
-            let original: serde_json::Value =
-                serde_json::Value::deserialize(&mut deserializer).unwrap();
+            let original: serde_json::Value = serde_json::from_str(&content).unwrap();
+            
+            // Filter out null values if needed
+            let original = filter_null_values(&original);
 
             // Output the original JSON value
             println!("Original JSON: {}", original);
