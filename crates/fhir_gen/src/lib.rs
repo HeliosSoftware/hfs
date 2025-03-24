@@ -261,7 +261,8 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         "uuid" => "std::string::String",
         "markdown" => "std::string::String",
         "xhtml" => "std::string::String",
-        "date" | "dateTime" | "instant" | "time" => "std::string::String",
+        "date" => "std::string::String",
+        "dateTime" | "instant" | "time" => "std::string::String",
         _ => "std::string::String",
     };
     
