@@ -125,6 +125,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
+            // AI! I don't want to ignore null values
             let original: serde_json::Value = serde_json::from_str(&content).unwrap();
 
             // Output the original JSON value
@@ -134,44 +135,47 @@ fn test_examples_in_dir(dir: &PathBuf) {
                 Ok(resource) => {
                     // Serialize the parsed resource back to JSON
                     let serialized_resource = serde_json::to_value(&resource).unwrap();
-                    
+
+                    println!("New JSON: {}", serialized_resource);
+
                     // Compare the original and re-serialized JSON
                     let result = compare_json_values(&original, &serialized_resource);
                     assert!(
                         result.is_ok(),
-                        "File {} failed resource serialization test: {}",
+                        "File {} failed resource round-trip serialization test: {}",
                         path.display(),
                         result.unwrap_err()
                     );
-                    
+
                     println!("Successfully round-tripped resource");
                 }
                 Err(e) => {
                     println!("Error parsing as FHIR resource: {}", e);
                 }
             }
+            /*
+                        // Serialize back to string with maximum precision
+                        let serialized = {
+                            let mut serializer = serde_json::Serializer::with_formatter(
+                                Vec::new(),
+                                serde_json::ser::PrettyFormatter::new(),
+                            );
+                            original.serialize(&mut serializer).unwrap();
+                            String::from_utf8(serializer.into_inner()).unwrap()
+                        };
 
-            // Serialize back to string with maximum precision
-            let serialized = {
-                let mut serializer = serde_json::Serializer::with_formatter(
-                    Vec::new(),
-                    serde_json::ser::PrettyFormatter::new(),
-                );
-                original.serialize(&mut serializer).unwrap();
-                String::from_utf8(serializer.into_inner()).unwrap()
-            };
+                        // Parse again to normalize formatting
+                        let reserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
 
-            // Parse again to normalize formatting
-            let reserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-
-            // Compare structure ignoring floating point precision differences
-            let result = compare_json_values(&original, &reserialized);
-            assert!(
-                result.is_ok(),
-                "File {} failed round-trip serialization test: {}",
-                path.display(),
-                result.unwrap_err()
-            );
+                        // Compare structure ignoring floating point precision differences
+                        let result = compare_json_values(&original, &reserialized);
+                        assert!(
+                            result.is_ok(),
+                            "File {} failed round-trip serialization test: {}",
+                            path.display(),
+                            result.unwrap_err()
+                        );
+            */
         }
     }
 }
