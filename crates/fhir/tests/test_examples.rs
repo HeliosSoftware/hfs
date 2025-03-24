@@ -123,11 +123,13 @@ fn test_examples_in_dir(dir: &PathBuf) {
             println!("Processing file: {}", path.display());
 
             let content = fs::read_to_string(&path).unwrap();
+            println!("Content JSON: {}", content);
 
             // Parse the JSON into serde_json::Value
             let mut deserializer = serde_json::Deserializer::from_str(&content);
             deserializer.options_mut().set_ignore_null(true);
-            let original: serde_json::Value = serde_json::Value::deserialize(&mut deserializer).unwrap();
+            let original: serde_json::Value =
+                serde_json::Value::deserialize(&mut deserializer).unwrap();
 
             // Output the original JSON value
             println!("Original JSON: {}", original);
