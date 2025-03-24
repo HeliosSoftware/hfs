@@ -48,9 +48,13 @@ pub fn process_fhir_version(
         None => {
             // Process all versions
             for ver in [
+                #[cfg(feature = "R4")]
                 FhirVersion::R4,
+                #[cfg(feature = "R4B")]
                 FhirVersion::R4B,
+                #[cfg(feature = "R5")]
                 FhirVersion::R5,
+                #[cfg(feature = "R6")]
                 FhirVersion::R6,
             ] {
                 if let Err(e) = process_single_version(&ver, &output_path) {
@@ -356,6 +360,7 @@ fn process_elements(
 
         // Generate struct
         output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+        output.push_str("#[serde(deny_unknown_fields)]\n");
         output.push_str(&format!(
             "pub struct {} {{\n",
             capitalize_first_letter(&type_name)
