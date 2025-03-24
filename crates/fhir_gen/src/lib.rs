@@ -244,12 +244,6 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
     let type_name = &sd.name;
     let mut output = String::new();
     
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-    output.push_str("#[serde(deny_unknown_fields)]\n");
-    output.push_str(&format!("pub struct {} {{\n", type_name));
-    output.push_str("    pub id: Option<std::string::String>,\n");
-    output.push_str("    pub extension: Option<Vec<Extension>>,\n");
-    
     // Determine the value type based on the primitive type
     let value_type = match type_name.as_str() {
         "boolean" => "bool",
@@ -259,19 +253,8 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         _ => "std::string::String",
     };
     
-    output.push_str(&format!("    pub value: Option<{}>,\n", value_type));
-    output.push_str("}\n\n");
-    
-    // Implement Element trait for the primitive type
-    output.push_str(&format!("impl Element for {} {{\n", type_name));
-    output.push_str("    fn id(&self) -> Option<&str> {\n");
-    output.push_str("        self.id.as_deref()\n");
-    output.push_str("    }\n\n");
-    
-    output.push_str("    fn extensions(&self) -> Option<&[Extension]> {\n");
-    output.push_str("        self.extension.as_deref()\n");
-    output.push_str("    }\n");
-    output.push_str("}\n\n");
+    // Generate a type alias using Element<T, Extension>
+    output.push_str(&format!("pub type {} = Element<{}, Extension>;\n\n", type_name, value_type));
     
     output
 }
