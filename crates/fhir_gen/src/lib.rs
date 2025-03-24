@@ -1,11 +1,9 @@
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
-use fhir::Element;
 use fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
-use serde::{Deserialize, Serialize};
 use serde_json::Result;
 use std::fs::File;
 use std::io::BufReader;
@@ -271,8 +269,9 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
 
     // Generate a type alias using Element<T, Extension>
     output.push_str(&format!(
-        "pub type {} = Element<{}, Extension>;\n\n",
-        capitalize_first_letter(type_name), value_type
+        "pub type {} = Element<{}, Extension>;\n",
+        capitalize_first_letter(type_name),
+        value_type
     ));
 
     output
