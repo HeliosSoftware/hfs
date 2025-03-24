@@ -125,8 +125,9 @@ fn test_examples_in_dir(dir: &PathBuf) {
             let content = fs::read_to_string(&path).unwrap();
 
             // Parse the JSON into serde_json::Value
-            // AI! I want to ignore null values
-            let original: serde_json::Value = serde_json::from_str(&content).unwrap();
+            let mut deserializer = serde_json::Deserializer::from_str(&content);
+            deserializer.options_mut().set_ignore_null(true);
+            let original: serde_json::Value = serde_json::Value::deserialize(&mut deserializer).unwrap();
 
             // Output the original JSON value
             println!("Original JSON: {}", original);
