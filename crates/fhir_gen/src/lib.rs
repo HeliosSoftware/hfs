@@ -272,7 +272,7 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
     // Generate a type alias using Element<T, Extension>
     output.push_str(&format!(
         "pub type {} = Element<{}, Extension>;\n\n",
-        type_name, value_type
+        capitalize_first_letter(type_name), value_type
     ));
 
     output
