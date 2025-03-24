@@ -2,6 +2,7 @@ pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
 use fhir::FhirVersion;
+use fhir::Element;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde_json::Result;
@@ -258,6 +259,17 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
     };
     
     output.push_str(&format!("    pub value: Option<{}>,\n", value_type));
+    output.push_str("}\n\n");
+    
+    // Implement Element trait for the primitive type
+    output.push_str(&format!("impl Element for {} {{\n", type_name));
+    output.push_str("    fn id(&self) -> Option<&str> {\n");
+    output.push_str("        self.id.as_deref()\n");
+    output.push_str("    }\n\n");
+    
+    output.push_str("    fn extensions(&self) -> Option<&[Extension]> {\n");
+    output.push_str("        self.extension.as_deref()\n");
+    output.push_str("    }\n");
     output.push_str("}\n\n");
     
     output
