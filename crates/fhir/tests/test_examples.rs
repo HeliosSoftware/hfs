@@ -1,8 +1,7 @@
-use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-use fhir::r4::{Patient, Resource};
+use fhir::r4::Resource;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -43,30 +42,6 @@ fn test_r6_examples() {
         .join("data")
         .join("r6");
     test_examples_in_dir(&examples_dir);
-}
-
-// Helper function to filter out null values from a JSON value
-fn filter_null_values(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut new_map = serde_json::Map::new();
-            for (k, v) in map {
-                if !v.is_null() {
-                    new_map.insert(k.clone(), filter_null_values(v));
-                }
-            }
-            serde_json::Value::Object(new_map)
-        }
-        serde_json::Value::Array(arr) => {
-            let new_arr: Vec<serde_json::Value> = arr
-                .iter()
-                .filter(|v| !v.is_null())
-                .map(filter_null_values)
-                .collect();
-            serde_json::Value::Array(new_arr)
-        }
-        _ => value.clone(),
-    }
 }
 
 fn compare_json_values(left: &serde_json::Value, right: &serde_json::Value) -> Result<(), String> {
@@ -140,88 +115,35 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
             // Only process the specific file
-            if path.file_name().unwrap().to_string_lossy() != "patient-example-mom.json" {
+            if path.file_name().unwrap().to_string_lossy()
+                != "extension-careplan-activity-title.json"
+            {
                 continue;
             }
 
             println!("Processing file: {}", path.display());
 
             let content = fs::read_to_string(&path).unwrap();
-            println!("Content JSON: {}", content);
 
             // Parse the JSON into serde_json::Value
             let original: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-            // Filter out null values if needed
-            let original = filter_null_values(&original);
-
-            // Output the original JSON value
-            println!("Original JSON: {}", original);
 
             match serde_json::from_value::<Resource>(original.clone()) {
                 Ok(resource) => {
                     // Serialize the parsed resource back to JSON
                     let serialized_resource = serde_json::to_value(&resource).unwrap();
-                    
-                    // Filter out null values from the serialized JSON
-                    let serialized_resource = filter_null_values(&serialized_resource);
-
-                    println!("New JSON: {}", serialized_resource);
 
                     // Compare the original and re-serialized JSON
-                    let result = compare_json_values(&original, &serialized_resource);
                     assert!(
-                        result.is_ok(),
-                        "File {} failed resource round-trip serialization test: {}",
+                        original == serialized_resource,
+                        "File {} failed resource round-trip serialization test",
                         path.display(),
-                        result.unwrap_err()
                     );
-
-                    println!("Successfully round-tripped resource");
                 }
                 Err(e) => {
-                    println!("Error parsing as FHIR resource: {}", e);
+                    println!("Error parsing as FHIR resource: {}:{}", path.display(), e);
                 }
             }
-            /*
-                        // Serialize back to string with maximum precision
-                        let serialized = {
-                            let mut serializer = serde_json::Serializer::with_formatter(
-                                Vec::new(),
-                                serde_json::ser::PrettyFormatter::new(),
-                            );
-                            original.serialize(&mut serializer).unwrap();
-                            String::from_utf8(serializer.into_inner()).unwrap()
-                        };
-
-                        // Parse again to normalize formatting
-                        let reserialized: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-
-                        // Compare structure ignoring floating point precision differences
-                        let result = compare_json_values(&original, &reserialized);
-                        assert!(
-                            result.is_ok(),
-                            "File {} failed round-trip serialization test: {}",
-                            path.display(),
-                            result.unwrap_err()
-                        );
-            */
         }
     }
-}
-
-#[cfg(feature = "R4")]
-#[test]
-fn test_boolean_initialization() {
-    //   use fhir::r4::Boolean;
-
-    // Create a Boolean with value true
-    //    let boolean = Boolean::new(true);
-
-    // Verify the value is true
-    //    assert_eq!(boolean.value.unwrap(), true);
-    //    println!(
-    //        "Successfully created Boolean with value: {:?}",
-    //        boolean.value
-    //    );
 }
