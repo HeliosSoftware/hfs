@@ -102,6 +102,10 @@ fn is_valid_structure_definition(def: &StructureDefinition) -> bool {
         && def.r#abstract == false
 }
 
+fn is_primitive_type(def: &StructureDefinition) -> bool {
+    def.kind == "primitive-type"
+}
+
 fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // First collect all ElementDefinitions across all StructureDefinitions
     // Also collect all Resource names
@@ -218,13 +222,44 @@ fn structure_definition_to_rust(
     cycles: &std::collections::HashSet<(String, String)>,
 ) -> String {
     let mut output = String::new();
-    // Process elements
+    
+    // Handle primitive types differently
+    if is_primitive_type(sd) {
+        return generate_primitive_type(sd);
+    }
+    
+    // Process elements for complex types and resources
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
             let mut processed_types = std::collections::HashSet::new();
             process_elements(elements, &mut output, &mut processed_types, cycles);
         }
     }
+    output
+}
+
+fn generate_primitive_type(sd: &StructureDefinition) -> String {
+    let type_name = &sd.name;
+    let mut output = String::new();
+    
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    output.push_str("#[serde(deny_unknown_fields)]\n");
+    output.push_str(&format!("pub struct {} {{\n", type_name));
+    output.push_str("    pub id: Option<std::string::String>,\n");
+    output.push_str("    pub extension: Option<Vec<Extension>>,\n");
+    
+    // Determine the value type based on the primitive type
+    let value_type = match type_name.as_str() {
+        "boolean" => "bool",
+        "integer" | "positiveInt" | "unsignedInt" => "std::primitive::i32",
+        "decimal" => "std::primitive::f64",
+        "integer64" => "std::primitive::i64",
+        _ => "std::string::String",
+    };
+    
+    output.push_str(&format!("    pub value: Option<{}>,\n", value_type));
+    output.push_str("}\n\n");
+    
     output
 }
 
