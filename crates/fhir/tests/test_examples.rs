@@ -161,12 +161,10 @@ fn test_examples_in_dir(dir: &PathBuf) {
             match serde_json::from_value::<Resource>(original.clone()) {
                 Ok(resource) => {
                     // Serialize the parsed resource back to JSON
-                    let serialized_resource = {
-                        let mut serializer = serde_json::Serializer::new(Vec::new());
-                        serializer.serialize_none_as_null(false);
-                        resource.serialize(&mut serializer).unwrap();
-                        serde_json::from_slice(&serializer.into_inner()).unwrap()
-                    };
+                    let serialized_resource = serde_json::to_value(&resource).unwrap();
+                    
+                    // Filter out null values from the serialized JSON
+                    let serialized_resource = filter_null_values(&serialized_resource);
 
                     println!("New JSON: {}", serialized_resource);
 
