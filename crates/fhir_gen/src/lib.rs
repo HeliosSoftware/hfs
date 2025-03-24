@@ -252,9 +252,9 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         "integer64" => "std::primitive::i64",
         "string" => "std::string::String",
         "code" => "std::string::String",
+        "base64Binary" => "std::string::String",
         "id" | "uri" | "url" | "canonical" | "markdown" | "xhtml" => "std::string::String",
         "date" | "dateTime" | "instant" | "time" => "std::string::String",
-        "base64Binary" => "std::string::String",
         _ => "std::string::String",
     };
     
