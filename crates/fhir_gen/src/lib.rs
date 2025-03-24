@@ -5,6 +5,7 @@ use fhir::FhirVersion;
 use fhir::Element;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
+use serde::{Deserialize, Serialize};
 use serde_json::Result;
 use std::fs::File;
 use std::io::BufReader;
