@@ -535,10 +535,13 @@ fn generate_element_definition(
                     .chain(base_name.chars().skip(1))
                     .collect::<String>()
             );
+            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
             format!("Option<{}>", enum_name)
         } else if is_array {
+            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
             format!("Option<Vec<{}>>", base_type)
         } else if element.min.unwrap_or(0) == 0 {
+            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
             format!("Option<{}>", base_type)
         } else {
             base_type.to_string()
