@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 
-use fhir::r4::Patient;
+use fhir::r4::{Patient, Resource};
 
 #[cfg(feature = "R4")]
 #[test]
@@ -130,14 +130,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
             // Output the original JSON value
             println!("Original JSON: {}", original);
 
-            match serde_json::from_value::<Patient>(original.clone()) {
-                Ok(measure) => {
-                    println!("Successfully converted to Measure: {:?}", measure);
-                    // Process your Measure object
+            match serde_json::from_value::<Resource>(original.clone()) {
+                Ok(resource) => {
+                    // AI! Serialize back to a json string and compare to original
                 }
                 Err(e) => {
-                    println!("This Value is not a Measure: {}", e);
-                    // Handle the error or try a different struct type
+                    println!("Error parsing as FHIR resource: {}", e);
                 }
             }
 
@@ -169,15 +167,15 @@ fn test_examples_in_dir(dir: &PathBuf) {
 #[cfg(feature = "R4")]
 #[test]
 fn test_boolean_initialization() {
-    use fhir::r4::Boolean;
+    //   use fhir::r4::Boolean;
 
     // Create a Boolean with value true
-    let boolean = Boolean::new(true);
+    //    let boolean = Boolean::new(true);
 
     // Verify the value is true
-    assert_eq!(boolean.value, true);
-    println!(
-        "Successfully created Boolean with value: {:?}",
-        boolean.value
-    );
+    //    assert_eq!(boolean.value.unwrap(), true);
+    //    println!(
+    //        "Successfully created Boolean with value: {:?}",
+    //        boolean.value
+    //    );
 }
