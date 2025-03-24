@@ -1,8 +1,8 @@
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
-use fhir::FhirVersion;
 use fhir::Element;
+use fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,10 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         .join(&format!("{}.rs", version.as_str()));
 
     // Create the version-specific output file with initial content
-    std::fs::write(&version_path, "use serde::{Serialize, Deserialize};\nuse crate::{Element};\n\n")?;
+    std::fs::write(
+        &version_path,
+        "use serde::{Serialize, Deserialize};\nuse crate::Element;\n\n",
+    )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
     visit_dirs(&version_dir)?
@@ -224,12 +227,12 @@ fn structure_definition_to_rust(
     cycles: &std::collections::HashSet<(String, String)>,
 ) -> String {
     let mut output = String::new();
-    
+
     // Handle primitive types differently
     if is_primitive_type(sd) {
         return generate_primitive_type(sd);
     }
-    
+
     // Process elements for complex types and resources
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
@@ -243,7 +246,7 @@ fn structure_definition_to_rust(
 fn generate_primitive_type(sd: &StructureDefinition) -> String {
     let type_name = &sd.name;
     let mut output = String::new();
-    
+
     // Determine the value type based on the primitive type
     let value_type = match type_name.as_str() {
         "boolean" => "bool",
@@ -265,10 +268,13 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         "dateTime" | "instant" | "time" => "std::string::String",
         _ => "std::string::String",
     };
-    
+
     // Generate a type alias using Element<T, Extension>
-    output.push_str(&format!("pub type {} = Element<{}, Extension>;\n\n", type_name, value_type));
-    
+    output.push_str(&format!(
+        "pub type {} = Element<{}, Extension>;\n\n",
+        type_name, value_type
+    ));
+
     output
 }
 
