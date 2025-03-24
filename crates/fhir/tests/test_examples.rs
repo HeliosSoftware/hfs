@@ -132,7 +132,19 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
             match serde_json::from_value::<Resource>(original.clone()) {
                 Ok(resource) => {
-                    // AI! Serialize back to a json string and compare to original
+                    // Serialize the parsed resource back to JSON
+                    let serialized_resource = serde_json::to_value(&resource).unwrap();
+                    
+                    // Compare the original and re-serialized JSON
+                    let result = compare_json_values(&original, &serialized_resource);
+                    assert!(
+                        result.is_ok(),
+                        "File {} failed resource serialization test: {}",
+                        path.display(),
+                        result.unwrap_err()
+                    );
+                    
+                    println!("Successfully round-tripped resource");
                 }
                 Err(e) => {
                     println!("Error parsing as FHIR resource: {}", e);
