@@ -256,7 +256,8 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         "canonical" => "std::string::String",
         "id" => "std::string::String",
         "oid" => "std::string::String",
-        "uri" | "url" | "markdown" | "xhtml" => "std::string::String",
+        "uri" => "std::string::String",
+        "url" | "markdown" | "xhtml" => "std::string::String",
         "date" | "dateTime" | "instant" | "time" => "std::string::String",
         _ => "std::string::String",
     };
