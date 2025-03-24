@@ -56,7 +56,7 @@ fn filter_null_values(value: &serde_json::Value) -> serde_json::Value {
                 }
             }
             serde_json::Value::Object(new_map)
-        },
+        }
         serde_json::Value::Array(arr) => {
             let new_arr: Vec<serde_json::Value> = arr
                 .iter()
@@ -64,7 +64,7 @@ fn filter_null_values(value: &serde_json::Value) -> serde_json::Value {
                 .map(filter_null_values)
                 .collect();
             serde_json::Value::Array(new_arr)
-        },
+        }
         _ => value.clone(),
     }
 }
@@ -151,7 +151,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
             // Parse the JSON into serde_json::Value
             let original: serde_json::Value = serde_json::from_str(&content).unwrap();
-            
+
             // Filter out null values if needed
             let original = filter_null_values(&original);
 
@@ -161,6 +161,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
             match serde_json::from_value::<Resource>(original.clone()) {
                 Ok(resource) => {
                     // Serialize the parsed resource back to JSON
+                    // AI! Ignore null values
                     let serialized_resource = serde_json::to_value(&resource).unwrap();
 
                     println!("New JSON: {}", serialized_resource);
