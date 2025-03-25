@@ -1,7 +1,5 @@
-use fhir::r4::Resource;
+use fhir_gen::initial_fhir_model::Resource;
 use std::fs;
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 #[cfg(feature = "R4")]
@@ -88,10 +86,16 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             match serde_json::to_value(&resource) {
                                                 Ok(resource_json) => {
                                                     println!("Successfully serialized Resource back to JSON");
-                                                    
+
+                                                    // AI! Turn the code below into an assert_eq!
+                                                    // and output both json strings if the test
+                                                    // fails
+
                                                     // Compare the original JSON with the re-serialized JSON
                                                     if resource_json == json_value {
-                                                        println!("Resource JSON matches original JSON");
+                                                        println!(
+                                                            "Resource JSON matches original JSON"
+                                                        );
                                                     } else {
                                                         println!("WARNING: Resource JSON differs from original JSON");
                                                         // In a real test, we might want to assert here
@@ -113,27 +117,6 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             );
                                         }
                                     }
-
-                                    // Re-serialize the JSON value to a string
-                                    match serde_json::to_string(&json_value) {
-                                        Ok(_) => {
-                                            // We already have the original JSON value parsed,
-                                            // so we can just compare it with itself to verify
-                                            // the round-trip works
-                                            println!(
-                                                "File {} passed JSON round-trip test",
-                                                path.display()
-                                            );
-                                        }
-                                        Err(e) => {
-                                            println!("Error re-serializing JSON: {}", e);
-                                        }
-                                    }
-
-                                    println!(
-                                        "File {} passed basic JSON validation",
-                                        path.display()
-                                    );
                                 } else {
                                     println!("resourceType is not a string");
                                 }
