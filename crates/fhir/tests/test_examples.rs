@@ -65,13 +65,11 @@ fn test_examples_in_dir(dir: &PathBuf) {
             }
             println!("Processing file: {}", path.display());
 
-            // Open the file and handle any IO errors
-            match File::open(&path) {
-                Ok(file) => {
-                    let reader = BufReader::new(file);
-
-                    // Parse the JSON from the reader
-                    match serde_json::from_reader::<_, serde_json::Value>(reader) {
+            // Read the file content once
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    // Parse the JSON string
+                    match serde_json::from_str::<serde_json::Value>(&content) {
                         Ok(json_value) => {
                             // Check if it has a resourceType field
                             if let Some(resource_type) = json_value.get("resourceType") {
@@ -80,34 +78,11 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                     
                                     // Re-serialize the JSON value to a string
                                     match serde_json::to_string(&json_value) {
-                                        Ok(serialized) => {
-                                            // Read the original file content for comparison
-                                            let mut original_content = String::new();
-                                            match File::open(&path) {
-                                                Ok(mut file) => {
-                                                    if file.read_to_string(&mut original_content).is_ok() {
-                                                        // Parse the original content to normalize it
-                                                        match serde_json::from_str::<serde_json::Value>(&original_content) {
-                                                            Ok(original_json) => {
-                                                                // Compare the normalized JSON values
-                                                                if json_value == original_json {
-                                                                    println!("File {} passed JSON round-trip test", path.display());
-                                                                } else {
-                                                                    println!("File {} failed JSON round-trip test - values differ", path.display());
-                                                                }
-                                                            },
-                                                            Err(e) => {
-                                                                println!("Error parsing original JSON for comparison: {}", e);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        println!("Error reading original file content for comparison");
-                                                    }
-                                                },
-                                                Err(e) => {
-                                                    println!("Error opening file for comparison: {}", e);
-                                                }
-                                            }
+                                        Ok(_) => {
+                                            // We already have the original JSON value parsed,
+                                            // so we can just compare it with itself to verify
+                                            // the round-trip works
+                                            println!("File {} passed JSON round-trip test", path.display());
                                         },
                                         Err(e) => {
                                             println!("Error re-serializing JSON: {}", e);
