@@ -87,20 +87,15 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                                 Ok(resource_json) => {
                                                     println!("Successfully serialized Resource back to JSON");
 
-                                                    // AI! Turn the code below into an assert_eq!
-                                                    // and output both json strings if the test
-                                                    // fails
-
-                                                    // Compare the original JSON with the re-serialized JSON
-                                                    if resource_json == json_value {
-                                                        println!(
-                                                            "Resource JSON matches original JSON"
-                                                        );
-                                                    } else {
-                                                        println!("WARNING: Resource JSON differs from original JSON");
-                                                        // In a real test, we might want to assert here
-                                                        // assert_eq!(resource_json, json_value, "JSON values should match");
-                                                    }
+                                                    // Compare the original JSON with the re-serialized JSON using assert_eq!
+                                                    assert_eq!(
+                                                        resource_json, 
+                                                        json_value, 
+                                                        "JSON values should match.\nOriginal: {}\nReserialized: {}", 
+                                                        serde_json::to_string_pretty(&json_value).unwrap_or_default(),
+                                                        serde_json::to_string_pretty(&resource_json).unwrap_or_default()
+                                                    );
+                                                    println!("Resource JSON matches original JSON");
                                                 }
                                                 Err(e) => {
                                                     println!(
