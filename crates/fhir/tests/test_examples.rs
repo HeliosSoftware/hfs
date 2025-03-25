@@ -64,12 +64,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
                 continue;
             }
             println!("Processing file: {}", path.display());
-            
+
             // Open the file and handle any IO errors
             match File::open(&path) {
                 Ok(file) => {
                     let reader = BufReader::new(file);
-                    
+
                     // Parse the JSON from the reader
                     match serde_json::from_reader::<_, serde_json::Value>(reader) {
                         Ok(json_value) => {
@@ -77,7 +77,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
                             if let Some(resource_type) = json_value.get("resourceType") {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
-                                    println!("File {} passed basic JSON validation", path.display());
+                                    println!(
+                                        "File {} passed basic JSON validation",
+                                        path.display()
+                                    );
+                                    // AI! Re-serialize the json_value and compare it to the
+                                    // original and assert that they are the same.
                                 } else {
                                     println!("resourceType is not a string");
                                 }
