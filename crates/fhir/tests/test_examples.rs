@@ -2,6 +2,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
+use fhir::r4::Resource;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -76,7 +77,25 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
 
-                                    // AI!  Obtain a Resourse from json_value
+                                    // Try to convert the JSON value to a FHIR Resource
+                                    match serde_json::from_value::<Resource>(json_value.clone()) {
+                                        Ok(resource) => {
+                                            println!("Successfully converted JSON to FHIR Resource");
+                                            
+                                            // Verify we can serialize the Resource back to JSON
+                                            match serde_json::to_value(&resource) {
+                                                Ok(resource_json) => {
+                                                    println!("Successfully serialized Resource back to JSON");
+                                                },
+                                                Err(e) => {
+                                                    println!("Error serializing Resource to JSON: {}", e);
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("Error converting JSON to FHIR Resource: {}", e);
+                                        }
+                                    }
 
                                     // Re-serialize the JSON value to a string
                                     match serde_json::to_string(&json_value) {
