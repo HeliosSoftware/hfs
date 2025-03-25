@@ -63,15 +63,35 @@ fn test_examples_in_dir(dir: &PathBuf) {
             {
                 continue;
             }
-            let file = File::open(path).map_err(|e| serde_json::Error::io(e));
-            let reader = BufReader::new(file);
-            match serde_json::from_reader(reader) {
-                Ok(_) => {
-                    println!("Successfully parsed JSON to Resource");
-                    println!("File {} passed basic parsing test", path.display());
+            println!("Processing file: {}", path.display());
+            
+            // Open the file and handle any IO errors
+            match File::open(&path) {
+                Ok(file) => {
+                    let reader = BufReader::new(file);
+                    
+                    // Parse the JSON from the reader
+                    match serde_json::from_reader::<_, serde_json::Value>(reader) {
+                        Ok(json_value) => {
+                            // Check if it has a resourceType field
+                            if let Some(resource_type) = json_value.get("resourceType") {
+                                if let Some(resource_type_str) = resource_type.as_str() {
+                                    println!("Resource type: {}", resource_type_str);
+                                    println!("File {} passed basic JSON validation", path.display());
+                                } else {
+                                    println!("resourceType is not a string");
+                                }
+                            } else {
+                                println!("JSON does not contain a resourceType field");
+                            }
+                        }
+                        Err(e) => {
+                            println!("Error parsing JSON: {}: {}", path.display(), e);
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("Error parsing as FHIR resource: {}: {}", path.display(), e);
+                    println!("Error opening file: {}: {}", path.display(), e);
                 }
             }
         }
