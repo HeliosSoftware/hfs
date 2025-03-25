@@ -1,7 +1,7 @@
 use std::fs;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
-
-use fhir::r4::Resource;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -63,16 +63,9 @@ fn test_examples_in_dir(dir: &PathBuf) {
             {
                 continue;
             }
-
-            println!("Processing file: {}", path.display());
-            println!("Step 1: Reading file content");
-            let content = fs::read_to_string(&path).unwrap();
-            println!("Step 2: File content read successfully, length: {}", content.len());
-
-            // Instead of using serde_json::Value as an intermediate step, directly try to parse
-            // the JSON string into a Resource. This avoids one level of deserialization.
-            println!("Step 3: Directly parsing JSON string to Resource");
-            match serde_json::from_str::<Resource>(&content) {
+            let file = File::open(path).map_err(|e| serde_json::Error::io(e));
+            let reader = BufReader::new(file);
+            match serde_json::from_reader(reader) {
                 Ok(_) => {
                     println!("Successfully parsed JSON to Resource");
                     println!("File {} passed basic parsing test", path.display());
@@ -82,5 +75,25 @@ fn test_examples_in_dir(dir: &PathBuf) {
                 }
             }
         }
+        /*
+                    println!("Processing file: {}", path.display());
+                    println!("Step 1: Reading file content");
+                    let content = fs::read_to_string(&path).unwrap();
+                    println!("Step 2: File content read successfully, length: {}", content.len());
+
+                    // Instead of using serde_json::Value as an intermediate step, directly try to parse
+                    // the JSON string into a Resource. This avoids one level of deserialization.
+                    println!("Step 3: Directly parsing JSON string to Resource");
+                    match serde_json::from_str::<Resource>(&content) {
+                        Ok(_) => {
+                            println!("Successfully parsed JSON to Resource");
+                            println!("File {} passed basic parsing test", path.display());
+                        }
+                        Err(e) => {
+                            println!("Error parsing as FHIR resource: {}: {}", path.display(), e);
+                        }
+                    }
+                }
+        */
     }
 }
