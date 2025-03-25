@@ -1,8 +1,8 @@
+use fhir::r4::Resource;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use fhir::r4::Resource;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -80,20 +80,31 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                     // Try to convert the JSON value to a FHIR Resource
                                     match serde_json::from_value::<Resource>(json_value.clone()) {
                                         Ok(resource) => {
-                                            println!("Successfully converted JSON to FHIR Resource");
-                                            
+                                            println!(
+                                                "Successfully converted JSON to FHIR Resource"
+                                            );
+
                                             // Verify we can serialize the Resource back to JSON
                                             match serde_json::to_value(&resource) {
                                                 Ok(resource_json) => {
                                                     println!("Successfully serialized Resource back to JSON");
-                                                },
+
+                                                    //AI! Assert that resource_json is the same as
+                                                    //json_value
+                                                }
                                                 Err(e) => {
-                                                    println!("Error serializing Resource to JSON: {}", e);
+                                                    println!(
+                                                        "Error serializing Resource to JSON: {}",
+                                                        e
+                                                    );
                                                 }
                                             }
-                                        },
+                                        }
                                         Err(e) => {
-                                            println!("Error converting JSON to FHIR Resource: {}", e);
+                                            println!(
+                                                "Error converting JSON to FHIR Resource: {}",
+                                                e
+                                            );
                                         }
                                     }
 
