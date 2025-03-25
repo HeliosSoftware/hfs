@@ -1,4 +1,4 @@
-use fhir_gen::initial_fhir_model::Resource;
+use fhir::r4::Resource;
 use std::fs;
 use std::path::PathBuf;
 
@@ -57,11 +57,11 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
         if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
             // Only process the specific file
-            if path.file_name().unwrap().to_string_lossy()
-                != "extension-careplan-activity-title.json"
-            {
-                continue;
-            }
+            //if path.file_name().unwrap().to_string_lossy()
+            //    != "extension-careplan-activity-title.json"
+            //{
+            //    continue;
+            //}
             println!("Processing file: {}", path.display());
 
             // Read the file content
@@ -86,6 +86,10 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             match serde_json::to_value(&resource) {
                                                 Ok(resource_json) => {
                                                     println!("Successfully serialized Resource back to JSON");
+
+                                                    // AI! Should the two values not match, is
+                                                    // there a way to identify exactly what may be
+                                                    // different?
 
                                                     // Compare the original JSON with the re-serialized JSON using assert_eq!
                                                     assert_eq!(
