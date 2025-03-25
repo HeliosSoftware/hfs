@@ -1,6 +1,7 @@
 use fhir::r4::Resource;
 use std::fs;
 use std::path::PathBuf;
+use serde_json::Value;
 
 #[cfg(feature = "R4")]
 #[test]
@@ -45,6 +46,60 @@ fn test_r6_examples() {
 
 // This function is no longer needed with our simplified approach
 
+// Function to find differences between two JSON values
+fn find_json_differences(original: &Value, reserialized: &Value) -> Vec<(String, Value, Value)> {
+    let mut differences = Vec::new();
+    compare_json_values(original, reserialized, String::new(), &mut differences);
+    differences
+}
+
+// Recursively compare JSON values and collect differences
+fn compare_json_values(original: &Value, reserialized: &Value, path: String, differences: &mut Vec<(String, Value, Value)>) {
+    match (original, reserialized) {
+        (Value::Object(orig_obj), Value::Object(reser_obj)) => {
+            // Check for missing keys in either direction
+            let orig_keys: std::collections::HashSet<&String> = orig_obj.keys().collect();
+            let reser_keys: std::collections::HashSet<&String> = reser_obj.keys().collect();
+            
+            // Keys in original but not in reserialized
+            for key in orig_keys.difference(&reser_keys) {
+                let new_path = if path.is_empty() { key.to_string() } else { format!("{}.{}", path, key) };
+                differences.push((new_path, orig_obj[*key].clone(), Value::Null));
+            }
+            
+            // Keys in reserialized but not in original
+            for key in reser_keys.difference(&orig_keys) {
+                let new_path = if path.is_empty() { key.to_string() } else { format!("{}.{}", path, key) };
+                differences.push((new_path, Value::Null, reser_obj[*key].clone()));
+            }
+            
+            // Compare values for keys that exist in both
+            for key in orig_keys.intersection(&reser_keys) {
+                let new_path = if path.is_empty() { key.to_string() } else { format!("{}.{}", path, key) };
+                compare_json_values(&orig_obj[*key], &reser_obj[*key], new_path, differences);
+            }
+        },
+        (Value::Array(orig_arr), Value::Array(reser_arr)) => {
+            // Compare arrays element by element if they're the same length
+            if orig_arr.len() == reser_arr.len() {
+                for (i, (orig_val, reser_val)) in orig_arr.iter().zip(reser_arr.iter()).enumerate() {
+                    let new_path = if path.is_empty() { format!("[{}]", i) } else { format!("{}[{}]", path, i) };
+                    compare_json_values(orig_val, reser_val, new_path, differences);
+                }
+            } else {
+                // If arrays have different lengths, just report the whole array as different
+                differences.push((path, original.clone(), reserialized.clone()));
+            }
+        },
+        // For primitive values, just check equality
+        _ => {
+            if original != reserialized {
+                differences.push((path, original.clone(), reserialized.clone()));
+            }
+        }
+    }
+}
+
 fn test_examples_in_dir(dir: &PathBuf) {
     if !dir.exists() {
         println!("Directory does not exist: {:?}", dir);
@@ -87,18 +142,27 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                                 Ok(resource_json) => {
                                                     println!("Successfully serialized Resource back to JSON");
 
-                                                    // AI! Should the two values not match, is
-                                                    // there a way to identify exactly what may be
-                                                    // different?
-
-                                                    // Compare the original JSON with the re-serialized JSON using assert_eq!
-                                                    assert_eq!(
-                                                        resource_json, 
-                                                        json_value, 
-                                                        "JSON values should match.\nOriginal: {}\nReserialized: {}", 
-                                                        serde_json::to_string_pretty(&json_value).unwrap_or_default(),
-                                                        serde_json::to_string_pretty(&resource_json).unwrap_or_default()
-                                                    );
+                                                    // Compare the original JSON with the re-serialized JSON
+                                                    if resource_json != json_value {
+                                                        // Find and report the differences
+                                                        let diff_paths = find_json_differences(&json_value, &resource_json);
+                                                        if !diff_paths.is_empty() {
+                                                            println!("Found {} differences between original and reserialized JSON:", diff_paths.len());
+                                                            for (path, orig_val, new_val) in diff_paths {
+                                                                println!("  Path: {}", path);
+                                                                println!("    Original: {}", serde_json::to_string_pretty(&orig_val).unwrap_or_default());
+                                                                println!("    Reserialized: {}", serde_json::to_string_pretty(&new_val).unwrap_or_default());
+                                                            }
+                                                        }
+                                                        
+                                                        // Still fail the test with assert_eq
+                                                        assert_eq!(
+                                                            resource_json, 
+                                                            json_value, 
+                                                            "JSON values should match.\nSee above for specific differences."
+                                                        );
+                                                    }
+                                                    
                                                     println!("Resource JSON matches original JSON");
                                                 }
                                                 Err(e) => {
