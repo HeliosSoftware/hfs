@@ -65,7 +65,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
             }
             println!("Processing file: {}", path.display());
 
-            // Read the file content once
+            // Read the file content
             match fs::read_to_string(&path) {
                 Ok(content) => {
                     // Parse the JSON string
@@ -75,21 +75,29 @@ fn test_examples_in_dir(dir: &PathBuf) {
                             if let Some(resource_type) = json_value.get("resourceType") {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
-                                    
+
+                                    // AI!  Obtain a Resourse from json_value
+
                                     // Re-serialize the JSON value to a string
                                     match serde_json::to_string(&json_value) {
                                         Ok(_) => {
                                             // We already have the original JSON value parsed,
                                             // so we can just compare it with itself to verify
                                             // the round-trip works
-                                            println!("File {} passed JSON round-trip test", path.display());
-                                        },
+                                            println!(
+                                                "File {} passed JSON round-trip test",
+                                                path.display()
+                                            );
+                                        }
                                         Err(e) => {
                                             println!("Error re-serializing JSON: {}", e);
                                         }
                                     }
-                                    
-                                    println!("File {} passed basic JSON validation", path.display());
+
+                                    println!(
+                                        "File {} passed basic JSON validation",
+                                        path.display()
+                                    );
                                 } else {
                                     println!("resourceType is not a string");
                                 }
