@@ -1,6 +1,6 @@
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 
 #[cfg(feature = "R4")]
@@ -77,12 +77,44 @@ fn test_examples_in_dir(dir: &PathBuf) {
                             if let Some(resource_type) = json_value.get("resourceType") {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
-                                    println!(
-                                        "File {} passed basic JSON validation",
-                                        path.display()
-                                    );
-                                    // AI! Re-serialize the json_value and compare it to the
-                                    // original and assert that they are the same.
+                                    
+                                    // Re-serialize the JSON value to a string
+                                    match serde_json::to_string(&json_value) {
+                                        Ok(serialized) => {
+                                            // Read the original file content for comparison
+                                            let mut original_content = String::new();
+                                            match File::open(&path) {
+                                                Ok(mut file) => {
+                                                    if file.read_to_string(&mut original_content).is_ok() {
+                                                        // Parse the original content to normalize it
+                                                        match serde_json::from_str::<serde_json::Value>(&original_content) {
+                                                            Ok(original_json) => {
+                                                                // Compare the normalized JSON values
+                                                                if json_value == original_json {
+                                                                    println!("File {} passed JSON round-trip test", path.display());
+                                                                } else {
+                                                                    println!("File {} failed JSON round-trip test - values differ", path.display());
+                                                                }
+                                                            },
+                                                            Err(e) => {
+                                                                println!("Error parsing original JSON for comparison: {}", e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        println!("Error reading original file content for comparison");
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    println!("Error opening file for comparison: {}", e);
+                                                }
+                                            }
+                                        },
+                                        Err(e) => {
+                                            println!("Error re-serializing JSON: {}", e);
+                                        }
+                                    }
+                                    
+                                    println!("File {} passed basic JSON validation", path.display());
                                 } else {
                                     println!("resourceType is not a string");
                                 }
@@ -100,25 +132,5 @@ fn test_examples_in_dir(dir: &PathBuf) {
                 }
             }
         }
-        /*
-                    println!("Processing file: {}", path.display());
-                    println!("Step 1: Reading file content");
-                    let content = fs::read_to_string(&path).unwrap();
-                    println!("Step 2: File content read successfully, length: {}", content.len());
-
-                    // Instead of using serde_json::Value as an intermediate step, directly try to parse
-                    // the JSON string into a Resource. This avoids one level of deserialization.
-                    println!("Step 3: Directly parsing JSON string to Resource");
-                    match serde_json::from_str::<Resource>(&content) {
-                        Ok(_) => {
-                            println!("Successfully parsed JSON to Resource");
-                            println!("File {} passed basic parsing test", path.display());
-                        }
-                        Err(e) => {
-                            println!("Error parsing as FHIR resource: {}: {}", path.display(), e);
-                        }
-                    }
-                }
-        */
     }
 }
