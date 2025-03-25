@@ -95,6 +95,7 @@ fn compare_json_values(original: &Value, reserialized: &Value, path: String, dif
         (Value::Number(n1), Value::Number(n2)) => {
             // If both can be represented as f64, compare them as floating point
             if let (Some(f1), Some(f2)) = (n1.as_f64(), n2.as_f64()) {
+                // AI!  Compare 74 should equal 74.0
                 // Check if they're very close (to handle floating point precision issues)
                 if (f1 - f2).abs() < 1e-10 {
                     // Numbers are effectively equal, don't report a difference
