@@ -203,14 +203,15 @@ impl Serialize for FhirDecimal {
     where
         S: Serializer,
     {
-        // If scale is 0 AND the value is a whole number, serialize as integer
+        // Always respect the original scale, even for whole numbers
+        // Only serialize as integer if scale is explicitly 0
         if self.scale == 0 && self.value.fract().is_zero() {
             if let Some(int_val) = self.value.to_i64() {
                 return serializer.serialize_i64(int_val);
             }
         }
 
-        // Format with exact scale, then serialize as string for non-zero scale
+        // Format with exact scale, preserving decimal places
         let formatted = format!("{:.*}", self.scale, self.value);
         serializer.serialize_str(&formatted)
     }
