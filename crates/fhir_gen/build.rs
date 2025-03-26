@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::io::copy;
-use std::path::Path;
+use std::path::PathBuf;
 use zip::ZipArchive;
 
 fn main() {
@@ -9,8 +9,8 @@ fn main() {
     if !cfg!(feature = "R6") {
         return;
     }
-
-    let resources_dir = Path::new("resources/r6");
+    // AI! create the resource/R6 directory if it doesn't yet exist
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/R6");
     let url = "https://build.fhir.org/definitions.json.zip";
 
     let output_path = resources_dir.join("definitions.json.zip");

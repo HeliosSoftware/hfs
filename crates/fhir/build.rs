@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::io::copy;
-use std::path::Path;
+use std::path::PathBuf;
 use zip::ZipArchive;
 
 fn main() {
@@ -10,7 +10,7 @@ fn main() {
         return;
     }
 
-    let resources_dir = Path::new("tests/data/r6");
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/r6");
     let url = "https://build.fhir.org/examples-json.zip";
 
     let output_path = resources_dir.join("examples.json.zip");
