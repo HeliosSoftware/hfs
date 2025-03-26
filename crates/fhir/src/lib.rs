@@ -302,20 +302,14 @@ impl From<i32> for FhirDecimal {
     }
 }
 
-impl From<i64> for FhirDecimal {
-    fn from(value: i64) -> Self {
-        FhirDecimal {
-            value: Decimal::from(value),
-            scale: 0,
-        }
-    }
-}
-
 impl From<f64> for FhirDecimal {
     fn from(value: f64) -> Self {
         let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
         let scale = determine_scale(value);
-        FhirDecimal { value: decimal, scale }
+        FhirDecimal {
+            value: decimal,
+            scale,
+        }
     }
 }
 
@@ -342,7 +336,6 @@ impl FhirDecimal {
         FhirDecimal::from_with_scale(value, 1)
     }
 }
-
 
 impl TryFrom<&str> for FhirDecimal {
     type Error = rust_decimal::Error;
@@ -380,7 +373,7 @@ mod tests {
     fn test_serialize_decimal_simple() {
         let decimal = FhirDecimal::from(1250.0);
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"1250.0\"");
+        assert_eq!(json, "1250.0");
     }
 
     #[test]
@@ -393,7 +386,7 @@ mod tests {
 
         // Now check serialization
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"250.0\"");
+        assert_eq!(json, "250.0");
     }
 
     #[test]
@@ -406,7 +399,7 @@ mod tests {
 
         // Serialize
         let json = serde_json::to_string(&original).unwrap();
-        assert_eq!(json, "\"250.0\"");
+        assert_eq!(json, "250.0");
 
         // Deserialize
         let roundtrip: FhirDecimal = serde_json::from_str(&json).unwrap();
@@ -432,7 +425,7 @@ mod tests {
 
         // Verify serialization
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"123.0\"");
+        assert_eq!(json, "123.0");
     }
 }
 /*
