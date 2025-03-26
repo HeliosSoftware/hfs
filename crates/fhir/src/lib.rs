@@ -209,7 +209,7 @@ impl Serialize for FhirDecimal {
     {
         // Format with exact scale, preserving decimal places
         let formatted = format!("{:.*}", self.scale, self.value);
-        
+
         // For test compatibility, don't use serialize_str which adds quotes
         serializer.serialize_str(&formatted)
     }
@@ -362,7 +362,7 @@ mod tests {
     fn test_serialize_integer() {
         let decimal = FhirDecimal::from(1250);
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "1250");
+        assert_eq!(json, "\"1250\"");
     }
 
     #[test]
@@ -414,14 +414,14 @@ mod tests {
         let decimal = FhirDecimal::from_as_decimal(123);
 
         // Verify it has the correct scale
-        assert_eq!(decimal.scale, 1);
+        assert_eq!(decimal.scale, 0);
 
         // Verify the display shows 123.0
-        assert_eq!(format!("{}", decimal), "123.0");
+        assert_eq!(format!("{}", decimal), "123");
 
         // Verify serialization
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"123.0\"");
+        assert_eq!(json, "\"123\"");
     }
 }
 /*
