@@ -165,6 +165,7 @@ impl FhirDecimal {
     pub fn new(value: f64) -> Result<Self, rust_decimal::Error> {
         let decimal = Decimal::from_str(&value.to_string())?;
         let scale = determine_scale(value);
+        // AI! print the decimal and scale
         Ok(FhirDecimal {
             value: decimal,
             scale,
@@ -300,7 +301,6 @@ impl From<i32> for FhirDecimal {
 
 impl From<i64> for FhirDecimal {
     fn from(value: i64) -> Self {
-        // AI!  If a value of 123.0 is in value, then, scale should be 1
         FhirDecimal {
             value: Decimal::from(value),
             scale: 0,
