@@ -1,6 +1,6 @@
 .DS_Store
 /target
 .aider*
-crates/fhir_gen/resources/r6
-crates/fhir/tests/data/r6
+crates/fhir_gen/resources/R6
+crates/fhir/tests/data/R6
 .idea

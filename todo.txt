@@ -16,4 +16,9 @@
   decide - could be helpful too in the future when we need to use it for Cassandra table separation
 - Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
 - Document: export RUST_MIN_STACK=8388608
+- Document: Build process:
+      cargo build --features R4,R4B,R5,R6
+      ./target/debug/fhir_gen --all
+      cargo test --features R4,R4B,R5,R6
+
 

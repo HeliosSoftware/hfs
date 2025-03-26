@@ -9,11 +9,12 @@ fn main() {
     if !cfg!(feature = "R6") {
         return;
     }
-    
+
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/R6");
-    
+
     // Create the resources directory if it doesn't exist
     fs::create_dir_all(&resources_dir).expect("Failed to create resources directory");
+
     let url = "https://build.fhir.org/definitions.json.zip";
 
     let output_path = resources_dir.join("definitions.json.zip");

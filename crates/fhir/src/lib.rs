@@ -66,13 +66,13 @@ impl FhirVersion {
     pub fn as_str(&self) -> &'static str {
         match self {
             #[cfg(feature = "R4")]
-            FhirVersion::R4 => "r4",
+            FhirVersion::R4 => "R4",
             #[cfg(feature = "R4B")]
-            FhirVersion::R4B => "r4b",
+            FhirVersion::R4B => "R4B",
             #[cfg(feature = "R5")]
-            FhirVersion::R5 => "r5",
+            FhirVersion::R5 => "R5",
             #[cfg(feature = "R6")]
-            FhirVersion::R6 => "r6",
+            FhirVersion::R6 => "R6",
         }
     }
 }

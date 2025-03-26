@@ -19,7 +19,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
 
     let version_path = output_path
         .as_ref()
-        .join(&format!("{}.rs", version.as_str()));
+        .join(&format!("{}.rs", version.as_str().to_lowercase()));
 
     // Create the version-specific output file with initial content
     std::fs::write(

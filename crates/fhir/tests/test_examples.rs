@@ -9,7 +9,7 @@ fn test_r4_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
-        .join("r4");
+        .join("R4");
     println!("Testing R4 examples in directory: {:?}", examples_dir);
     test_examples_in_dir(&examples_dir);
 }
@@ -20,7 +20,7 @@ fn test_r4b_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
-        .join("r4b");
+        .join("R4B");
     test_examples_in_dir(&examples_dir);
 }
 
@@ -30,7 +30,7 @@ fn test_r5_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
-        .join("r5");
+        .join("R5");
     test_examples_in_dir(&examples_dir);
 }
 
@@ -40,7 +40,7 @@ fn test_r6_examples() {
     let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("data")
-        .join("r6");
+        .join("R6");
     test_examples_in_dir(&examples_dir);
 }
 

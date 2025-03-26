@@ -10,10 +10,11 @@ fn main() {
         return;
     }
 
-    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/r6");
-    
+    let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/R6");
+
     // Create the resources directory if it doesn't exist
     fs::create_dir_all(&resources_dir).expect("Failed to create resources directory");
+
     let url = "https://build.fhir.org/examples-json.zip";
 
     let output_path = resources_dir.join("examples.json.zip");
