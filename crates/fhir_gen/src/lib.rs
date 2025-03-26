@@ -24,7 +24,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Create the version-specific output file with initial content
     std::fs::write(
         &version_path,
-        "use serde::{Serialize, Deserialize};\nuse crate::Element;\n\n",
+        "use serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
     )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
