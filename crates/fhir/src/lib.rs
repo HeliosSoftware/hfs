@@ -300,6 +300,7 @@ impl From<i32> for FhirDecimal {
 
 impl From<i64> for FhirDecimal {
     fn from(value: i64) -> Self {
+        // AI!  If a value of 123.0 is in value, then, scale should be 1
         FhirDecimal {
             value: Decimal::from(value),
             scale: 0,
