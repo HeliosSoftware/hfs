@@ -1,3 +1,6 @@
+- 74 needs to not be 74.0
+- Need to figure out how to support extensions on primitives (or any json _ attribute) and placement into the extension Vec.
+- Need to improve the deserialize/serialze/deserialze test - it's currently only checking ::Value
 - Need to add resourceType as an attribute to all resources
 - I can use a Custom Derive Macro, but I'm unsure what output it should have to send to the evaluator?
 - Change the form of the evaluator to:  expr:Expression, fhir_resources: Array(Resources), base:Expression, env_variables (HashMap(String, String), model (r4) ??, options (struct 
@@ -12,3 +15,5 @@
 - The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to 
   decide - could be helpful too in the future when we need to use it for Cassandra table separation
 - Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
+- Document: export RUST_MIN_STACK=8388608
+

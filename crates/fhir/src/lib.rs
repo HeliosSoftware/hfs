@@ -1,8 +1,10 @@
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, Deserializer},
+    ser::Serializer,
+    Deserialize, Serialize,
+};
 use std::fmt;
-use std::str::FromStr;
 //use time::{Date, Month};
 #[cfg(feature = "R4")]
 pub mod r4;
@@ -115,7 +117,6 @@ pub struct Element<V, E> {
     pub value: Option<V>,
 }
 
-// Generic implementation of Deserialize
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
     V: Deserialize<'de>,
@@ -137,7 +138,6 @@ where
     }
 }
 
-// Generic implementation of Serialize
 impl<V, E> Serialize for Element<V, E>
 where
     V: Serialize,
@@ -153,275 +153,98 @@ where
     }
 }
 
-/// A decimal type that preserves exact precision when serializing to/from JSON.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FhirDecimal {
-    pub value: Decimal,
-    pub scale: usize, // Explicit scale (number of decimal places)
+#[derive(Debug)]
+pub struct DecimalElement<E> {
+    pub id: Option<String>,
+    pub extension: Option<Vec<E>>,
+    pub value: Option<Decimal>,
 }
 
-impl FhirDecimal {
-    /// Create a new FhirDecimal from an f64 value
-    pub fn new(value: f64) -> Result<Self, rust_decimal::Error> {
-        let decimal = Decimal::from_str(&value.to_string())?;
-        let scale = determine_scale(value);
-        println!(
-            "Creating FhirDecimal - value: {}, scale: {}",
-            decimal, scale
-        );
-        Ok(FhirDecimal {
-            value: decimal,
-            scale,
-        })
-    }
-
-    /// Create from a Decimal with specified scale
-    pub fn with_scale(value: Decimal, scale: usize) -> Self {
-        FhirDecimal { value, scale }
-    }
-
-    /// Get the underlying Decimal value
-    pub fn value(&self) -> Decimal {
-        self.value
-    }
-
-    /// Convert to f64
-    pub fn to_f64(&self) -> f64 {
-        self.value.to_f64().unwrap_or(0.0)
-    }
-}
-
-// Determine scale from f64
-fn determine_scale(value: f64) -> usize {
-    let s = value.to_string();
-    if let Some(dot_pos) = s.find('.') {
-        s.len() - dot_pos - 1
-    } else {
-        0
-    }
-}
-
-// Custom implementation of Serialize
-impl Serialize for FhirDecimal {
+// Custom serializer implementation
+impl<E: Serialize> Serialize for DecimalElement<E> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Format with exact scale, preserving decimal places
-        let formatted = format!("{:.*}", self.scale, self.value);
+        // Create a temporary serialization structure
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("DecimalElement", 3)?;
 
-        // For test compatibility, don't use serialize_str which adds quotes
-        serializer.serialize_str(&formatted)
+        // Serialize id and extension normally
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("extension", &self.extension)?;
+
+        // Custom serialization for the decimal value to preserve scale
+        if let Some(decimal) = &self.value {
+            // Get the scale to preserve trailing zeros
+            let scale = decimal.scale();
+            let formatted = format!("{:.*}", scale as usize, decimal);
+            state.serialize_field("value", &formatted)?;
+        } else {
+            state.serialize_field("value", &Option::<String>::None)?;
+        }
+
+        state.end()
     }
 }
 
-// Custom implementation of Deserialize
-impl<'de> Deserialize<'de> for FhirDecimal {
+// Custom deserializer implementation
+impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum NumericOrString {
-            String(String),
-            Int(i64),
-            Float(f64),
-        }
+        // Define a visitor struct for deserialization
+        struct DecimalElementVisitor<E>(std::marker::PhantomData<E>);
 
-        let value = NumericOrString::deserialize(deserializer)?;
+        impl<'de, E: Deserialize<'de>> de::Visitor<'de> for DecimalElementVisitor<E> {
+            type Value = DecimalElement<E>;
 
-        match value {
-            NumericOrString::String(s) => {
-                let decimal = Decimal::from_str(&s).map_err(serde::de::Error::custom)?;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a DecimalElement")
+            }
 
-                // Calculate scale from the string representation
-                let scale = if let Some(dot_pos) = s.find('.') {
-                    s.len() - dot_pos - 1
-                } else {
-                    0
-                };
+            // Implement visit_map to handle the struct fields
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut extension = None;
+                let mut value = None;
 
-                Ok(FhirDecimal {
-                    value: decimal,
-                    scale,
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            id = map.next_value()?;
+                        }
+                        "extension" => {
+                            extension = map.next_value()?;
+                        }
+                        "value" => {
+                            // Handle decimal value with scale preservation
+                            let decimal_str: Option<String> = map.next_value()?;
+                            if let Some(s) = decimal_str {
+                                value =
+                                    Some(Decimal::from_str_exact(&s).map_err(de::Error::custom)?);
+                            }
+                        }
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(DecimalElement {
+                    id,
+                    extension,
+                    value,
                 })
             }
-            NumericOrString::Int(i) => {
-                let decimal = Decimal::from(i);
-                // For integers, set scale to 0
-                Ok(FhirDecimal {
-                    value: decimal,
-                    scale: 0,
-                })
-            }
-            NumericOrString::Float(f) => {
-                let decimal =
-                    Decimal::from_str(&f.to_string()).map_err(serde::de::Error::custom)?;
-
-                // For floats, determine scale from the string representation
-                let scale = determine_scale(f);
-
-                Ok(FhirDecimal {
-                    value: decimal,
-                    scale,
-                })
-            }
-        }
-    }
-}
-
-// Implement Display
-impl fmt::Display for FhirDecimal {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // If scale is 0 and it's a whole number, format as integer
-        if self.scale == 0 && self.value.fract().is_zero() {
-            if let Some(int_val) = self.value.to_i64() {
-                return write!(f, "{}", int_val);
-            }
         }
 
-        // Otherwise format with the specified scale
-        write!(f, "{:.*}", self.scale, self.value)
-    }
-}
-
-// Convert from common types
-impl From<i32> for FhirDecimal {
-    fn from(value: i32) -> Self {
-        FhirDecimal {
-            value: Decimal::from(value),
-            scale: 0,
-        }
-    }
-}
-
-impl From<f64> for FhirDecimal {
-    fn from(value: f64) -> Self {
-        let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
-        let scale = determine_scale(value);
-        // Ensure scale is at least 1 for floating point values
-        let scale = if scale == 0 { 1 } else { scale };
-        FhirDecimal {
-            value: decimal,
-            scale,
-        }
-    }
-}
-
-// Create with specific scale - fixed implementation
-impl FhirDecimal {
-    pub fn from_with_scale(value: i64, scale: usize) -> Self {
-        // Use string manipulation to ensure correct decimal places
-        let value_str = if scale > 0 {
-            format!("{}.{}", value, "0".repeat(scale))
-        } else {
-            value.to_string()
-        };
-
-        // Parse the formatted string
-        let decimal = Decimal::from_str(&value_str).unwrap_or(Decimal::from(value));
-        FhirDecimal {
-            value: decimal,
-            scale,
-        }
-    }
-
-    // Create a decimal value from an integer with a scale of 1 (e.g., 123 becomes 123.0)
-    pub fn from_as_decimal(value: i64) -> Self {
-        FhirDecimal::from_with_scale(value, 1)
-    }
-}
-
-impl TryFrom<&str> for FhirDecimal {
-    type Error = rust_decimal::Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let decimal = Decimal::from_str(value)?;
-
-        // Calculate scale from the string
-        let scale = if let Some(dot_pos) = value.find('.') {
-            value.len() - dot_pos - 1
-        } else {
-            0
-        };
-
-        Ok(FhirDecimal {
-            value: decimal,
-            scale,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json;
-
-    #[test]
-    fn test_serialize_integer() {
-        let decimal = FhirDecimal::from(1250);
-        let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"1250\"");
-    }
-
-    #[test]
-    fn test_serialize_decimal_simple() {
-        let decimal = FhirDecimal::from(1250.0);
-        let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"1250.0\"");
-    }
-
-    #[test]
-    fn test_serialize_decimal() {
-        // Create a decimal with value 250 and scale 1 (should be 250.0)
-        let decimal = FhirDecimal::with_scale(Decimal::from_str("250.0").unwrap(), 1);
-
-        // Verify the display shows 250.0
-        assert_eq!(format!("{}", decimal), "250.0");
-
-        // Now check serialization
-        let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"250.0\"");
-    }
-
-    #[test]
-    fn test_roundtrip1() {
-        // Create a decimal with value 250 and scale 1 (should be 250.0)
-        let original = FhirDecimal::with_scale(Decimal::from_str("250.0").unwrap(), 1);
-
-        // Verify original display
-        assert_eq!(format!("{}", original), "250.0");
-
-        // Serialize
-        let json = serde_json::to_string(&original).unwrap();
-        assert_eq!(json, "\"250.0\"");
-
-        // Deserialize
-        let roundtrip: FhirDecimal = serde_json::from_str(&json).unwrap();
-
-        // Verify value and scale
-        assert_eq!(original.value, roundtrip.value);
-        assert_eq!(original.scale, roundtrip.scale);
-
-        // Verify display format
-        assert_eq!(format!("{}", roundtrip), "250.0");
-    }
-
-    #[test]
-    fn test_from_as_decimal() {
-        // Create a decimal from an integer with scale 1
-        let decimal = FhirDecimal::from_as_decimal(123);
-
-        // Verify it has the correct scale
-        assert_eq!(decimal.scale, 0);
-
-        // Verify the display shows 123.0
-        assert_eq!(format!("{}", decimal), "123");
-
-        // Verify serialization
-        let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "\"123\"");
+        // Use the visitor to deserialize
+        deserializer.deserialize_map(DecimalElementVisitor(std::marker::PhantomData))
     }
 }
 /*

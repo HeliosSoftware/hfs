@@ -212,7 +212,7 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
                     return context.get_variable_as_result(var_name);
                 }
             }
-            
+
             if context.resources.is_empty() {
                 // If there are no resources, return Empty for resource-based invocations
                 evaluate_invocation(&EvaluationResult::Empty, invocation, context)
@@ -238,6 +238,7 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     // you would convert the resource to a proper object representation
     // that can be navigated with FHIRPath
     match resource {
+        #[cfg(feature = "R4")]
         FhirResource::R4(_r) => {
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
@@ -249,6 +250,7 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
             );
             EvaluationResult::Object(obj)
         }
+        #[cfg(feature = "R4B")]
         FhirResource::R4B(_r) => {
             let mut obj = HashMap::new();
             obj.insert(
@@ -257,6 +259,7 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
             );
             EvaluationResult::Object(obj)
         }
+        #[cfg(feature = "R5")]
         FhirResource::R5(_r) => {
             let mut obj = HashMap::new();
             obj.insert(
@@ -265,6 +268,7 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
             );
             EvaluationResult::Object(obj)
         }
+        #[cfg(feature = "R6")]
         FhirResource::R6(_r) => {
             let mut obj = HashMap::new();
             obj.insert(
@@ -447,7 +451,7 @@ fn call_function(
             if args.is_empty() {
                 return EvaluationResult::Empty;
             }
-            
+
             match context {
                 EvaluationResult::String(s) => {
                     if let EvaluationResult::String(arg) = &args[0] {
@@ -455,13 +459,13 @@ fn call_function(
                     } else {
                         EvaluationResult::Boolean(false)
                     }
-                },
+                }
                 EvaluationResult::Collection(items) => {
-                    let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", &args[0]).to_boolean()
-                    });
+                    let contains = items
+                        .iter()
+                        .any(|item| compare_equality(item, "=", &args[0]).to_boolean());
                     EvaluationResult::Boolean(contains)
-                },
+                }
                 _ => EvaluationResult::Boolean(false),
             }
         }
@@ -857,17 +861,15 @@ fn check_membership(
                     let contains = items
                         .iter()
                         .any(|item| compare_equality(item, "=", right).to_boolean());
-                    
+
                     EvaluationResult::Boolean(contains)
-                },
+                }
                 // For strings, check if the string contains the substring
-                EvaluationResult::String(s) => {
-                    match right {
-                        EvaluationResult::String(substr) => {
-                            EvaluationResult::Boolean(s.contains(substr))
-                        },
-                        _ => EvaluationResult::Boolean(false),
+                EvaluationResult::String(s) => match right {
+                    EvaluationResult::String(substr) => {
+                        EvaluationResult::Boolean(s.contains(substr))
                     }
+                    _ => EvaluationResult::Boolean(false),
                 },
                 // For other types, return false
                 _ => EvaluationResult::Boolean(false),

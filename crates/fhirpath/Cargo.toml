@@ -3,6 +3,13 @@ name = "fhirpath"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["R4"]
+R4 = []
+R4B = []
+R5 = []
+R6 = []
+
 [dependencies]
 fhir = { path = "../fhir" }
 chumsky = "0.9.3"
