@@ -313,12 +313,9 @@ impl From<i64> for FhirDecimal {
 
 impl From<f64> for FhirDecimal {
     fn from(value: f64) -> Self {
-        // Use try_from but handle the error case by providing a default
-        Self::try_from(value).unwrap_or_else(|_| {
-            let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
-            let scale = determine_scale(value);
-            FhirDecimal { value: decimal, scale }
-        })
+        let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
+        let scale = determine_scale(value);
+        FhirDecimal { value: decimal, scale }
     }
 }
 
@@ -346,13 +343,6 @@ impl FhirDecimal {
     }
 }
 
-impl TryFrom<f64> for FhirDecimal {
-    type Error = rust_decimal::Error;
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
-        FhirDecimal::new(value)
-    }
-}
 
 impl TryFrom<&str> for FhirDecimal {
     type Error = rust_decimal::Error;
