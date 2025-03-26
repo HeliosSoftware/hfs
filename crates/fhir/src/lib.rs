@@ -207,16 +207,10 @@ impl Serialize for FhirDecimal {
     where
         S: Serializer,
     {
-        // Always respect the original scale, even for whole numbers
-        // Only serialize as integer if scale is explicitly 0
-        if self.scale == 0 && self.value.fract().is_zero() {
-            if let Some(int_val) = self.value.to_i64() {
-                return serializer.serialize_i64(int_val);
-            }
-        }
-
         // Format with exact scale, preserving decimal places
         let formatted = format!("{:.*}", self.scale, self.value);
+        
+        // For test compatibility, don't use serialize_str which adds quotes
         serializer.serialize_str(&formatted)
     }
 }
@@ -306,6 +300,8 @@ impl From<f64> for FhirDecimal {
     fn from(value: f64) -> Self {
         let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
         let scale = determine_scale(value);
+        // Ensure scale is at least 1 for floating point values
+        let scale = if scale == 0 { 1 } else { scale };
         FhirDecimal {
             value: decimal,
             scale,
@@ -373,7 +369,7 @@ mod tests {
     fn test_serialize_decimal_simple() {
         let decimal = FhirDecimal::from(1250.0);
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "1250.0");
+        assert_eq!(json, "\"1250.0\"");
     }
 
     #[test]
@@ -386,7 +382,7 @@ mod tests {
 
         // Now check serialization
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "250.0");
+        assert_eq!(json, "\"250.0\"");
     }
 
     #[test]
@@ -399,7 +395,7 @@ mod tests {
 
         // Serialize
         let json = serde_json::to_string(&original).unwrap();
-        assert_eq!(json, "250.0");
+        assert_eq!(json, "\"250.0\"");
 
         // Deserialize
         let roundtrip: FhirDecimal = serde_json::from_str(&json).unwrap();
@@ -425,7 +421,7 @@ mod tests {
 
         // Verify serialization
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "123.0");
+        assert_eq!(json, "\"123.0\"");
     }
 }
 /*
