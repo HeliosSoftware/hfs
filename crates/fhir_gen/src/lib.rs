@@ -267,12 +267,16 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
         _ => "std::string::String",
     };
 
-    // Generate a type alias using Element<T, Extension>
-    output.push_str(&format!(
-        "pub type {} = Element<{}, Extension>;\n",
-        capitalize_first_letter(type_name),
-        value_type
-    ));
+    // Generate a type alias using Element<T, Extension> or DecimalElement<Extension> for decimal type
+    if type_name == "decimal" {
+        output.push_str("pub type Decimal = DecimalElement<Extension>;\n");
+    } else {
+        output.push_str(&format!(
+            "pub type {} = Element<{}, Extension>;\n",
+            capitalize_first_letter(type_name),
+            value_type
+        ));
+    }
 
     output
 }
