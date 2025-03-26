@@ -165,7 +165,7 @@ impl FhirDecimal {
     pub fn new(value: f64) -> Result<Self, rust_decimal::Error> {
         let decimal = Decimal::from_str(&value.to_string())?;
         let scale = determine_scale(value);
-        // AI! print the decimal and scale
+        println!("Creating FhirDecimal - value: {}, scale: {}", decimal, scale);
         Ok(FhirDecimal {
             value: decimal,
             scale,
@@ -325,6 +325,11 @@ impl FhirDecimal {
             scale,
         }
     }
+    
+    // Create a decimal value from an integer with a scale of 1 (e.g., 123 becomes 123.0)
+    pub fn from_as_decimal(value: i64) -> Self {
+        FhirDecimal::from_with_scale(value, 1)
+    }
 }
 
 impl TryFrom<f64> for FhirDecimal {
@@ -401,6 +406,22 @@ mod tests {
 
         // Verify display format
         assert_eq!(format!("{}", roundtrip), "250.0");
+    }
+    
+    #[test]
+    fn test_from_as_decimal() {
+        // Create a decimal from an integer with scale 1
+        let decimal = FhirDecimal::from_as_decimal(123);
+        
+        // Verify it has the correct scale
+        assert_eq!(decimal.scale, 1);
+        
+        // Verify the display shows 123.0
+        assert_eq!(format!("{}", decimal), "123.0");
+        
+        // Verify serialization
+        let json = serde_json::to_string(&decimal).unwrap();
+        assert_eq!(json, "\"123.0\"");
     }
 }
 /*
