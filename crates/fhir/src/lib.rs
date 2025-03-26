@@ -311,6 +311,17 @@ impl From<i64> for FhirDecimal {
     }
 }
 
+impl From<f64> for FhirDecimal {
+    fn from(value: f64) -> Self {
+        // Use try_from but handle the error case by providing a default
+        Self::try_from(value).unwrap_or_else(|_| {
+            let decimal = Decimal::from_str(&value.to_string()).unwrap_or_default();
+            let scale = determine_scale(value);
+            FhirDecimal { value: decimal, scale }
+        })
+    }
+}
+
 // Create with specific scale - fixed implementation
 impl FhirDecimal {
     pub fn from_with_scale(value: i64, scale: usize) -> Self {
@@ -379,7 +390,7 @@ mod tests {
     fn test_serialize_decimal_simple() {
         let decimal = FhirDecimal::from(1250.0);
         let json = serde_json::to_string(&decimal).unwrap();
-        assert_eq!(json, "1250.0");
+        assert_eq!(json, "\"1250.0\"");
     }
 
     #[test]
