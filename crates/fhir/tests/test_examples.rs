@@ -113,22 +113,6 @@ fn compare_json_values(
                 differences.push((path, original.clone(), reserialized.clone()));
             }
         }
-        // Special case for number comparisons (handle integer vs float)
-        /* (Value::Number(n1), Value::Number(n2)) => {
-            // If both can be represented as f64, compare them as floating point
-            if let (Some(f1), Some(f2)) = (n1.as_f64(), n2.as_f64()) {
-                // This handles cases like 74 vs 74.0
-                if (f1.round() == f2.round() && (f1.fract() == 0.0 || f2.fract() == 0.0)) {
-                    // Numbers are effectively equal, don't report a difference
-                    return;
-                }
-            }
-
-            // If they're not equal as floating point, report the difference
-            if original != reserialized {
-                differences.push((path, original.clone(), reserialized.clone()));
-            }
-        } */
         // For other primitive values, just check equality
         _ => {
             if original != reserialized {
