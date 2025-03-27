@@ -222,12 +222,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = map.next_value()?;
                         }
                         "value" => {
-                            // Handle decimal value with scale preservation
-                            let decimal_str: Option<String> = map.next_value()?;
-                            if let Some(s) = decimal_str {
-                                value =
-                                    Some(Decimal::from_str_exact(&s).map_err(de::Error::custom)?);
-                            }
+                            value = rust_decimal::serde::float_option::deserialize(deserializer);
                         }
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
