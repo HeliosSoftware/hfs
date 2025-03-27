@@ -213,8 +213,24 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                 let mut extension = None;
                 let mut value = None;
 
-                // AI!  Next, we want to find the value attribute in the map and set value using  rust_decimal::serde::float_option::deserialize
-
+                // Process each field in the map
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            id = Some(map.next_value()?);
+                        }
+                        "extension" => {
+                            extension = Some(map.next_value()?);
+                        }
+                        "value" => {
+                            value = rust_decimal::serde::float::deserialize(map.next_value()?);
+                        }
+                        _ => {
+                            // Skip unknown fields
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
                 Ok(DecimalElement {
                     id,
                     extension,
