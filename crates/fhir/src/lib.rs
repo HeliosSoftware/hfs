@@ -213,26 +213,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                 let mut extension = None;
                 let mut value = None;
 
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "id" => {
-                            id = map.next_value()?;
-                        }
-                        "extension" => {
-                            extension = map.next_value()?;
-                        }
-                        "value" => {
-                            // Parse the string value into a Decimal
-                            let str_val: Option<String> = map.next_value()?;
-                            if let Some(s) = str_val {
-                                value = s.parse::<Decimal>().ok();
-                            }
-                        }
-                        _ => {
-                            let _ = map.next_value::<de::IgnoredAny>()?;
-                        }
-                    }
-                }
+                // AI!  Next, we want to find the value attribute in the map and set value using  rust_decimal::serde::float_option::deserialize
 
                 Ok(DecimalElement {
                     id,
