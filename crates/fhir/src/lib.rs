@@ -169,7 +169,12 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
-                return serializer.serialize_f64(decimal);
+                // Convert Decimal to f64 and serialize that
+                if let Some(f64_val) = decimal.to_f64() {
+                    return serializer.serialize_f64(f64_val);
+                }
+                // Fall back to string serialization if conversion fails
+                return serializer.serialize_str(&decimal.to_string());
             } else {
                 return serializer.serialize_none();
             }
