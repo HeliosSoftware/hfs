@@ -223,7 +223,11 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            value = rust_decimal::serde::float::deserialize(map.next_value()?);
+                            let decimal_result = rust_decimal::serde::float::deserialize(map.next_value()?);
+                            value = match decimal_result {
+                                Ok(decimal) => Some(decimal),
+                                Err(_) => None,
+                            };
                         }
                         _ => {
                             // Skip unknown fields
