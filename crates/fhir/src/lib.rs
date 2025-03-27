@@ -281,11 +281,14 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
             where
                 E2: de::Error,
             {
-                Ok(DecimalElement {
-                    id: None,
-                    extension: None,
-                    value: Decimal::try_from(value).ok(),
-                })
+                match Decimal::try_from(value) {
+                    Ok(decimal) => Ok(DecimalElement {
+                        id: None,
+                        extension: None,
+                        value: Some(decimal),
+                    }),
+                    Err(_) => Err(E2::custom(format!("Failed to convert f64 {} to Decimal", value))),
+                }
             }
 
             // Add support for integer values
@@ -293,11 +296,14 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
             where
                 E2: de::Error,
             {
-                Ok(DecimalElement {
-                    id: None,
-                    extension: None,
-                    value: Decimal::try_from(value).ok(),
-                })
+                match Decimal::from_i64(value) {
+                    Some(decimal) => Ok(DecimalElement {
+                        id: None,
+                        extension: None,
+                        value: Some(decimal),
+                    }),
+                    None => Err(E2::custom(format!("Failed to convert i64 {} to Decimal", value))),
+                }
             }
 
             // Add support for unsigned integer values
@@ -305,11 +311,14 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
             where
                 E2: de::Error,
             {
-                Ok(DecimalElement {
-                    id: None,
-                    extension: None,
-                    value: Decimal::try_from(value).ok(),
-                })
+                match Decimal::from_u64(value) {
+                    Some(decimal) => Ok(DecimalElement {
+                        id: None,
+                        extension: None,
+                        value: Some(decimal),
+                    }),
+                    None => Err(E2::custom(format!("Failed to convert u64 {} to Decimal", value))),
+                }
             }
 
             // Add support for string values
@@ -317,16 +326,39 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
             where
                 E2: de::Error,
             {
+                match value.parse::<Decimal>() {
+                    Ok(decimal) => Ok(DecimalElement {
+                        id: None,
+                        extension: None,
+                        value: Some(decimal),
+                    }),
+                    Err(_) => Err(E2::custom(format!("Failed to parse string '{}' as Decimal", value))),
+                }
+            }
+            
+            // Handle null values
+            fn visit_unit<E2>(self) -> Result<Self::Value, E2>
+            where
+                E2: de::Error,
+            {
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: value.parse::<Decimal>().ok(),
+                    value: None,
                 })
             }
         }
 
-        // Use the visitor to deserialize any type
-        deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
+        // Try to deserialize as a number first
+        let result = deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData));
+        
+        // If that fails, try again with a different approach
+        if result.is_err() {
+            // Try to deserialize as a specific type based on the expected format
+            deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
+        } else {
+            result
+        }
     }
 }
 /*
