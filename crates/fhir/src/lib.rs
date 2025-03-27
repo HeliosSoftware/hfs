@@ -194,14 +194,24 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
     where
         D: Deserializer<'de>,
     {
-        // Define a visitor struct for deserialization
+        // First try to deserialize as a simple value (for direct numeric values)
+        let value_result = f64::deserialize(deserializer.clone());
+        if let Ok(num) = value_result {
+            return Ok(DecimalElement {
+                id: None,
+                extension: None,
+                value: Decimal::try_from(num).ok(),
+            });
+        }
+
+        // If that fails, try to deserialize as a map
         struct DecimalElementVisitor<E>(std::marker::PhantomData<E>);
 
         impl<'de, E: Deserialize<'de>> de::Visitor<'de> for DecimalElementVisitor<E> {
             type Value = DecimalElement<E>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a DecimalElement")
+                formatter.write_str("a DecimalElement or a number")
             }
 
             // Implement visit_map to handle the struct fields
@@ -256,10 +266,22 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                     value,
                 })
             }
+
+            // Add support for direct numeric values
+            fn visit_f64<E2>(self, value: f64) -> Result<Self::Value, E2>
+            where
+                E2: de::Error,
+            {
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: Decimal::try_from(value).ok(),
+                })
+            }
         }
 
         // Use the visitor to deserialize
-        deserializer.deserialize_map(DecimalElementVisitor(std::marker::PhantomData))
+        deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
     }
 }
 /*
