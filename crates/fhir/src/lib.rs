@@ -166,7 +166,25 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
     where
         S: Serializer,
     {
-        // Create a temporary serialization structure
+        // If we have a value and no id or extension, serialize just the value
+        if self.id.is_none() && self.extension.is_none() {
+            if let Some(decimal) = &self.value {
+                // Preserve scale for decimal values
+                let scale = decimal.scale();
+                if scale > 0 {
+                    // Format with trailing zeros
+                    let formatted = format!("{:.*}", scale as usize, decimal);
+                    return serializer.serialize_str(&formatted);
+                } else {
+                    // For whole numbers, serialize as is
+                    return decimal.serialize(serializer);
+                }
+            } else {
+                return serializer.serialize_none();
+            }
+        }
+        
+        // Otherwise, serialize as a structure
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("DecimalElement", 3)?;
 
