@@ -176,8 +176,9 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
                     let formatted = format!("{:.*}", scale as usize, decimal);
                     return serializer.serialize_str(&formatted);
                 } else {
-                    // For whole numbers, serialize as is
-                    return decimal.serialize(serializer);
+                    // For whole numbers, serialize as a string without decimal places
+                    let formatted = decimal.to_string();
+                    return serializer.serialize_str(&formatted);
                 }
             } else {
                 return serializer.serialize_none();
