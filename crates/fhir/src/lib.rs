@@ -169,16 +169,12 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
-                // Preserve scale for decimal values
-                let scale = decimal.scale();
-                // Serialize as a number to maintain the original format (e.g., 250.0)
-                let value = decimal.to_f64().unwrap_or(0.0);
-                return serializer.serialize_f64(value);
+                return serializer.serialize_f64(decimal);
             } else {
                 return serializer.serialize_none();
             }
         }
-        
+
         // Otherwise, serialize as a structure
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("DecimalElement", 3)?;
@@ -239,13 +235,11 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                         "value" => {
                             // Try to deserialize the value in a way that handles both strings and numbers
                             let value_result: Result<serde_json::Value, _> = map.next_value();
-                            
+
                             if let Ok(json_value) = value_result {
                                 value = match json_value {
                                     // Handle string values
-                                    serde_json::Value::String(s) => {
-                                        s.parse::<Decimal>().ok()
-                                    },
+                                    serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
                                     // Handle numeric values
                                     serde_json::Value::Number(num) => {
                                         if let Some(n) = num.as_f64() {
@@ -253,7 +247,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                                         } else {
                                             None
                                         }
-                                    },
+                                    }
                                     _ => None,
                                 };
                             }
