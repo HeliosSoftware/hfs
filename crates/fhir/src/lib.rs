@@ -223,27 +223,25 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            // Try to deserialize as a string first
-                            let result: Result<Option<String>, _> = map.next_value();
-                            if let Ok(str_value) = result {
-                                // Convert the string to Decimal if it exists
-                                value = match str_value {
-                                    Some(s) => match s.parse::<Decimal>() {
-                                        Ok(decimal) => Some(decimal),
-                                        Err(_) => None,
+                            // Try to deserialize the value in a way that handles both strings and numbers
+                            let value_result: Result<serde_json::Value, _> = map.next_value();
+                            
+                            if let Ok(json_value) = value_result {
+                                value = match json_value {
+                                    // Handle string values
+                                    serde_json::Value::String(s) => {
+                                        s.parse::<Decimal>().ok()
                                     },
-                                    None => None,
+                                    // Handle numeric values
+                                    serde_json::Value::Number(num) => {
+                                        if let Some(n) = num.as_f64() {
+                                            Decimal::try_from(n).ok()
+                                        } else {
+                                            None
+                                        }
+                                    },
+                                    _ => None,
                                 };
-                            } else {
-                                // If string deserialization fails, try as a number
-                                map.next_value::<serde::de::IgnoredAny>()?; // Skip the failed value
-                                
-                                // Deserialize again as a number
-                                let num_value: Result<f64, _> = map.next_value();
-                                if let Ok(num) = num_value {
-                                    // Convert f64 to Decimal
-                                    value = Decimal::try_from(num).ok();
-                                }
                             }
                         }
                         _ => {
