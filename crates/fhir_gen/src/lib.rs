@@ -472,8 +472,9 @@ fn generate_element_definition(
     if let Some(field_name) = element.path.split('.').last() {
         let rust_field_name = make_rust_safe(field_name);
 
+        let mut serde_attrs = Vec::new();
         if field_name != rust_field_name {
-            output.push_str(&format!("    #[serde(rename = \"{}\")]\n", field_name));
+            serde_attrs.push(format!("rename = \"{}\"", field_name));
         }
 
         let ty = match element.r#type.as_ref().and_then(|t| t.first()) {
@@ -539,13 +540,13 @@ fn generate_element_definition(
                     .chain(base_name.chars().skip(1))
                     .collect::<String>()
             );
-            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
+            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", enum_name)
         } else if is_array {
-            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
+            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<Vec<{}>>", base_type)
         } else if element.min.unwrap_or(0) == 0 {
-            output.push_str("    #[serde(skip_serializing_if = \"Option::is_none\")]\n");
+            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", base_type)
         } else {
             base_type.to_string()
@@ -568,6 +569,12 @@ fn generate_element_definition(
                 }
             }
         }
+        
+        // Output consolidated serde attributes if any exist
+        if !serde_attrs.is_empty() {
+            output.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
+        }
+        
         output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
     }
 }
