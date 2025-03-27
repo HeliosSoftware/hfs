@@ -1,4 +1,4 @@
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use serde::{
@@ -349,16 +349,8 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
             }
         }
 
-        // Try to deserialize as a number first
-        let result = deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData));
-        
-        // If that fails, try again with a different approach
-        if result.is_err() {
-            // Try to deserialize as a specific type based on the expected format
-            deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
-        } else {
-            result
-        }
+        // Use the visitor to deserialize
+        deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
     }
 }
 /*
