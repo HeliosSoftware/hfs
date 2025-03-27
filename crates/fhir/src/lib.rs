@@ -171,6 +171,8 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
+                // AI! If the scale is zero, let's output as a u64
+
                 // Convert Decimal to f64 and serialize that
                 if let Some(f64_val) = decimal.to_f64() {
                     return serializer.serialize_f64(f64_val);
@@ -287,7 +289,10 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                         extension: None,
                         value: Some(decimal),
                     }),
-                    Err(_) => Err(E2::custom(format!("Failed to convert f64 {} to Decimal", value))),
+                    Err(_) => Err(E2::custom(format!(
+                        "Failed to convert f64 {} to Decimal",
+                        value
+                    ))),
                 }
             }
 
@@ -302,7 +307,10 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                         extension: None,
                         value: Some(decimal),
                     }),
-                    None => Err(E2::custom(format!("Failed to convert i64 {} to Decimal", value))),
+                    None => Err(E2::custom(format!(
+                        "Failed to convert i64 {} to Decimal",
+                        value
+                    ))),
                 }
             }
 
@@ -317,7 +325,10 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                         extension: None,
                         value: Some(decimal),
                     }),
-                    None => Err(E2::custom(format!("Failed to convert u64 {} to Decimal", value))),
+                    None => Err(E2::custom(format!(
+                        "Failed to convert u64 {} to Decimal",
+                        value
+                    ))),
                 }
             }
 
@@ -332,10 +343,13 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                         extension: None,
                         value: Some(decimal),
                     }),
-                    Err(_) => Err(E2::custom(format!("Failed to parse string '{}' as Decimal", value))),
+                    Err(_) => Err(E2::custom(format!(
+                        "Failed to parse string '{}' as Decimal",
+                        value
+                    ))),
                 }
             }
-            
+
             // Handle null values
             fn visit_unit<E2>(self) -> Result<Self::Value, E2>
             where
