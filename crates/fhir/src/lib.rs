@@ -1,4 +1,5 @@
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::serde::float::*;
 use rust_decimal::Decimal;
 
 use serde::{
@@ -171,23 +172,7 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
-                // If scale is zero, output as u64 if possible
-                if decimal.scale() == 0 {
-                    if let Some(u64_val) = decimal.to_u64() {
-                        return serializer.serialize_u64(u64_val);
-                    }
-                    // If it doesn't fit in u64 (negative or too large), try i64
-                    if let Some(i64_val) = decimal.to_i64() {
-                        return serializer.serialize_i64(i64_val);
-                    }
-                }
-                
-                // Convert Decimal to f64 and serialize that
-                if let Some(f64_val) = decimal.to_f64() {
-                    return serializer.serialize_f64(f64_val);
-                }
-                // Fall back to string serialization if conversion fails
-                return serializer.serialize_str(&decimal.to_string());
+                return rust_decimal::serde::float::serialize(decimal, serializer);
             } else {
                 return serializer.serialize_none();
             }
@@ -251,28 +236,32 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            // Try to deserialize the value in a way that handles both strings and numbers
-                            let value_result: Result<serde_json::Value, _> = map.next_value();
+                            value = rust_decimal::serde::float::deserialize(deserializer);
 
-                            if let Ok(json_value) = value_result {
-                                value = match json_value {
-                                    // Handle string values
-                                    serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
-                                    // Handle numeric values
-                                    serde_json::Value::Number(num) => {
-                                        if let Some(n) = num.as_f64() {
-                                            Decimal::try_from(n).ok()
-                                        } else if let Some(n) = num.as_i64() {
-                                            Decimal::try_from(n).ok()
-                                        } else if let Some(n) = num.as_u64() {
-                                            Decimal::try_from(n).ok()
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    _ => None,
-                                };
-                            }
+                            /*
+                                                        // Try to deserialize the value in a way that handles both strings and numbers
+                                                        let value_result: Result<serde_json::Value, _> = map.next_value();
+
+                                                        if let Ok(json_value) = value_result {
+                                                            value = match json_value {
+                                                                // Handle string values
+                                                                serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
+                                                                // Handle numeric values
+                                                                serde_json::Value::Number(num) => {
+                                                                    if let Some(n) = num.as_f64() {
+                                                                        Decimal::try_from(n).ok()
+                                                                    } else if let Some(n) = num.as_i64() {
+                                                                        Decimal::try_from(n).ok()
+                                                                    } else if let Some(n) = num.as_u64() {
+                                                                        Decimal::try_from(n).ok()
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                                _ => None,
+                                                            };
+                                                        }
+                            */
                         }
                         _ => {
                             // Skip unknown fields
