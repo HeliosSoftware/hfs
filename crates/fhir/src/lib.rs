@@ -171,15 +171,9 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
             if let Some(decimal) = &self.value {
                 // Preserve scale for decimal values
                 let scale = decimal.scale();
-                if scale > 0 {
-                    // Format with trailing zeros
-                    let formatted = format!("{:.*}", scale as usize, decimal);
-                    return serializer.serialize_str(&formatted);
-                } else {
-                    // For whole numbers, serialize as a string without decimal places
-                    let formatted = decimal.to_string();
-                    return serializer.serialize_str(&formatted);
-                }
+                // Serialize as a number to maintain the original format (e.g., 250.0)
+                let value = decimal.to_f64().unwrap_or(0.0);
+                return serializer.serialize_f64(value);
             } else {
                 return serializer.serialize_none();
             }
