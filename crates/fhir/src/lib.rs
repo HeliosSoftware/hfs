@@ -1,4 +1,6 @@
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+
 use serde::{
     de::{self, Deserializer},
     ser::Serializer,
@@ -248,6 +250,8 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                                     // Handle numeric values
                                     serde_json::Value::Number(num) => {
                                         if let Some(n) = num.as_f64() {
+                                            Decimal::try_from(n).ok()
+                                        } else if let Some(n) = num.as_i64() {
                                             Decimal::try_from(n).ok()
                                         } else {
                                             None
