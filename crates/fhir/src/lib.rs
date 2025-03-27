@@ -171,8 +171,17 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
-                // AI! If the scale is zero, let's output as a u64
-
+                // If scale is zero, output as u64 if possible
+                if decimal.scale() == 0 {
+                    if let Some(u64_val) = decimal.to_u64() {
+                        return serializer.serialize_u64(u64_val);
+                    }
+                    // If it doesn't fit in u64 (negative or too large), try i64
+                    if let Some(i64_val) = decimal.to_i64() {
+                        return serializer.serialize_i64(i64_val);
+                    }
+                }
+                
                 // Convert Decimal to f64 and serialize that
                 if let Some(f64_val) = decimal.to_f64() {
                     return serializer.serialize_f64(f64_val);
