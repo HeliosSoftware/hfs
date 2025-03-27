@@ -194,17 +194,8 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
     where
         D: Deserializer<'de>,
     {
-        // First try to deserialize as a simple value (for direct numeric values)
-        let value_result = f64::deserialize(deserializer.clone());
-        if let Ok(num) = value_result {
-            return Ok(DecimalElement {
-                id: None,
-                extension: None,
-                value: Decimal::try_from(num).ok(),
-            });
-        }
+        // Use a visitor that can handle both direct values and structured data
 
-        // If that fails, try to deserialize as a map
         struct DecimalElementVisitor<E>(std::marker::PhantomData<E>);
 
         impl<'de, E: Deserialize<'de>> de::Visitor<'de> for DecimalElementVisitor<E> {
@@ -278,9 +269,21 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                     value: Decimal::try_from(value).ok(),
                 })
             }
+
+            // Add support for string values
+            fn visit_str<E2>(self, value: &str) -> Result<Self::Value, E2>
+            where
+                E2: de::Error,
+            {
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: value.parse::<Decimal>().ok(),
+                })
+            }
         }
 
-        // Use the visitor to deserialize
+        // Use the visitor to deserialize any type
         deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
     }
 }
