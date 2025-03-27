@@ -253,6 +253,8 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                                             Decimal::try_from(n).ok()
                                         } else if let Some(n) = num.as_i64() {
                                             Decimal::try_from(n).ok()
+                                        } else if let Some(n) = num.as_u64() {
+                                            Decimal::try_from(n).ok()
                                         } else {
                                             None
                                         }
@@ -285,7 +287,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                     value: Decimal::try_from(value).ok(),
                 })
             }
-            
+
             // Add support for integer values
             fn visit_i64<E2>(self, value: i64) -> Result<Self::Value, E2>
             where
@@ -297,7 +299,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                     value: Decimal::try_from(value).ok(),
                 })
             }
-            
+
             // Add support for unsigned integer values
             fn visit_u64<E2>(self, value: u64) -> Result<Self::Value, E2>
             where
