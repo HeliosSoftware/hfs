@@ -223,10 +223,16 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            let decimal_result = rust_decimal::serde::float::deserialize(map.next_value()?);
-                            value = match decimal_result {
-                                Ok(decimal) => Some(decimal),
-                                Err(_) => None,
+                            // Get the string value from the map first
+                            let str_value: Option<String> = map.next_value()?;
+
+                            // Convert the string to Decimal if it exists
+                            value = match str_value {
+                                Some(s) => match s.parse::<Decimal>() {
+                                    Ok(decimal) => Some(decimal),
+                                    Err(_) => None,
+                                },
+                                None => None,
                             };
                         }
                         _ => {
