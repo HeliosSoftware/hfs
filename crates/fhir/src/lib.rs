@@ -285,6 +285,30 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                     value: Decimal::try_from(value).ok(),
                 })
             }
+            
+            // Add support for integer values
+            fn visit_i64<E2>(self, value: i64) -> Result<Self::Value, E2>
+            where
+                E2: de::Error,
+            {
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: Decimal::try_from(value).ok(),
+                })
+            }
+            
+            // Add support for unsigned integer values
+            fn visit_u64<E2>(self, value: u64) -> Result<Self::Value, E2>
+            where
+                E2: de::Error,
+            {
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: Decimal::try_from(value).ok(),
+                })
+            }
 
             // Add support for string values
             fn visit_str<E2>(self, value: &str) -> Result<Self::Value, E2>
