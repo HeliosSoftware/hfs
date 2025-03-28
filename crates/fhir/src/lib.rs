@@ -1,6 +1,6 @@
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
-
+use rust_decimal_macros::dec;
 use serde::{
     de::{self, Deserializer},
     ser::Serializer,
@@ -8,6 +8,7 @@ use serde::{
 };
 use std::fmt;
 //use time::{Date, Month};
+
 #[cfg(feature = "R4")]
 pub mod r4;
 #[cfg(feature = "R4B")]
@@ -169,7 +170,9 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         S: Serializer,
     {
         match &self.value {
-            Some(decimal) => rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer),
+            Some(decimal) => {
+                rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer)
+            }
             None => serializer.serialize_none(),
         }
     }
@@ -211,7 +214,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            value = Decimal::from_f64(map.next_value()?);
+                            value = map.next_value::<Option<Decimal>>()?;
                         }
                         _ => {
                             // Skip unknown fields
