@@ -168,8 +168,10 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
     where
         S: Serializer,
     {
-
-        // AI! if value is not null, then serialize using rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer); if it is null, then don't serialize it at all.
+        match &self.value {
+            Some(decimal) => rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer),
+            None => serializer.serialize_none(),
+        }
     }
 }
 
