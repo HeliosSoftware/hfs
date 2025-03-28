@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{
     de::{self, Deserializer},
-    ser::Serializer,
+    ser::{Serializer, SerializeStruct},
     Deserialize, Serialize,
 };
 use std::fmt;
@@ -169,11 +169,25 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
     where
         S: Serializer,
     {
-        match &self.value {
-            Some(decimal) => {
-                rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer)
+        // If we have id or extension fields, we need to serialize as a complex object
+        if self.id.is_some() || self.extension.is_some() {
+            let mut state = serializer.serialize_struct("DecimalElement", 3)?;
+            if let Some(id) = &self.id {
+                state.serialize_field("id", id)?;
             }
-            None => serializer.serialize_none(),
+            if let Some(ext) = &self.extension {
+                state.serialize_field("extension", ext)?;
+            }
+            if let Some(val) = &self.value {
+                state.serialize_field("value", val)?;
+            }
+            state.end()
+        } else {
+            // Otherwise, just serialize the decimal value directly
+            match &self.value {
+                Some(decimal) => decimal.serialize(serializer),
+                None => serializer.serialize_none(),
+            }
         }
     }
 }
@@ -185,7 +199,6 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
         D: Deserializer<'de>,
     {
         // Use a visitor that can handle both direct values and structured data
-
         struct DecimalElementVisitor<E>(std::marker::PhantomData<E>);
 
         impl<'de, E: Deserialize<'de>> de::Visitor<'de> for DecimalElementVisitor<E> {
