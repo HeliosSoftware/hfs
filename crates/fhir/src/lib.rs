@@ -1,4 +1,4 @@
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{
     de::{self, Deserializer},
@@ -184,7 +184,14 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         } else {
             // Otherwise, just serialize the decimal value directly
             match &self.value {
-                Some(decimal) => serializer.serialize_f64(decimal.to_f64().unwrap_or(0.0)),
+                Some(decimal) => {
+                    if let Some(f) = decimal.to_f64() {
+                        serializer.serialize_f64(f)
+                    } else {
+                        // Fallback to string serialization if f64 conversion fails
+                        serializer.serialize_str(&decimal.to_string())
+                    }
+                },
                 None => serializer.serialize_none(),
             }
         }
