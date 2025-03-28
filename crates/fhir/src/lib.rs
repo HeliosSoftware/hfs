@@ -168,34 +168,8 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
     where
         S: Serializer,
     {
-        // If we have a value and no id or extension, serialize just the value
-        if self.id.is_none() && self.extension.is_none() {
-            if let Some(decimal) = &self.value {
-                return rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer);
-            } else {
-                return serializer.serialize_none();
-            }
-        }
 
-        // Otherwise, serialize as a structure
-        use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("DecimalElement", 3)?;
-
-        // Serialize id and extension normally
-        state.serialize_field("id", &self.id)?;
-        state.serialize_field("extension", &self.extension)?;
-
-        // Custom serialization for the decimal value to preserve scale
-        if let Some(decimal) = &self.value {
-            // Get the scale to preserve trailing zeros
-            let scale = decimal.scale();
-            let formatted = format!("{:.*}", scale as usize, decimal);
-            state.serialize_field("value", &formatted)?;
-        } else {
-            state.serialize_field("value", &Option::<String>::None)?;
-        }
-
-        state.end()
+        // AI! if value is not null, then serialize using rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer); if it is null, then don't serialize it at all.
     }
 }
 
@@ -235,41 +209,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             extension = Some(map.next_value()?);
                         }
                         "value" => {
-                            // Try to deserialize the value as a Decimal
-                            let value_result: Result<serde_json::Value, _> = map.next_value();
-
-                            if let Ok(json_value) = value_result {
-                                match json_value {
-                                    serde_json::Value::String(s) => {
-                                        match s.parse::<Decimal>() {
-                                            Ok(decimal) => value = Some(decimal),
-                                            Err(e) => return Err(de::Error::custom(format!(
-                                                "Failed to parse string '{}' as Decimal: {}", s, e
-                                            ))),
-                                        }
-                                    },
-                                    serde_json::Value::Number(n) => {
-                                        if let Some(n_f64) = n.as_f64() {
-                                            match Decimal::try_from(n_f64) {
-                                                Ok(decimal) => value = Some(decimal),
-                                                Err(e) => return Err(de::Error::custom(format!(
-                                                    "Failed to convert number {} to Decimal: {}", n, e
-                                                ))),
-                                            }
-                                        } else {
-                                            return Err(de::Error::custom(format!(
-                                                "Number {} cannot be represented as f64", n
-                                            )));
-                                        }
-                                    },
-                                    serde_json::Value::Null => value = None,
-                                    _ => return Err(de::Error::custom(format!(
-                                        "Expected string or number for Decimal, got {:?}", json_value
-                                    ))),
-                                }
-                            } else {
-                                return Err(de::Error::custom("Failed to deserialize value field"));
-                            }
+                            value = Decimal::from_f64(map.next_value()?);
                         }
                         _ => {
                             // Skip unknown fields
