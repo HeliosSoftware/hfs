@@ -238,7 +238,38 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             // Try to deserialize the value as a Decimal
                             let value_result: Result<serde_json::Value, _> = map.next_value();
 
-                            // AI! turn value_result into value by deserializing it using  rust_decimal::serde::arbitrary_precision
+                            if let Ok(json_value) = value_result {
+                                match json_value {
+                                    serde_json::Value::String(s) => {
+                                        match s.parse::<Decimal>() {
+                                            Ok(decimal) => value = Some(decimal),
+                                            Err(e) => return Err(de::Error::custom(format!(
+                                                "Failed to parse string '{}' as Decimal: {}", s, e
+                                            ))),
+                                        }
+                                    },
+                                    serde_json::Value::Number(n) => {
+                                        if let Some(n_f64) = n.as_f64() {
+                                            match Decimal::try_from(n_f64) {
+                                                Ok(decimal) => value = Some(decimal),
+                                                Err(e) => return Err(de::Error::custom(format!(
+                                                    "Failed to convert number {} to Decimal: {}", n, e
+                                                ))),
+                                            }
+                                        } else {
+                                            return Err(de::Error::custom(format!(
+                                                "Number {} cannot be represented as f64", n
+                                            )));
+                                        }
+                                    },
+                                    serde_json::Value::Null => value = None,
+                                    _ => return Err(de::Error::custom(format!(
+                                        "Expected string or number for Decimal, got {:?}", json_value
+                                    ))),
+                                }
+                            } else {
+                                return Err(de::Error::custom("Failed to deserialize value field"));
+                            }
                         }
                         _ => {
                             // Skip unknown fields
