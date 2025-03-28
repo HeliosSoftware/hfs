@@ -1,5 +1,4 @@
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use rust_decimal::serde::float::*;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
 use serde::{
@@ -172,7 +171,7 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         // If we have a value and no id or extension, serialize just the value
         if self.id.is_none() && self.extension.is_none() {
             if let Some(decimal) = &self.value {
-                return rust_decimal::serde::float::serialize(decimal, serializer);
+                return rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer);
             } else {
                 return serializer.serialize_none();
             }
@@ -239,25 +238,7 @@ impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
                             // Try to deserialize the value as a Decimal
                             let value_result: Result<serde_json::Value, _> = map.next_value();
 
-                            if let Ok(json_value) = value_result {
-                                value = match json_value {
-                                    // Handle string values
-                                    serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
-                                    // Handle numeric values
-                                    serde_json::Value::Number(num) => {
-                                        if let Some(n) = num.as_f64() {
-                                            Decimal::try_from(n).ok()
-                                        } else if let Some(n) = num.as_i64() {
-                                            Decimal::from_i64(n)
-                                        } else if let Some(n) = num.as_u64() {
-                                            Decimal::from_u64(n)
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    _ => None,
-                                };
-                            }
+                            // AI! turn value_result into value by deserializing it using  rust_decimal::serde::arbitrary_precision
                         }
                         _ => {
                             // Skip unknown fields
