@@ -169,7 +169,10 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         S: Serializer,
     {
         match &self.value {
-            Some(decimal) => rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer),
+            Some(decimal) => {
+                // rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer)
+                // AI! Serialize decimal here
+            }
             None => serializer.serialize_none(),
         }
     }
