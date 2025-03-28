@@ -1,6 +1,5 @@
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use serde::{
     de::{self, Deserializer},
     ser::{Serializer, SerializeStruct},
@@ -185,7 +184,7 @@ impl<E: Serialize> Serialize for DecimalElement<E> {
         } else {
             // Otherwise, just serialize the decimal value directly
             match &self.value {
-                Some(decimal) => decimal.serialize(serializer),
+                Some(decimal) => serializer.serialize_f64(decimal.to_f64().unwrap_or(0.0)),
                 None => serializer.serialize_none(),
             }
         }
