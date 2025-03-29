@@ -6,7 +6,64 @@ use serde::{
 };
 use std::marker::PhantomData; // Added PhantomData
 use serde_json::value::RawValue; // Added for precise number serialization via RawValue
+use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
 //use time::{Date, Month};
+
+// --- Newtype wrapper for precise Decimal serialization ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PreciseDecimal(pub Decimal); // Make inner Decimal public for convenience
+
+// Allow accessing the inner Decimal easily
+impl Deref for PreciseDecimal {
+    type Target = Decimal;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for PreciseDecimal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Serialize for PreciseDecimal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Format the inner decimal to its precise string representation (e.g., "3.0")
+        let precise_string = self.0.to_string();
+
+        // Create a RawValue from this string. This tells serde_json to treat
+        // the string as a literal JSON token (in this case, a number).
+        match RawValue::from_string(precise_string) {
+            // Serialize the RawValue directly.
+            Ok(raw_value) => raw_value.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!(
+                "Failed to create RawValue for PreciseDecimal: {}",
+                e
+            ))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PreciseDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Use arbitrary_precision deserializer for the inner Decimal
+        let decimal_value =
+            rust_decimal::serde::arbitrary_precision::deserialize(deserializer)?;
+        Ok(PreciseDecimal(decimal_value))
+    }
+}
+
+
+// --- End Newtype ---
+
 
 #[cfg(feature = "R4")]
 pub mod r4;
@@ -155,14 +212,23 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)] // Can derive now with PreciseDecimal handling its own Serde
+#[serde(rename_all = "camelCase")] // Assuming camelCase for FHIR fields
 pub struct DecimalElement<E> {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<E>>,
-    pub value: Option<Decimal>,
+    // Use the PreciseDecimal wrapper for the value field
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<PreciseDecimal>,
 }
 
-// Visitor is no longer needed with the new Deserialize implementation below
+// Custom Deserialize implementation is no longer strictly needed if we derive
+// and PreciseDecimal handles its own logic correctly. Let's remove it for now
+// and see if deriving works. If not, we'll reinstate a modified version.
+
+/* // Keep old implementation commented out for reference if needed
 
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
@@ -212,77 +278,17 @@ where
             )),
         }
     }
-}
+*/
 
 
-// --- Visitor and Seed for Object Deserialization ---
-
-// Seed for deserializing Option<Decimal> with arbitrary precision
-struct DecimalOptionSeed;
-
-impl<'de> de::DeserializeSeed<'de> for DecimalOptionSeed {
-    type Value = Option<Decimal>;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer)
-    }
-}
-
-// Visitor specifically for deserializing the fields of a DecimalElement from a map
-struct DecimalObjectVisitor<E>(PhantomData<E>);
-
-impl<'de, E> Visitor<'de> for DecimalObjectVisitor<E>
-where
-    E: Deserialize<'de>,
-{
-    // Use fully qualified syntax for the associated type
-    type Value = DecimalElement<E>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a DecimalElement object")
-    }
-
-    // Use fully qualified syntax for the return type's associated type
-    fn visit_map<A>(self, mut map: A) -> Result<<Self as Visitor<'de>>::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut id: Option<String> = None;
-        let mut extension: Option<Vec<E>> = None;
-        let mut value: Option<Decimal> = None;
-
-        // Manually deserialize fields from the map
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "id" => {
-                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
-                    id = Some(map.next_value()?);
-                }
-                "extension" => {
-                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
-                    extension = Some(map.next_value()?);
-                }
-                "value" => {
-                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
-                    // Use the seed to deserialize the value field with arbitrary precision
-                    value = map.next_value_seed(DecimalOptionSeed)?;
-                }
-                // Ignore any unknown fields encountered
-                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
-            }
-        }
-
-        Ok(DecimalElement { id, extension, value })
-    }
-}
-
-// --- End Visitor and Seed ---
+// Custom Visitor/Seed/Deserialize logic is likely no longer needed
+// as PreciseDecimal handles its own Serde implementation.
+// We remove them for now. If deriving Serialize/Deserialize on DecimalElement
+// doesn't work as expected, we might need to re-introduce custom logic.
 
 
 // Helper extension trait for serde_json::Value to get Unexpected type
+// This might still be useful if we need custom Deserialize later. Keep for now.
 trait UnexpectedValue {
     fn unexpected(&self) -> de::Unexpected;
 }
@@ -310,76 +316,8 @@ impl UnexpectedValue for serde_json::Value {
     }
 }
 
-// --- Serialization for DecimalElement ---
-
-impl<E> Serialize for DecimalElement<E>
-where
-    E: Serialize, // Add the Serialize bound for the generic type E
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // If we only have a value and no other fields, serialize just the value using RawValue
-        if self.id.is_none() && self.extension.is_none() {
-            if let Some(value) = &self.value {
-                let precise_string = value.to_string();
-                return match RawValue::from_string(precise_string) {
-                    Ok(raw_value) => raw_value.serialize(serializer),
-                    Err(e) => Err(serde::ser::Error::custom(format!(
-                        "Failed to create RawValue for bare decimal: {}",
-                        e
-                    ))),
-                };
-            } else {
-                // If value is also None, serialize as an empty object (or null? FHIR spec?)
-                // Let's stick to empty object for now based on test_serialize_decimal_with_no_fields
-                // Fall through to struct serialization with 0 fields.
-            }
-        }
-
-        // Otherwise, serialize as a struct with all present fields
-        // Calculate the number of fields that are NOT None
-        let mut len = 0;
-        if self.id.is_some() {
-            len += 1;
-        }
-        if self.extension.is_some() {
-            len += 1;
-        }
-        if self.value.is_some() {
-            len += 1;
-        }
-
-        // Start serializing a struct with the calculated length
-        let mut state = serializer.serialize_struct("DecimalElement", len)?;
-
-        // Serialize 'id' field if it's Some
-        if let Some(id) = &self.id {
-            state.serialize_field("id", id)?;
-        }
-
-        // Serialize 'extension' field if it's Some
-        if let Some(extension) = &self.extension {
-            state.serialize_field("extension", extension)?;
-        }
-
-        // Serialize 'value' field if it's Some, using RawValue
-        if let Some(value) = &self.value {
-            let precise_string = value.to_string();
-            match RawValue::from_string(precise_string) {
-                Ok(raw_value) => state.serialize_field("value", &raw_value)?,
-                Err(e) => return Err(serde::ser::Error::custom(format!(
-                    "Failed to create RawValue for struct decimal field: {}",
-                    e
-                ))),
-            }
-        }
-
-        // End the struct serialization
-        state.end()
-    }
-}
+// Custom Serialize implementation is no longer needed as we derive Serialize
+// and PreciseDecimal handles its own serialization.
 
 /*
 pub trait ElementTrait<V, E> {
