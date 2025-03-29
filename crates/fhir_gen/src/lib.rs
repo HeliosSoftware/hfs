@@ -415,7 +415,7 @@ fn process_elements(
         output.push_str("#[serde(deny_unknown_fields)]\n");
         output.push_str(&format!(
             "pub struct {} {{\n",
-            capitalize_first_letter(type_name)
+            capitalize_first_letter(&type_name)
         ));
 
         for element in &group {
