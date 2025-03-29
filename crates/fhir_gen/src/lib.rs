@@ -1,6 +1,6 @@
 pub mod initial_fhir_model;
 
-use crate::initial_fhir_model::{Bundle, ElementDefinitionType, Resource};
+use crate::initial_fhir_model::{Bundle, Resource};
 use fhir::FhirVersion;
 use initial_fhir_model::ElementDefinition;
 use initial_fhir_model::StructureDefinition;
@@ -386,7 +386,7 @@ fn process_elements(
             // Add documentation comment for the enum
             output.push_str(&format!("/// Choice of types for the {}[x] field in {}\n", 
                 base_name, 
-                capitalize_first_letter(type_name)));
+                capitalize_first_letter(&type_name)));
                 
             output.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
@@ -415,7 +415,7 @@ fn process_elements(
         output.push_str("#[serde(deny_unknown_fields)]\n");
         output.push_str(&format!(
             "pub struct {} {{\n",
-            capitalize_first_letter(&type_name)
+            capitalize_first_letter(type_name)
         ));
 
         for element in &group {
