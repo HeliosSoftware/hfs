@@ -122,6 +122,24 @@ fn compare_json_values(
     }
 }
 
+// Helper function to find items in a Questionnaire that are missing linkId
+fn find_missing_linkid(json: &serde_json::Value) {
+    if let Some(items) = json.get("item").and_then(|i| i.as_array()) {
+        for (index, item) in items.iter().enumerate() {
+            if !item.get("linkId").is_some() {
+                println!("Item at index {} is missing linkId", index);
+                println!("Item content: {}", serde_json::to_string_pretty(item).unwrap_or_default());
+            }
+            
+            // Recursively check nested items
+            if let Some(nested_items) = item.get("item") {
+                println!("Checking nested items for item at index {}", index);
+                find_missing_linkid(&serde_json::json!({"item": nested_items}));
+            }
+        }
+    }
+}
+
 fn test_examples_in_dir(dir: &PathBuf) {
     if !dir.exists() {
         println!("Directory does not exist: {:?}", dir);
@@ -214,10 +232,28 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             }
                                         }
                                         Err(e) => {
+                                            let error_message = format!("Error converting JSON to FHIR Resource: {}", e);
+                                            println!("{}", error_message);
+                                            
+                                            // Try to extract more information about the missing field
+                                            if error_message.contains("missing field") {
+                                                // Print the JSON structure to help locate the issue
+                                                println!("JSON structure:");
+                                                if let Ok(pretty_json) = serde_json::to_string_pretty(&json_value) {
+                                                    println!("{}", pretty_json);
+                                                }
+                                                
+                                                // If it's a Questionnaire, look for items without linkId
+                                                if resource_type_str == "Questionnaire" {
+                                                    println!("Checking for Questionnaire items without linkId:");
+                                                    find_missing_linkid(&json_value);
+                                                }
+                                            }
+                                            
                                             assert!(
                                                 false,
-                                                "Error converting JSON to FHIR Resource: {}",
-                                                e
+                                                "{}",
+                                                error_message
                                             );
                                         }
                                     }
