@@ -444,6 +444,7 @@ fn generate_element_definition(
         let rust_field_name = make_rust_safe(field_name);
 
         let mut serde_attrs = Vec::new();
+        // Handle field renaming, ensuring we don't add duplicate rename attributes
         if field_name != rust_field_name {
             // For choice fields, use the name without [x]
             if field_name.ends_with("[x]") {
@@ -512,7 +513,10 @@ fn generate_element_definition(
             );
             // Make sure the field name doesn't include [x] in the Rust code
             // but keep the original field name (without [x]) for serialization
-            serde_attrs.push(format!("rename = \"{}\"", field_name.trim_end_matches("[x]")));
+            // Only add rename if we haven't already added it above
+            if serde_attrs.iter().all(|attr| !attr.starts_with("rename = ")) {
+                serde_attrs.push(format!("rename = \"{}\"", field_name.trim_end_matches("[x]")));
+            }
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", enum_name)
         } else if is_array {
