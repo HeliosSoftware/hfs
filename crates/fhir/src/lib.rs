@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer, Unexpected, MapAccess, DeserializeSeed}, // Added MapAccess, DeserializeSeed
+    de::{self, Deserializer, Unexpected, MapAccess, DeserializeSeed, Visitor}, // Added Visitor
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
 };
@@ -246,13 +246,15 @@ impl<'de, E> Visitor<'de> for DecimalObjectVisitor<E>
 where
     E: Deserialize<'de>,
 {
+    // Use fully qualified syntax for the associated type
     type Value = DecimalElement<E>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("a DecimalElement object")
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    // Use fully qualified syntax for the return type's associated type
+    fn visit_map<A>(self, mut map: A) -> Result<<Self as Visitor<'de>>::Value, A::Error>
     where
         A: MapAccess<'de>,
     {
