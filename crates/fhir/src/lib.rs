@@ -34,10 +34,9 @@ impl Serialize for PreciseDecimal {
         S: Serializer,
     {
         // Round the decimal to its own scale to potentially preserve trailing zeros for formatting
+        // Use to_string_fixed with the decimal's scale to ensure trailing zeros are preserved.
         let scale = self.0.scale();
-        let rounded_decimal = self.0.round_dp(scale);
-        // Format the rounded decimal to its precise string representation (e.g., "3.0")
-        let precise_string = rounded_decimal.to_string();
+        let precise_string = self.0.to_string_fixed(scale);
 
         // Create a RawValue from this string. This tells serde_json to treat
         // the string as a literal JSON token (in this case, a number).
