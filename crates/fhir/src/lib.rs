@@ -654,4 +654,35 @@ mod tests {
         // Verify we get the same JSON back
         assert_eq!(json_value, reserialized);
     }
+    
+    #[test]
+    fn test_decimal_with_trailing_zeros() {
+        // Test with a decimal value that has trailing zeros (3.0)
+        let json_value = serde_json::json!(3.0);
+        
+        // Deserialize to our type
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_value(json_value.clone()).expect("Deserialization failed");
+        
+        // Serialize back to JSON
+        let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+        
+        // Verify we get the same JSON back, preserving the trailing zero
+        assert_eq!(json_value, reserialized, 
+            "Original: {:?}\nReserialized: {:?}", 
+            json_value, reserialized);
+        
+        // Also test with a string representation to be extra sure
+        let json_str = r#"3.0"#;
+        let parsed_value: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_value(parsed_value.clone()).expect("Deserialization failed");
+        
+        let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+        
+        assert_eq!(parsed_value, reserialized,
+            "Original string: {}\nParsed: {:?}\nReserialized: {:?}", 
+            json_str, parsed_value, reserialized);
+    }
 }
