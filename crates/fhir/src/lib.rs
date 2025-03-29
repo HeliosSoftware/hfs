@@ -358,8 +358,7 @@ where
             {
                 match value {
                     Some(decimal) => {
-                        // Serialize as string to preserve exact decimal representation
-                        serializer.serialize_str(&decimal.to_string())
+                        rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer)
                     }
                     None => serializer.serialize_none(),
                 }
@@ -400,8 +399,8 @@ impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
     where
         S: Serializer,
     {
-        // Serialize as a string to preserve exact decimal representation including trailing zeros
-        serializer.serialize_str(&self.0.to_string())
+        // Call the specific serialize function from the arbitrary_precision module
+        rust_decimal::serde::arbitrary_precision::serialize(self.0, serializer)
     }
 }
 
