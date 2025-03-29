@@ -167,18 +167,7 @@ pub struct DecimalElement<E> {
 struct DecimalElementVisitor<E>(PhantomData<E>);
 
 impl<'de, E> DecimalElementVisitor<E>
-where
-    E: Deserialize<'de>, // Keep constraint here if needed for future helpers
-                         // or if the struct itself needs it
-{
-    // Helper to deserialize a primitive value using the arbitrary_precision_option logic
-    fn deserialize_bare_value<D>(&self, deserializer: D) -> Result<Option<Decimal>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Now this function is correctly called via self.deserialize_bare_value(...)
-        rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer)
-    }
+// No helper needed here anymore
 }
 
 impl<'de, E> Visitor<'de> for DecimalElementVisitor<E>
