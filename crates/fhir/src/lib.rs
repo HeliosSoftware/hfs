@@ -327,12 +327,8 @@ impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
         // the string as a literal JSON token (in this case, a number).
         // We need to box it as RawValue::serialize takes Box<Self>.
         match RawValue::from_string(precise_string) {
-            Ok(raw_value) => serializer.serialize_newtype_struct(
-                // Provide a name for the newtype struct wrapper for RawValue
-                // This might not be strictly necessary for all serializers, but good practice.
-                "DecimalRawValue",
-                &raw_value,
-            ),
+            // Serialize the RawValue directly. This requires the Serializer to support it.
+            Ok(raw_value) => raw_value.serialize(serializer),
             Err(e) => Err(serde::ser::Error::custom(format!(
                 "Failed to create RawValue for decimal: {}",
                 e
