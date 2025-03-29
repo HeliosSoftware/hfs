@@ -33,24 +33,9 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Round the decimal to its own scale to potentially preserve trailing zeros for formatting
-        // Use format! with the decimal's scale to ensure trailing zeros are preserved.
-        let scale = self.0.scale();
-        let precise_string = format!("{:.scale$}", self.0, scale = scale as usize);
-
-        // Create a RawValue from this string. This tells serde_json to treat
-        // the string as a literal JSON token (in this case, a number).
-        /* // RawValue approach failed to force number formatting
-        match RawValue::from_string(precise_string.clone()) {
-             Ok(raw_value) => raw_value.serialize(serializer),
-             Err(e) => Err(serde::ser::Error::custom(format!(
-                 "Failed to create RawValue for PreciseDecimal: {}",
-                 e
-             ))),
-         }
-         */
         // Serialize using rust_decimal's arbitrary precision serializer.
-        // This outputs a JSON number, but serde_json might strip trailing zeros (e.g., 3.0 -> 3).
+        // This outputs a JSON number. serde_json's to_string representation
+        // seems to preserve trailing zeros correctly with this serializer.
         rust_decimal::serde::arbitrary_precision::serialize(&self.0, serializer)
     }
 }
@@ -538,15 +523,14 @@ mod tests {
             serde_json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
 
         // With our new implementation, a bare decimal with no other fields
-        // is serialized as just the number. serde_json likely formats 1050.00 as 1050.0 or 1050.
-        // We create the expected value directly using serde_json::json! macro for comparison.
-        let expected_value = serde_json::json!(1050.00); // Let serde_json handle number representation
+        // is serialized as just the number.
+        let expected_json_string = "1050.00";
 
-        // Compare the parsed serde_json::Value objects
+        // Compare the output string directly
         assert_eq!(
-            actual_value, expected_value,
-            "Actual JSON Value: {:?} \nExpected JSON Value: {:?}",
-            actual_value, expected_value
+            actual_json_string, expected_json_string,
+            "Actual JSON: {} \nExpected JSON: {}",
+            actual_json_string, expected_json_string
         );
     }
 
@@ -691,9 +675,8 @@ mod tests {
     fn test_decimal_with_trailing_zeros() {
         // Test with a decimal value that has trailing zeros (3.0)
         let json_value = serde_json::json!(3.0); // Input is a JSON number 3.0
-        // EXPECTED OUTPUT IS NOW A JSON NUMBER 3 (represented as string "3")
-        // due to serde_json stripping trailing zeros on number serialization.
-        let expected_string = "3";
+        // EXPECTED OUTPUT IS NOW A JSON NUMBER 3.0 (represented as string "3.0")
+        let expected_string = "3.0";
 
         // Deserialize to our type
         let element: DecimalElement<UnitTestExtension> =
@@ -702,7 +685,7 @@ mod tests {
         // Serialize back to string
         let reserialized_string = serde_json::to_string(&element).expect("Serialization to string failed");
 
-        // Verify the string representation is the JSON number 3 (as string "3")
+        // Verify the string representation is the JSON number 3.0 (as string "3.0")
         assert_eq!(reserialized_string, expected_string,
             "Original JSON Value: {:?}\nExpected String: {}\nReserialized String: {}",
             json_value, expected_string, reserialized_string);
@@ -718,7 +701,7 @@ mod tests {
         // Serialize back to string
         let reserialized_string_from_str = serde_json::to_string(&element_from_string).expect("Serialization to string failed");
 
-        // Verify the string representation is the JSON number 3 (as string "3")
+        // Verify the string representation is the JSON number 3.0 (as string "3.0")
         assert_eq!(reserialized_string_from_str, expected_string,
             "Original JSON String: {}\nExpected String: {}\nReserialized String: {}",
             json_str_input, expected_string, reserialized_string_from_str);
@@ -732,7 +715,7 @@ mod tests {
 
         let reserialized_string_from_bare = serde_json::to_string(&element_from_bare_string).expect("Serialization failed");
 
-        // Verify the string representation is the JSON number 3 (as string "3")
+        // Verify the string representation is the JSON number 3.0 (as string "3.0")
         assert_eq!(reserialized_string_from_bare, expected_string,
             "Original bare string: {}\nParsed Value: {:?}\nExpected String: {}\nReserialized String: {}",
             json_str, parsed_value, expected_string, reserialized_string_from_bare);
