@@ -59,10 +59,34 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     where
         D: Deserializer<'de>,
     {
-        // Use arbitrary_precision deserializer for the inner Decimal
-        let decimal_value =
-            rust_decimal::serde::arbitrary_precision::deserialize(deserializer)?;
-        Ok(PreciseDecimal(decimal_value))
+        // Deserialize into an intermediate serde_json::Value first
+        let json_value = serde_json::Value::deserialize(deserializer)?;
+
+        match json_value {
+            serde_json::Value::String(s) => {
+                // If it's a string, parse it directly
+                s.parse::<Decimal>().map(PreciseDecimal).map_err(de::Error::custom)
+            }
+            serde_json::Value::Number(n) => {
+                // If it's a number, convert it to a string first, then parse.
+                // This preserves the scale (e.g., 3.0 stays "3.0").
+                n.to_string().parse::<Decimal>().map(PreciseDecimal).map_err(de::Error::custom)
+            }
+            other => {
+                // Handle other unexpected types
+                Err(de::Error::invalid_type(
+                    match other {
+                        serde_json::Value::Null => de::Unexpected::Unit,
+                        serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
+                        serde_json::Value::Array(_) => de::Unexpected::Seq,
+                        serde_json::Value::Object(_) => de::Unexpected::Map,
+                        // Should not happen based on Value enum definition
+                        _ => de::Unexpected::Other("unexpected JSON type"),
+                    },
+                    &"a number or a string",
+                ))
+            }
+        }
     }
 }
 
