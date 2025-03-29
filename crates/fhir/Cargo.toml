@@ -16,7 +16,10 @@ serde_json = { workspace = true }
 clap = { version = "4.4", features = ["derive"] }
 fhir_macro = { path = "../fhir_macro" } 
 time = "0.3.41"
-rust_decimal = { version = "1.37.1", features = ["serde-with-float", "macros"] }
+rust_decimal = { version = "1.37.1", features = ["serde-with-arbitrary-precision", "macros"] }
+
+[dev-dependencies]
+rust_decimal_macros = "1.37.1"
 
 [build-dependencies]
 reqwest = { version = "0.11", features = ["blocking"] }

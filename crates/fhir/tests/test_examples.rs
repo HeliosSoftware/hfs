@@ -205,7 +205,8 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                                     println!("Resource JSON matches original JSON");
                                                 }
                                                 Err(e) => {
-                                                    println!(
+                                                    assert!(
+                                                        false,
                                                         "Error serializing Resource to JSON: {}",
                                                         e
                                                     );
@@ -213,7 +214,8 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             }
                                         }
                                         Err(e) => {
-                                            println!(
+                                            assert!(
+                                                false,
                                                 "Error converting JSON to FHIR Resource: {}",
                                                 e
                                             );

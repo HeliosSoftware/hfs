@@ -1,11 +1,13 @@
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use crate::de::MapAccess;
+use crate::de::Visitor;
 use rust_decimal::Decimal;
 use serde::{
     de::{self, Deserializer},
-    ser::{Serializer, SerializeStruct},
+    ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
 };
 use std::fmt;
+use std::marker::PhantomData;
 //use time::{Date, Month};
 
 #[cfg(feature = "R4")]
@@ -162,181 +164,212 @@ pub struct DecimalElement<E> {
     pub value: Option<Decimal>,
 }
 
-// Custom serializer implementation
-impl<E: Serialize> Serialize for DecimalElement<E> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+struct DecimalElementVisitor<E>(PhantomData<E>);
+
+impl<'de, E> DecimalElementVisitor<E>
+where
+    E: Deserialize<'de>, // Keep constraint here if needed for future helpers
+                         // or if the struct itself needs it
+{
+    // Helper to deserialize a primitive value using the arbitrary_precision_option logic
+    fn deserialize_bare_value<D>(&self, deserializer: D) -> Result<Option<Decimal>, D::Error>
     where
-        S: Serializer,
+        D: Deserializer<'de>,
     {
-        // If we have id or extension fields, we need to serialize as a complex object
-        if self.id.is_some() || self.extension.is_some() {
-            let mut state = serializer.serialize_struct("DecimalElement", 3)?;
-            if let Some(id) = &self.id {
-                state.serialize_field("id", id)?;
-            }
-            if let Some(ext) = &self.extension {
-                state.serialize_field("extension", ext)?;
-            }
-            if let Some(val) = &self.value {
-                state.serialize_field("value", val)?;
-            }
-            state.end()
-        } else {
-            // Otherwise, just serialize the decimal value directly
-            match &self.value {
-                Some(decimal) => {
-                    if let Some(f) = decimal.to_f64() {
-                        serializer.serialize_f64(f)
-                    } else {
-                        // Fallback to string serialization if f64 conversion fails
-                        serializer.serialize_str(&decimal.to_string())
-                    }
-                },
-                None => serializer.serialize_none(),
-            }
-        }
+        // Now this function is correctly called via self.deserialize_bare_value(...)
+        rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer)
     }
 }
 
-// Custom deserializer implementation
-impl<'de, E: Deserialize<'de>> Deserialize<'de> for DecimalElement<E> {
+impl<'de, E> Visitor<'de> for DecimalElementVisitor<E>
+where
+    E: Deserialize<'de>,
+{
+    type Value = DecimalElement<E>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a decimal value (string or number) or a DecimalElement object")
+    }
+
+    // --- Handle the Bare Decimal Case ---
+
+    // Handle number types (integers, floats)
+    fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        let value_deserializer = de::value::F64Deserializer::new(v);
+        // Call the helper method via self
+        let value = self.deserialize_bare_value(value_deserializer)?;
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value,
+        })
+    }
+
+    fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        let value_deserializer = de::value::I64Deserializer::new(v);
+        // Call the helper method via self
+        let value = self.deserialize_bare_value(value_deserializer)?;
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value,
+        })
+    }
+
+    fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        let value_deserializer = de::value::U64Deserializer::new(v);
+        // Call the helper method via self
+        let value = self.deserialize_bare_value(value_deserializer)?;
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value,
+        })
+    }
+
+    // Handle string type
+    fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        let value_deserializer = de::value::StrDeserializer::<'_, Er>::new(v);
+        // Call the helper method via self
+        let value = self.deserialize_bare_value(value_deserializer)?;
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value,
+        })
+    }
+
+    // Handle borrowed string
+    fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        let value_deserializer = de::value::BorrowedStrDeserializer::<'de, Er>::new(v);
+        // Call the helper method via self
+        let value = self.deserialize_bare_value(value_deserializer)?;
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value,
+        })
+    }
+
+    // --- Handle the JSON Object Case ---
+
+    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        dbg!("visit_map");
+        // Use a helper struct for deserializing the object structure
+        #[derive(Deserialize)]
+        struct DecimalElementHelper<T> {
+            id: Option<String>,
+            extension: Option<Vec<T>>,
+            #[serde(
+                skip_serializing_if = "Option::is_none",
+                with = "rust_decimal::serde::arbitrary_precision_option"
+            )]
+            value: Option<Decimal>,
+        }
+
+        // Deserialize the map into the helper struct
+        let helper: DecimalElementHelper<E> =
+            Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
+
+        dbg!(helper.value);
+        // Construct the actual DecimalElement from the helper
+        Ok(DecimalElement {
+            id: helper.id,
+            extension: helper.extension,
+            value: helper.value,
+        })
+    }
+}
+
+impl<'de, E> Deserialize<'de> for DecimalElement<E>
+where
+    E: Deserialize<'de>,
+{
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Use a visitor that can handle both direct values and structured data
-        struct DecimalElementVisitor<E>(std::marker::PhantomData<E>);
-
-        impl<'de, E: Deserialize<'de>> de::Visitor<'de> for DecimalElementVisitor<E> {
-            type Value = DecimalElement<E>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a DecimalElement or a number")
-            }
-
-            // Implement visit_map to handle the struct fields
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::MapAccess<'de>,
-            {
-                let mut id = None;
-                let mut extension = None;
-                let mut value = None;
-
-                // Process each field in the map
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "id" => {
-                            id = Some(map.next_value()?);
-                        }
-                        "extension" => {
-                            extension = Some(map.next_value()?);
-                        }
-                        "value" => {
-                            value = map.next_value::<Option<Decimal>>()?;
-                        }
-                        _ => {
-                            // Skip unknown fields
-                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(DecimalElement {
-                    id,
-                    extension,
-                    value,
-                })
-            }
-
-            // Add support for direct numeric values
-            fn visit_f64<E2>(self, value: f64) -> Result<Self::Value, E2>
-            where
-                E2: de::Error,
-            {
-                match Decimal::try_from(value) {
-                    Ok(decimal) => Ok(DecimalElement {
-                        id: None,
-                        extension: None,
-                        value: Some(decimal),
-                    }),
-                    Err(_) => Err(E2::custom(format!(
-                        "Failed to convert f64 {} to Decimal",
-                        value
-                    ))),
-                }
-            }
-
-            // Add support for integer values
-            fn visit_i64<E2>(self, value: i64) -> Result<Self::Value, E2>
-            where
-                E2: de::Error,
-            {
-                match Decimal::from_i64(value) {
-                    Some(decimal) => Ok(DecimalElement {
-                        id: None,
-                        extension: None,
-                        value: Some(decimal),
-                    }),
-                    None => Err(E2::custom(format!(
-                        "Failed to convert i64 {} to Decimal",
-                        value
-                    ))),
-                }
-            }
-
-            // Add support for unsigned integer values
-            fn visit_u64<E2>(self, value: u64) -> Result<Self::Value, E2>
-            where
-                E2: de::Error,
-            {
-                match Decimal::from_u64(value) {
-                    Some(decimal) => Ok(DecimalElement {
-                        id: None,
-                        extension: None,
-                        value: Some(decimal),
-                    }),
-                    None => Err(E2::custom(format!(
-                        "Failed to convert u64 {} to Decimal",
-                        value
-                    ))),
-                }
-            }
-
-            // Add support for string values
-            fn visit_str<E2>(self, value: &str) -> Result<Self::Value, E2>
-            where
-                E2: de::Error,
-            {
-                match value.parse::<Decimal>() {
-                    Ok(decimal) => Ok(DecimalElement {
-                        id: None,
-                        extension: None,
-                        value: Some(decimal),
-                    }),
-                    Err(_) => Err(E2::custom(format!(
-                        "Failed to parse string '{}' as Decimal",
-                        value
-                    ))),
-                }
-            }
-
-            // Handle null values
-            fn visit_unit<E2>(self) -> Result<Self::Value, E2>
-            where
-                E2: de::Error,
-            {
-                Ok(DecimalElement {
-                    id: None,
-                    extension: None,
-                    value: None,
-                })
-            }
-        }
-
-        // Use the visitor to deserialize
-        deserializer.deserialize_any(DecimalElementVisitor(std::marker::PhantomData))
+        // Use deserialize_any to handle different top-level JSON types
+        deserializer.deserialize_any(DecimalElementVisitor(PhantomData))
     }
 }
+
+// Helper struct to wrap the Decimal and use the specific serializer
+struct SerializeDecimalWithArbitraryPrecision<'a>(&'a Decimal);
+
+impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Call the specific serialize function from the arbitrary_precision module
+        rust_decimal::serde::arbitrary_precision::serialize(self.0, serializer)
+    }
+}
+
+impl<E> Serialize for DecimalElement<E>
+where
+    E: Serialize, // Add the Serialize bound for the generic type E
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Calculate the number of fields that are NOT None
+        let mut len = 0;
+        if self.id.is_some() {
+            len += 1;
+        }
+        if self.extension.is_some() {
+            len += 1;
+        }
+        if self.value.is_some() {
+            len += 1;
+        }
+
+        // Start serializing a struct with the calculated length
+        let mut state = serializer.serialize_struct("DecimalElement", len)?;
+
+        // Serialize 'id' field if it's Some
+        if let Some(id) = &self.id {
+            state.serialize_field("id", id)?;
+        }
+
+        // Serialize 'extension' field if it's Some
+        if let Some(extension) = &self.extension {
+            state.serialize_field("extension", extension)?;
+        }
+
+        // Serialize 'value' field if it's Some, using our helper wrapper
+        if let Some(value) = &self.value {
+            // Pass the inner Decimal to our wrapper struct,
+            // which implements Serialize using arbitrary_precision::serialize
+            state.serialize_field("value", &SerializeDecimalWithArbitraryPrecision(value))?;
+        }
+
+        // End the struct serialization
+        state.end()
+    }
+}
+
 /*
 pub trait ElementTrait<V, E> {
     type Value;
@@ -362,3 +395,132 @@ pub enum FhirDate {
     Date(Date),
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    use serde_json;
+
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+    struct UnitTestExtension {
+        code: String,
+        is_valid: bool,
+    }
+
+    #[test]
+    fn test_serialize_decimal_with_value_present() {
+        // Use the dec! macro
+        let decimal_val = dec!(1050.00);
+        let element = DecimalElement::<UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: Some(decimal_val),
+        };
+
+        // Serialize the actual element
+        let actual_json_string = serde_json::to_string(&element).expect("Serialization failed");
+        let actual_value: serde_json::Value =
+            serde_json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
+
+        // --- ASSERTION CORRECTION ---
+        // Define the expected JSON as a string
+        let expected_json_string = r#"{"value":1050.00}"#;
+        // Parse the expected JSON string into a serde_json::Value
+        let expected_value: serde_json::Value =
+            serde_json::from_str(expected_json_string).expect("Parsing expected JSON failed");
+
+        // Compare the parsed serde_json::Value objects
+        assert_eq!(
+            actual_value, expected_value,
+            "Actual JSON: {} \nExpected JSON: {}",
+            actual_json_string, expected_json_string
+        );
+
+        assert!(actual_value.get("id").is_none());
+        assert!(actual_value.get("extension").is_none());
+    }
+
+    #[test]
+    fn test_serialize_decimal_with_value_absent() {
+        let element = DecimalElement::<UnitTestExtension> {
+            id: Some("test-id-123".to_string()),
+            extension: None,
+            value: None,
+        };
+
+        let json_string = serde_json::to_string(&element).expect("Serialization failed");
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_string).expect("Parsing JSON failed");
+
+        assert!(
+            json_value.get("value").is_none(),
+            "Value field should be absent. JSON string was: {}",
+            json_string
+        );
+        assert_eq!(
+            json_value.get("id"),
+            Some(&serde_json::json!("test-id-123"))
+        );
+        assert!(json_value.get("extension").is_none());
+    }
+
+    #[test]
+    fn test_serialize_decimal_with_all_fields() {
+        // Use the dec! macro
+        let decimal_val = dec!(-987.654321);
+        let element = DecimalElement::<UnitTestExtension> {
+            id: Some("all-fields-present".to_string()),
+            extension: Some(vec![
+                UnitTestExtension {
+                    code: "C1".to_string(),
+                    is_valid: true,
+                },
+                UnitTestExtension {
+                    code: "C2".to_string(),
+                    is_valid: false,
+                },
+            ]),
+            value: Some(decimal_val),
+        };
+
+        let json_string = serde_json::to_string(&element).expect("Serialization failed");
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_string).expect("Parsing JSON failed");
+
+        assert_eq!(
+            json_value.get("id"),
+            Some(&serde_json::json!("all-fields-present"))
+        );
+        // Assertion remains the same (expecting JSON number output)
+        assert_eq!(
+            json_value.get("value"),
+            Some(&serde_json::json!(-987.654321)),
+            "JSON string was: {}",
+            json_string
+        );
+        assert!(json_value.get("extension").is_some());
+        assert_eq!(
+            json_value["extension"],
+            serde_json::json!([
+                { "code": "C1", "is_valid": true },
+                { "code": "C2", "is_valid": false }
+            ])
+        );
+    }
+
+    #[test]
+    fn test_serialize_decimal_with_no_fields() {
+        let element = DecimalElement::<UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: None,
+        };
+
+        let json_string = serde_json::to_string(&element).expect("Serialization failed");
+        assert_eq!(
+            json_string, "{}",
+            "Serialization of empty element should be empty object"
+        );
+    }
+}
