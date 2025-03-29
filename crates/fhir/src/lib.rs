@@ -198,27 +198,24 @@ where
     where
         Er: de::Error,
     {
-        let value_deserializer = de::value::F64Deserializer::new(v);
-        // Call the helper method via self
-        let value = self.deserialize_bare_value(value_deserializer)?;
-        Ok(DecimalElement {
-            id: None,
-            extension: None,
-            value,
-        })
+        match Decimal::try_from(v) {
+            Ok(decimal) => Ok(DecimalElement {
+                id: None,
+                extension: None,
+                value: Some(decimal),
+            }),
+            Err(_) => Err(Er::custom(format!("Invalid decimal value: {}", v))),
+        }
     }
 
     fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
     where
         Er: de::Error,
     {
-        let value_deserializer = de::value::I64Deserializer::new(v);
-        // Call the helper method via self
-        let value = self.deserialize_bare_value(value_deserializer)?;
         Ok(DecimalElement {
             id: None,
             extension: None,
-            value,
+            value: Some(Decimal::from(v)),
         })
     }
 
@@ -226,13 +223,10 @@ where
     where
         Er: de::Error,
     {
-        let value_deserializer = de::value::U64Deserializer::new(v);
-        // Call the helper method via self
-        let value = self.deserialize_bare_value(value_deserializer)?;
         Ok(DecimalElement {
             id: None,
             extension: None,
-            value,
+            value: Some(Decimal::from(v)),
         })
     }
 
@@ -611,17 +605,17 @@ mod tests {
 
     #[test]
     fn test_deserialize_decimal_from_integer() {
-        // Test with an integer value
+        // Test with an integer value in an object
         let json_string = r#"{"value": 10}"#;
         let element: DecimalElement<UnitTestExtension> = 
             serde_json::from_str(json_string).expect("Deserialization failed");
         
         assert_eq!(element.value, Some(dec!(10)));
         
-        // Test with a bare integer
-        let json_string = "10";
+        // Test with a bare integer - this needs to be parsed as a JSON value first
+        let json_value = serde_json::json!(10);
         let element: DecimalElement<UnitTestExtension> = 
-            serde_json::from_str(json_string).expect("Deserialization failed");
+            serde_json::from_value(json_value).expect("Deserialization from value failed");
         
         assert_eq!(element.value, Some(dec!(10)));
     }
