@@ -505,6 +505,8 @@ fn generate_element_definition(
                 capitalize_first_letter(type_name),
                 capitalize_first_letter(base_name)
             );
+            // Make sure the field name doesn't include [x]
+            serde_attrs.push(format!("rename = \"{}\"", field_name));
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", enum_name)
         } else if is_array {
@@ -540,7 +542,14 @@ fn generate_element_definition(
             output.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
         }
         
-        output.push_str(&format!("    pub {}: {},\n", rust_field_name, type_str));
+        // For choice fields, strip the [x] from the field name
+        let clean_field_name = if rust_field_name.ends_with("[x]") {
+            rust_field_name.trim_end_matches("[x]").to_string()
+        } else {
+            rust_field_name
+        };
+        
+        output.push_str(&format!("    pub {}: {},\n", clean_field_name, type_str));
     }
 }
 
