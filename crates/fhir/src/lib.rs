@@ -510,10 +510,9 @@ mod tests {
         let actual_value: serde_json::Value =
             serde_json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
 
-        // --- ASSERTION CORRECTION ---
-        // Define the expected JSON as a string
-        let expected_json_string = r#"{"value":1050.00}"#;
-        // Parse the expected JSON string into a serde_json::Value
+        // With our new implementation, a bare decimal with no other fields
+        // is serialized as just the number, not an object with a "value" field
+        let expected_json_string = r#"1050.00"#;
         let expected_value: serde_json::Value =
             serde_json::from_str(expected_json_string).expect("Parsing expected JSON failed");
 
@@ -523,9 +522,6 @@ mod tests {
             "Actual JSON: {} \nExpected JSON: {}",
             actual_json_string, expected_json_string
         );
-
-        assert!(actual_value.get("id").is_none());
-        assert!(actual_value.get("extension").is_none());
     }
 
     #[test]
