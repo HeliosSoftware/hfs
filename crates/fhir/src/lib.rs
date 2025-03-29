@@ -278,76 +278,99 @@ where
         struct DecimalElementHelper<T> {
             id: Option<String>,
             extension: Option<Vec<T>>,
-            // Use deserialize_with instead of with to handle both string and number formats
+            // Use with = instead of deserialize_with to avoid the Clone constraint issue
             #[serde(
                 skip_serializing_if = "Option::is_none",
-                deserialize_with = "deserialize_decimal_option"
+                with = "decimal_option_deserializer"
             )]
             value: Option<Decimal>,
         }
 
-        // Custom deserializer function that can handle both string and number formats
-        fn deserialize_decimal_option<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
-        where
-            D: Deserializer<'de> + Clone, // Add Clone constraint to allow cloning deserializer
-        {
-            // First try using the arbitrary_precision_option deserializer with a clone
-            let result = rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer.clone());
+        // Module to handle decimal deserialization without requiring Clone
+        mod decimal_option_deserializer {
+            use super::*;
             
-            if result.is_ok() {
-                return result;
-            }
-            
-            // If that fails, try deserializing as different number types
-            struct DecimalOptionVisitor;
-            
-            impl<'de> Visitor<'de> for DecimalOptionVisitor {
-                type Value = Option<Decimal>;
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                // Try the standard decimal deserialization first
+                struct DecimalOptionVisitor;
                 
-                fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                    formatter.write_str("a decimal value as number or string")
-                }
-                
-                fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    Ok(Some(Decimal::from(v)))
-                }
-                
-                fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    Ok(Some(Decimal::from(v)))
-                }
-                
-                fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    match Decimal::try_from(v) {
-                        Ok(d) => Ok(Some(d)),
-                        Err(_) => Err(E::custom(format!("Invalid decimal value: {}", v))),
+                impl<'de> Visitor<'de> for DecimalOptionVisitor {
+                    type Value = Option<Decimal>;
+                    
+                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                        formatter.write_str("a decimal value as number or string")
+                    }
+                    
+                    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(Some(Decimal::from(v)))
+                    }
+                    
+                    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(Some(Decimal::from(v)))
+                    }
+                    
+                    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        match Decimal::try_from(v) {
+                            Ok(d) => Ok(Some(d)),
+                            Err(_) => Err(E::custom(format!("Invalid decimal value: {}", v))),
+                        }
+                    }
+                    
+                    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        // Try to parse the string as a decimal
+                        match v.parse::<Decimal>() {
+                            Ok(d) => Ok(Some(d)),
+                            Err(_) => Err(E::custom(format!("Invalid decimal string: {}", v))),
+                        }
+                    }
+                    
+                    fn visit_none<E>(self) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        Ok(None)
+                    }
+                    
+                    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        deserializer.deserialize_any(self)
                     }
                 }
                 
-                fn visit_none<E>(self) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    Ok(None)
-                }
-                
-                fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-                where
-                    D: Deserializer<'de>,
-                {
-                    deserializer.deserialize_any(self)
-                }
+                // Try to deserialize using our custom visitor
+                deserializer.deserialize_any(DecimalOptionVisitor)
             }
             
-            deserializer.deserialize_any(DecimalOptionVisitor)
+            // We need to implement serialize too for the with attribute
+            pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                match value {
+                    Some(decimal) => {
+                        rust_decimal::serde::arbitrary_precision::serialize(decimal, serializer)
+                    }
+                    None => serializer.serialize_none(),
+                }
+            }
+        }
         }
 
         // Deserialize the map into the helper struct
