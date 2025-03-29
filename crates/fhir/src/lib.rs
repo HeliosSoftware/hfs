@@ -543,6 +543,7 @@ mod tests {
         let expected_value = serde_json::json!(1050.00); // Let serde_json handle number representation
 
         // Compare the parsed serde_json::Value objects
+        assert_eq!(
             actual_value, expected_value,
             "Actual JSON Value: {:?} \nExpected JSON Value: {:?}",
             actual_value, expected_value
