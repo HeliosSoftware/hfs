@@ -364,30 +364,17 @@ fn process_elements(
         // Process choice types first
         let choice_fields: Vec<_> = group.iter().filter(|e| e.path.ends_with("[x]")).collect();
         for choice in choice_fields {
+            let base_name = choice
+                .path
+                .split('.')
+                .last()
+                .unwrap()
+                .trim_end_matches("[x]");
+                
             let enum_name = format!(
                 "{}{}",
-                type_name,
-                choice
-                    .path
-                    .split('.')
-                    .last()
-                    .unwrap()
-                    .trim_end_matches("[x]")
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .to_uppercase()
-                    .chain(
-                        choice
-                            .path
-                            .split('.')
-                            .last()
-                            .unwrap()
-                            .trim_end_matches("[x]")
-                            .chars()
-                            .skip(1)
-                    )
-                    .collect::<String>()
+                capitalize_first_letter(type_name),
+                capitalize_first_letter(base_name)
             );
 
             // Skip if we've already processed this enum
@@ -395,16 +382,28 @@ fn process_elements(
                 continue;
             }
             processed_types.insert(enum_name.clone());
-            output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+            
+            // Add documentation comment for the enum
+            output.push_str(&format!("/// Choice of types for the {}[x] field in {}\n", 
+                base_name, 
+                capitalize_first_letter(type_name)));
+                
+            output.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
 
             if let Some(types) = &choice.r#type {
                 for ty in types {
+                    let type_code = capitalize_first_letter(&ty.code);
+                    let rename_value = format!("{}{}", base_name, type_code);
+                    
+                    // Add documentation for each variant
+                    output.push_str(&format!("    /// Variant accepting the {} type.\n", type_code));
+                    output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
                     output.push_str(&format!(
                         "    {}({}),\n",
-                        capitalize_first_letter(&ty.code),
-                        capitalize_first_letter(&ty.code)
+                        type_code,
+                        type_code
                     ));
                 }
             }
@@ -424,37 +423,9 @@ fn process_elements(
                 if !field_name.contains("[x]") {
                     generate_element_definition(element, &type_name, output, cycles, elements);
                 } else {
-                    let mut choice_fields: Vec<ElementDefinition> = vec![];
-                    if let Some(types) = &element.r#type {
-                        for choice_type in types {
-                            let choice_type_type = capitalize_first_letter(&choice_type.code);
-                            let mut new_choice_type = ElementDefinition::default();
-                            new_choice_type.id = element.id.clone().map(|id| {
-                                let mut s = id.trim_end_matches("[x]").to_string();
-                                s.push_str(&choice_type_type);
-                                s
-                            });
-                            new_choice_type.path =
-                                element.path.clone().trim_end_matches("[x]").to_string();
-                            new_choice_type.path.push_str(&choice_type_type);
-                            new_choice_type.short = element.short.clone();
-                            new_choice_type.definition = element.definition.clone();
-                            new_choice_type.min = element.min;
-                            new_choice_type.max = element.max.clone();
-                            let edt = ElementDefinitionType::new(choice_type.code.clone());
-                            new_choice_type.r#type = Some(vec![edt]);
-                            choice_fields.push(new_choice_type);
-                        }
-                    }
-                    for choice_field in choice_fields {
-                        generate_element_definition(
-                            &choice_field,
-                            &type_name,
-                            output,
-                            cycles,
-                            elements,
-                        );
-                    }
+                    // For choice types, we've already created an enum, so we just need to add the field
+                    // that uses that enum type. We don't need to expand each choice type into separate fields.
+                    generate_element_definition(element, &type_name, output, cycles, elements);
                 }
             }
         }
@@ -531,14 +502,8 @@ fn generate_element_definition(
             let base_name = field_name.trim_end_matches("[x]");
             let enum_name = format!(
                 "{}{}",
-                type_name,
-                base_name
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .to_uppercase()
-                    .chain(base_name.chars().skip(1))
-                    .collect::<String>()
+                capitalize_first_letter(type_name),
+                capitalize_first_letter(base_name)
             );
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", enum_name)
