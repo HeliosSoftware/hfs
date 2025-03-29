@@ -371,58 +371,7 @@ where
     }
 }
 
-impl<'de, E> Deserialize<'de> for DecimalElement<E>
-where
-    E: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Intermediate step: Deserialize into serde_json::Value to inspect the type
-        let json_value = serde_json::Value::deserialize(deserializer)?;
-
-        match json_value {
-            serde_json::Value::Object(map) => {
-                // If it's an object, deserialize using the visitor approach
-                // The helper struct DecimalElementHelper is no longer needed here.
-
-                // Create a deserializer from the map's iterator
-                let map_deserializer = de::value::MapDeserializer::new(map.into_iter());
-                // Deserialize using a visitor designed for the object structure by calling deserialize_map on the deserializer
-                // Map the specific serde_json::Error to the generic D::Error
-                map_deserializer.deserialize_map(DecimalObjectVisitor(PhantomData))
-                    .map_err(de::Error::custom)
-            }
-            // If it's a number or string, use arbitrary_precision deserializer directly on the Value
-            value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
-                // Deserialize the primitive Value using the precision-preserving deserializer
-                let decimal_value =
-                    rust_decimal::serde::arbitrary_precision_option::deserialize(value)
-                        .map_err(de::Error::custom)?;
-
-                Ok(DecimalElement {
-                    id: None,
-                    extension: None,
-                    value: decimal_value,
-                })
-            }
-            // A bare null is invalid for a required primitive
-            serde_json::Value::Null => Err(de::Error::invalid_type(
-                Unexpected::Unit, // Use Unexpected::Unit for null
-                &"a decimal number, string, or object",
-            )),
-            // Other types (Array, Bool) are invalid
-            other => Err(de::Error::invalid_type(
-                other.unexpected(),
-                &"a decimal number, string, or object",
-            )),
-        }
-    }
-*/
-
-
-// Custom Visitor/Seed/Deserialize logic reinstated above.
+// Note: The custom Deserialize impl below handles both object and primitive cases.
 
 
 // Helper extension trait for serde_json::Value to get Unexpected type
