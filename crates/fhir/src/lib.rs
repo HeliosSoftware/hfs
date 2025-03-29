@@ -5,7 +5,7 @@ use serde::{
     Deserialize, Serialize,
 };
 use std::marker::PhantomData; // Re-added PhantomData
-use serde_json::value::RawValue; // Added for precise number serialization via RawValue
+// Removed unused RawValue import
 use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
 //use time::{Date, Month};
 
@@ -33,8 +33,11 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Format the inner decimal to its precise string representation (e.g., "3.0")
-        let precise_string = self.0.to_string();
+        // Round the decimal to its own scale to potentially preserve trailing zeros for formatting
+        let scale = self.0.scale();
+        let rounded_decimal = self.0.round_dp(scale);
+        // Format the rounded decimal to its precise string representation (e.g., "3.0")
+        let precise_string = rounded_decimal.to_string();
 
         // Create a RawValue from this string. This tells serde_json to treat
         // the string as a literal JSON token (in this case, a number).
