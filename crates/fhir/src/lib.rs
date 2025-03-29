@@ -5,7 +5,6 @@ use serde::{
     Deserialize, Serialize,
 };
 use std::marker::PhantomData; // Added PhantomData
-use serde_json::value::RawValue; // Added for precise number serialization
 //use time::{Date, Month};
 
 #[cfg(feature = "R4")]
@@ -320,19 +319,9 @@ impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
     where
         S: Serializer,
     {
-        // Format the decimal to its precise string representation (e.g., "3.0")
-        let precise_string = self.0.to_string();
-
-        // Serialize this string directly as a raw JSON value (which should be treated as a number token)
-        // This relies on the Serializer (like serde_json's) supporting RawValue.
-        match RawValue::from_string(precise_string) {
-            // Box the RawValue before serializing
-            Ok(raw_value) => raw_value.serialize(serializer),
-            Err(e) => Err(serde::ser::Error::custom(format!(
-                "Failed to create RawValue for decimal: {}",
-                e
-            ))),
-        }
+        // Call the specific serialize function from the rust_decimal arbitrary_precision module
+        // This should serialize as a JSON number (e.g., 3.0) for human-readable formats like JSON.
+        rust_decimal::serde::arbitrary_precision::serialize(self.0, serializer)
     }
 }
 
