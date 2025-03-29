@@ -373,7 +373,7 @@ fn process_elements(
                 
             let enum_name = format!(
                 "{}{}",
-                capitalize_first_letter(type_name),
+                capitalize_first_letter(&type_name),
                 capitalize_first_letter(base_name)
             );
 
