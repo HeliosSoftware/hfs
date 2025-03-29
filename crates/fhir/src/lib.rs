@@ -375,8 +375,7 @@ where
 
 
 // Helper extension trait for serde_json::Value to get Unexpected type
-// This might be needed again for better error messages in Deserialize.
-// Let's uncomment it.
+// Used in the custom Deserialize implementation below.
 trait UnexpectedValue {
     fn unexpected(&self) -> de::Unexpected;
 }
@@ -403,7 +402,6 @@ impl UnexpectedValue for serde_json::Value {
         }
     }
 }
-*/
 
 // Custom Serialize implementation is no longer needed as we derive Serialize
 // and PreciseDecimal handles its own serialization.
