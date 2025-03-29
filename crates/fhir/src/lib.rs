@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer, Unexpected, MapAccess, DeserializeSeed, Visitor}, // Added Visitor
+    de::{self, Deserializer, Unexpected, MapAccess, Visitor}, // Removed DeserializeSeed, Added Visitor
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
 };
@@ -193,7 +193,9 @@ where
                 // Create a deserializer from the map's iterator
                 let map_deserializer = de::value::MapDeserializer::new(map.into_iter());
                 // Deserialize using a visitor designed for the object structure by calling deserialize_map on the deserializer
+                // Map the specific serde_json::Error to the generic D::Error
                 map_deserializer.deserialize_map(DecimalObjectVisitor(PhantomData))
+                    .map_err(de::Error::custom)
             }
             // If it's a number or string, use arbitrary_precision deserializer directly on the Value
             value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
