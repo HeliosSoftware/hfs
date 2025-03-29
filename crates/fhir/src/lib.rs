@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer, Unexpected, MapAccess, Visitor}, // Re-added MapAccess, Visitor
-    ser::Serializer,
+    de::{self, Deserializer, MapAccess, Visitor}, // Removed Unexpected
+    ser::{Serializer, SerializeStruct}, // Added SerializeStruct
     Deserialize, Serialize,
 };
 use std::marker::PhantomData; // Re-added PhantomData
@@ -266,15 +266,11 @@ where
 
 // Remove derive Serialize as we implement it manually below
 #[derive(Debug)]
-#[serde(rename_all = "camelCase")] // Keep rename_all for potential future derive
+// Remove serde attributes as they are not used without derive
 pub struct DecimalElement<E> {
-    // Remove Serialize attributes from fields, handled in impl Serialize
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<E>>,
     // Use the PreciseDecimal wrapper for the value field
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<PreciseDecimal>,
 }
 
