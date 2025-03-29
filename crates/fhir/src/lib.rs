@@ -272,7 +272,6 @@ where
     where
         A: MapAccess<'de>,
     {
-        dbg!("visit_map");
         // Use a helper struct for deserializing the object structure
         #[derive(Deserialize)]
         struct DecimalElementHelper<T> {
@@ -294,7 +293,7 @@ where
             where
                 D: Deserializer<'de>,
             {
-                // Try the standard decimal deserialization first
+                // Custom visitor that handles all number formats
                 struct DecimalOptionVisitor;
                 
                 impl<'de> Visitor<'de> for DecimalOptionVisitor {
@@ -376,7 +375,6 @@ where
         let helper: DecimalElementHelper<E> =
             Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
 
-        dbg!(helper.value);
         // Construct the actual DecimalElement from the helper
         Ok(DecimalElement {
             id: helper.id,
@@ -609,5 +607,22 @@ mod tests {
             json_string, "{}",
             "Serialization of empty element should be empty object"
         );
+    }
+
+    #[test]
+    fn test_deserialize_decimal_from_integer() {
+        // Test with an integer value
+        let json_string = r#"{"value": 10}"#;
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_str(json_string).expect("Deserialization failed");
+        
+        assert_eq!(element.value, Some(dec!(10)));
+        
+        // Test with a bare integer
+        let json_string = "10";
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_str(json_string).expect("Deserialization failed");
+        
+        assert_eq!(element.value, Some(dec!(10)));
     }
 }
