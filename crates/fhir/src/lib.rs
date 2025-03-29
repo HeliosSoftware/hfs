@@ -289,10 +289,10 @@ where
         // Custom deserializer function that can handle both string and number formats
         fn deserialize_decimal_option<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
         where
-            D: Deserializer<'de>,
+            D: Deserializer<'de> + Clone, // Add Clone constraint to allow cloning deserializer
         {
-            // First try using the arbitrary_precision_option deserializer
-            let result = rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer);
+            // First try using the arbitrary_precision_option deserializer with a clone
+            let result = rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer.clone());
             
             if result.is_ok() {
                 return result;
