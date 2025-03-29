@@ -264,11 +264,11 @@ where
     }
 }
 
-// Remove derive Deserialize, keep Serialize
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")] // Assuming camelCase for FHIR fields
+// Remove derive Serialize as we implement it manually below
+#[derive(Debug)]
+#[serde(rename_all = "camelCase")] // Keep rename_all for potential future derive
 pub struct DecimalElement<E> {
-    // Keep Serialize attributes
+    // Remove Serialize attributes from fields, handled in impl Serialize
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,6 +376,7 @@ where
 
 // Helper extension trait for serde_json::Value to get Unexpected type
 // Used in the custom Deserialize implementation below.
+/* // Trait is unused currently
 trait UnexpectedValue {
     fn unexpected(&self) -> de::Unexpected;
 }
@@ -402,10 +403,59 @@ impl UnexpectedValue for serde_json::Value {
         }
     }
 }
+*/ // Trait is unused currently
 
-// Custom Serialize implementation is no longer needed as we derive Serialize
-// and PreciseDecimal handles its own serialization.
-// We keep the derive Serialize attribute on DecimalElement.
+// Reinstate custom Serialize implementation for DecimalElement
+impl<E> Serialize for DecimalElement<E>
+where
+    E: Serialize, // Add the Serialize bound for the generic type E
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // If we only have a value and no other fields, serialize just the value
+        if self.id.is_none() && self.extension.is_none() {
+            if let Some(value) = &self.value {
+                // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
+                return value.serialize(serializer);
+            } else {
+                // If value is also None, serialize as an empty object
+                // based on test_serialize_decimal_with_no_fields
+                return serializer.serialize_struct("DecimalElement", 0)?.end();
+            }
+        }
+
+        // Otherwise, serialize as a struct with all present fields
+        // Calculate the number of fields that are NOT None
+        let mut len = 0;
+        if self.id.is_some() { len += 1; }
+        if self.extension.is_some() { len += 1; }
+        if self.value.is_some() { len += 1; }
+
+        // Start serializing a struct with the calculated length
+        let mut state = serializer.serialize_struct("DecimalElement", len)?;
+
+        // Serialize 'id' field if it's Some
+        if let Some(id) = &self.id {
+            state.serialize_field("id", id)?;
+        }
+
+        // Serialize 'extension' field if it's Some
+        if let Some(extension) = &self.extension {
+            state.serialize_field("extension", extension)?;
+        }
+
+        // Serialize 'value' field if it's Some
+        if let Some(value) = &self.value {
+             // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
+            state.serialize_field("value", value)?;
+        }
+
+        // End the struct serialization
+        state.end()
+    }
+}
 
 /*
 pub trait ElementTrait<V, E> {
