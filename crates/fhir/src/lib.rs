@@ -177,20 +177,78 @@ where
     }
 
     // --- Handle the Bare Decimal Case ---
-    // Use visit_any to delegate to the arbitrary_precision deserializer,
-    // which handles numbers and strings correctly, preserving precision.
-    fn visit_any<Er>(self, deserializer: Er) -> Result<Self::Value, Er::Error>
+    // Implement specific visitors for primitive types that can represent a decimal.
+
+    fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
     where
-        Er: Deserializer<'de>,
+        Er: de::Error,
     {
-        // Deserialize using the rust_decimal helper
-        match rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer) {
-            Ok(value_opt) => Ok(DecimalElement {
+        // Use Decimal::from_str to preserve precision from the string representation
+        // This relies on the source JSON having the number represented accurately.
+        // Direct Decimal::try_from(f64) can lose precision.
+        // We need a way to access the original string or use a precision-preserving number type.
+        // For now, let's try parsing from the standard float string representation,
+        // acknowledging potential precision issues with f64 itself.
+        // A better solution might involve enabling serde_json's arbitrary_precision feature.
+        match v.to_string().parse::<Decimal>() {
+            Ok(decimal) => Ok(DecimalElement {
                 id: None,
                 extension: None,
-                value: value_opt,
+                value: Some(decimal),
             }),
-            Err(e) => Err(e), // Propagate the error
+            Err(_) => Err(Er::custom(format!("Invalid decimal value from f64: {}", v))),
+        }
+    }
+
+    fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value: Some(Decimal::from(v)),
+        })
+    }
+
+    fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        Ok(DecimalElement {
+            id: None,
+            extension: None,
+            value: Some(Decimal::from(v)),
+        })
+    }
+
+    // Handle string type
+    fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        match v.parse::<Decimal>() {
+            Ok(decimal) => Ok(DecimalElement {
+                id: None,
+                extension: None,
+                value: Some(decimal),
+            }),
+            Err(_) => Err(Er::custom(format!("Invalid decimal string: {}", v))),
+        }
+    }
+
+    // Handle borrowed string
+    fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
+    where
+        Er: de::Error,
+    {
+        match v.parse::<Decimal>() {
+            Ok(decimal) => Ok(DecimalElement {
+                id: None,
+                extension: None,
+                value: Some(decimal),
+            }),
+            Err(_) => Err(Er::custom(format!("Invalid decimal string: {}", v))),
         }
     }
 
