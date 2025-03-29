@@ -1,9 +1,10 @@
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer, Unexpected},
+    de::{self, Deserializer, Unexpected, MapAccess, DeserializeSeed}, // Added MapAccess, DeserializeSeed
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
 };
+use std::marker::PhantomData; // Added PhantomData
 //use time::{Date, Month};
 
 #[cfg(feature = "R4")]
@@ -189,16 +190,10 @@ where
                     value: Option<Decimal>,
                 }
 
-                // Deserialize from the map Value
-                let helper: DecimalElementHelper<E> =
-                    serde_json::from_value(serde_json::Value::Object(map))
-                        .map_err(de::Error::custom)?;
-
-                Ok(DecimalElement {
-                    id: helper.id,
-                    extension: helper.extension,
-                    value: helper.value,
-                })
+                // Create a deserializer from the map's iterator
+                let map_deserializer = de::value::MapDeserializer::new(map.into_iter());
+                // Deserialize using a visitor designed for the object structure
+                DecimalObjectVisitor(PhantomData).deserialize(map_deserializer)
             }
             // If it's a number or string, use arbitrary_precision deserializer directly on the Value
             value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
@@ -227,6 +222,72 @@ where
     }
 }
 
+
+// --- Visitor and Seed for Object Deserialization ---
+
+// Seed for deserializing Option<Decimal> with arbitrary precision
+struct DecimalOptionSeed;
+
+impl<'de> de::DeserializeSeed<'de> for DecimalOptionSeed {
+    type Value = Option<Decimal>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        rust_decimal::serde::arbitrary_precision_option::deserialize(deserializer)
+    }
+}
+
+// Visitor specifically for deserializing the fields of a DecimalElement from a map
+struct DecimalObjectVisitor<E>(PhantomData<E>);
+
+impl<'de, E> Visitor<'de> for DecimalObjectVisitor<E>
+where
+    E: Deserialize<'de>,
+{
+    type Value = DecimalElement<E>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a DecimalElement object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut id: Option<String> = None;
+        let mut extension: Option<Vec<E>> = None;
+        let mut value: Option<Decimal> = None;
+
+        // Manually deserialize fields from the map
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => {
+                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                    id = Some(map.next_value()?);
+                }
+                "extension" => {
+                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
+                    extension = Some(map.next_value()?);
+                }
+                "value" => {
+                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                    // Use the seed to deserialize the value field with arbitrary precision
+                    value = map.next_value_seed(DecimalOptionSeed)?;
+                }
+                // Ignore any unknown fields encountered
+                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
+            }
+        }
+
+        Ok(DecimalElement { id, extension, value })
+    }
+}
+
+// --- End Visitor and Seed ---
+
+
 // Helper extension trait for serde_json::Value to get Unexpected type
 trait UnexpectedValue {
     fn unexpected(&self) -> de::Unexpected;
@@ -254,6 +315,8 @@ impl UnexpectedValue for serde_json::Value {
         }
     }
 }
+
+// --- Serialization Helpers ---
 
 // Helper struct to wrap the Decimal and use the specific serializer
 struct SerializeDecimalWithArbitraryPrecision<'a>(&'a Decimal);
