@@ -1,13 +1,9 @@
-use crate::de::MapAccess;
-use crate::de::Visitor;
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer},
+    de::{self, Deserializer, Unexpected},
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
 };
-use std::fmt;
-use std::marker::PhantomData;
 //use time::{Date, Month};
 
 #[cfg(feature = "R4")]
@@ -219,7 +215,7 @@ where
             }
             // A bare null is invalid for a required primitive
             serde_json::Value::Null => Err(de::Error::invalid_type(
-                de::Unexpected::Null,
+                Unexpected::Unit, // Use Unexpected::Unit for null
                 &"a decimal number, string, or object",
             )),
             // Other types (Array, Bool) are invalid
@@ -237,24 +233,24 @@ trait UnexpectedValue {
 }
 
 impl UnexpectedValue for serde_json::Value {
-    fn unexpected(&self) -> de::Unexpected {
+    fn unexpected(&self) -> Unexpected { // Use the imported Unexpected type directly
         match self {
-            serde_json::Value::Null => de::Unexpected::Null,
-            serde_json::Value::Bool(b) => de::Unexpected::Bool(*b),
+            serde_json::Value::Null => Unexpected::Unit, // Use Unexpected::Unit for null
+            serde_json::Value::Bool(b) => Unexpected::Bool(*b),
             serde_json::Value::Number(n) => {
                 if let Some(u) = n.as_u64() {
-                    de::Unexpected::Unsigned(u)
+                    Unexpected::Unsigned(u)
                 } else if let Some(i) = n.as_i64() {
-                    de::Unexpected::Signed(i)
+                    Unexpected::Signed(i)
                 } else if let Some(f) = n.as_f64() {
-                    de::Unexpected::Float(f)
+                    Unexpected::Float(f)
                 } else {
-                    de::Unexpected::Other("number")
+                    Unexpected::Other("number")
                 }
             }
-            serde_json::Value::String(s) => de::Unexpected::Str(s),
-            serde_json::Value::Array(_) => de::Unexpected::Seq,
-            serde_json::Value::Object(_) => de::Unexpected::Map,
+            serde_json::Value::String(s) => Unexpected::Str(s),
+            serde_json::Value::Array(_) => Unexpected::Seq,
+            serde_json::Value::Object(_) => Unexpected::Map,
         }
     }
 }
