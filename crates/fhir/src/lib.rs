@@ -5,6 +5,7 @@ use serde::{
     Deserialize, Serialize,
 };
 use std::marker::PhantomData; // Added PhantomData
+use serde_json::value::RawValue; // Added for precise number serialization
 //use time::{Date, Month};
 
 #[cfg(feature = "R4")]
@@ -176,19 +177,8 @@ where
 
         match json_value {
             serde_json::Value::Object(map) => {
-                // If it's an object, deserialize using the helper struct approach
-                // Re-define helper struct here as it's only used in this context now
-                #[derive(Deserialize)]
-                struct DecimalElementHelper<T> {
-                    id: Option<String>,
-                    extension: Option<Vec<T>>,
-                    #[serde(
-                        default, // Use default if 'value' is missing or null in object
-                        skip_serializing_if = "Option::is_none",
-                        with = "rust_decimal::serde::arbitrary_precision_option"
-                    )]
-                    value: Option<Decimal>,
-                }
+                // If it's an object, deserialize using the visitor approach
+                // The helper struct DecimalElementHelper is no longer needed here.
 
                 // Create a deserializer from the map's iterator
                 let map_deserializer = de::value::MapDeserializer::new(map.into_iter());
@@ -330,8 +320,19 @@ impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
     where
         S: Serializer,
     {
-        // Call the specific serialize function from the arbitrary_precision module
-        rust_decimal::serde::arbitrary_precision::serialize(self.0, serializer)
+        // Format the decimal to its precise string representation (e.g., "3.0")
+        let precise_string = self.0.to_string();
+
+        // Serialize this string directly as a raw JSON value (which should be treated as a number token)
+        // This relies on the Serializer (like serde_json's) supporting RawValue.
+        match RawValue::from_string(precise_string) {
+            // Box the RawValue before serializing
+            Ok(raw_value) => raw_value.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!(
+                "Failed to create RawValue for decimal: {}",
+                e
+            ))),
+        }
     }
 }
 
