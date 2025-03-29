@@ -371,7 +371,6 @@ where
                 }
             }
         }
-        }
 
         // Deserialize the map into the helper struct
         let helper: DecimalElementHelper<E> =
