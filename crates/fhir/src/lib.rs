@@ -164,126 +164,7 @@ pub struct DecimalElement<E> {
     pub value: Option<Decimal>,
 }
 
-struct DecimalElementVisitor<E>(PhantomData<E>);
-
-impl<'de, E> Visitor<'de> for DecimalElementVisitor<E>
-where
-    E: Deserialize<'de>,
-{
-    type Value = DecimalElement<E>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a decimal value (string or number) or a DecimalElement object")
-    }
-
-    // --- Handle the Bare Decimal Case ---
-    // Implement specific visitors for primitive types that can represent a decimal.
-
-    fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
-    where
-        Er: de::Error,
-    {
-        // Use Decimal::from_str to preserve precision from the string representation
-        // This relies on the source JSON having the number represented accurately.
-        // Direct Decimal::try_from(f64) can lose precision.
-        // We need a way to access the original string or use a precision-preserving number type.
-        // For now, let's try parsing from the standard float string representation,
-        // acknowledging potential precision issues with f64 itself.
-        // A better solution might involve enabling serde_json's arbitrary_precision feature.
-        match v.to_string().parse::<Decimal>() {
-            Ok(decimal) => Ok(DecimalElement {
-                id: None,
-                extension: None,
-                value: Some(decimal),
-            }),
-            Err(_) => Err(Er::custom(format!("Invalid decimal value from f64: {}", v))),
-        }
-    }
-
-    fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
-    where
-        Er: de::Error,
-    {
-        Ok(DecimalElement {
-            id: None,
-            extension: None,
-            value: Some(Decimal::from(v)),
-        })
-    }
-
-    fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
-    where
-        Er: de::Error,
-    {
-        Ok(DecimalElement {
-            id: None,
-            extension: None,
-            value: Some(Decimal::from(v)),
-        })
-    }
-
-    // Handle string type
-    fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
-    where
-        Er: de::Error,
-    {
-        match v.parse::<Decimal>() {
-            Ok(decimal) => Ok(DecimalElement {
-                id: None,
-                extension: None,
-                value: Some(decimal),
-            }),
-            Err(_) => Err(Er::custom(format!("Invalid decimal string: {}", v))),
-        }
-    }
-
-    // Handle borrowed string
-    fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
-    where
-        Er: de::Error,
-    {
-        match v.parse::<Decimal>() {
-            Ok(decimal) => Ok(DecimalElement {
-                id: None,
-                extension: None,
-                value: Some(decimal),
-            }),
-            Err(_) => Err(Er::custom(format!("Invalid decimal string: {}", v))),
-        }
-    }
-
-    // --- Handle the JSON Object Case ---
-
-    fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        // Use a helper struct for deserializing the object structure
-        #[derive(Deserialize)]
-        struct DecimalElementHelper<T> {
-            id: Option<String>,
-            extension: Option<Vec<T>>,
-            // Use with = instead of deserialize_with to avoid the Clone constraint issue
-            #[serde(
-                skip_serializing_if = "Option::is_none",
-                // Use the correct module from rust_decimal directly
-                with = "rust_decimal::serde::arbitrary_precision_option"
-            )]
-            value: Option<Decimal>,
-        }
-
-        // Deserialize the map into the helper struct
-        let helper: DecimalElementHelper<E> =
-            Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-
-        // Construct the actual DecimalElement from the helper
-        Ok(DecimalElement {
-            id: helper.id,
-            extension: helper.extension,
-            value: helper.value,
-        })
-    }
-}
+// Visitor is no longer needed with the new Deserialize implementation below
 
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
@@ -293,8 +174,88 @@ where
     where
         D: Deserializer<'de>,
     {
-        // Use deserialize_any to handle different top-level JSON types
-        deserializer.deserialize_any(DecimalElementVisitor(PhantomData))
+        // Intermediate step: Deserialize into serde_json::Value to inspect the type
+        let json_value = serde_json::Value::deserialize(deserializer)?;
+
+        match json_value {
+            serde_json::Value::Object(map) => {
+                // If it's an object, deserialize using the helper struct approach
+                // Re-define helper struct here as it's only used in this context now
+                #[derive(Deserialize)]
+                struct DecimalElementHelper<T> {
+                    id: Option<String>,
+                    extension: Option<Vec<T>>,
+                    #[serde(
+                        default, // Use default if 'value' is missing or null in object
+                        skip_serializing_if = "Option::is_none",
+                        with = "rust_decimal::serde::arbitrary_precision_option"
+                    )]
+                    value: Option<Decimal>,
+                }
+
+                // Deserialize from the map Value
+                let helper: DecimalElementHelper<E> =
+                    serde_json::from_value(serde_json::Value::Object(map))
+                        .map_err(de::Error::custom)?;
+
+                Ok(DecimalElement {
+                    id: helper.id,
+                    extension: helper.extension,
+                    value: helper.value,
+                })
+            }
+            // If it's a number or string, use arbitrary_precision deserializer directly on the Value
+            value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
+                // Deserialize the primitive Value using the precision-preserving deserializer
+                let decimal_value =
+                    rust_decimal::serde::arbitrary_precision_option::deserialize(value)
+                        .map_err(de::Error::custom)?;
+
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: decimal_value,
+                })
+            }
+            // A bare null is invalid for a required primitive
+            serde_json::Value::Null => Err(de::Error::invalid_type(
+                de::Unexpected::Null,
+                &"a decimal number, string, or object",
+            )),
+            // Other types (Array, Bool) are invalid
+            other => Err(de::Error::invalid_type(
+                other.unexpected(),
+                &"a decimal number, string, or object",
+            )),
+        }
+    }
+}
+
+// Helper extension trait for serde_json::Value to get Unexpected type
+trait UnexpectedValue {
+    fn unexpected(&self) -> de::Unexpected;
+}
+
+impl UnexpectedValue for serde_json::Value {
+    fn unexpected(&self) -> de::Unexpected {
+        match self {
+            serde_json::Value::Null => de::Unexpected::Null,
+            serde_json::Value::Bool(b) => de::Unexpected::Bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    de::Unexpected::Unsigned(u)
+                } else if let Some(i) = n.as_i64() {
+                    de::Unexpected::Signed(i)
+                } else if let Some(f) = n.as_f64() {
+                    de::Unexpected::Float(f)
+                } else {
+                    de::Unexpected::Other("number")
+                }
+            }
+            serde_json::Value::String(s) => de::Unexpected::Str(s),
+            serde_json::Value::Array(_) => de::Unexpected::Seq,
+            serde_json::Value::Object(_) => de::Unexpected::Map,
+        }
     }
 }
 
