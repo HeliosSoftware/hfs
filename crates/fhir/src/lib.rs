@@ -412,6 +412,14 @@ where
     where
         S: Serializer,
     {
+        // If we only have a value and no other fields, serialize just the value
+        if self.id.is_none() && self.extension.is_none() && self.value.is_some() {
+            // Directly serialize the decimal value using our helper wrapper
+            return SerializeDecimalWithArbitraryPrecision(self.value.as_ref().unwrap())
+                .serialize(serializer);
+        }
+
+        // Otherwise, serialize as a struct with all present fields
         // Calculate the number of fields that are NOT None
         let mut len = 0;
         if self.id.is_some() {
@@ -618,5 +626,36 @@ mod tests {
             serde_json::from_value(json_value).expect("Deserialization from value failed");
         
         assert_eq!(element.value, Some(dec!(10)));
+    }
+    
+    #[test]
+    fn test_roundtrip_decimal_serialization() {
+        // Test with a bare integer
+        let json_value = serde_json::json!(10);
+        
+        // Deserialize to our type
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_value(json_value.clone()).expect("Deserialization failed");
+        
+        // Serialize back to JSON
+        let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+        
+        // Verify we get the same JSON back (a bare number, not an object)
+        assert_eq!(json_value, reserialized, 
+            "Original: {:?}\nReserialized: {:?}", 
+            json_value, reserialized);
+        
+        // Test with a decimal value
+        let json_value = serde_json::json!(123.456);
+        
+        // Deserialize to our type
+        let element: DecimalElement<UnitTestExtension> = 
+            serde_json::from_value(json_value.clone()).expect("Deserialization failed");
+        
+        // Serialize back to JSON
+        let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+        
+        // Verify we get the same JSON back
+        assert_eq!(json_value, reserialized);
     }
 }
