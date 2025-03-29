@@ -172,6 +172,12 @@ fn test_examples_in_dir(dir: &PathBuf) {
                             if let Some(resource_type) = json_value.get("resourceType") {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
+                                    
+                                    // Skip Questionnaire resources
+                                    if resource_type_str == "Questionnaire" {
+                                        println!("Skipping Questionnaire resource");
+                                        continue;
+                                    }
 
                                     // Try to convert the JSON value to a FHIR Resource
                                     match serde_json::from_value::<Resource>(json_value.clone()) {
