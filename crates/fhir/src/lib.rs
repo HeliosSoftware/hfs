@@ -166,10 +166,6 @@ pub struct DecimalElement<E> {
 
 struct DecimalElementVisitor<E>(PhantomData<E>);
 
-impl<'de, E> DecimalElementVisitor<E>
-// No helper needed here anymore
-}
-
 impl<'de, E> Visitor<'de> for DecimalElementVisitor<E>
 where
     E: Deserialize<'de>,
