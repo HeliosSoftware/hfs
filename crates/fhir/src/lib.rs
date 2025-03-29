@@ -1,10 +1,10 @@
 use rust_decimal::Decimal;
 use serde::{
-    de::{self, Deserializer, Unexpected, MapAccess, Visitor}, // Removed DeserializeSeed, Added Visitor
-    ser::{SerializeStruct, Serializer},
+    de::{self, Deserializer, Unexpected}, // Removed MapAccess, Visitor
+    ser::Serializer, // Removed SerializeStruct
     Deserialize, Serialize,
 };
-use std::marker::PhantomData; // Added PhantomData
+// Removed PhantomData
 use serde_json::value::RawValue; // Added for precise number serialization via RawValue
 use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
 //use time::{Date, Month};
@@ -288,7 +288,8 @@ where
 
 
 // Helper extension trait for serde_json::Value to get Unexpected type
-// This might still be useful if we need custom Deserialize later. Keep for now.
+// This is no longer used as we removed the custom Deserialize impl.
+/*
 trait UnexpectedValue {
     fn unexpected(&self) -> de::Unexpected;
 }
@@ -315,6 +316,7 @@ impl UnexpectedValue for serde_json::Value {
         }
     }
 }
+*/
 
 // Custom Serialize implementation is no longer needed as we derive Serialize
 // and PreciseDecimal handles its own serialization.
@@ -364,7 +366,8 @@ mod tests {
         let element = DecimalElement::<UnitTestExtension> {
             id: None,
             extension: None,
-            value: Some(decimal_val),
+            // Wrap the Decimal in PreciseDecimal
+            value: Some(PreciseDecimal(decimal_val)),
         };
 
         // Serialize the actual element
@@ -426,7 +429,8 @@ mod tests {
                     is_valid: false,
                 },
             ]),
-            value: Some(decimal_val),
+            // Wrap the Decimal in PreciseDecimal
+            value: Some(PreciseDecimal(decimal_val)),
         };
 
         let json_string = serde_json::to_string(&element).expect("Serialization failed");
@@ -476,14 +480,16 @@ mod tests {
         let element: DecimalElement<UnitTestExtension> =
             serde_json::from_str(json_string).expect("Deserialization failed");
 
-        assert_eq!(element.value, Some(dec!(10)));
+        // Compare against PreciseDecimal
+        assert_eq!(element.value, Some(PreciseDecimal(dec!(10))));
 
         // Test with a bare integer - this needs to be parsed as a JSON value first
         let json_value = serde_json::json!(10);
         let element: DecimalElement<UnitTestExtension> =
             serde_json::from_value(json_value).expect("Deserialization from value failed");
 
-        assert_eq!(element.value, Some(dec!(10)));
+        // Compare against PreciseDecimal
+        assert_eq!(element.value, Some(PreciseDecimal(dec!(10))));
     }
 
     #[test]
