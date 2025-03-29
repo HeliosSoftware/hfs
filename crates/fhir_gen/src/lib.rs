@@ -370,7 +370,7 @@ fn process_elements(
                 .last()
                 .unwrap()
                 .trim_end_matches("[x]");
-                
+
             let enum_name = format!(
                 "{}{}",
                 capitalize_first_letter(&type_name),
@@ -382,13 +382,15 @@ fn process_elements(
                 continue;
             }
             processed_types.insert(enum_name.clone());
-            
+
             // Add documentation comment for the enum
-            output.push_str(&format!("/// Choice of types for the {}[x] field in {}\n", 
-                base_name, 
-                capitalize_first_letter(&type_name)));
-                
-            output.push_str("#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
+            output.push_str(&format!(
+                "/// Choice of types for the {}[x] field in {}\n",
+                base_name,
+                capitalize_first_letter(&type_name)
+            ));
+
+            output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
 
@@ -396,15 +398,14 @@ fn process_elements(
                 for ty in types {
                     let type_code = capitalize_first_letter(&ty.code);
                     let rename_value = format!("{}{}", base_name, type_code);
-                    
+
                     // Add documentation for each variant
-                    output.push_str(&format!("    /// Variant accepting the {} type.\n", type_code));
-                    output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
                     output.push_str(&format!(
-                        "    {}({}),\n",
-                        type_code,
+                        "    /// Variant accepting the {} type.\n",
                         type_code
                     ));
+                    output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
+                    output.push_str(&format!("    {}({}),\n", type_code, type_code));
                 }
             }
             output.push_str("}\n\n");
@@ -448,7 +449,10 @@ fn generate_element_definition(
         if field_name != rust_field_name {
             // For choice fields, use the name without [x]
             if field_name.ends_with("[x]") {
-                serde_attrs.push(format!("rename = \"{}\"", field_name.trim_end_matches("[x]")));
+                serde_attrs.push(format!(
+                    "rename = \"{}\"",
+                    field_name.trim_end_matches("[x]")
+                ));
             } else {
                 serde_attrs.push(format!("rename = \"{}\"", field_name));
             }
@@ -514,8 +518,14 @@ fn generate_element_definition(
             // Make sure the field name doesn't include [x] in the Rust code
             // but keep the original field name (without [x]) for serialization
             // Only add rename if we haven't already added it above
-            if serde_attrs.iter().all(|attr| !attr.starts_with("rename = ")) {
-                serde_attrs.push(format!("rename = \"{}\"", field_name.trim_end_matches("[x]")));
+            if serde_attrs
+                .iter()
+                .all(|attr| !attr.starts_with("rename = "))
+            {
+                serde_attrs.push(format!(
+                    "rename = \"{}\"",
+                    field_name.trim_end_matches("[x]")
+                ));
             }
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", enum_name)
@@ -546,19 +556,19 @@ fn generate_element_definition(
                 }
             }
         }
-        
+
         // Output consolidated serde attributes if any exist
         if !serde_attrs.is_empty() {
             output.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
         }
-        
+
         // For choice fields, strip the [x] from the field name
         let clean_field_name = if rust_field_name.ends_with("[x]") {
             rust_field_name.trim_end_matches("[x]").to_string()
         } else {
             rust_field_name
         };
-        
+
         output.push_str(&format!("    pub {}: {},\n", clean_field_name, type_str));
     }
 }
