@@ -310,32 +310,7 @@ impl UnexpectedValue for serde_json::Value {
     }
 }
 
-// --- Serialization Helpers ---
-
-// Helper struct to wrap the Decimal and use the specific serializer
-struct SerializeDecimalWithArbitraryPrecision<'a>(&'a Decimal);
-
-impl<'a> Serialize for SerializeDecimalWithArbitraryPrecision<'a> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Format the decimal to its precise string representation (e.g., "3.0")
-        let precise_string = self.0.to_string();
-
-        // Create a RawValue from this string. This tells serde_json to treat
-        // the string as a literal JSON token (in this case, a number).
-        // We need to box it as RawValue::serialize takes Box<Self>.
-        match RawValue::from_string(precise_string) {
-            // Serialize the RawValue directly. This requires the Serializer to support it.
-            Ok(raw_value) => raw_value.serialize(serializer),
-            Err(e) => Err(serde::ser::Error::custom(format!(
-                "Failed to create RawValue for decimal: {}",
-                e
-            ))),
-        }
-    }
-}
+// --- Serialization for DecimalElement ---
 
 impl<E> Serialize for DecimalElement<E>
 where
@@ -345,11 +320,22 @@ where
     where
         S: Serializer,
     {
-        // If we only have a value and no other fields, serialize just the value
-        if self.id.is_none() && self.extension.is_none() && self.value.is_some() {
-            // Directly serialize the decimal value using our helper wrapper
-            return SerializeDecimalWithArbitraryPrecision(self.value.as_ref().unwrap())
-                .serialize(serializer);
+        // If we only have a value and no other fields, serialize just the value using RawValue
+        if self.id.is_none() && self.extension.is_none() {
+            if let Some(value) = &self.value {
+                let precise_string = value.to_string();
+                return match RawValue::from_string(precise_string) {
+                    Ok(raw_value) => raw_value.serialize(serializer),
+                    Err(e) => Err(serde::ser::Error::custom(format!(
+                        "Failed to create RawValue for bare decimal: {}",
+                        e
+                    ))),
+                };
+            } else {
+                // If value is also None, serialize as an empty object (or null? FHIR spec?)
+                // Let's stick to empty object for now based on test_serialize_decimal_with_no_fields
+                // Fall through to struct serialization with 0 fields.
+            }
         }
 
         // Otherwise, serialize as a struct with all present fields
@@ -378,11 +364,16 @@ where
             state.serialize_field("extension", extension)?;
         }
 
-        // Serialize 'value' field if it's Some, using our helper wrapper
+        // Serialize 'value' field if it's Some, using RawValue
         if let Some(value) = &self.value {
-            // Pass the inner Decimal to our wrapper struct,
-            // which implements Serialize using arbitrary_precision::serialize
-            state.serialize_field("value", &SerializeDecimalWithArbitraryPrecision(value))?;
+            let precise_string = value.to_string();
+            match RawValue::from_string(precise_string) {
+                Ok(raw_value) => state.serialize_field("value", &raw_value)?,
+                Err(e) => return Err(serde::ser::Error::custom(format!(
+                    "Failed to create RawValue for struct decimal field: {}",
+                    e
+                ))),
+            }
         }
 
         // End the struct serialization
