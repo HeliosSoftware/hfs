@@ -515,19 +515,9 @@ fn generate_element_definition(
                 capitalize_first_letter(type_name),
                 capitalize_first_letter(base_name)
             );
-            // Make sure the field name doesn't include [x] in the Rust code
-            // but keep the original field name (without [x]) for serialization
-            // Only add rename if we haven't already added it above
-            if serde_attrs
-                .iter()
-                .all(|attr| !attr.starts_with("rename = "))
-            {
-                serde_attrs.push(format!(
-                    "rename = \"{}\"",
-                    field_name.trim_end_matches("[x]")
-                ));
-            }
-            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
+            // For choice fields, we use flatten instead of rename
+            serde_attrs.clear(); // Clear any previous attributes
+            serde_attrs.push("flatten".to_string());
             format!("Option<{}>", enum_name)
         } else if is_array {
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
