@@ -401,14 +401,14 @@ fn process_struct_elements(
         .collect();
 
 
-    // Process choice types first for this specific struct using only field elements
-    let choice_fields: Vec<_> = direct_elements
+    let choice_fields: Vec<_> = field_elements // Use field_elements here
         .iter()
         .filter(|e| e.path.ends_with("[x]"))
+        .cloned() // Clone references
         .collect();
     let mut processed_choice_enums = std::collections::HashSet::new(); // Track enums generated for this struct
 
-    for choice in choice_fields {
+    for choice in &choice_fields { // Iterate over references
         let base_name = choice
             .path
             .split('.')
