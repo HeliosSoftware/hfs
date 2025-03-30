@@ -407,11 +407,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // visitor_struct_name already defined above with unique name
 
     let deserialize_impl = quote! {
-        #field_enum
-        #field_visitor_impl
-
-        // Define the helper struct for deserializing extensions outside the visitor implementation
-        // Use the unique name
+        // Define helper types *inside* the Deserialize impl block for proper scoping
         #[derive(::serde::Deserialize)] // Use ::serde::
         struct #extension_helper_name<E> { // Use unique helper name
              #[serde(default)] // This is an attribute macro arg, keep as is
@@ -459,6 +455,46 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 D: ::serde::Deserializer<'de>,
             {
+                // Define helper types *inside* the deserialize function's scope
+                #field_enum
+                #field_visitor_impl
+                #[derive(::serde::Deserialize)]
+                struct #extension_helper_name<E> {
+                     #[serde(default)]
+                     id: Option<String>,
+                     #[serde(default)]
+                     extension: Option<Vec<E>>,
+                }
+                struct #visitor_struct_name;
+
+                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+                    type Value = #name;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!("struct ", #struct_name_str))
+                    }
+
+                    fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+                    where
+                        V: ::serde::de::MapAccess<'de>,
+                    {
+                        #(#visitor_field_defs;)*
+
+                        while let Some(key) = map.next_key::<#field_enum_name>()? {
+                            match key {
+                                #(#visitor_map_assignments)*
+                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                            }
+                        }
+
+                        #(#visitor_build_steps)*
+
+                        Ok(#name {
+                            #(#field_idents),*
+                        })
+                    }
+                }
+
                 // Define the fields Serde should expect
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
                 deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
