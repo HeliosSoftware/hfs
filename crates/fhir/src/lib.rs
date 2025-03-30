@@ -357,7 +357,8 @@ where
                 }).map_err(|_| de::Error::invalid_type(de::Unexpected::Bytes(v), &self))
             }
             fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::ByteBufDeserializer::new(v.clone())).map(|value| Element { // Clone v for error message
+                 // Use BytesDeserializer with a slice reference &v
+                 V::deserialize(de::value::BytesDeserializer::new(&v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
                 }).map_err(|_| de::Error::invalid_type(de::Unexpected::Bytes(&v), &self))
             }
