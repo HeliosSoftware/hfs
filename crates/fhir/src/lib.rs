@@ -1,14 +1,14 @@
 use rust_decimal::Decimal;
 use serde::{
-    Deserialize,
-    Serialize,
     de::{self, Deserializer, MapAccess, Visitor}, // Removed Unexpected
     ser::{SerializeStruct, Serializer},           // Added SerializeStruct
+    Deserialize,
+    Serialize,
 };
 use std::marker::PhantomData; // Re-added PhantomData
-// Removed unused RawValue import
+                              // Removed unused RawValue import
 use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
-//use time::{Date, Month};
+                                 //use time::{Date, Month};
 
 // --- Newtype wrapper for precise Decimal serialization ---
 
@@ -1044,7 +1044,7 @@ mod tests {
     fn test_decimal_with_trailing_zeros() {
         // Test with a decimal value that has trailing zeros (3.0)
         let json_value = serde_json::json!(3.0); // Input is a JSON number 3.0
-        // EXPECTED OUTPUT IS NOW A JSON NUMBER 3.0 (represented as string "3.0")
+                                                 // EXPECTED OUTPUT IS NOW A JSON NUMBER 3.0 (represented as string "3.0")
         let expected_string = "3.0";
 
         // Deserialize to our type
@@ -1064,9 +1064,9 @@ mod tests {
 
         // Also test with a string representation in the JSON input: "3.0"
         let json_str_input = r#""3.0""#; // Input is a JSON string "3.0"
-        // Note: Deserializing a JSON string "3.0" into DecimalElement should still work
-        // because the visitor handles visit_str/visit_borrowed_str.
-        // The serialized output should still be the bare number 3.0.
+                                         // Note: Deserializing a JSON string "3.0" into DecimalElement should still work
+                                         // because the visitor handles visit_str/visit_borrowed_str.
+                                         // The serialized output should still be the bare number 3.0.
         let element_from_string: DecimalElement<UnitTestExtension> =
             serde_json::from_str(json_str_input).expect("Deserialization from string failed");
 
@@ -1318,12 +1318,10 @@ mod tests {
             serde_json::from_str(json_bool);
         assert!(result_bool.is_err());
         // Error comes from V::deserialize failing inside the visitor
-        assert!(
-            result_bool
-                .unwrap_err()
-                .to_string()
-                .contains("invalid type: boolean `true`, expected i32")
-        );
+        assert!(result_bool
+            .unwrap_err()
+            .to_string()
+            .contains("invalid type: boolean `true`, expected i32"));
 
         // Object containing a boolean value when expecting Element<i32, _>
         let json_obj_bool_val = r#"{"value": true}"#;
@@ -1331,12 +1329,10 @@ mod tests {
             serde_json::from_str(json_obj_bool_val);
         assert!(result_obj_bool.is_err());
         // Error comes from trying to deserialize the "value": true into Option<i32>
-        assert!(
-            result_obj_bool
-                .unwrap_err()
-                .to_string()
-                .contains("invalid type: boolean `true`, expected i32")
-        );
+        assert!(result_obj_bool
+            .unwrap_err()
+            .to_string()
+            .contains("invalid type: boolean `true`, expected i32"));
 
         // Define a simple struct that CANNOT deserialize from primitive types
         // Add Eq derive
@@ -1351,12 +1347,10 @@ mod tests {
             serde_json::from_str(json_prim_str);
         assert!(result_prim_nonprim.is_err());
         // Error comes from V::deserialize failing inside the visitor
-        assert!(
-            result_prim_nonprim
-                .unwrap_err()
-                .to_string()
-                .contains("invalid type: string \"hello\", expected struct NonPrimitive")
-        );
+        assert!(result_prim_nonprim
+            .unwrap_err()
+            .to_string()
+            .contains("invalid type: string \"hello\", expected struct NonPrimitive"));
 
         // Try deserializing an object into Element<NonPrimitive, _> (this should work if object has correct field)
         let json_obj_nonprim = r#"{"value": {"field": "world"}}"#;
@@ -1508,7 +1502,8 @@ mod tests {
 
         // Case 2: Only extension for birthDate
         let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
-        let _expected2 = FhirSerdeTestStruct { // Prefixed unused variable
+        let _expected2 = FhirSerdeTestStruct {
+            // Prefixed unused variable
             name: Some("Test2".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id".to_string()),
@@ -1522,11 +1517,12 @@ mod tests {
             count: None,
         };
         let _s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap(); // Prefixed unused variable
-        // assert_eq!(_s2, expected2); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s2.birth_date is None.
+                                                                             // assert_eq!(_s2, expected2); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s2.birth_date is None.
 
         // Case 3: Both primitive value and extension for birthDate and isActive
         let json3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}]},"isActive":true,"_isActive":{"id":"active-id"},"count":3}"#;
-        let _expected3 = FhirSerdeTestStruct { // Prefixed unused variable
+        let _expected3 = FhirSerdeTestStruct {
+            // Prefixed unused variable
             name: Some("Test3".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id-3".to_string()),
@@ -1544,12 +1540,13 @@ mod tests {
             count: Some(3),
         };
         let _s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap(); // Prefixed unused variable
-        // assert_eq!(_s3, expected3); // EXPECTED FAILURE with standard serde: _birthDate/_isActive are ignored. Actual s3.birth_date/is_active have no id/extension from _.
+                                                                             // assert_eq!(_s3, expected3); // EXPECTED FAILURE with standard serde: _birthDate/_isActive are ignored. Actual s3.birth_date/is_active have no id/extension from _.
 
         // Case 4: birthDate field is missing, isActive has only extension
         let json4 =
             r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
-        let _expected4 = FhirSerdeTestStruct { // Prefixed unused variable
+        let _expected4 = FhirSerdeTestStruct {
+            // Prefixed unused variable
             name: Some("Test4".to_string()),
             birth_date: None,
             is_active: Some(Element {
@@ -1563,7 +1560,7 @@ mod tests {
             count: None,
         };
         let _s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap(); // Prefixed unused variable
-        // assert_eq!(_s4, expected4); // EXPECTED FAILURE with standard serde: _isActive is ignored. Actual s4.is_active is None.
+                                                                             // assert_eq!(_s4, expected4); // EXPECTED FAILURE with standard serde: _isActive is ignored. Actual s4.is_active is None.
 
         // Case 5: Empty object
         let json5 = r#"{}"#;
@@ -1578,7 +1575,8 @@ mod tests {
 
         // Case 6: Primitive value is null, but extension exists
         let json6 = r#"{"birthDate":null,"_birthDate":{"id":"bd-null"}}"#;
-        let _expected6 = FhirSerdeTestStruct { // Prefixed unused variable
+        let _expected6 = FhirSerdeTestStruct {
+            // Prefixed unused variable
             name: None,
             birth_date: Some(Element {
                 id: Some("bd-null".to_string()),
@@ -1589,11 +1587,12 @@ mod tests {
             count: None,
         };
         let _s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap(); // Prefixed unused variable
-        // assert_eq!(_s6, expected6); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s6.birth_date is None (due to "birthDate": null).
+                                                                             // assert_eq!(_s6, expected6); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s6.birth_date is None (due to "birthDate": null).
 
         // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
         let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
-        let _expected7 = FhirSerdeTestStruct { // Prefixed unused variable
+        let _expected7 = FhirSerdeTestStruct {
+            // Prefixed unused variable
             name: None,
             birth_date: Some(Element {
                 id: None,
@@ -1604,21 +1603,21 @@ mod tests {
             count: None,
         };
         let _s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap(); // Prefixed unused variable
-        // assert_eq!(_s7, expected7); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s7.birth_date has no id/extension.
+                                                                             // assert_eq!(_s7, expected7); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s7.birth_date has no id/extension.
 
         // Case 8: Duplicate primitive field (should error)
         let json8 = r#"{"birthDate":"1970-03-30", "birthDate":"1971-04-01"}"#;
         let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
         assert!(res8.is_err());
-        assert!(
-            res8.unwrap_err()
-                .to_string()
-                .contains("duplicate field `birthDate`")
-        );
+        assert!(res8
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate field `birthDate`"));
 
         // Case 9: Duplicate extension field (should error)
         let json9 = r#"{"_birthDate":{"id":"a"}, "_birthDate":{"id":"b"}}"#;
-        let _res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9); // Prefixed unused variable
+        let _res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9);
+        // Prefixed unused variable
         // assert!(_res9.is_err()); // EXPECTED FAILURE with standard serde: Unknown fields (_birthDate) are ignored, so no error occurs.
         // assert!(_res9.unwrap_err().to_string().contains("duplicate field `_birthDate`"));
         // Standard serde ignores unknown fields like _birthDate, so it won't report a duplicate error for it.
