@@ -178,9 +178,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ty = &field.ty;
         let original_name = get_original_field_name(field);
         let underscore_name = format!("_{}", original_name);
-
-        // Sanitize field name for enum variant (remove r#, convert to UpperCamelCase)
-        let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
         // Convert snake_case or camelCase to UpperCamelCase for the base enum variant name
         let field_ident_enum_str = {
             let mut camel_case = String::new();
@@ -438,7 +435,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // visitor_struct_name already defined above with unique name
 
-    // Generate the element construction logic *before* the main deserialize_impl quote block
+    // Element construction logic generation (moved back outside)
     let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
         if info.is_element {
             let field_ident = info.ident; // Final field ident (e.g., birth_date)
@@ -509,8 +506,41 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Execute the construction logic (which was generated outside)
-                        #(#element_construction_logic)*
+                        // Construct Element fields from parts *after* the loop
+                        #( // Iterate through field_infos again to generate construction logic
+                            {
+                                let info = &field_infos[#idx]; // Use index generated below
+                                if info.is_element {
+                                    let field_ident = info.ident;
+                                    let inner_ty = info.inner_ty;
+                                    let val_field = format_ident!("{}_value", field_ident);
+                                    let id_field = format_ident!("{}_id", field_ident);
+                                    let ext_field = format_ident!("{}_extension", field_ident);
+
+                                    quote! {
+                                        // Assign to the final #field_ident variable declared at the top
+                                        #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
+                                            Some(#inner_ty { // Use the inner type (Element<V,E> or DecimalElement<E>)
+                                                value: #val_field,
+                                                id: #id_field,
+                                                extension: #ext_field,
+                                            })
+                                        } else {
+                                            None // Assign None if no parts were found
+                                        };
+                                    }
+                                } else {
+                                    quote! {} // No construction needed for non-elements
+                                }
+                            }
+                        // Generate indices 0..N for the loop above
+                        let construction_indices = (0..field_infos.len()).map(|i| quote!{#i});
+                        let element_construction_logic = quote! {
+                            #( #construction_indices => { /* generated code from above block */ } )*
+                        };
+
+                        #element_construction_logic // Execute the construction logic
+
 
                         // Construct the final struct using the final field variables
                         Ok(#name {
