@@ -450,15 +450,18 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl<'de> ::_::_serde::Deserialize<'de> for #name { // Use ::_::_serde::
+        impl<'de> ::_::_serde::Deserialize<'de> for #name { // Keep ::_::_serde::
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: ::_::_serde::Deserializer<'de>, // Use ::_::_serde::
+                D: ::_::_serde::Deserializer<'de>, // Keep ::_::_serde::
             {
+                // Add use statements for serde traits/types needed within the impl
+                use serde::de::{self, Visitor, MapAccess, Deserializer, IgnoredAny}; // Add use statement
+
                 // Define helper types *inside* the deserialize function's scope
                 #field_enum
                 #field_visitor_impl
-                #[derive(::serde::Deserialize)]
+                #[derive(::serde::Deserialize)] // Keep ::serde:: here
                 struct #extension_helper_name<E> {
                      #[serde(default)]
                      id: Option<String>,
