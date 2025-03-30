@@ -605,13 +605,17 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
 
-    // Combine implementations, placing helper definitions *before* the main impls
+    // Combine implementations, placing helper definitions inside a const block
+    // to ensure proper scoping, before the main impls.
     let expanded = quote! {
-        // Define all helper types first
-        #serialize_helper_struct_def
-        #deserialize_extension_helper_def // Moved deserialize helper def earlier
-        #field_enum
-        #field_visitor_impl
+        #[allow(non_snake_case)] // Allow helper names like FhirSerdeTestStructField
+        const _: () = {
+            // Define all helper types first
+            #serialize_helper_struct_def
+            #deserialize_extension_helper_def
+            #field_enum
+            #field_visitor_impl
+        };
 
         // Then define the main impls that use these helpers
         #serialize_impl
