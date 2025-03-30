@@ -156,7 +156,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // --- Generate Deserialize Implementation ---
 
-    // 1. Define Field enum
+    // Define Field enum variants and match arms (needed outside the final quote!)
     let mut field_enum_variants = Vec::new();
     let mut field_match_arms = Vec::new();
     let mut field_strings = Vec::new(); // For deserialize_struct
@@ -272,7 +272,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // 3. Generate Visitor struct and its implementation
+    // 3. Generate parts needed for the Visitor struct implementation
     let mut visitor_field_defs = Vec::new();
     let mut visitor_map_assignments = Vec::new();
     let mut visitor_build_steps = Vec::new();
@@ -407,13 +407,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // visitor_struct_name already defined above with unique name
 
     let deserialize_impl = quote! {
-        // Define helper types *outside* the Deserialize impl block again
-        #field_enum
-        #field_visitor_impl
-        #[derive(::serde::Deserialize)]
-        struct #extension_helper_name<E> {
-             #[serde(default)]
-             id: Option<String>,
+        // Define ALL helper types *inside* the deserialize function's scope
              #[serde(default)] // This is an attribute macro arg, keep as is
              extension: Option<Vec<E>>,
         }
