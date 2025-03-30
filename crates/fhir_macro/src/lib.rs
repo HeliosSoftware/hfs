@@ -161,6 +161,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let mut field_match_arms = Vec::new();
     let mut field_strings = Vec::new(); // For deserialize_struct
 
+    // Generate unique names for helper types *before* the loop
+    let field_enum_name = format_ident!("{}Field", name);
+    let field_visitor_name = format_ident!("{}FieldVisitor", name);
+    let visitor_struct_name = format_ident!("{}Visitor", name);
+    let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
+
     // Temporary struct to hold field info for deserialization generation
     struct FieldInfo<'a> {
         ident: &'a Ident,
@@ -247,12 +253,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
      // Use #field_enum_name instead of Field
     field_match_arms.push(quote! { _ => Ok(#field_enum_name::Ignore) });
 
-    // Generate unique names for helper types
-    let field_enum_name = format_ident!("{}Field", name);
-    let field_visitor_name = format_ident!("{}FieldVisitor", name);
-    let visitor_struct_name = format_ident!("{}Visitor", name);
-    let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
-
+    // Unique names are now generated before the loop
 
     let field_enum = quote! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
