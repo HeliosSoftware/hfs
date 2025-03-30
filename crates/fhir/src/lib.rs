@@ -356,11 +356,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::BoolDeserializer<Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Bool(v), &self)
-                        },
-                    ) // Removed <'_>
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
             where
@@ -372,11 +369,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::I64Deserializer<Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Signed(v), &self)
-                        },
-                    ) // Removed <'_>
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
             where
@@ -388,11 +382,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::U64Deserializer<Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Unsigned(v), &self)
-                        },
-                    ) // Removed <'_>
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
             where
@@ -404,11 +395,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::F64Deserializer<Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Float(v), &self)
-                        },
-                    ) // Removed <'_>
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
             where
@@ -420,11 +408,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::StrDeserializer<'_, Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Str(v), &self)
-                        },
-                    ) // Use Er from visit_str
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er>
             where
@@ -437,11 +422,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::StringDeserializer<Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Str(&v), &self)
-                        },
-                    ) // Use Er from visit_string
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
             where
@@ -449,8 +431,9 @@ where
             {
                 V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BorrowedStrDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Str(v), &self))
-                // Use Er from visit_borrowed_str
+                })
+                // Propagate the error from V::deserialize directly
+                .map_err(|e| e)
             }
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
             where
@@ -462,11 +445,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Bytes(v), &self)
-                        },
-                    ) // Use Er from visit_bytes
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
             where
@@ -479,11 +459,8 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    .map_err(
-                        |_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| {
-                            de::Error::invalid_type(de::Unexpected::Bytes(&v), &self)
-                        },
-                    ) // Use Er from visit_byte_buf
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
 
             // Handle null
@@ -1317,11 +1294,13 @@ mod tests {
         let result_bool: Result<Element<i32, UnitTestExtension>, _> =
             serde_json::from_str(json_bool);
         assert!(result_bool.is_err());
-        // Error comes from V::deserialize failing inside the visitor
-        assert!(result_bool
-            .unwrap_err()
-            .to_string()
-            .contains("invalid type: boolean `true`, expected i32"));
+        // Error should now come directly from V::deserialize (i32 failing on bool)
+        let err_string = result_bool.unwrap_err().to_string();
+        assert!(
+            err_string.contains("invalid type: boolean `true`, expected i32"),
+            "Unexpected error message: {}", err_string // Add message for easier debugging
+        );
+
 
         // Object containing a boolean value when expecting Element<i32, _>
         let json_obj_bool_val = r#"{"value": true}"#;
@@ -1421,8 +1400,8 @@ mod tests {
             count: None,
         };
         let json2 = serde_json::to_string(&s2).unwrap();
-        // Adjusted expected output for standard Serialize + Element::serialize
-        let expected2 = r#"{"name":"Test2","birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
+        // Expected output according to FHIR primitive extension pattern (_fieldName for extension object)
+        let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
         assert_eq!(json2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate
@@ -1445,9 +1424,10 @@ mod tests {
             count: Some(3),
         };
         let json3 = serde_json::to_string(&s3).unwrap();
-        // Adjusted expected output for standard Serialize + Element::serialize
-        // birthDate serializes as an object because id/extension are present. isActive serializes as primitive.
-        let expected3 = r#"{"name":"Test3","birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}],"value":"1970-03-30"},"isActive":true,"count":3}"#;
+        // Expected output according to FHIR primitive extension pattern
+        // "fieldName": value, "_fieldName": { id/extension }
+        // "isActive": true (primitive only)
+        let expected3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}]},"isActive":true,"count":3}"#;
         assert_eq!(json3, expected3);
 
         // Case 4: birthDate field is None
@@ -1466,9 +1446,9 @@ mod tests {
             count: None,
         };
         let json4 = serde_json::to_string(&s4).unwrap();
-        // Adjusted expected output for standard Serialize + Element::serialize
+        // Expected output according to FHIR primitive extension pattern (_fieldName for extension object)
         let expected4 =
-            r#"{"name":"Test4","isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
+            r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
         assert_eq!(json4, expected4);
 
         // Case 5: All optional fields are None
@@ -1517,7 +1497,7 @@ mod tests {
             count: None,
         };
         let _s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap(); // Prefixed unused variable
-                                                                             // assert_eq!(_s2, expected2); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s2.birth_date is None.
+        assert_eq!(_s2, _expected2); // Should now pass with macro fix
 
         // Case 3: Both primitive value and extension for birthDate and isActive
         let json3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}]},"isActive":true,"_isActive":{"id":"active-id"},"count":3}"#;
@@ -1540,7 +1520,7 @@ mod tests {
             count: Some(3),
         };
         let _s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap(); // Prefixed unused variable
-                                                                             // assert_eq!(_s3, expected3); // EXPECTED FAILURE with standard serde: _birthDate/_isActive are ignored. Actual s3.birth_date/is_active have no id/extension from _.
+        assert_eq!(_s3, _expected3); // Should now pass with macro fix
 
         // Case 4: birthDate field is missing, isActive has only extension
         let json4 =
@@ -1560,7 +1540,7 @@ mod tests {
             count: None,
         };
         let _s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap(); // Prefixed unused variable
-                                                                             // assert_eq!(_s4, expected4); // EXPECTED FAILURE with standard serde: _isActive is ignored. Actual s4.is_active is None.
+        assert_eq!(_s4, _expected4); // Should now pass with macro fix
 
         // Case 5: Empty object
         let json5 = r#"{}"#;
@@ -1587,7 +1567,7 @@ mod tests {
             count: None,
         };
         let _s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap(); // Prefixed unused variable
-                                                                             // assert_eq!(_s6, expected6); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s6.birth_date is None (due to "birthDate": null).
+        assert_eq!(_s6, _expected6); // Should now pass with macro fix
 
         // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
         let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
@@ -1603,7 +1583,7 @@ mod tests {
             count: None,
         };
         let _s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap(); // Prefixed unused variable
-                                                                             // assert_eq!(_s7, expected7); // EXPECTED FAILURE with standard serde: _birthDate is ignored. Actual s7.birth_date has no id/extension.
+        assert_eq!(_s7, _expected7); // Should now pass with macro fix
 
         // Case 8: Duplicate primitive field (should error)
         let json8 = r#"{"birthDate":"1970-03-30", "birthDate":"1971-04-01"}"#;
@@ -1618,10 +1598,10 @@ mod tests {
         let json9 = r#"{"_birthDate":{"id":"a"}, "_birthDate":{"id":"b"}}"#;
         let _res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9);
         // Prefixed unused variable
-        // assert!(_res9.is_err()); // EXPECTED FAILURE with standard serde: Unknown fields (_birthDate) are ignored, so no error occurs.
-        // assert!(_res9.unwrap_err().to_string().contains("duplicate field `_birthDate`"));
-        // Standard serde ignores unknown fields like _birthDate, so it won't report a duplicate error for it.
-        // The error reported might be different or it might not error at all depending on serde_json flags.
-        // Commenting out this specific check as it's not relevant to standard serde behavior.
+        assert!(_res9.is_err()); // Should now error due to duplicate field handled by macro visitor
+        assert!(_res9
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate field `_birthDate`"));
     }
 }

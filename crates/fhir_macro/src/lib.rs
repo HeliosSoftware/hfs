@@ -524,13 +524,20 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Assign to temporary _id and _extension fields
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-                 // Use #field_enum_name directly (defined inside impl block)
+                 // Use #field_enum_name directly (defined outside impl block)
                  #field_enum_name::#underscore_ident_enum => {
-                    // Use updated #extension_helper_name (no __) directly (defined inside impl block)
-                    let helper: #extension_helper_name<#ext_ty> = map.next_value()?;
-                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
-                    #id_field = helper.id;
-                    #ext_field = helper.extension;
+                    // Deserialize into Value first to check for null
+                    let value = map.next_value::<::serde_json::Value>()?;
+                    if !value.is_null() {
+                        // If not null, deserialize the Value into the helper
+                        // Use updated #extension_helper_name (no __) directly (defined outside impl block)
+                        let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
+                            .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
+                        if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
+                        #id_field = helper.id;
+                        #ext_field = helper.extension;
+                    }
+                    // If value was null, do nothing, fields remain None
                 }
             });
         } else {
