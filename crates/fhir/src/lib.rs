@@ -1377,22 +1377,27 @@ mod tests {
 
     // Define a test struct that uses the FhirSerde derive
     // FhirSerde must be the only derive that generates Serialize/Deserialize impls
-    #[derive(Debug, PartialEq, FhirSerde)] // Use FhirSerde derive
+    // Reverted back to standard Serialize/Deserialize to test Element's custom impl
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct FhirSerdeTestStruct {
         // Regular field
+        #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
 
         // Field with potential extension (_birthDate)
-        // The FhirSerde macro should handle the 'birthDate'/'_birthDate' logic.
+        // Standard serde needs rename attribute. The _birthDate field will be ignored by standard serde.
+        #[serde(rename = "birthDate", skip_serializing_if = "Option::is_none")]
         #[rustfmt::skip]
         birth_date: Option::<Element::<String, UnitTestExtension>>,
 
         // Another potentially extended field
-        // The FhirSerde macro should handle the 'isActive'/'_isActive' logic.
+        // Standard serde needs rename attribute. The _isActive field will be ignored.
+        #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
         #[rustfmt::skip]
         is_active: Option::<Element::<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
+        #[serde(skip_serializing_if = "Option::is_none")]
         count: Option<i32>,
     }
 
