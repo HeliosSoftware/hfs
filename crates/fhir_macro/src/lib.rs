@@ -363,9 +363,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 );
             };
 
-            visitor_field_defs.push(quote! { #val_field: Option<#val_ty_token> = None });
-            visitor_field_defs.push(quote! { #id_field: Option<String> = None });
-            visitor_field_defs.push(quote! { #ext_field: Option<Vec<#ext_ty_token>> = None });
+            // Use the correct Type variables val_ty and ext_ty and add 'let mut'
+            visitor_field_defs.push(quote! { let mut #val_field: Option<#val_ty> = None; });
+            visitor_field_defs.push(quote! { let mut #id_field: Option<String> = None; });
+            visitor_field_defs.push(quote! { let mut #ext_field: Option<Vec<#ext_ty>> = None; });
 
             // Deserialize the value part (fieldName)
             // Create LitStr for field name interpolation in error messages
@@ -381,11 +382,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Deserialize the extension part (_fieldName)
             // Create LitStr for field name interpolation in error messages
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
-            let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use outside the quote! macro
+            // Use the extracted Type 'ext_ty' here, no need to clone it separately for quote!
             visitor_map_assignments.push(quote! {
                  #field_enum_name::#underscore_ident_enum => { // Use unique enum name
                     // Deserialize the helper struct directly using the type defined outside visit_map
-                    let helper: #extension_helper_name<#ext_ty_token_clone> = map.next_value()?; // Use unique helper name
+                    let helper: #extension_helper_name<#ext_ty> = map.next_value()?; // Use unique helper name and ext_ty
                     // Check for duplicates before assigning
                     // Use the LitStr for duplicate_field
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
