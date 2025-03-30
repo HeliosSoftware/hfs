@@ -670,7 +670,8 @@ mod tests {
     use serde_json;
     use fhir_macro::FhirSerde; // Import the derive macro
 
-    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+    // Add Eq derive
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     struct UnitTestExtension {
         code: String,
         is_valid: bool,
@@ -1076,7 +1077,8 @@ mod tests {
         assert!(result_obj_bool.unwrap_err().to_string().contains("invalid type: boolean `true`, expected i32"));
 
         // Define a simple struct that CANNOT deserialize from primitive types
-        #[derive(Deserialize, Debug, PartialEq)]
+        // Add Eq derive
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
         struct NonPrimitive { field: String }
 
         // Try deserializing a primitive string into Element<NonPrimitive, _>

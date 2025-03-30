@@ -111,13 +111,12 @@ fn is_primitive_type(def: &StructureDefinition) -> bool {
 }
 
 fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
-    // First collect all ElementDefinitions across all StructureDefinitions
-    // Also collect all Resource names
     let mut all_elements = Vec::new();
     let mut all_resources = Vec::new();
+    let mut generated_structs_code = String::new(); // Accumulate struct code
 
     if let Some(entries) = bundle.entry.as_ref() {
-        // First pass: collect all elements
+        // First pass: collect elements and resource names
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 if let Resource::StructureDefinition(def) = resource {
@@ -135,47 +134,41 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
             }
         }
 
-        // Detect cycles using all collected elements
+        // Detect cycles
         let element_refs: Vec<&ElementDefinition> = all_elements;
         let cycles = detect_struct_cycles(&element_refs);
 
-        // Second pass: generate code
+        // Second pass: generate struct/type code into the string buffer
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
                         if is_valid_structure_definition(def) {
                             let content = structure_definition_to_rust(def, &cycles);
-                            let mut file = std::fs::OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .append(true)
-                                .open(output_path.as_ref())?;
-                            writeln!(file, "{}", content)?;
+                            generated_structs_code.push_str(&content); // Append to buffer
+                            generated_structs_code.push('\n'); // Add newline between definitions
                         }
                     }
-                    Resource::SearchParameter(_param) => {
-                        // TODO: Generate code for search parameter
-                    }
-                    Resource::OperationDefinition(_op) => {
-                        // TODO: Generate code for operation definition
-                    }
-                    _ => {} // Skip other resource types for now
+                    // Skip SearchParameter, OperationDefinition, etc. for now
+                    _ => {}
                 }
             }
         }
 
-        // Finally, generate the Resource enum
+        // Generate the Resource enum code into the string buffer
         if !all_resources.is_empty() {
-            let resource_enum =
+            let resource_enum_code =
                 generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(true)
-                .open(output_path.as_ref())?;
-            writeln!(file, "{}", resource_enum)?;
+            generated_structs_code.push_str(&resource_enum_code); // Append enum to buffer
         }
+
+        // Append the generated code to the file (opened once)
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true) // Still append to the initial content written earlier
+            .open(output_path.as_ref())?;
+        write!(file, "{}", generated_structs_code)?; // Write the accumulated code
     }
 
     Ok(())
@@ -183,7 +176,8 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    // Use FhirSerde for the Resource enum as well
+    output.push_str("#[derive(Debug, FhirSerde)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 

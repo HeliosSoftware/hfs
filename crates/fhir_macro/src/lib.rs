@@ -115,11 +115,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
                             // Create a temporary struct holding only id and extension
-                            #[derive(Serialize)]
-                            struct ExtensionHelper<'a, E: Serialize> {
-                                #[serde(skip_serializing_if = "Option::is_none")]
+                            #[derive(::serde::Serialize)] // Use ::serde::
+                            struct ExtensionHelper<'a, E: ::serde::Serialize> { // Use ::serde::
+                                #[serde(skip_serializing_if = "Option::is_none")] // This is an attribute macro arg, keep as is
                                 id: &'a Option<String>,
-                                #[serde(skip_serializing_if = "Option::is_none")]
+                                #[serde(skip_serializing_if = "Option::is_none")] // This is an attribute macro arg, keep as is
                                 extension: &'a Option<Vec<E>>,
                             }
                             let helper = ExtensionHelper {
@@ -393,11 +393,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         // Define the helper struct for deserializing extensions outside the visitor implementation
         // Use a unique name to avoid conflicts
-        #[derive(::serde::Deserialize)]
+        #[derive(::serde::Deserialize)] // Use ::serde::
         struct __FhirSerdeExtensionHelper<E> {
-             #[serde(default)] // Use default for Option fields
+             #[serde(default)] // This is an attribute macro arg, keep as is
              id: Option<String>,
-             #[serde(default)] // Use default for Option fields
+             #[serde(default)] // This is an attribute macro arg, keep as is
              extension: Option<Vec<E>>,
         }
 
