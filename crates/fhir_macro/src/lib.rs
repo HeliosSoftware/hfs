@@ -493,7 +493,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #field_visitor_impl // Contains the visitor struct and Deserialize impl for the enum
 
                 // 2. Extension Helper Struct (for _fieldName)
-                #[derive(::serde::Deserialize)] // Keep ::serde:: here
+                // Use the full path for the derive macro as well
+                #[derive(::serde::Deserialize)]
                 struct #extension_helper_name<E> {
                      #[serde(default)]
                      id: Option<String>,
