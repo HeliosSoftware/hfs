@@ -591,8 +591,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Combine implementations
     let expanded = quote! {
-        #serialize_impl
-        #deserialize_impl // Add the deserialize implementation
+        // #serialize_impl // Temporarily comment out Serialize impl
+        #deserialize_impl // Only generate Deserialize impl for now
     };
 
     // For debugging: Print the generated code
