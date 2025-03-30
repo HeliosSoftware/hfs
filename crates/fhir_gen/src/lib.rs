@@ -511,9 +511,8 @@ fn process_struct_elements(
 
     // Only add FhirSerde derive for complex-types and resources (structs)
     if struct_def.kind == "complex-type" || struct_def.kind == "resource" {
-         output.push_str("#[derive(Debug, FhirSerde)]\n"); // Add FhirSerde derive
-         // Add standard derives needed by FhirSerde or for general use
-         output.push_str("#[derive(Serialize, Deserialize, PartialEq)]\n");
+         // Add standard derives first, then FhirSerde
+         output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq, FhirSerde)]\n");
     } else {
          // For other kinds like BackboneElement (if treated differently) or potentially others
          // just add standard derives. Enums are handled separately.
