@@ -235,7 +235,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         struct #field_visitor_name;
 
         // Use the unique names
-        impl<'de> ::_::_serde::de::Visitor<'de> for #field_visitor_name { // Use ::_::_serde::
+        impl<'de> ::serde::de::Visitor<'de> for #field_visitor_name { // Revert to ::serde::
             type Value = #field_enum_name;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -243,7 +243,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where E: ::_::_serde::de::Error, // Use ::_::_serde::
+            where E: ::serde::de::Error, // Revert to ::serde::
             {
                  // Use the unique enum name
                 match value {
@@ -252,7 +252,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
              // Handle borrowed strings as well
             fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-            where E: ::_::_serde::de::Error, // Use ::_::_serde::
+            where E: ::serde::de::Error, // Revert to ::serde::
             {
                  match value {
                     // Use the unique enum name here
@@ -262,9 +262,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
 
         // Use the unique enum name
-        impl<'de> ::_::_serde::Deserialize<'de> for #field_enum_name { // Use ::_::_serde::
+        impl<'de> ::serde::Deserialize<'de> for #field_enum_name { // Revert to ::serde::
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where D: ::_::_serde::Deserializer<'de>, // Use ::_::_serde::
+            where D: ::serde::Deserializer<'de>, // Revert to ::serde::
             {
                  // Use the unique visitor name
                 deserializer.deserialize_identifier(#field_visitor_name)
@@ -408,7 +408,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     let deserialize_impl = quote! {
         // Define helper types *inside* the Deserialize impl block for proper scoping
-        #[derive(::_::_serde::Deserialize)] // Use ::_::_serde::
+        #[derive(::serde::Deserialize)] // Revert to ::serde::
         struct #extension_helper_name<E> { // Use unique helper name
              #[serde(default)] // This is an attribute macro arg, keep as is
              id: Option<String>,
@@ -467,7 +467,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 }
                 struct #visitor_struct_name;
 
-                impl<'de> ::_::_serde::de::Visitor<'de> for #visitor_struct_name { // Use ::_::_serde::
+                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name { // Revert to ::serde::
                     type Value = #name;
 
                     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -476,14 +476,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
                     fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
                     where
-                        V: ::_::_serde::de::MapAccess<'de>, // Use ::_::_serde::
+                        V: ::serde::de::MapAccess<'de>, // Revert to ::serde::
                     {
                         #(#visitor_field_defs;)*
 
                         while let Some(key) = map.next_key::<#field_enum_name>()? {
                             match key {
                                 #(#visitor_map_assignments)*
-                                #field_enum_name::Ignore => { let _ = map.next_value::<::_::_serde::de::IgnoredAny>()?; } // Use ::_::_serde::
+                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; } // Revert to ::serde::
                             }
                         }
 
@@ -504,12 +504,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // --- Combine Serialize and Deserialize ---
     let serialize_impl = quote! {
-        impl ::_::_serde::Serialize for #name { // Use ::_::_serde::
+        impl ::serde::Serialize for #name { // Revert to ::serde::
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
-                S: ::_::_serde::Serializer, // Use ::_::_serde::
+                S: ::serde::Serializer, // Revert to ::serde::
             {
-                use ::_::_serde::ser::SerializeStruct; // Use ::_::_serde::
+                // Add use statements for serde traits/types needed within the impl
+                use serde::ser::{SerializeStruct, Serializer}; // Add use statement
 
                 // Calculate the number of fields to serialize
                 let mut count = 0;
