@@ -483,6 +483,18 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     }).collect();
 
+    // Define the extension helper struct for Deserialize here as well
+    // Use updated helper name (no __)
+    let deserialize_extension_helper_def = quote! {
+        #[derive(::serde::Deserialize)] // Use Deserialize from use statement
+        struct #extension_helper_name<E> {
+             #[serde(default)]
+             id: ::std::option::Option<String>,
+             #[serde(default)]
+             extension: ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
 
     // --- Generate Deserialize Implementation ---
     // Note: Helper types will be defined *inside* the impl block below
