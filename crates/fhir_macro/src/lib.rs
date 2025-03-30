@@ -178,6 +178,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ty = &field.ty;
         let original_name = get_original_field_name(field);
         let underscore_name = format!("_{}", original_name);
+        // Get the field name as a string, removing raw identifier prefix if present
+        let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
         // Convert snake_case or camelCase to UpperCamelCase for the base enum variant name
         let field_ident_enum_str = {
             let mut camel_case = String::new();
