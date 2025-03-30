@@ -390,9 +390,6 @@ fn process_struct_elements(
         })
         .collect();
 
-    // Find the root element definition for the current struct (e.g., the one with path "Patient")
-    let root_element = direct_elements.iter().find(|e| e.path == *type_name);
-
     // Filter out the root element itself when generating fields
     let field_elements: Vec<&ElementDefinition> = direct_elements
         .iter()
