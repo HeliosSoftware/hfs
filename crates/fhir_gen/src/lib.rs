@@ -200,8 +200,8 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     output.push_str("pub enum Resource {\n");
 
     for resource in resources {
-        if resource == "Bundle" {
-            // Apply Box for the recursive Bundle variant
+        // Apply Box for recursive variants like Bundle and Parameters
+        if resource == "Bundle" || resource == "Parameters" {
             output.push_str(&format!("    {}(Box<{}>),\n", resource, resource));
         } else {
             output.push_str(&format!("    {}({}),\n", resource, resource));
@@ -421,8 +421,8 @@ fn process_struct_elements(
             capitalize_first_letter(type_name),
             capitalize_first_letter(base_name)
         );
-        // Ensure choice enum names are distinct by adding a suffix
-        let enum_name = format!("{}_Choice", enum_name);
+        // Use UpperCamelCase for the choice enum name
+        let enum_name = format!("{}Choice", enum_name);
 
 
         // Skip if we've already generated this enum for this struct
@@ -629,7 +629,11 @@ fn generate_element_definition(
             } else { // T -> Box<T>
                 type_str = format!("Box<{}>", type_str);
             }
+        } else if from_struct_name == "Parameters" && clean_field_name == "resource" {
+             // Explicitly Box Parameters.resource to break cycle with Resource enum
+             type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource" here
         }
+
 
         // Output consolidated serde attributes if any exist
         if !serde_attrs.is_empty() {
