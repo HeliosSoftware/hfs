@@ -329,19 +329,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Deserialize the extension part (_fieldName)
             // Create LitStr for field name interpolation in error messages
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
-            let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use in helper struct definition
+            let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use outside the quote! macro
             visitor_map_assignments.push(quote! {
                  Field::#underscore_ident_enum => {
-                    // Define a helper struct to deserialize id and extension
-                    // Use #ext_ty_token_clone here
-                    #[derive(Deserialize)]
-                    struct ExtensionHelper<E> {
-                        id: Option<String>,
-                        id: Option<String>,
-                        extension: Option<Vec<E>>,
-                    }
-                    // Deserialize the helper struct
-                    let helper: ExtensionHelper<#ext_ty_token_clone> = map.next_value()?; // Use #ext_ty_token_clone here too
+                    // Deserialize the helper struct directly using the type defined outside visit_map
+                    let helper: __FhirSerdeExtensionHelper<#ext_ty_token_clone> = map.next_value()?;
                     // Check for duplicates before assigning
                     // Use the LitStr for duplicate_field
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
@@ -398,6 +390,16 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let deserialize_impl = quote! {
         #field_enum
         #field_visitor_impl
+
+        // Define the helper struct for deserializing extensions outside the visitor implementation
+        // Use a unique name to avoid conflicts
+        #[derive(::serde::Deserialize)]
+        struct __FhirSerdeExtensionHelper<E> {
+             #[serde(default)] // Use default for Option fields
+             id: Option<String>,
+             #[serde(default)] // Use default for Option fields
+             extension: Option<Vec<E>>,
+        }
 
         struct #visitor_struct_name;
 

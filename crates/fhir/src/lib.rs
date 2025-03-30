@@ -11,6 +11,7 @@ use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
 
 // --- Newtype wrapper for precise Decimal serialization ---
 
+// Add Eq derive
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PreciseDecimal(pub Decimal); // Make inner Decimal public for convenience
 
@@ -282,8 +283,8 @@ where
 }
 // --- End Element Visitor ---
 
-
-#[derive(Debug)]
+// Add PartialEq, Eq derives
+#[derive(Debug, PartialEq, Eq)]
 pub struct Element<V, E> {
     // Fields are already public
     pub id: Option<String>,
@@ -292,10 +293,11 @@ pub struct Element<V, E> {
 }
 
 // Custom Deserialize for Element<V, E>
+// Add PartialEq + Eq bounds for V and E
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
-    V: Deserialize<'de>,
-    E: Deserialize<'de>, // Add bound for E
+    V: Deserialize<'de> + PartialEq + Eq,
+    E: Deserialize<'de> + PartialEq + Eq,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -403,10 +405,11 @@ where
 }
 
 // Custom Serialize for Element<V, E>
+// Add PartialEq + Eq bounds for V and E
 impl<V, E> Serialize for Element<V, E>
 where
-    V: Serialize,
-    E: Serialize, // Add bound for E
+    V: Serialize + PartialEq + Eq,
+    E: Serialize + PartialEq + Eq,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -442,7 +445,8 @@ where
 }
 
 // Remove derive Serialize as we implement it manually below
-#[derive(Debug)]
+// Add PartialEq, Eq derives
+#[derive(Debug, PartialEq, Eq)]
 // Remove serde attributes as they are not used without derive
 pub struct DecimalElement<E> {
     pub id: Option<String>,
@@ -452,9 +456,10 @@ pub struct DecimalElement<E> {
 }
 
 // Reinstate custom Deserialize implementation
+// Add PartialEq + Eq bound for E
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
-    E: Deserialize<'de>,
+    E: Deserialize<'de> + PartialEq + Eq,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -579,9 +584,10 @@ impl UnexpectedValue for serde_json::Value {
 */ // Trait is unused currently
 
 // Reinstate custom Serialize implementation for DecimalElement
+// Add PartialEq + Eq bound for E
 impl<E> Serialize for DecimalElement<E>
 where
-    E: Serialize, // Add the Serialize bound for the generic type E
+    E: Serialize + PartialEq + Eq,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -683,7 +689,8 @@ mod tests {
 
         // Serialize the actual element
         let actual_json_string = serde_json::to_string(&element).expect("Serialization failed");
-        let actual_value: serde_json::Value =
+        // Prefix unused variable
+        let _actual_value: serde_json::Value =
             serde_json::from_str(&actual_json_string).expect("Parsing actual JSON failed");
 
         // With our new implementation, a bare decimal with no other fields
