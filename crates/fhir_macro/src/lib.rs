@@ -450,13 +450,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl<'de> ::_::_serde::Deserialize<'de> for #name { // Keep ::_::_serde::
+        impl<'de> ::serde::Deserialize<'de> for #name { // Revert to ::serde::
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: ::_::_serde::Deserializer<'de>, // Keep ::_::_serde::
+                D: ::serde::Deserializer<'de>, // Revert to ::serde::
             {
-                // Add use statements for serde traits/types needed within the impl
-                use serde::de::{self, Visitor, MapAccess, Deserializer, IgnoredAny}; // Add use statement
+                // REMOVE use statements for serde traits/types needed within the impl
 
                 // Define helper types *inside* the deserialize function's scope
                 #field_enum
