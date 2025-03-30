@@ -453,8 +453,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             Some(quote! {
                 // This generated code will be placed inside visit_map
                 // It references #field_ident (final variable) and the temporary variables
-                 // Construct the Element struct instance correctly using the temporary variables
-                let constructed_element = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
+                 // Assign the constructed Option<Element<...>> directly to the final field variable
+                #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
                     // Use the actual type path stored in inner_ty
                     Some(#inner_ty {
                         value: #val_field_ident,
@@ -464,8 +464,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 } else {
                     None // If no parts were found, the element is None
                 };
-                // Assign the constructed Option<Element<...>> to the final field variable
-                #field_ident = constructed_element;
             })
         } else {
             None
