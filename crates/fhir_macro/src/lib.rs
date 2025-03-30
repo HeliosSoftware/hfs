@@ -594,7 +594,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Define the serialization helper struct definition here
     let serialize_helper_struct_def = quote! {
-        #[derive(::serde::Serialize)]
+        #[derive(::serde::Serialize)] // Use Serialize from the use statement above
         struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
             #[serde(skip_serializing_if = "Option::is_none")]
             id: &'a ::std::option::Option<String>,
