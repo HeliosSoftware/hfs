@@ -22,10 +22,9 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         .join(&format!("{}.rs", version.as_str().to_lowercase()));
 
     // Create the version-specific output file with initial content
-    // Add use fhir_macro::FhirSerde;
     std::fs::write(
         &version_path,
-        "use serde::{Serialize, Deserialize};\nuse fhir_macro::FhirSerde;\nuse crate::{Element, DecimalElement};\n\n",
+        "use serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
     )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -117,20 +116,80 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
     // Define the list of types we want to generate (Patient and its core dependencies)
     // This list might need adjustment based on the specific FHIR version and Patient definition.
     let allowed_types: std::collections::HashSet<String> = [
-        "Patient", "Identifier", "HumanName", "Address", "Reference", "Extension",
-        "CodeableConcept", "Coding", "ContactPoint", "Period", "Meta", "Narrative",
-        "DomainResource", "Resource", "Element", "BackboneElement",
+        "Patient",
+        "Identifier",
+        "HumanName",
+        "Address",
+        "Reference",
+        "Extension",
+        "CodeableConcept",
+        "Coding",
+        "ContactPoint",
+        "Period",
+        "Meta",
+        "Narrative",
+        "DomainResource",
+        "Resource",
+        "Element",
+        "BackboneElement",
         // Primitives (handled by generate_primitive_type, but good to list)
-        "string", "boolean", "integer", "decimal", "uri", "code", "dateTime", "date",
-        "instant", "time", "base64Binary", "canonical", "id", "markdown", "oid",
-        "positiveInt", "unsignedInt", "url", "uuid", "xhtml", "integer64",
+        "string",
+        "boolean",
+        "integer",
+        "decimal",
+        "uri",
+        "code",
+        "dateTime",
+        "date",
+        "instant",
+        "time",
+        "base64Binary",
+        "canonical",
+        "id",
+        "markdown",
+        "oid",
+        "positiveInt",
+        "unsignedInt",
+        "url",
+        "uuid",
+        "xhtml",
+        "integer64",
         // Other potentially required complex types for Patient
-        "Attachment", "Quantity", "Age", "Count", "Distance", "Duration", "Money",
-        "SimpleQuantity", "Range", "Ratio", "SampledData", "Signature", "Timing",
-        "ContactDetail", "Contributor", "DataRequirement", "Expression", "ParameterDefinition",
-        "RelatedArtifact", "TriggerDefinition", "UsageContext", "Annotation",
-        // Add any other types found necessary during testing
-    ].iter().map(|s| s.to_string()).collect();
+        "Attachment",
+        "Quantity",
+        "Age",
+        "Count",
+        "Distance",
+        "Duration",
+        "Money",
+        "SimpleQuantity",
+        "Range",
+        "Ratio",
+        "SampledData",
+        "Signature",
+        "Timing",
+        "ContactDetail",
+        "Contributor",
+        "DataRequirement",
+        "Expression",
+        "ParameterDefinition",
+        "RelatedArtifact",
+        "TriggerDefinition",
+        "UsageContext",
+        "Annotation",
+        "Dosage",
+        "DataRequirementSort",
+        "DataRequirementFilter",
+        "DataRequirementCodeFilter",
+        "DataRequirementDateFilter",
+        "TimingRepeat",
+        "PatientContact",
+        "PatientCommunication",
+        "PatientLink",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
 
     if let Some(entries) = bundle.entry.as_ref() {
         // First pass: collect elements ONLY for allowed types
@@ -178,7 +237,6 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
         let resource_enum_code = generate_resource_enum(vec!["Patient".to_string()]);
         generated_structs_code.push_str(&resource_enum_code); // Append enum to buffer
 
-
         // Append the generated code to the file
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -193,8 +251,7 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    // Resource enum should derive standard traits, not FhirSerde
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n"); // Add standard derives
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
@@ -351,7 +408,7 @@ fn detect_struct_cycles(
 // Renamed from process_elements to avoid confusion, processes elements for a *single* struct/type
 fn process_struct_elements(
     struct_def: &StructureDefinition, // The definition of the struct being generated
-    elements: &[ElementDefinition], // Elements belonging to this struct definition
+    elements: &[ElementDefinition],   // Elements belonging to this struct definition
     output: &mut String,
     cycles: &std::collections::HashSet<(String, String)>,
     all_allowed_elements: &[&ElementDefinition], // All elements from allowed types for context
@@ -375,9 +432,11 @@ fn process_struct_elements(
         // Collect the references directly
         .collect();
 
-
     // Process choice types first for this specific struct
-    let choice_fields: Vec<_> = direct_elements.iter().filter(|e| e.path.ends_with("[x]")).collect();
+    let choice_fields: Vec<_> = direct_elements
+        .iter()
+        .filter(|e| e.path.ends_with("[x]"))
+        .collect();
     let mut processed_choice_enums = std::collections::HashSet::new(); // Track enums generated for this struct
 
     for choice in choice_fields {
@@ -429,9 +488,7 @@ fn process_struct_elements(
         output.push_str("}\n\n");
     }
 
-
-    // Generate struct - Use FhirSerde derive
-    output.push_str("#[derive(Debug, FhirSerde)]\n");
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
     output.push_str(&format!(
         "pub struct {} {{\n",
         capitalize_first_letter(type_name)
@@ -442,17 +499,22 @@ fn process_struct_elements(
 
     for element in &direct_elements {
         if let Some(field_name) = element.path.split('.').last() {
-             // Use the cleaned field name (without [x]) for tracking
+            // Use the cleaned field name (without [x]) for tracking
             let clean_field_name = field_name.trim_end_matches("[x]");
             if !added_fields.contains(clean_field_name) {
-                 generate_element_definition(element, type_name, output, cycles, all_allowed_elements);
-                 added_fields.insert(clean_field_name.to_string());
+                generate_element_definition(
+                    element,
+                    type_name,
+                    output,
+                    cycles,
+                    all_allowed_elements,
+                );
+                added_fields.insert(clean_field_name.to_string());
             }
         }
     }
     output.push_str("}\n\n");
 }
-
 
 fn generate_element_definition(
     element: &ElementDefinition,
@@ -483,13 +545,14 @@ fn generate_element_definition(
             None => {
                 if let Some(content_ref) = &element.content_reference {
                     let ref_id = &content_ref[1..]; // e.g., "Patient.contact.name"
-                    // Search in all allowed elements passed for context
+                                                    // Search in all allowed elements passed for context
                     if let Some(referenced_element) = all_allowed_elements
                         .iter()
                         .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
                     {
                         // Use the type from the referenced element
-                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first())
+                        if let Some(ref_ty) =
+                            referenced_element.r#type.as_ref().and_then(|t| t.first())
                         {
                             ref_ty
                         } else {
