@@ -1384,11 +1384,13 @@ mod tests {
 
         // Field with potential extension (_birthDate)
         // The FhirSerde macro should handle the 'birthDate'/'_birthDate' logic.
-        birth_date: Option<Element<String, UnitTestExtension>>,
+        #[rustfmt::skip]
+        birth_date: Option::<Element::<String, UnitTestExtension>>,
 
         // Another potentially extended field
         // The FhirSerde macro should handle the 'isActive'/'_isActive' logic.
-        is_active: Option<Element<bool, UnitTestExtension>>,
+        #[rustfmt::skip]
+        is_active: Option::<Element::<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
         count: Option<i32>,
