@@ -235,7 +235,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         struct #field_visitor_name;
 
         // Use the unique names
-        impl<'de> ::serde::de::Visitor<'de> for #field_visitor_name { // Revert to ::serde::
+        impl<'de> ::serde::de::Visitor<'de> for #field_visitor_name {
             type Value = #field_enum_name;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -243,7 +243,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where E: ::serde::de::Error, // Revert to ::serde::
+            where E: ::serde::de::Error,
             {
                  // Use the unique enum name
                 match value {
@@ -252,7 +252,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
              // Handle borrowed strings as well
             fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-            where E: ::serde::de::Error, // Revert to ::serde::
+            where E: ::serde::de::Error,
             {
                  match value {
                     // Use the unique enum name here
@@ -262,9 +262,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
 
         // Use the unique enum name
-        impl<'de> ::serde::Deserialize<'de> for #field_enum_name { // Revert to ::serde::
+        impl<'de> ::serde::Deserialize<'de> for #field_enum_name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where D: ::serde::Deserializer<'de>, // Revert to ::serde::
+            where D: ::serde::Deserializer<'de>,
             {
                  // Use the unique visitor name
                 deserializer.deserialize_identifier(#field_visitor_name)
@@ -452,15 +452,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
         }
 
-        impl<'de> ::serde::Deserialize<'de> for #name { // Revert to ::serde::
+        impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: ::serde::Deserializer<'de>, // Revert to ::serde::
+                D: ::serde::Deserializer<'de>,
             {
-                // REMOVE use statements for serde traits/types needed within the impl
-
-                // Define helper types *inside* the deserialize function's scope
-                #field_enum
+                // Define the visitor struct *inside* the deserialize function scope
+                // This seems necessary for it to find the uniquely named Field enum and ExtensionHelper
                 #field_visitor_impl
                 #[derive(::serde::Deserialize)] // Keep ::serde:: here
                 struct #extension_helper_name<E> {
