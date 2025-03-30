@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::{quote, format_ident}; // Added format_ident back
 use syn::{parse_macro_input, DeriveInput, Data, Fields, Type, PathArguments, GenericArgument, LitStr, Meta, NestedMeta, Ident}; // Added Ident back
 use proc_macro2::Span;
-use std::collections::HashMap; // Added HashMap
+// Removed unused HashMap import
 
 // Helper function to check if a type is Option<T> and return T
 fn get_option_inner_type(ty: &Type) -> Option<&Type> {
@@ -306,26 +306,35 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             visitor_field_defs.push(quote! { #ext_field: Option<Vec<#ext_ty_token>> = None });
 
             // Deserialize the value part (fieldName)
-            visitor_map_assignments.push(quote! {
-                Field::#field_ident_enum => {
-                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#info.original_name)); }
-                    #val_field = Some(map.next_value()?);
-                }
+           // Extract field names needed in the quote! macro
+           let original_name_str = &info.original_name;
+           visitor_map_assignments.push(quote! {
+               Field::#field_ident_enum => {
+                   // Interpolate the string directly
+                   if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_str)); }
+                   #val_field = Some(map.next_value()?);
+               }
             });
 
             // Deserialize the extension part (_fieldName)
-            visitor_map_assignments.push(quote! {
+           // Extract field names needed in the quote! macro
+           let underscore_name_str = &info.underscore_name;
+           let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use in helper struct definition
+           visitor_map_assignments.push(quote! {
                  Field::#underscore_ident_enum => {
                     // Define a helper struct to deserialize id and extension
+                    // Use #ext_ty_token_clone here
                     #[derive(Deserialize)]
                     struct ExtensionHelper<E> {
+                        id: Option<String>,
                         id: Option<String>,
                         extension: Option<Vec<E>>,
                     }
                     // Deserialize the helper struct
-                    let helper: ExtensionHelper<#ext_ty_token> = map.next_value()?;
+                    let helper: ExtensionHelper<#ext_ty_token_clone> = map.next_value()?; // Use #ext_ty_token_clone here too
                     // Check for duplicates before assigning
-                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#info.underscore_name)); }
+                    // Interpolate the string directly
+                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_str)); }
                     #id_field = helper.id;
                     #ext_field = helper.extension;
                 }
@@ -347,11 +356,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         } else {
             // Regular field (might be Option<T> or just T)
             visitor_field_defs.push(quote! { #field_ident: #field_ty = None }); // Initialize Option<T> or T = None/Default? Let's stick to Option<T> for simplicity in visitor
-            visitor_map_assignments.push(quote! {
-                Field::#field_ident_enum => {
-                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#info.original_name)); }
-                    #field_ident = Some(map.next_value()?);
-                }
+           // Extract field name needed in the quote! macro
+           let original_name_str = &info.original_name;
+           visitor_map_assignments.push(quote! {
+               Field::#field_ident_enum => {
+                   // Interpolate the string directly
+                   if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_str)); }
+                   #field_ident = Some(map.next_value()?);
+               }
             });
              // No build step needed, just use the value directly
              // If the original field was not Option, we need to unwrap or handle None later
@@ -359,8 +371,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  visitor_build_steps.push(quote! { let #field_ident = #field_ident; }); // Already Option<T>
              } else {
                  // If original field was T, unwrap the Option<T> from visitor or error if None
+                 // Extract field name needed in the quote! macro
+                 let original_name_str = &info.original_name;
                  visitor_build_steps.push(quote! {
-                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#info.original_name))?;
+                     // Interpolate the string directly
+                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_str))?;
                  });
              }
         }
