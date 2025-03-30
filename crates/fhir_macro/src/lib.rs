@@ -315,8 +315,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ident = info.ident;
         let field_ty = info.ty; // Use the original field type (Option<...> or T)
 
-        // Declare the final variable matching the struct field type
-        visitor_field_defs.push(quote! { let mut #field_ident: #field_ty = None; });
+        // Declare the final variable matching the struct field type, explicitly using None path
+        visitor_field_defs.push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
 
         if info.is_element {
             // Declare temporary variables for element parts
@@ -345,9 +345,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
 
-            visitor_field_defs.push(quote! { let mut #val_field: Option<#val_ty> = None; });
-            visitor_field_defs.push(quote! { let mut #id_field: Option<String> = None; });
-            visitor_field_defs.push(quote! { let mut #ext_field: Option<Vec<#ext_ty>> = None; });
+            // Use fully qualified paths for Option and Vec
+            visitor_field_defs.push(quote! { let mut #val_field: ::std::option::Option<#val_ty> = None; });
+            visitor_field_defs.push(quote! { let mut #id_field: ::std::option::Option<String> = None; });
+            visitor_field_defs.push(quote! { let mut #ext_field: ::std::option::Option<::std::vec::Vec<#ext_ty>> = None; });
         }
     }
 
@@ -461,10 +462,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         id: #id_field_ident,
                         extension: #ext_field_ident,
                     };
-                    // Then wrap it in Some
-                    Some(element_value)
+                    // Then wrap it in Some using fully qualified path
+                    ::std::option::Option::Some(element_value)
                 } else {
-                    None // If no parts were found, the element is None
+                    ::std::option::Option::None // Use fully qualified path
                 };
             })
         } else {
@@ -497,9 +498,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #[derive(::serde::Deserialize)]
                 struct #extension_helper_name<E> {
                      #[serde(default)]
-                     id: Option<String>,
+                     id: ::std::option::Option<String>, // Use fully qualified path
                      #[serde(default)]
-                     extension: Option<Vec<E>>,
+                     extension: ::std::option::Option<::std::vec::Vec<E>>, // Use fully qualified path
                 }
 
                 // 3. Main Visitor Struct for the type #name
