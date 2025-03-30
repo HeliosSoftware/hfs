@@ -77,7 +77,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let mut field_count_calculation = Vec::new();
 
     // Define the serialization helper name *before* the loop that uses it
-    let serialize_extension_helper_name = format_ident!("__{}SerializeExtensionHelper", name);
+    // Removed leading __
+    let serialize_extension_helper_name = format_ident!("{}SerializeExtensionHelper", name);
 
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
@@ -168,7 +169,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let field_enum_name = format_ident!("{}Field", name);
     let field_visitor_name = format_ident!("{}FieldVisitor", name);
     let visitor_struct_name = format_ident!("{}Visitor", name);
-    let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
+    // Removed leading __
+    let extension_helper_name = format_ident!("{}ExtensionHelper", name);
     // Serialization helper name is now defined before the serialization loop
 
     // Temporary struct to hold field info for deserialization generation
@@ -420,7 +422,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             visitor_map_assignments.push(quote! {
                  // Use #field_enum_name directly (defined inside impl block)
                  #field_enum_name::#underscore_ident_enum => {
-                    // Use #extension_helper_name directly (defined inside impl block)
+                    // Use updated #extension_helper_name (no __) directly (defined inside impl block)
                     let helper: #extension_helper_name<#ext_ty> = map.next_value()?;
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                     #id_field = helper.id;
@@ -552,6 +554,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
 
     // Define the serialization helper struct definition *before* serialize_impl
+    // Use updated helper name (no __)
     let serialize_helper_struct_def = quote! {
         #[derive(::serde::Serialize)] // Use Serialize from the use statement above
         struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
@@ -594,6 +597,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Serialization helper struct definition is now moved before serialize_impl
 
     // Define the extension helper struct for Deserialize here as well
+    // Use updated helper name (no __)
     let deserialize_extension_helper_def = quote! {
         #[derive(::serde::Deserialize)] // Use Deserialize from use statement
         struct #extension_helper_name<E> {
@@ -605,17 +609,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
 
-    // Combine implementations, placing helper definitions inside a const block
-    // to ensure proper scoping, before the main impls.
+    // Combine implementations, defining helper types directly before the impls
+    // Removed the const _: () = { ... }; block
     let expanded = quote! {
-        #[allow(non_snake_case)] // Allow helper names like FhirSerdeTestStructField
-        const _: () = {
-            // Define all helper types first
-            #serialize_helper_struct_def
-            #deserialize_extension_helper_def
-            #field_enum
-            #field_visitor_impl
-        };
+        // Define all helper types first, directly in the generated code scope
+        #serialize_helper_struct_def
+        #deserialize_extension_helper_def
+        #field_enum
+        #field_visitor_impl
 
         // Then define the main impls that use these helpers
         #serialize_impl
