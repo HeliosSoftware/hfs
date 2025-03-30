@@ -129,8 +129,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
-                            // Use the pre-defined helper struct and the ext_ty extracted outside this quote block
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
+                            // Use the pre-defined helper struct (using self::) and the ext_ty extracted outside this quote block
+                            let helper = self::#serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
                             };
@@ -422,8 +422,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Assign to temporary _id and _extension fields
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-                 #field_enum_name::#underscore_ident_enum => {
-                    let helper: #extension_helper_name<#ext_ty> = map.next_value()?;
+                 // Use self:: for enum variant
+                 self::#field_enum_name::#underscore_ident_enum => {
+                    // Use self:: for helper struct
+                    let helper: self::#extension_helper_name<#ext_ty> = map.next_value()?;
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                     #id_field = helper.id;
                     #ext_field = helper.extension;
@@ -434,7 +436,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Assign directly to the final field variable for non-elements
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-               #field_enum_name::#field_ident_enum => {
+               // Use self:: for enum variant
+               self::#field_enum_name::#field_ident_enum => {
                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #field_ident = Some(map.next_value()?); // Assign to final variable #field_ident
                }
@@ -519,10 +522,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         #(#visitor_field_defs;)*
 
                         // Loop through fields in the JSON map
-                        while let Some(key) = map.next_key::<#field_enum_name>()? { // Use unique enum name defined outside
+                        // Use self:: to access helper enum defined in the same module
+                        while let Some(key) = map.next_key::<self::#field_enum_name>()? {
                             match key {
                                 #(#visitor_map_assignments)*
-                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; } // Use unique enum name
+                                // Use self:: to access helper enum defined in the same module
+                                self::#field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
                             }
                         }
 
@@ -539,7 +544,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Define the fields Serde should expect *inside* the function body
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
                 // Start deserialization using the main visitor struct defined above
-                deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
+                // Use self:: to access helper visitor defined in the same module
+                deserializer.deserialize_struct(#struct_name_str, FIELDS, self::#visitor_struct_name)
             }
         }
     };
@@ -583,10 +589,26 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Combine implementations directly, without the const block wrapper
+    // Generate unique module name
+    let mod_name = format_ident!("_fhir_serde_impl_{}", name);
+
+    // Combine implementations, wrapping everything in a module
     let expanded = quote! {
-        // Define the moved helper structs/enums here, outside the impl blocks
-        #serialize_helper_struct_def // Use the defined variable
+        mod #mod_name {
+            // Import the necessary items into the module scope
+            // Use super::#name to refer to the struct defined outside the module
+            use super::#name;
+            // Import common serde traits/types needed by generated code
+            use ::serde::{Serialize, Deserialize, Serializer, Deserializer};
+            use ::serde::ser::{SerializeStruct}; // Keep specific imports if needed
+            use ::serde::de::{self, Visitor, MapAccess}; // Keep specific imports if needed
+            use ::std::fmt; // For Formatter
+            use ::std::vec::Vec; // For Vec
+            use ::std::option::Option; // For Option
+            use ::std::string::String; // For String
+
+            // Define the moved helper structs/enums here, inside the module
+            #serialize_helper_struct_def // Use the defined variable
         #field_enum
         #field_visitor_impl
         // Define the extension helper struct here as well
@@ -600,7 +622,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             #serialize_impl
             #deserialize_impl // Restore Deserialize impl
-        // }; // End of const block removed
+        } // End of module
     };
 
     // For debugging: Print the generated code
