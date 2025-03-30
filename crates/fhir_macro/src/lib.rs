@@ -608,43 +608,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Serialization helper struct definition is now moved before serialize_impl
 
-    // Generate unique module name
-    let mod_name = format_ident!("_fhir_serde_impl_{}", name);
+    // Return an empty TokenStream to test for parsing interference
+    let expanded = quote! {};
 
-    // Combine implementations, wrapping everything in a module
-    let expanded = quote! {
-        mod #mod_name {
-            // Import the target struct and other necessary items from the parent scope
-            use super::*;
-            // Explicitly import serde traits/types needed within the generated code
-            use ::serde::{Serialize, Deserialize, Serializer, Deserializer};
-            use ::serde::ser::{SerializeStruct};
-            use ::serde::de::{self, Visitor, MapAccess};
-            use ::std::fmt;
-            use ::std::vec::Vec;
-            use ::std::option::Option;
-            use ::std::string::String;
-            // Import the Element and DecimalElement types if they are used
-            // Assuming they are defined in the same crate or imported globally
-            // If they are in `crate::`, use that path. Adjust if needed.
-            use crate::{Element, DecimalElement, PreciseDecimal}; // Adjust path if necessary
-
-            // Define helper types needed by both Serialize and Deserialize here
-            #serialize_helper_struct_def // Serialization helper
-
-            // Note: Deserialize helper types (Field enum, FieldVisitor, ExtensionHelper)
-            // are defined *inside* the deserialize function within deserialize_impl
-
-            // Include the implementation blocks
-            #serialize_impl
-            #deserialize_impl
-        // }; // End of module removed
-    };
-
-        } // End of module #mod_name
-    };
-
-    // For debugging: Print the generated code
+    // For debugging: Print the generated code (will be empty)
     // println!("{}", expanded.to_string());
 
     expanded.into()
