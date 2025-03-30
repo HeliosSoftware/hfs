@@ -418,6 +418,9 @@ fn process_struct_elements(
             capitalize_first_letter(type_name),
             capitalize_first_letter(base_name)
         );
+        // Ensure choice enum names are distinct by adding a suffix
+        let enum_name = format!("{}_Choice", enum_name);
+
 
         // Skip if we've already generated this enum for this struct
         if processed_choice_enums.contains(&enum_name) {
