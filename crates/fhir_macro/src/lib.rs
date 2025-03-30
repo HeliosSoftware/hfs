@@ -591,11 +591,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Combine implementations
     let expanded = quote! {
-        // #serialize_impl // Temporarily comment out Serialize impl
-        // #deserialize_impl // Temporarily comment out Deserialize impl
-
-        // Generate a minimal dummy impl block to ensure the macro returns valid, non-interfering tokens
-        impl #name { fn _fhir_serde_marker() {} }
+        #serialize_impl
+        #deserialize_impl // Add the deserialize implementation
     };
 
     // For debugging: Print the generated code

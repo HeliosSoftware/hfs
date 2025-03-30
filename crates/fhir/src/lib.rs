@@ -1102,8 +1102,7 @@ mod tests {
     // --- Tests for FhirSerde derive macro (_fieldName logic) ---
 
     // Define a test struct that uses the FhirSerde derive
-    // Temporarily remove PartialEq to isolate FhirSerde issues
-    #[derive(Debug, FhirSerde)]
+    #[derive(Debug, FhirSerde, PartialEq)] // Re-add PartialEq
     struct FhirSerdeTestStruct {
         // Regular field
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1215,7 +1214,7 @@ mod tests {
             count: Some(1),
         };
         let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
-        // assert_eq!(s1, expected1); // Comment out due to removed PartialEq
+        assert_eq!(s1, expected1); // Uncomment assertion
 
         // Case 2: Only extension for birthDate
         let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
@@ -1230,7 +1229,7 @@ mod tests {
             count: None,
         };
         let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
-        // assert_eq!(s2, expected2); // Comment out due to removed PartialEq
+        assert_eq!(s2, expected2); // Uncomment assertion
 
         // Case 3: Both primitive value and extension for birthDate and isActive
         let json3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}]},"isActive":true,"_isActive":{"id":"active-id"},"count":3}"#;
@@ -1249,7 +1248,7 @@ mod tests {
             count: Some(3),
         };
         let s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap();
-        // assert_eq!(s3, expected3); // Comment out due to removed PartialEq
+        assert_eq!(s3, expected3); // Uncomment assertion
 
         // Case 4: birthDate field is missing, isActive has only extension
         let json4 = r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
@@ -1264,7 +1263,7 @@ mod tests {
             count: None,
         };
         let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
-        // assert_eq!(s4, expected4); // Comment out due to removed PartialEq
+        assert_eq!(s4, expected4); // Uncomment assertion
 
         // Case 5: Empty object
         let json5 = r#"{}"#;
@@ -1275,7 +1274,7 @@ mod tests {
             count: None,
         };
         let s5: FhirSerdeTestStruct = serde_json::from_str(json5).unwrap();
-        // assert_eq!(s5, expected5); // Comment out due to removed PartialEq
+        assert_eq!(s5, expected5); // Uncomment assertion
 
         // Case 6: Primitive value is null, but extension exists
         let json6 = r#"{"birthDate":null,"_birthDate":{"id":"bd-null"}}"#;
@@ -1290,7 +1289,7 @@ mod tests {
             count: None,
         };
         let s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap();
-        // assert_eq!(s6, expected6); // Comment out due to removed PartialEq
+        assert_eq!(s6, expected6); // Uncomment assertion
 
          // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
         let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
@@ -1305,7 +1304,7 @@ mod tests {
             count: None,
         };
         let s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap();
-        // assert_eq!(s7, expected7); // Comment out due to removed PartialEq
+        assert_eq!(s7, expected7); // Uncomment assertion
 
         // Case 8: Duplicate primitive field (should error)
         let json8 = r#"{"birthDate":"1970-03-30", "birthDate":"1971-04-01"}"#;
