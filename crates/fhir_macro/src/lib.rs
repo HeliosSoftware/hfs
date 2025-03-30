@@ -173,7 +173,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     }
     let mut field_infos = Vec::new();
 
-    for (idx, field) in fields.iter().enumerate() {
+    for (_idx, field) in fields.iter().enumerate() { // Prefix idx with _
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
         let original_name = get_original_field_name(field);
@@ -264,7 +264,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     for info in &field_infos {
         let field_ident = info.ident;
-        let field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>)
+        let _field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>) - Prefix with _
         let inner_ty = info.inner_ty; // Type inside Option (e.g., Element<String, E>)
         let field_ident_enum = format_ident!("{}", field_ident.to_string().to_uppercase());
 
