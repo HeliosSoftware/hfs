@@ -589,14 +589,19 @@ fn generate_element_definition(
 
         let mut type_str = if field_name.ends_with("[x]") {
             let base_name = field_name.trim_end_matches("[x]");
+            // Construct the correct UpperCamelCase enum name
             let enum_name = format!(
-                "{}{}",
-                capitalize_first_letter(type_name),
-                capitalize_first_letter(base_name)
+                "{}Choice", // Use "Choice" suffix
+                format!(
+                    "{}{}",
+                    capitalize_first_letter(type_name),
+                    capitalize_first_letter(base_name)
+                )
             );
             // For choice fields, we use flatten instead of rename
             serde_attrs.clear(); // Clear any previous attributes
             serde_attrs.push("flatten".to_string());
+            // Use the correctly generated enum name
             format!("Option<{}>", enum_name)
         } else if is_array {
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
