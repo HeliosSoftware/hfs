@@ -1110,11 +1110,11 @@ mod tests {
 
         // Field with potential extension (_birthDate)
         #[serde(rename = "birthDate", skip_serializing_if = "Option::is_none")]
-        birth_date: Option<Element::<String, UnitTestExtension>>,
+        birth_date: Option<Element<String, UnitTestExtension>>,
 
         // Another potentially extended field
         #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
-        is_active: Option<Element::<bool, UnitTestExtension>>,
+        is_active: Option<Element<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
         #[serde(skip_serializing_if = "Option::is_none")]
