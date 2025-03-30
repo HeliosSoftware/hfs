@@ -168,7 +168,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         original_name: String,
         underscore_name: String,
         is_element: bool,
-        is_option: bool,
+        // is_option: bool, // Removed unused field
         inner_ty: &'a Type, // Type inside Option if applicable, otherwise same as ty
     }
     let mut field_infos = Vec::new();
@@ -226,7 +226,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             original_name: original_name.clone(),
             underscore_name: underscore_name.clone(),
             is_element,
-            is_option,
+            // is_option, // Removed unused field
             inner_ty,
         });
 
@@ -378,8 +378,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         if info.is_element {
             // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
-            let id_field = format_ident!("{}_id", field_ident);
-            let id_field = format_ident!("{}_id", field_ident);
+            let id_field = format_ident!("{}_id", field_ident); // Keep one definition
+            // let id_field = format_ident!("{}_id", field_ident); // Remove duplicate definition
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
 
