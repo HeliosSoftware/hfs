@@ -211,7 +211,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
 
-        let (is_option, inner_ty) = match get_option_inner_type(field_ty) {
+        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
             Some(inner) => (true, inner),
             None => (false, field_ty), // If not Option, inner_ty is the same as ty
         };
@@ -506,40 +506,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Construct Element fields from parts *after* the loop
-                        #( // Iterate through field_infos again to generate construction logic
-                            {
-                                let info = &field_infos[#idx]; // Use index generated below
-                                if info.is_element {
-                                    let field_ident = info.ident;
-                                    let inner_ty = info.inner_ty;
-                                    let val_field = format_ident!("{}_value", field_ident);
-                                    let id_field = format_ident!("{}_id", field_ident);
-                                    let ext_field = format_ident!("{}_extension", field_ident);
-
-                                    quote! {
-                                        // Assign to the final #field_ident variable declared at the top
-                                        #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
-                                            Some(#inner_ty { // Use the inner type (Element<V,E> or DecimalElement<E>)
-                                                value: #val_field,
-                                                id: #id_field,
-                                                extension: #ext_field,
-                                            })
-                                        } else {
-                                            None // Assign None if no parts were found
-                                        };
-                                    }
-                                } else {
-                                    quote! {} // No construction needed for non-elements
-                                }
-                            }
-                        // Generate indices 0..N for the loop above
-                        let construction_indices = (0..field_infos.len()).map(|i| quote!{#i});
-                        let element_construction_logic = quote! {
-                            #( #construction_indices => { /* generated code from above block */ } )*
-                        };
-
-                        #element_construction_logic // Execute the construction logic
+                        // Execute the construction logic (generated outside)
+                        #(#element_construction_logic)*
 
 
                         // Construct the final struct using the final field variables
