@@ -27,18 +27,35 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         "use serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
     )?;
 
+    let mut all_resource_names = std::collections::HashSet::new(); // Use HashSet for automatic deduplication
+
     // Process all JSON files in the resources/{FhirVersion} directory
     visit_dirs(&version_dir)?
         .into_iter()
         .try_for_each::<_, io::Result<()>>(|file_path| {
             match parse_structure_definitions(&file_path) {
-                Ok(bundle) => generate_code(bundle, &version_path)?,
+                // Pass a mutable reference to collect resource names
+                Ok(bundle) => generate_code(bundle, &version_path, &mut all_resource_names)?,
                 Err(e) => {
                     eprintln!("Warning: Failed to parse {}: {}", file_path.display(), e)
                 }
             }
             Ok(())
         })?;
+
+    // --- Generate Resource enum once after processing all files ---
+    // For now, hardcode Patient as it's the focus.
+    // In the future, this could use `all_resource_names`.
+    let final_resource_names = vec!["Patient".to_string()];
+    let resource_enum_code = generate_resource_enum(final_resource_names);
+
+    // Append the single Resource enum definition to the file
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&version_path)?;
+    write!(file, "{}", resource_enum_code)?;
+    // --- End Resource enum generation ---
+
 
     Ok(())
 }
@@ -221,6 +238,10 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                     Resource::StructureDefinition(def) => {
                         // Only generate code for allowed types
                         if is_valid_structure_definition(def) && allowed_types.contains(&def.name) {
+                            // Collect resource names (if it's a resource type)
+                            if def.kind == "resource" {
+                                resource_names.insert(def.name.clone());
+                            }
                             // Pass references to all elements of allowed types for context
                             let content = structure_definition_to_rust(def, &cycles, &all_elements);
                             generated_structs_code.push_str(&content); // Append to buffer
@@ -233,20 +254,16 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
             }
         }
 
-        // Generate the Resource enum code, hardcoded to only include Patient
-        let resource_enum_code = generate_resource_enum(vec!["Patient".to_string()]);
-        generated_structs_code.push_str(&resource_enum_code); // Append enum to buffer
+        // --- REMOVED Resource enum generation from here ---
 
-        // Append the generated code to the file
+        // Append the generated struct/type code for this bundle to the file
         let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true) // Still append to the initial content written earlier
+            .append(true) // Append to the file opened in process_single_version
             .open(output_path.as_ref())?;
-        write!(file, "{}", generated_structs_code)?; // Write the accumulated code
+        write!(file, "{}", generated_structs_code)?; // Write the accumulated struct code
     }
 
-    Ok(())
+    Ok(()) // Return Ok(()) as per the new signature
 }
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
