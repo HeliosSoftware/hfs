@@ -1102,7 +1102,8 @@ mod tests {
     // --- Tests for FhirSerde derive macro (_fieldName logic) ---
 
     // Define a test struct that uses the FhirSerde derive
-    #[derive(Debug, PartialEq, Serialize, Deserialize, FhirSerde)]
+    // FhirSerde must be the only derive that generates Serialize/Deserialize impls
+    #[derive(Debug, PartialEq, FhirSerde)]
     struct FhirSerdeTestStruct {
         // Regular field
         #[serde(skip_serializing_if = "Option::is_none")]
