@@ -438,6 +438,28 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // visitor_struct_name already defined above with unique name
 
+    // Generate the element construction logic *before* the main deserialize_impl quote block
+    let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
+        if info.is_element {
+            let field_ident = info.ident; // Final field ident (e.g., birth_date)
+            let inner_ty = info.inner_ty; // Type: Element<String, E>
+            // Idents for temporary variables *inside* visit_map
+            let val_field_ident = format_ident!("{}_value", field_ident);
+            let id_field_ident = format_ident!("{}_id", field_ident);
+            let ext_field_ident = format_ident!("{}_extension", field_ident);
+            Some(quote! {
+                // This generated code will be placed inside visit_map
+                // It references #field_ident (final variable) and the temporary variables
+                #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
+                    Some(#inner_ty { value: #val_field_ident, id: #id_field_ident, extension: #ext_field_ident })
+                } else { None };
+            })
+        } else {
+            None
+        }
+    }).collect();
+
+
     let deserialize_impl = quote! {
         // No helper types defined outside the impl block anymore
 
@@ -487,26 +509,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Generate construction logic for all element fields here
-                        let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
-                            if info.is_element {
-                                let field_ident = info.ident;
-                                let inner_ty = info.inner_ty;
-                                let val_field = format_ident!("{}_value", field_ident);
-                                let id_field = format_ident!("{}_id", field_ident);
-                                let ext_field = format_ident!("{}_extension", field_ident);
-                                Some(quote! {
-                                    // Assign to the final #field_ident variable declared at the top
-                                    #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
-                                        Some(#inner_ty { value: #val_field, id: #id_field, extension: #ext_field })
-                                    } else { None };
-                                })
-                            } else {
-                                None
-                            }
-                        }).collect();
-
-                        // Execute the construction logic
+                        // Execute the construction logic (which was generated outside)
                         #(#element_construction_logic)*
 
                         // Construct the final struct using the final field variables
