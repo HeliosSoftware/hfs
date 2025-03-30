@@ -493,6 +493,44 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         impl<'de> ::serde::Deserialize<'de> for #name {
             // FIELDS constant will be defined inside the function body below
 
+            // Define the main visitor struct and its impl *outside* the deserialize function
+            struct #visitor_struct_name;
+
+            impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+                type Value = #name;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str(concat!("struct ", #struct_name_str))
+                }
+
+                fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+                where
+                    V: ::serde::de::MapAccess<'de>,
+                {
+                    // Initialize Option fields for the visitor
+                    #(#visitor_field_defs;)*
+
+                    // Loop through fields in the JSON map
+                    // Use #field_enum_name directly (defined inside impl block)
+                    while let Some(key) = map.next_key::<#field_enum_name>()? {
+                        match key {
+                            #(#visitor_map_assignments)*
+                            // Use #field_enum_name directly (defined inside impl block)
+                            #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                        }
+                    }
+
+                    // Construct Element fields *after* the loop using temp variables
+                    #(#element_construction_logic)*
+
+                    // Construct the final struct using the final field variables
+                    Ok(#name {
+                        #(#final_struct_fields),*
+                    })
+                }
+            }
+
+            // Now define the deserialize function
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
                 D: ::serde::Deserializer<'de>,
@@ -514,43 +552,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                      extension: ::std::option::Option<::std::vec::Vec<E>>,
                 }
 
-                // Define the main visitor struct *inside* the deserialize function scope
-                // This ensures it has access to generic parameters if needed
-                struct #visitor_struct_name;
-
-                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
-                    type Value = #name;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        formatter.write_str(concat!("struct ", #struct_name_str))
-                    }
-
-                    fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
-                    where
-                        V: ::serde::de::MapAccess<'de>,
-                    {
-                        // Initialize Option fields for the visitor
-                        #(#visitor_field_defs;)*
-
-                        // Loop through fields in the JSON map
-                        // Use #field_enum_name directly (defined inside impl block)
-                        while let Some(key) = map.next_key::<#field_enum_name>()? {
-                            match key {
-                                #(#visitor_map_assignments)*
-                                // Use #field_enum_name directly (defined inside impl block)
-                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
-                            }
-                        }
-
-                        // Construct Element fields *after* the loop using temp variables
-                        #(#element_construction_logic)*
-
-                        // Construct the final struct using the final field variables
-                        Ok(#name {
-                            #(#final_struct_fields),*
-                        })
-                    }
-                }
+                // Main visitor struct is now defined outside this function
 
                 // Define the fields Serde should expect *inside* the function body
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
