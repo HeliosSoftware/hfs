@@ -562,6 +562,17 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
 
+    // Define the serialization helper struct definition *before* serialize_impl
+    let serialize_helper_struct_def = quote! {
+        #[derive(::serde::Serialize)] // Use Serialize from the use statement above
+        struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: &'a ::std::option::Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
     // --- Combine Serialize and Deserialize ---
     let serialize_impl = quote! {
         impl ::serde::Serialize for #name {
