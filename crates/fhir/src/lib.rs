@@ -1387,14 +1387,12 @@ mod tests {
         // Field with potential extension (_birthDate)
         // Standard serde needs rename attribute. The _birthDate field will be ignored by standard serde.
         #[serde(rename = "birthDate", skip_serializing_if = "Option::is_none")]
-        #[rustfmt::skip]
-        birth_date: Option::<Element::<String, UnitTestExtension>>,
+        birth_date: Option<Element<String, UnitTestExtension>>,
 
         // Another potentially extended field
         // Standard serde needs rename attribute. The _isActive field will be ignored.
         #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
-        #[rustfmt::skip]
-        is_active: Option::<Element::<bool, UnitTestExtension>>,
+        is_active: Option<Element<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
         #[serde(skip_serializing_if = "Option::is_none")]
