@@ -488,6 +488,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     let deserialize_impl = quote! {
         impl<'de> ::serde::Deserialize<'de> for #name {
+            // Define the FIELDS constant directly within the impl block
+            const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
+
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
                 D: ::serde::Deserializer<'de>,
@@ -534,10 +537,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     }
                 }
 
-                // Define the fields Serde should expect
-                const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
+                // FIELDS constant is now defined outside the function body
                 // Start deserialization using the main visitor struct defined above
-                deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
+                // Use Self::FIELDS to refer to the associated constant
+                deserializer.deserialize_struct(#struct_name_str, Self::FIELDS, #visitor_struct_name)
             }
         }
     };
