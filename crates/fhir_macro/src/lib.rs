@@ -455,12 +455,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // It references #field_ident (final variable) and the temporary variables
                  // Assign the constructed Option<Element<...>> directly to the final field variable
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
-                    // Use the actual type path stored in inner_ty
-                    Some(#inner_ty {
+                    // Create the Element instance with an explicit type annotation first
+                    let element_value: #inner_ty = #inner_ty {
                         value: #val_field_ident,
                         id: #id_field_ident,
                         extension: #ext_field_ident,
-                    })
+                    };
+                    // Then wrap it in Some
+                    Some(element_value)
                 } else {
                     None // If no parts were found, the element is None
                 };
