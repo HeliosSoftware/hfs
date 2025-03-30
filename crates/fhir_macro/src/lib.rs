@@ -583,11 +583,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Combine implementations, wrapping everything in a const block for isolation
+    // Combine implementations directly, without the const block wrapper
     let expanded = quote! {
-        const _: () = {
-            // Define the moved helper structs/enums here, inside the const block
-            #serialize_helper_struct_def // Use the defined variable
+        // Define the moved helper structs/enums here, outside the impl blocks
+        #serialize_helper_struct_def // Use the defined variable
         #field_enum
         #field_visitor_impl
         // Define the extension helper struct here as well
@@ -601,7 +600,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             #serialize_impl
             #deserialize_impl // Restore Deserialize impl
-        }; // End of const block
+        // }; // End of const block removed
     };
 
     // For debugging: Print the generated code
