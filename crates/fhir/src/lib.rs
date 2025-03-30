@@ -670,8 +670,8 @@ mod tests {
     use serde_json;
     use fhir_macro::FhirSerde; // Import the derive macro
 
-    // Add Eq derive
-    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    // Add Eq, Default derives
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
     struct UnitTestExtension {
         code: String,
         is_valid: bool,

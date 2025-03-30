@@ -311,15 +311,31 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ident = info.ident;
         let _field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>) - Prefix with _
         let inner_ty = info.inner_ty; // Type inside Option (e.g., Element<String, E>)
-        // Sanitize field name for enum variant
+
+        // Get the correct UpperCamelCase enum variant names generated earlier
         let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
-        let field_ident_enum = format_ident!("{}", clean_field_ident_str.to_uppercase());
+        let field_ident_enum_str = {
+            let mut camel_case = String::new();
+            let mut capitalize = true;
+            for c in clean_field_ident_str.chars() {
+                if c == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    camel_case.push(c.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    camel_case.push(c);
+                }
+            }
+             if let Some(first) = camel_case.chars().next() { if !first.is_uppercase() { camel_case.insert(0, first.to_ascii_uppercase()); camel_case.remove(1); } } else { camel_case = format!("Field{}", field_ident); }
+            camel_case
+        };
+        let field_ident_enum = format_ident!("{}", field_ident_enum_str); // e.g., BirthDate
+        let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
+
 
         if info.is_element {
             // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
-            // Use the unique prefix for the underscore enum variant
-            let underscore_ident_enum =
-                format_ident!("{}__{}", name, clean_field_ident_str.to_uppercase());
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
@@ -424,25 +440,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     }
 
-    // Generate the final struct construction logic
-    let mut final_struct_fields = Vec::new();
-    for info in &field_infos {
+    // Generate the final struct construction logic - just use the field idents directly
+    let final_struct_fields: Vec<_> = field_infos.iter().map(|info| {
         let field_ident = info.ident;
-        let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
-
-        if info.is_element {
-             // Element fields are always Option<Element<...>> in the struct
-             final_struct_fields.push(quote! { #field_ident: #field_ident });
-        } else if info.is_option {
-            // Non-element Option<T> fields
-            final_struct_fields.push(quote! { #field_ident: #field_ident });
-        } else {
-            // Non-element required T fields
-            final_struct_fields.push(quote! {
-                #field_ident: #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_lit))?
-            });
-        }
-    }
+        quote! { #field_ident: #field_ident }
+    }).collect();
 
 
     // visitor_struct_name already defined above with unique name
