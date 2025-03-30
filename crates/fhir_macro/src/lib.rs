@@ -493,42 +493,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         impl<'de> ::serde::Deserialize<'de> for #name {
             // FIELDS constant will be defined inside the function body below
 
-            // Define the main visitor struct and its impl *outside* the deserialize function
-            struct #visitor_struct_name;
-
-            impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
-                type Value = #name;
-
-                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    formatter.write_str(concat!("struct ", #struct_name_str))
-                }
-
-                fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
-                where
-                    V: ::serde::de::MapAccess<'de>,
-                {
-                    // Initialize Option fields for the visitor
-                    #(#visitor_field_defs;)*
-
-                    // Loop through fields in the JSON map
-                    // Use #field_enum_name directly (defined inside impl block)
-                    while let Some(key) = map.next_key::<#field_enum_name>()? {
-                        match key {
-                            #(#visitor_map_assignments)*
-                            // Use #field_enum_name directly (defined inside impl block)
-                            #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
-                        }
-                    }
-
-                    // Construct Element fields *after* the loop using temp variables
-                    #(#element_construction_logic)*
-
-                    // Construct the final struct using the final field variables
-                    Ok(#name {
-                        #(#final_struct_fields),*
-                    })
-                }
-            }
+            // Main Visitor struct and its impl will be defined *inside* the deserialize function below
 
             // Now define the deserialize function
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -552,7 +517,43 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                      extension: ::std::option::Option<::std::vec::Vec<E>>,
                 }
 
-                // Main visitor struct is now defined outside this function
+                // Define the main visitor struct *inside* the deserialize function scope
+                struct #visitor_struct_name;
+
+                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+                    type Value = #name; // Use #name directly as it's in the outer scope
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!("struct ", #struct_name_str))
+                    }
+
+                    fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+                    where
+                        V: ::serde::de::MapAccess<'de>,
+                    {
+                        // Initialize Option fields for the visitor
+                        #(#visitor_field_defs;)*
+
+                        // Loop through fields in the JSON map
+                        // Use #field_enum_name directly (defined inside impl block)
+                        while let Some(key) = map.next_key::<#field_enum_name>()? {
+                            match key {
+                                #(#visitor_map_assignments)*
+                                // Use #field_enum_name directly (defined inside impl block)
+                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                            }
+                        }
+
+                        // Construct Element fields *after* the loop using temp variables
+                        #(#element_construction_logic)*
+
+                        // Construct the final struct using the final field variables
+                        Ok(#name {
+                            #(#final_struct_fields),*
+                        })
+                    }
+                }
+
 
                 // Define the fields Serde should expect *inside* the function body
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
@@ -607,12 +608,40 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Serialization helper struct definition is now moved before serialize_impl
 
-    // Combine implementations directly, helper types are now defined inside impl blocks
+    // Generate unique module name
+    let mod_name = format_ident!("_fhir_serde_impl_{}", name);
+
+    // Combine implementations, wrapping everything in a module
     let expanded = quote! {
-        // Helper types are no longer defined here at the top level
+        mod #mod_name {
+            // Import the target struct and other necessary items from the parent scope
+            use super::*;
+            // Explicitly import serde traits/types needed within the generated code
+            use ::serde::{Serialize, Deserialize, Serializer, Deserializer};
+            use ::serde::ser::{SerializeStruct};
+            use ::serde::de::{self, Visitor, MapAccess};
+            use ::std::fmt;
+            use ::std::vec::Vec;
+            use ::std::option::Option;
+            use ::std::string::String;
+            // Import the Element and DecimalElement types if they are used
+            // Assuming they are defined in the same crate or imported globally
+            // If they are in `crate::`, use that path. Adjust if needed.
+            use crate::{Element, DecimalElement, PreciseDecimal}; // Adjust path if necessary
+
+            // Define helper types needed by both Serialize and Deserialize here
+            #serialize_helper_struct_def // Serialization helper
+
+            // Note: Deserialize helper types (Field enum, FieldVisitor, ExtensionHelper)
+            // are defined *inside* the deserialize function within deserialize_impl
+
+            // Include the implementation blocks
             #serialize_impl
-            #deserialize_impl // Restore Deserialize impl
+            #deserialize_impl
         // }; // End of module removed
+    };
+
+        } // End of module #mod_name
     };
 
     // For debugging: Print the generated code
