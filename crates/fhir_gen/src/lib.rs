@@ -44,10 +44,10 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         })?;
 
     // --- Generate Resource enum once after processing all files ---
-    // For now, hardcode Patient as it's the focus.
-    // In the future, this could use `all_resource_names`.
-    let final_resource_names = vec!["Patient".to_string()];
-    let resource_enum_code = generate_resource_enum(final_resource_names);
+    // Use the collected resource names. Sort them for consistent output.
+    let mut sorted_resource_names: Vec<String> = all_resource_names.into_iter().collect();
+    sorted_resource_names.sort(); // Sort alphabetically
+    let resource_enum_code = generate_resource_enum(sorted_resource_names);
 
     // Append the single Resource enum definition to the file
     let mut file = std::fs::OpenOptions::new()
@@ -134,91 +134,13 @@ fn generate_code(
     let mut all_elements: Vec<&ElementDefinition> = Vec::new(); // Store references
     let mut generated_structs_code = String::new(); // Accumulate struct code
 
-    // Define the list of types we want to generate (Patient and its core dependencies)
-    // This list might need adjustment based on the specific FHIR version and Patient definition.
-    let allowed_types: std::collections::HashSet<String> = [
-        "Patient",
-        "Identifier",
-        "HumanName",
-        "Address",
-        "Reference",
-        "Extension",
-        "CodeableConcept",
-        "Coding",
-        "ContactPoint",
-        "Period",
-        "Meta",
-        "Narrative",
-        "DomainResource",
-        "Resource",
-        "Element",
-        "BackboneElement",
-        // Primitives (handled by generate_primitive_type, but good to list)
-        "string",
-        "boolean",
-        "integer",
-        "decimal",
-        "uri",
-        "code",
-        "dateTime",
-        "date",
-        "instant",
-        "time",
-        "base64Binary",
-        "canonical",
-        "id",
-        "markdown",
-        "oid",
-        "positiveInt",
-        "unsignedInt",
-        "url",
-        "uuid",
-        "xhtml",
-        "integer64",
-        // Other potentially required complex types for Patient
-        "Attachment",
-        "Quantity",
-        "Age",
-        "Count",
-        "Distance",
-        "Duration",
-        "Money",
-        "SimpleQuantity",
-        "Range",
-        "Ratio",
-        "SampledData",
-        "Signature",
-        "Timing",
-        "ContactDetail",
-        "Contributor",
-        "DataRequirement",
-        "Expression",
-        "ParameterDefinition",
-        "RelatedArtifact",
-        "TriggerDefinition",
-        "UsageContext",
-        "Annotation",
-        "Dosage",
-        "DataRequirementSort",
-        "DataRequirementFilter",
-        "DataRequirementCodeFilter",
-        "DataRequirementDateFilter",
-        "TimingRepeat",
-        "PatientContact",
-        "PatientCommunication",
-        "PatientLink",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-
     if let Some(entries) = bundle.entry.as_ref() {
-        // First pass: collect elements ONLY for allowed types
+        // First pass: collect elements for ALL valid types
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 if let Resource::StructureDefinition(def) = resource {
-                    // Only consider definitions for allowed types
-                    if is_valid_structure_definition(def) && allowed_types.contains(&def.name) {
+                    // Consider all valid structure definitions
+                    if is_valid_structure_definition(def) {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
                                 // Store references to elements
@@ -235,18 +157,18 @@ fn generate_code(
         let element_refs: Vec<&ElementDefinition> = all_elements.clone(); // Clone references for cycle detection
         let cycles = detect_struct_cycles(&element_refs);
 
-        // Second pass: generate struct/type code ONLY for allowed types
+        // Second pass: generate struct/type code for ALL valid types
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        // Only generate code for allowed types
-                        if is_valid_structure_definition(def) && allowed_types.contains(&def.name) {
+                        // Generate code for all valid structure definitions
+                        if is_valid_structure_definition(def) {
                             // Collect resource names (if it's a resource type)
                             if def.kind == "resource" {
                                 resource_names.insert(def.name.clone());
                             }
-                            // Pass references to all elements of allowed types for context
+                            // Pass references to all elements for context
                             let content = structure_definition_to_rust(def, &cycles, &all_elements);
                             generated_structs_code.push_str(&content); // Append to buffer
                             generated_structs_code.push('\n'); // Add newline between definitions
@@ -438,22 +360,48 @@ fn process_struct_elements(
 
     // Filter elements that belong directly to this type (path starts with type_name and has one dot)
     // or are the base element itself (path == type_name).
+    // Also handle BackboneElement which might have paths like "Patient.contact.address"
+    // where "Patient.contact" is the BackboneElement.
     let direct_elements: Vec<&ElementDefinition> = elements
         .iter()
         .filter(|e| {
             let path_parts: Vec<&str> = e.path.split('.').collect();
-            // Include the base element itself (e.g., "Patient")
+            // Check if the element path starts with the type name and has exactly one more part,
+            // OR if the element path *is* the type name (for the root element definition, though we often skip it).
+            // We need to handle cases like "Patient.identifier" (direct child of Patient)
+            // and potentially nested elements defined within the same StructureDefinition,
+            // like "Patient.contact.gender" if Patient.contact is a BackboneElement defined inline.
+            // The filtering logic here assumes elements are ordered such that parents appear before children.
+            // A robust approach might involve building a tree, but filtering by path prefix length is simpler.
+
+            // Include the root element definition itself (e.g., "Patient") - needed for metadata but not fields.
             if path_parts.len() == 1 && path_parts[0] == type_name.as_str() {
-                // Skip the base element itself, we only want fields
-                return false;
+                 return true; // Keep the root element for potential metadata access if needed later
             }
             // Include direct children (e.g., "Patient.identifier")
-            path_parts.len() > 1 && path_parts[0] == type_name.as_str()
+            if path_parts.len() > 1 && path_parts[0] == type_name.as_str() {
+                // Check if it's a direct child or a child of an inline BackboneElement
+                // This logic might need refinement depending on how BackboneElements are structured.
+                // For now, let's assume direct children are what we primarily need for struct fields.
+                // We filter out the root element later when generating fields.
+                return true;
+            }
+            false
         })
-        // Collect the references directly
         .collect();
 
-    // Process choice types first for this specific struct
+    // Find the root element definition for the current struct (e.g., the one with path "Patient")
+    let root_element = direct_elements.iter().find(|e| e.path == *type_name);
+
+    // Filter out the root element itself when generating fields
+    let field_elements: Vec<&ElementDefinition> = direct_elements
+        .iter()
+        .filter(|e| e.path != *type_name) // Exclude the root element
+        .cloned() // Clone the references
+        .collect();
+
+
+    // Process choice types first for this specific struct using only field elements
     let choice_fields: Vec<_> = direct_elements
         .iter()
         .filter(|e| e.path.ends_with("[x]"))
@@ -523,12 +471,26 @@ fn process_struct_elements(
         capitalize_first_letter(type_name)
     ));
 
-    // Keep track of fields added to avoid duplicates from slicing
+    // Keep track of fields added to avoid duplicates (e.g., from slicing or choice types)
     let mut added_fields = std::collections::HashSet::new();
 
-    for element in &direct_elements {
+    for element in &field_elements { // Use field_elements here
+        // Skip elements that don't directly define a field (e.g., intermediate BackboneElement paths)
+        // A simple check is if the path has more parts than the base type name path.
+        let base_path_parts = type_name.split('.').count();
+        let element_path_parts = element.path.split('.').count();
+
+        // Only process elements that are direct children or grandchildren (for simple cases)
+        // This might need adjustment for deeply nested BackboneElements.
+        // We primarily want elements like "Patient.identifier" or "Patient.contact.gender".
+        // Elements like "Patient.contact" itself (if it's a BackboneElement) are handled by their type definition.
+        if element_path_parts <= base_path_parts {
+             continue; // Skip elements that are not fields of the current struct
+        }
+
+
         if let Some(field_name) = element.path.split('.').last() {
-            // Use the cleaned field name (without [x]) for tracking
+            // Use the cleaned field name (without [x]) for tracking duplicates
             let clean_field_name = field_name.trim_end_matches("[x]");
             if !added_fields.contains(clean_field_name) {
                 generate_element_definition(
