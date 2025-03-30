@@ -244,20 +244,58 @@ fn structure_definition_to_rust(
     all_allowed_elements: &[&ElementDefinition], // Pass all relevant elements for context
 ) -> String {
     let mut output = String::new();
+    let mut backbone_structs_code = String::new(); // Buffer for backbone structs
 
     // Handle primitive types differently
     if is_primitive_type(sd) {
-        // Ensure primitive types are handled even if not explicitly in allowed_types set initially
-        // as they are fundamental.
         return generate_primitive_type(sd);
     }
 
     // Process elements for complex types and resources
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
-            // We are generating code for a specific StructureDefinition (sd),
-            // so we don't need the processed_types check here as generate_code filters calls.
-            // We pass all_allowed_elements for context lookups (e.g., contentReference).
+            // --- First Pass: Generate BackboneElement Structs ---
+            let mut processed_backbone_paths = std::collections::HashSet::new();
+            for element in elements.iter() {
+                // Identify potential BackboneElement definitions (path has parts, type is BackboneElement or Element)
+                // and it's not the root element itself.
+                let path_parts: Vec<&str> = element.path.split('.').collect();
+                if path_parts.len() > 1 && path_parts[0] == sd.name { // Belongs to the current resource/type
+                    if let Some(types) = &element.r#type {
+                        if types.iter().any(|t| t.code == "BackboneElement" || t.code == "Element") && element.content_reference.is_none() {
+                            // Check if it's a definition point for a backbone element (often has children)
+                            let has_children = elements.iter().any(|child_el| {
+                                child_el.path.starts_with(&format!("{}.", element.path))
+                            });
+
+                            if has_children && !processed_backbone_paths.contains(&element.path) {
+                                let backbone_type_name = generate_type_name(&element.path);
+                                let mut backbone_output = String::new();
+                                // Generate the struct for this backbone element
+                                // We need a dummy StructureDefinition-like object or adapt process_struct_elements
+                                let backbone_sd = StructureDefinition {
+                                    name: backbone_type_name.clone(),
+                                    kind: "complex-type".to_string(), // Assume backbone is complex-type
+                                    r#abstract: false,
+                                    derivation: Some("specialization".to_string()), // Assume specialization
+                                    snapshot: Some(initial_fhir_model::StructureDefinitionSnapshot {
+                                        element: Some(elements.iter().filter(|e| e.path.starts_with(&format!("{}.", element.path)) || e.path == element.path).cloned().collect()), // Pass relevant elements
+                                    }),
+                                    ..Default::default() // Add other necessary fields if needed
+                                };
+                                process_struct_elements(&backbone_sd, elements, &mut backbone_output, cycles, all_allowed_elements);
+                                backbone_structs_code.push_str(&backbone_output);
+                                processed_backbone_paths.insert(element.path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Prepend backbone structs before the main struct
+            output.push_str(&backbone_structs_code);
+
+            // --- Second Pass: Generate the Main Struct ---
+            // Pass all_allowed_elements for context lookups (e.g., contentReference).
             process_struct_elements(sd, elements, &mut output, cycles, all_allowed_elements);
         }
     }
@@ -360,84 +398,47 @@ fn process_struct_elements(
     all_allowed_elements: &[&ElementDefinition], // All elements from allowed types for context
 ) {
     let type_name = &struct_def.name; // Use the struct name directly
+    let base_path = type_name; // For top-level types, base path is the type name
+    let base_path_parts_count = base_path.split('.').count();
 
-    // Filter elements that belong directly to this type (path starts with type_name and has one dot)
-    // or are the base element itself (path == type_name).
-    // Also handle BackboneElement which might have paths like "Patient.contact.address"
-    // where "Patient.contact" is the BackboneElement.
+    // Filter elements that are direct children of the current struct/backbone element.
     let direct_elements: Vec<&ElementDefinition> = elements
         .iter()
         .filter(|e| {
-            let path_parts: Vec<&str> = e.path.split('.').collect();
-            // Check if the element path starts with the type name and has exactly one more part,
-            // OR if the element path *is* the type name (for the root element definition, though we often skip it).
-            // We need to handle cases like "Patient.identifier" (direct child of Patient)
-            // and potentially nested elements defined within the same StructureDefinition,
-            // like "Patient.contact.gender" if Patient.contact is a BackboneElement defined inline.
-            // The filtering logic here assumes elements are ordered such that parents appear before children.
-            // A robust approach might involve building a tree, but filtering by path prefix length is simpler.
-
-            // Include the root element definition itself (e.g., "Patient") - needed for metadata but not fields.
-            if path_parts.len() == 1 && path_parts[0] == type_name.as_str() {
-                return true; // Keep the root element for potential metadata access if needed later
-            }
-            // Include direct children (e.g., "Patient.identifier")
-            if path_parts.len() > 1 && path_parts[0] == type_name.as_str() {
-                // Check if it's a direct child or a child of an inline BackboneElement
-                // This logic might need refinement depending on how BackboneElements are structured.
-                // For now, let's assume direct children are what we primarily need for struct fields.
-                // We filter out the root element later when generating fields.
-                return true;
-            }
-            false
+            e.path.starts_with(&format!("{}.", base_path)) // Must be under the current path
+            && e.path.split('.').count() == base_path_parts_count + 1 // Must be exactly one level deeper
         })
         .collect();
 
-    // Filter out the root element itself when generating fields
-    let field_elements: Vec<&ElementDefinition> = direct_elements
-        .iter()
-        .filter(|e| e.path != *type_name) // Exclude the root element
-        .cloned() // Clone the references
-        .collect();
-
-    let choice_fields: Vec<_> = field_elements // Use field_elements here
+    // Generate Choice Enums first (needed by fields)
+    let choice_fields: Vec<_> = direct_elements
         .iter()
         .filter(|e| e.path.ends_with("[x]"))
-        .cloned() // Clone references
+        .cloned()
         .collect();
-    let mut processed_choice_enums = std::collections::HashSet::new(); // Track enums generated for this struct
+    let mut processed_choice_enums = std::collections::HashSet::new();
 
     for choice in &choice_fields {
-        // Iterate over references
-        let base_name = choice
-            .path
-            .split('.')
-            .last()
-            .unwrap()
-            .trim_end_matches("[x]");
-
+        let base_name = choice.path.split('.').last().unwrap().trim_end_matches("[x]");
+        // Use the *struct_def name* (which could be Patient or PatientContact) for the enum prefix
         let enum_name = format!(
             "{}{}",
-            capitalize_first_letter(type_name),
+            capitalize_first_letter(type_name), // Use current struct/backbone name
             capitalize_first_letter(base_name)
         );
-        // Use UpperCamelCase for the choice enum name
         let enum_name = format!("{}Choice", enum_name);
 
-        // Skip if we've already generated this enum for this struct
         if processed_choice_enums.contains(&enum_name) {
             continue;
         }
         processed_choice_enums.insert(enum_name.clone());
 
-        // Add documentation comment for the enum
         output.push_str(&format!(
             "/// Choice of types for the {}[x] field in {}\n",
             base_name,
-            capitalize_first_letter(type_name)
+            capitalize_first_letter(type_name) // Use current struct/backbone name
         ));
-
-        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n"); // Add PartialEq
+        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
         output.push_str("#[serde(rename_all = \"camelCase\")]\n");
         output.push_str(&format!("pub enum {} {{\n", enum_name));
 
@@ -445,59 +446,32 @@ fn process_struct_elements(
             for ty in types {
                 let type_code = capitalize_first_letter(&ty.code);
                 let rename_value = format!("{}{}", base_name, type_code);
-
-                // Add documentation for each variant
                 output.push_str(&format!(
                     "    /// Variant accepting the {} type.\n",
                     type_code
                 ));
                 output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
-                // Assume the type itself (e.g., String, Reference) is generated elsewhere
                 output.push_str(&format!("    {}({}),\n", type_code, type_code));
             }
         }
         output.push_str("}\n\n");
     }
 
-    // Only add FhirSerde derive for complex-types and resources (structs)
-    if struct_def.kind == "complex-type" || struct_def.kind == "resource" {
-        // Add standard derives first, then FhirSerde
-        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
-    } else {
-        // For other kinds like BackboneElement (if treated differently) or potentially others
-        // just add standard derives. Enums are handled separately.
-        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
-    }
+    // Generate the struct definition
+    output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
     output.push_str(&format!(
         "pub struct {} {{\n",
-        capitalize_first_letter(type_name)
+        capitalize_first_letter(type_name) // Use current struct/backbone name
     ));
 
-    // Keep track of fields added to avoid duplicates (e.g., from slicing or choice types)
     let mut added_fields = std::collections::HashSet::new();
-
-    for element in &field_elements {
-        // Use field_elements here
-        // Skip elements that don't directly define a field (e.g., intermediate BackboneElement paths)
-        // A simple check is if the path has more parts than the base type name path.
-        let base_path_parts = type_name.split('.').count();
-        let element_path_parts = element.path.split('.').count();
-
-        // Only process elements that are direct children or grandchildren (for simple cases)
-        // This might need adjustment for deeply nested BackboneElements.
-        // We primarily want elements like "Patient.identifier" or "Patient.contact.gender".
-        // Elements like "Patient.contact" itself (if it's a BackboneElement) are handled by their type definition.
-        if element_path_parts <= base_path_parts {
-            continue; // Skip elements that are not fields of the current struct
-        }
-
+    for element in &direct_elements { // Iterate over direct children only
         if let Some(field_name) = element.path.split('.').last() {
-            // Use the cleaned field name (without [x]) for tracking duplicates
             let clean_field_name = field_name.trim_end_matches("[x]");
             if !added_fields.contains(clean_field_name) {
                 generate_element_definition(
                     element,
-                    type_name,
+                    type_name, // Pass the current struct/backbone name
                     output,
                     cycles,
                     all_allowed_elements,
@@ -571,36 +545,59 @@ fn generate_element_definition(
             "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
             "http://hl7.org/fhirpath/System.Time" => "std::string::String",
             "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-            "Element" | "BackboneElement" => &generate_type_name(&element.path), // Use path for BackboneElement type name
-            _ => &capitalize_first_letter(&ty.code),
+            // Use generate_type_name for BackboneElement/Element to get specific names like PatientContact
+            "Element" | "BackboneElement" => &generate_type_name(&element.path),
+            _ => &capitalize_first_letter(&ty.code), // Default: Capitalize the FHIR type code
         };
 
-        let base_type = if let Some(content_ref) = &element.content_reference {
+        let mut base_type = if let Some(content_ref) = &element.content_reference {
             if content_ref.starts_with('#') {
                 // If it's a contentReference, generate the type name from the reference path
-                generate_type_name(&content_ref[1..])
+                // Find the element definition by ID (which should match the content_ref without '#')
+                let ref_id = &content_ref[1..];
+                all_allowed_elements
+                    .iter()
+                    .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
+                    .map(|referenced_element| generate_type_name(&referenced_element.path))
+                    .unwrap_or_else(|| {
+                        eprintln!("Warning: Could not resolve contentReference: {}", content_ref);
+                        "UnknownType".to_string() // Fallback or error
+                    })
             } else {
-                base_type.to_string()
+                base_type_raw.to_string() // Should not happen for contentReference?
             }
         } else {
-            base_type.to_string()
+            base_type_raw.to_string()
         };
+
+        // Ensure primitive types use the generated type alias (e.g., String, Boolean)
+        // Check if base_type matches a known primitive alias we generate
+        match base_type.as_str() {
+            "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
+            "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
+            "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
+            "Uuid" | "Xhtml" => {
+                // It's a primitive type alias, keep it as is.
+            }
+            _ => {
+                // If it's not a primitive alias, assume it's a complex type/resource/backbone element name.
+                // No change needed here, base_type should already be the correct struct name.
+            }
+        }
+
 
         let mut type_str = if field_name.ends_with("[x]") {
             let base_name = field_name.trim_end_matches("[x]");
-            // Construct the correct UpperCamelCase enum name
             let enum_name = format!(
-                "{}Choice", // Use "Choice" suffix
+                "{}Choice",
                 format!(
                     "{}{}",
-                    capitalize_first_letter(type_name),
+                    capitalize_first_letter(type_name), // Use parent struct name
                     capitalize_first_letter(base_name)
                 )
             );
-            // For choice fields, we use flatten instead of rename
-            serde_attrs.clear(); // Clear any previous attributes
+            serde_attrs.clear();
             serde_attrs.push("flatten".to_string());
-            // Use the correctly generated enum name
             format!("Option<{}>", enum_name)
         } else if is_array {
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
@@ -609,47 +606,41 @@ fn generate_element_definition(
             serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", base_type)
         } else {
-            base_type.to_string()
+            base_type.clone() // Clone base_type here
         };
 
         // Add Box<> to break cycles
-        let from_struct_name = type_name; // The struct we are currently generating
-        let field_type_name = &base_type; // The type of the field being generated
+        let from_struct_name = type_name;
+        let field_type_name = &base_type; // Use the potentially generated backbone name
 
-        // Check if this specific field relationship is part of a detected cycle
         if cycles.contains(&(from_struct_name.clone(), field_type_name.clone())) ||
-           // Also check the reverse for bidirectional cycles like Bundle <-> Resource
            cycles.contains(&(field_type_name.clone(), from_struct_name.clone()))
         {
-            // Wrap the type in Box<>, handling Option and Vec correctly
             if type_str.starts_with("Option<Vec<") {
-                // Option<Vec<T>> -> Option<Vec<Box<T>>>
                 let inner = &type_str[12..type_str.len() - 2];
                 type_str = format!("Option<Vec<Box<{}>>>", inner);
             } else if type_str.starts_with("Option<") {
-                // Option<T> -> Option<Box<T>>
                 let inner = &type_str[7..type_str.len() - 1];
                 type_str = format!("Option<Box<{}>>", inner);
             } else if type_str.starts_with("Vec<") {
-                // Vec<T> -> Vec<Box<T>>
                 let inner = &type_str[4..type_str.len() - 1];
                 type_str = format!("Vec<Box<{}>>", inner);
             } else {
-                // T -> Box<T>
                 type_str = format!("Box<{}>", type_str);
             }
         } else if from_struct_name == "Parameters" && field_name == "resource" {
-            // Use field_name here
-            // Explicitly Box Parameters.resource to break cycle with Resource enum
-            type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource" here
+             // Explicitly Box Parameters.resource
+            type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource"
+        } else if from_struct_name == "Bundle" && field_name == "resource" {
+             // Explicitly Box Bundle.entry.resource
+            type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource"
         }
 
-        // Output consolidated serde attributes if any exist
+
         if !serde_attrs.is_empty() {
             output.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
         }
 
-        // For choice fields, strip the [x] from the field name
         let clean_field_name = if rust_field_name.ends_with("[x]") {
             rust_field_name.trim_end_matches("[x]").to_string()
         } else {
