@@ -597,10 +597,32 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Serialization helper struct definition is now moved before serialize_impl
 
-    // Return an empty TokenStream to test for parsing interference
-    let expanded = quote! {};
+    // Define the extension helper struct for Deserialize here as well
+    let deserialize_extension_helper_def = quote! {
+        #[derive(::serde::Deserialize)] // Use Deserialize from use statement
+        struct #extension_helper_name<E> {
+             #[serde(default)]
+             id: ::std::option::Option<String>,
+             #[serde(default)]
+             extension: ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
 
-    // For debugging: Print the generated code (will be empty)
+
+    // Combine implementations, placing helper definitions *before* the main impls
+    let expanded = quote! {
+        // Define all helper types first
+        #serialize_helper_struct_def
+        #field_enum
+        #field_visitor_impl
+        #deserialize_extension_helper_def
+
+        // Then define the main impls
+        #serialize_impl
+        #deserialize_impl
+    };
+
+    // For debugging: Print the generated code
     // println!("{}", expanded.to_string());
 
     expanded.into()
