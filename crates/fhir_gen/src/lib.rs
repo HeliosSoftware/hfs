@@ -126,7 +126,11 @@ fn is_primitive_type(def: &StructureDefinition) -> bool {
     def.kind == "primitive-type"
 }
 
-fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
+fn generate_code(
+    bundle: Bundle,
+    output_path: impl AsRef<Path>,
+    resource_names: &mut std::collections::HashSet<String>, // Add parameter to collect resource names
+) -> io::Result<()> { // Signature already returns io::Result<()>
     let mut all_elements: Vec<&ElementDefinition> = Vec::new(); // Store references
     let mut generated_structs_code = String::new(); // Accumulate struct code
 
