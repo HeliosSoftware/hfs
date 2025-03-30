@@ -564,10 +564,10 @@ fn generate_element_definition(
                         "UnknownType".to_string() // Fallback or error
                     })
             } else {
-                base_type_raw.to_string() // Should not happen for contentReference?
+                base_type.to_string() // Corrected typo: base_type_raw -> base_type
             }
         } else {
-            base_type_raw.to_string()
+            base_type.to_string() // Corrected typo: base_type_raw -> base_type
         };
 
         // Ensure primitive types use the generated type alias (e.g., String, Boolean)

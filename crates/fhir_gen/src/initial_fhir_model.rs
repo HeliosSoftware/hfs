@@ -260,6 +260,15 @@ pub struct StructureDefinitionContext {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct StructureDefinitionSnapshot { // Added this struct definition
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub element: Option<Vec<ElementDefinition>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StructureDefinitionSnapshotOrDifferential {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -690,7 +699,7 @@ pub struct Element {
     pub extension: Option<Vec<Extension>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)] // Added Clone
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
@@ -804,7 +813,7 @@ pub struct ElementDefinitionConstraint {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)] // Added Default
 #[serde(tag = "resourceType")]
 pub struct StructureDefinition {
     pub id: Option<String>,
