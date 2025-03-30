@@ -525,9 +525,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Execute the construction logic (generated outside)
+                        // Construct Element fields *after* the loop using temp variables
                         #(#element_construction_logic)*
-
 
                         // Construct the final struct using the final field variables
                         Ok(#name {
