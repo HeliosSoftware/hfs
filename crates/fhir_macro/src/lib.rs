@@ -2,8 +2,15 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{format_ident, quote}; // Added format_ident back
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, PathArguments, // Removed Meta, NestedMeta
-    Type, parse_macro_input,
+    Data,
+    DeriveInput,
+    Fields,
+    GenericArgument,
+    Ident,
+    LitStr,
+    PathArguments, // Removed Meta, NestedMeta
+    Type,
+    parse_macro_input,
 }; // Added Ident back
 // Removed unused HashMap import
 
@@ -58,7 +65,6 @@ fn rust_to_fhir_name(ident: &Ident) -> String {
     camel_case
 }
 
-
 #[proc_macro_derive(FhirSerde)]
 pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -98,13 +104,42 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     if type_path.path.segments.len() == 1 {
                         let segment = &type_path.path.segments[0];
                         if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                            if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
-                                let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
-                                match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") }
-                            } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
-                        } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
-                    } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
-                } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
+                            if (segment.ident == "Element" && args.args.len() == 2)
+                                || (segment.ident == "DecimalElement" && args.args.len() == 1)
+                            {
+                                let e_arg = if segment.ident == "Element" {
+                                    &args.args[1]
+                                } else {
+                                    &args.args[0]
+                                };
+                                match e_arg {
+                                    GenericArgument::Type(t) => t,
+                                    _ => panic!("Expected Type for E"),
+                                }
+                            } else {
+                                panic!(
+                                    "Unsupported Element type structure: {}",
+                                    quote!(#inner_ty).to_string()
+                                );
+                            }
+                        } else {
+                            panic!(
+                                "Element type missing generics: {}",
+                                quote!(#inner_ty).to_string()
+                            );
+                        }
+                    } else {
+                        panic!(
+                            "Unsupported Element type path: {}",
+                            quote!(#inner_ty).to_string()
+                        );
+                    }
+                } else {
+                    panic!(
+                        "Expected Element or DecimalElement type, found: {}",
+                        quote!(#inner_ty).to_string()
+                    );
+                };
 
                 // Calculate contribution to field count
                 field_count_calculation.push(quote! {
@@ -185,7 +220,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     }
     let mut field_infos = Vec::new();
 
-    for (_idx, field) in fields.iter().enumerate() { // Prefix idx with _
+    for (_idx, field) in fields.iter().enumerate() {
+        // Prefix idx with _
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
         // Convert Rust field name to FHIR JSON name (camelCase)
@@ -208,16 +244,16 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 }
             }
             // Ensure first char is uppercase even if original starts with non-alphabetic
-             if let Some(first) = camel_case.chars().next() {
-                 if !first.is_uppercase() {
-                     // This case is less likely with typical field names but handles edge cases
-                     camel_case.insert(0, first.to_ascii_uppercase());
-                     camel_case.remove(1);
-                 }
-             } else {
-                 // Handle empty or unusual field names if necessary, though unlikely
-                 camel_case = format!("Field{}", field_ident); // Fallback name
-             }
+            if let Some(first) = camel_case.chars().next() {
+                if !first.is_uppercase() {
+                    // This case is less likely with typical field names but handles edge cases
+                    camel_case.insert(0, first.to_ascii_uppercase());
+                    camel_case.remove(1);
+                }
+            } else {
+                // Handle empty or unusual field names if necessary, though unlikely
+                camel_case = format!("Field{}", field_ident); // Fallback name
+            }
 
             camel_case
         };
@@ -225,8 +261,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         // Append "Underscore" for the underscore variant name
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
-
-        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
+        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) {
+            // Prefix is_option with _
             Some(inner) => (true, inner),
             None => (false, field_ty), // If not Option, inner_ty is the same as ty
         };
@@ -251,13 +287,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         if is_element {
             field_enum_variants.push(quote! { #underscore_ident_enum });
             // Use #field_enum_name instead of Field
-            field_match_arms.push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
+            field_match_arms
+                .push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
             field_strings.push(underscore_name); // Add underscore name only for element types
         }
     }
     // Add Ignore variant for unknown fields
     field_enum_variants.push(quote! { Ignore });
-     // Use #field_enum_name instead of Field
+    // Use #field_enum_name instead of Field
     field_match_arms.push(quote! { _ => Ok(#field_enum_name::Ignore) });
 
     // Unique names are now generated before the loop
@@ -323,42 +360,75 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ty = info.ty; // Use the original field type (Option<...> or T)
 
         // Declare the final variable matching the struct field type, explicitly using None path
-        visitor_field_defs.push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
+        visitor_field_defs
+            .push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
 
         if info.is_element {
             // Declare temporary variables for element parts
             let inner_ty = info.inner_ty; // Element<V, E> or DecimalElement<E>
-             // Extract V and E types from Element<V, E> or DecimalElement<E>
+            // Extract V and E types from Element<V, E> or DecimalElement<E>
             let (val_ty, ext_ty) = if let Type::Path(type_path) = inner_ty {
                 if type_path.path.segments.len() == 1 {
                     let segment = &type_path.path.segments[0];
                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
                         if segment.ident == "Element" && args.args.len() == 2 {
-                            let v_arg = &args.args[0]; let e_arg = &args.args[1];
-                            let v_type = match v_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") };
-                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            let v_arg = &args.args[0];
+                            let e_arg = &args.args[1];
+                            let v_type = match v_arg {
+                                GenericArgument::Type(t) => t,
+                                _ => panic!("Expected Type for V"),
+                            };
+                            let e_type = match e_arg {
+                                GenericArgument::Type(t) => t,
+                                _ => panic!("Expected Type for E"),
+                            };
                             (v_type.clone(), e_type.clone())
                         } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
-                            let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                            let precise_decimal_type =
+                                syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
                             let e_arg = &args.args[0];
-                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            let e_type = match e_arg {
+                                GenericArgument::Type(t) => t,
+                                _ => panic!("Expected Type for E"),
+                            };
                             (precise_decimal_type, e_type.clone())
-                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
-                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
-                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
-            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
+                        } else {
+                            panic!(
+                                "Unsupported Element type structure: {}",
+                                quote!(#inner_ty).to_string()
+                            );
+                        }
+                    } else {
+                        panic!(
+                            "Element type missing generics: {}",
+                            quote!(#inner_ty).to_string()
+                        );
+                    }
+                } else {
+                    panic!(
+                        "Unsupported Element type path: {}",
+                        quote!(#inner_ty).to_string()
+                    );
+                }
+            } else {
+                panic!(
+                    "Expected Element or DecimalElement type, found: {}",
+                    quote!(#inner_ty).to_string()
+                );
+            };
 
             let val_field = format_ident!("{}_value", field_ident);
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
 
             // Use fully qualified paths for Option and Vec
-            visitor_field_defs.push(quote! { let mut #val_field: ::std::option::Option<#val_ty> = None; });
-            visitor_field_defs.push(quote! { let mut #id_field: ::std::option::Option<String> = None; });
+            visitor_field_defs
+                .push(quote! { let mut #val_field: ::std::option::Option<#val_ty> = None; });
+            visitor_field_defs
+                .push(quote! { let mut #id_field: ::std::option::Option<String> = None; });
             visitor_field_defs.push(quote! { let mut #ext_field: ::std::option::Option<::std::vec::Vec<#ext_ty>> = None; });
         }
     }
-
 
     // Generate map assignments (assign to temp vars or final vars)
     for info in &field_infos {
@@ -380,12 +450,18 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     camel_case.push(c);
                 }
             }
-             if let Some(first) = camel_case.chars().next() { if !first.is_uppercase() { camel_case.insert(0, first.to_ascii_uppercase()); camel_case.remove(1); } } else { camel_case = format!("Field{}", field_ident); }
+            if let Some(first) = camel_case.chars().next() {
+                if !first.is_uppercase() {
+                    camel_case.insert(0, first.to_ascii_uppercase());
+                    camel_case.remove(1);
+                }
+            } else {
+                camel_case = format!("Field{}", field_ident);
+            }
             camel_case
         };
         let field_ident_enum = format_ident!("{}", field_ident_enum_str); // e.g., BirthDate
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
-
 
         if info.is_element {
             // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
@@ -394,19 +470,47 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
 
-             // Extract E type for the helper struct
+            // Extract E type for the helper struct
             let ext_ty = if let Type::Path(type_path) = inner_ty {
                 if type_path.path.segments.len() == 1 {
                     let segment = &type_path.path.segments[0];
                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                         if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
-                            let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
-                            match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") }
-                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
-                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
-                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
-            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
-
+                        if (segment.ident == "Element" && args.args.len() == 2)
+                            || (segment.ident == "DecimalElement" && args.args.len() == 1)
+                        {
+                            let e_arg = if segment.ident == "Element" {
+                                &args.args[1]
+                            } else {
+                                &args.args[0]
+                            };
+                            match e_arg {
+                                GenericArgument::Type(t) => t.clone(),
+                                _ => panic!("Expected Type for E"),
+                            }
+                        } else {
+                            panic!(
+                                "Unsupported Element type structure: {}",
+                                quote!(#inner_ty).to_string()
+                            );
+                        }
+                    } else {
+                        panic!(
+                            "Element type missing generics: {}",
+                            quote!(#inner_ty).to_string()
+                        );
+                    }
+                } else {
+                    panic!(
+                        "Unsupported Element type path: {}",
+                        quote!(#inner_ty).to_string()
+                    );
+                }
+            } else {
+                panic!(
+                    "Expected Element or DecimalElement type, found: {}",
+                    quote!(#inner_ty).to_string()
+                );
+            };
 
             // Assign to temporary _value field
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
@@ -429,7 +533,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     #ext_field = helper.extension;
                 }
             });
-
         } else {
             // Assign directly to the final field variable for non-elements
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
@@ -444,11 +547,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     }
 
     // Generate the final struct construction logic (remains the same)
-    let final_struct_fields: Vec<_> = field_infos.iter().map(|info| {
-        let field_ident = info.ident;
-        quote! { #field_ident: #field_ident }
-    }).collect();
-
+    let final_struct_fields: Vec<_> = field_infos
+        .iter()
+        .map(|info| {
+            let field_ident = info.ident;
+            quote! { #field_ident: #field_ident }
+        })
+        .collect();
 
     // visitor_struct_name already defined above with unique name
 
@@ -494,7 +599,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
              extension: ::std::option::Option<::std::vec::Vec<E>>,
         }
     };
-
 
     // --- Generate Deserialize Implementation ---
     // Note: Helper types will be defined *inside* the impl block below
@@ -567,7 +671,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-
     // Define the serialization helper struct definition *before* serialize_impl
     // Use updated helper name (no __)
     let serialize_helper_struct_def = quote! {
@@ -621,7 +724,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
         }
     };
-
 
     // Combine implementations. Helper types are now defined *inside* the impl blocks.
     let expanded = quote! {
