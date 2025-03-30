@@ -319,22 +319,22 @@ where
             fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> where Er: de::Error {
                 V::deserialize(de::value::BoolDeserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BoolDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Bool(v), &self)) // Use Er from visit_bool
+                }).map_err(|_e: <de::value::BoolDeserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Bool(v), &self)) // Removed <'_>
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
                  V::deserialize(de::value::I64Deserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::I64Deserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Signed(v), &self)) // Use Er from visit_i64
+                }).map_err(|_e: <de::value::I64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Signed(v), &self)) // Removed <'_>
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
                  V::deserialize(de::value::U64Deserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::U64Deserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Unsigned(v), &self)) // Use Er from visit_u64
+                }).map_err(|_e: <de::value::U64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Unsigned(v), &self)) // Removed <'_>
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
                  V::deserialize(de::value::F64Deserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::F64Deserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Float(v), &self)) // Use Er from visit_f64
+                }).map_err(|_e: <de::value::F64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Float(v), &self)) // Removed <'_>
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
                  V::deserialize(de::value::StrDeserializer::new(v)).map(|value| Element {
