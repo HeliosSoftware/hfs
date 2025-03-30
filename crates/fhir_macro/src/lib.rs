@@ -231,18 +231,21 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         // For Field enum and match arms
         field_enum_variants.push(quote! { #field_ident_enum });
-        field_match_arms.push(quote! { #original_name => Ok(Field::#field_ident_enum) });
+        // Use #field_enum_name instead of Field
+        field_match_arms.push(quote! { #original_name => Ok(#field_enum_name::#field_ident_enum) });
         field_strings.push(original_name.clone()); // Add original name
 
         if is_element {
             field_enum_variants.push(quote! { #underscore_ident_enum });
-            field_match_arms.push(quote! { #underscore_name => Ok(Field::#underscore_ident_enum) });
+            // Use #field_enum_name instead of Field
+            field_match_arms.push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
             field_strings.push(underscore_name); // Add underscore name only for element types
         }
     }
     // Add Ignore variant for unknown fields
     field_enum_variants.push(quote! { Ignore });
-    field_match_arms.push(quote! { _ => Ok(Field::Ignore) });
+     // Use #field_enum_name instead of Field
+    field_match_arms.push(quote! { _ => Ok(#field_enum_name::Ignore) });
 
     // Generate unique names for helper types
     let field_enum_name = format_ident!("{}Field", name);
