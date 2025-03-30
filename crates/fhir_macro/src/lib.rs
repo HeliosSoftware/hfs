@@ -481,6 +481,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 D: ::serde::Deserializer<'de>,
             {
+                // Bring necessary serde items into scope for generated code
+                use ::serde::Deserialize; // Needed for derive on helper struct
+                use ::serde::de; // Needed for de::Error
+
                 // Define ALL helper types *inside* the deserialize function's scope
                 // This ensures they have access to generic parameters if needed and avoids name collisions
 
