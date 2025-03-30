@@ -1,7 +1,8 @@
 use proc_macro::TokenStream;
-use quote::quote; // Removed format_ident
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Type, PathArguments, GenericArgument, LitStr, Meta, NestedMeta}; // Removed Ident, Added Meta, NestedMeta
+use quote::{quote, format_ident}; // Added format_ident back
+use syn::{parse_macro_input, DeriveInput, Data, Fields, Type, PathArguments, GenericArgument, LitStr, Meta, NestedMeta, Ident}; // Added Ident back
 use proc_macro2::Span;
+use std::collections::HashMap; // Added HashMap
 
 // Helper function to check if a type is Option<T> and return T
 fn get_option_inner_type(ty: &Type) -> Option<&Type> {
@@ -151,6 +152,274 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     }
 
+    // --- Generate Deserialize Implementation ---
+
+    // 1. Define Field enum
+    let mut field_enum_variants = Vec::new();
+    let mut field_match_arms = Vec::new();
+    let mut field_strings = Vec::new(); // For deserialize_struct
+
+    // Temporary struct to hold field info for deserialization generation
+    struct FieldInfo<'a> {
+        ident: &'a Ident,
+        ty: &'a Type,
+        original_name: String,
+        underscore_name: String,
+        is_element: bool,
+        is_option: bool,
+        inner_ty: &'a Type, // Type inside Option if applicable, otherwise same as ty
+    }
+    let mut field_infos = Vec::new();
+
+
+    for (idx, field) in fields.iter().enumerate() {
+        let field_ident = field.ident.as_ref().unwrap();
+        let field_ty = &field.ty;
+        let original_name = get_original_field_name(field);
+        let underscore_name = format!("_{}", original_name);
+
+        let field_ident_enum = format_ident!("{}", field_ident.to_string().to_uppercase());
+        let underscore_ident_enum = format_ident!("__{}", field_ident.to_string().to_uppercase()); // Prefix with __ to avoid clashes if field starts with _
+
+        let (is_option, inner_ty) = match get_option_inner_type(field_ty) {
+            Some(inner) => (true, inner),
+            None => (false, field_ty), // If not Option, inner_ty is the same as ty
+        };
+        let is_element = is_fhir_element_type(inner_ty);
+
+        field_infos.push(FieldInfo {
+            ident: field_ident,
+            ty: field_ty,
+            original_name: original_name.clone(),
+            underscore_name: underscore_name.clone(),
+            is_element,
+            is_option,
+            inner_ty,
+        });
+
+        // For Field enum and match arms
+        field_enum_variants.push(quote! { #field_ident_enum });
+        field_match_arms.push(quote! { #original_name => Ok(Field::#field_ident_enum) });
+        field_strings.push(original_name.clone()); // Add original name
+
+        if is_element {
+            field_enum_variants.push(quote! { #underscore_ident_enum });
+            field_match_arms.push(quote! { #underscore_name => Ok(Field::#underscore_ident_enum) });
+            field_strings.push(underscore_name); // Add underscore name only for element types
+        }
+    }
+    // Add Ignore variant for unknown fields
+    field_enum_variants.push(quote! { Ignore });
+    // Add catch-all arm for unknown fields
+    field_match_arms.push(quote! { _ => Ok(Field::Ignore) });
+
+
+    let field_enum = quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Field { #(#field_enum_variants),* }
+    };
+
+    // 2. Implement Visitor trait for Field enum
+    let field_visitor_impl = quote! {
+        struct FieldVisitor;
+
+        impl<'de> ::serde::de::Visitor<'de> for FieldVisitor {
+            type Value = Field;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a field identifier")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where E: ::serde::de::Error,
+            {
+                match value {
+                    #(#field_match_arms),*
+                }
+            }
+             // Handle borrowed strings as well
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where E: ::serde::de::Error,
+            {
+                 match value {
+                    #(#field_match_arms),*
+                }
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where D: ::serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+    };
+
+
+    // 3. Generate Visitor struct and its implementation
+    let mut visitor_field_defs = Vec::new();
+    let mut visitor_map_assignments = Vec::new();
+    let mut visitor_build_steps = Vec::new();
+    let struct_name_str = name.to_string();
+
+    for info in &field_infos {
+        let field_ident = info.ident;
+        let field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>)
+        let inner_ty = info.inner_ty; // Type inside Option (e.g., Element<String, E>)
+        let field_ident_enum = format_ident!("{}", field_ident.to_string().to_uppercase());
+
+        if info.is_element {
+            // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
+            let underscore_ident_enum = format_ident!("__{}", field_ident.to_string().to_uppercase());
+            let id_field = format_ident!("{}_id", field_ident);
+            let ext_field = format_ident!("{}_extension", field_ident);
+            let val_field = format_ident!("{}_value", field_ident);
+
+            // Extract V and E from Element<V, E> or DecimalElement<E>
+            let (val_ty_token, ext_ty_token) = if let Type::Path(type_path) = inner_ty {
+                 if type_path.path.segments.len() == 1 {
+                    let segment = &type_path.path.segments[0];
+                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if segment.ident == "Element" && args.args.len() == 2 {
+                             (args.args[0].clone(), args.args[1].clone())
+                        } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
+                            // For DecimalElement, value type is PreciseDecimal
+                            let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                            (GenericArgument::Type(precise_decimal_type), args.args[0].clone())
+                        } else {
+                            panic!("Unsupported Element type structure: {:?}", inner_ty);
+                        }
+                    } else {
+                         panic!("Element type missing generics: {:?}", inner_ty);
+                    }
+                 } else {
+                     panic!("Unsupported Element type path: {:?}", inner_ty);
+                 }
+            } else {
+                 panic!("Expected Element or DecimalElement type, found: {:?}", inner_ty);
+            };
+
+
+            visitor_field_defs.push(quote! { #val_field: Option<#val_ty_token> = None });
+            visitor_field_defs.push(quote! { #id_field: Option<String> = None });
+            visitor_field_defs.push(quote! { #ext_field: Option<Vec<#ext_ty_token>> = None });
+
+            // Deserialize the value part (fieldName)
+            visitor_map_assignments.push(quote! {
+                Field::#field_ident_enum => {
+                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#info.original_name)); }
+                    #val_field = Some(map.next_value()?);
+                }
+            });
+
+            // Deserialize the extension part (_fieldName)
+            visitor_map_assignments.push(quote! {
+                 Field::#underscore_ident_enum => {
+                    // Define a helper struct to deserialize id and extension
+                    #[derive(Deserialize)]
+                    struct ExtensionHelper<E> {
+                        id: Option<String>,
+                        extension: Option<Vec<E>>,
+                    }
+                    // Deserialize the helper struct
+                    let helper: ExtensionHelper<#ext_ty_token> = map.next_value()?;
+                    // Check for duplicates before assigning
+                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#info.underscore_name)); }
+                    #id_field = helper.id;
+                    #ext_field = helper.extension;
+                }
+            });
+
+            // Build the final Element/DecimalElement
+            visitor_build_steps.push(quote! {
+                let #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
+                    Some(#inner_ty {
+                        value: #val_field,
+                        id: #id_field,
+                        extension: #ext_field,
+                    })
+                } else {
+                    None
+                };
+            });
+
+        } else {
+            // Regular field (might be Option<T> or just T)
+            visitor_field_defs.push(quote! { #field_ident: #field_ty = None }); // Initialize Option<T> or T = None/Default? Let's stick to Option<T> for simplicity in visitor
+            visitor_map_assignments.push(quote! {
+                Field::#field_ident_enum => {
+                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#info.original_name)); }
+                    #field_ident = Some(map.next_value()?);
+                }
+            });
+             // No build step needed, just use the value directly
+             // If the original field was not Option, we need to unwrap or handle None later
+             if info.is_option {
+                 visitor_build_steps.push(quote! { let #field_ident = #field_ident; }); // Already Option<T>
+             } else {
+                 // If original field was T, unwrap the Option<T> from visitor or error if None
+                 visitor_build_steps.push(quote! {
+                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#info.original_name))?;
+                 });
+             }
+        }
+    }
+
+    let visitor_struct_name = format_ident!("{}Visitor", name);
+
+    let deserialize_impl = quote! {
+        #field_enum
+        #field_visitor_impl
+
+        struct #visitor_struct_name;
+
+        impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+            type Value = #name;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(concat!("struct ", #struct_name_str))
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+            where
+                V: ::serde::de::MapAccess<'de>,
+            {
+                // Initialize Option fields for the visitor
+                #(#visitor_field_defs;)*
+
+                // Loop through fields in the JSON map
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        #(#visitor_map_assignments)*
+                        Field::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                    }
+                }
+
+                // Combine parts for Element fields and check required fields
+                #(#visitor_build_steps)*
+
+                // Construct the final struct
+                Ok(#name {
+                    #(#field_infos.iter().map(|info| info.ident)),*
+                })
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                // Define the fields Serde should expect
+                const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
+                deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
+            }
+        }
+    };
+
+
+    // --- Combine Serialize and Deserialize ---
     let serialize_impl = quote! {
         impl ::serde::Serialize for #name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -174,27 +443,15 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // --- Generate Deserialize Implementation (Placeholder for now) ---
-    // TODO: Implement the complex deserialization logic
-    // Mark as unused for now
-    let _deserialize_impl = quote! {
-         // Placeholder - Use standard derive for now until custom logic is implemented
-         // This will NOT handle the _fieldName correctly yet.
-         #[derive(::serde::Deserialize)]
-         #[serde(rename = "PLACEHOLDER_STRUCT_NAME")] // Avoid conflict
-         struct #name; // This needs to be replaced with the actual struct definition + custom impl
-
-         // We need a custom Deserialize impl here that uses a visitor
-         // to handle fieldName and _fieldName merging.
-         // This is complex and will be added in the next step.
-    };
-
 
     // Combine implementations
     let expanded = quote! {
         #serialize_impl
-        // #_deserialize_impl // Add this back once implemented
+        #deserialize_impl // Add the deserialize implementation
     };
+
+    // For debugging: Print the generated code
+    // println!("{}", expanded.to_string());
 
     expanded.into()
 }
