@@ -572,8 +572,7 @@ fn generate_element_definition(
             "http://hl7.org/fhirpath/System.DateTime" => "std::string::String",
             "http://hl7.org/fhirpath/System.Time" => "std::string::String",
             "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
-            "Element" | "BackboneElement" => &generate_type_name(&element.path),
-            "BackboneElement" => &generate_type_name(&element.path), // Use path for BackboneElement type name
+            "Element" | "BackboneElement" => &generate_type_name(&element.path), // Use path for BackboneElement type name
             _ => &capitalize_first_letter(&ty.code),
         };
 
