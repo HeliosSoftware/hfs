@@ -372,7 +372,7 @@ fn process_struct_elements(
             // Include direct children (e.g., "Patient.identifier")
             path_parts.len() > 1 && path_parts[0] == type_name.as_str()
         })
-        .copied() // Copy the references (&ElementDefinition is Copy)
+        // Collect the references directly
         .collect();
 
 
