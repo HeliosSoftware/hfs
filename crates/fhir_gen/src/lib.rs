@@ -194,12 +194,18 @@ fn generate_code(
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    // Add PartialEq here
+    output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
     for resource in resources {
-        output.push_str(&format!("    {}({}),\n", resource, resource));
+        if resource == "Bundle" {
+            // Apply Box for the recursive Bundle variant
+            output.push_str(&format!("    {}(Box<{}>),\n", resource, resource));
+        } else {
+            output.push_str(&format!("    {}({}),\n", resource, resource));
+        }
     }
 
     output.push_str("}\n\n");
@@ -337,13 +343,10 @@ fn detect_struct_cycles(
         }
     }
 
-    // Add cycle from Bundle to Resource since Bundle.issues contains Resources (an specially generated enum) beginning in R5
-    if elements
-        .iter()
-        .any(|e| e.id.as_ref().map_or(false, |id| id == "Bundle.issues"))
-    {
-        cycles.insert(("Bundle".to_string(), "Resource".to_string()));
-    }
+    // Explicitly add known cycles that might not be detected by the simple logic above
+    // (e.g., involving the generated Resource enum or specific FHIR patterns)
+    cycles.insert(("Bundle".to_string(), "Resource".to_string()));
+    cycles.insert(("Resource".to_string(), "Bundle".to_string())); // Ensure bidirectional check
 
     cycles
 }
@@ -435,7 +438,7 @@ fn process_struct_elements(
             capitalize_first_letter(type_name)
         ));
 
-        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n"); // Keep Serialize, Deserialize for choice enums
+        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n"); // Add PartialEq
         output.push_str("#[serde(rename_all = \"camelCase\")]\n");
         output.push_str(&format!("pub enum {} {{\n", enum_name));
 
@@ -570,11 +573,13 @@ fn generate_element_definition(
             "http://hl7.org/fhirpath/System.Time" => "std::string::String",
             "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
             "Element" | "BackboneElement" => &generate_type_name(&element.path),
+            "BackboneElement" => &generate_type_name(&element.path), // Use path for BackboneElement type name
             _ => &capitalize_first_letter(&ty.code),
         };
 
         let base_type = if let Some(content_ref) = &element.content_reference {
             if content_ref.starts_with('#') {
+                 // If it's a contentReference, generate the type name from the reference path
                 generate_type_name(&content_ref[1..])
             } else {
                 base_type.to_string()
@@ -604,21 +609,26 @@ fn generate_element_definition(
             base_type.to_string()
         };
 
-        // Add Box<> to break cycles (only to the "to" type in the cycle)
-        if let Some(field_type) = element.r#type.as_ref().and_then(|t| t.first()) {
-            let from_type = element.path.split('.').next().unwrap_or("");
-            if !from_type.is_empty() {
-                for (cycle_from, cycle_to) in cycles.iter() {
-                    if cycle_from == from_type && cycle_to == &field_type.code {
-                        // Add Box<> around the type, preserving Option if present
-                        if type_str.starts_with("Option<") {
-                            type_str = format!("Option<Box<{}>>", &type_str[7..type_str.len() - 1]);
-                        } else {
-                            type_str = format!("Box<{}>", type_str);
-                        }
-                        break;
-                    }
-                }
+        // Add Box<> to break cycles
+        let from_struct_name = type_name; // The struct we are currently generating
+        let field_type_name = &base_type; // The type of the field being generated
+
+        // Check if this specific field relationship is part of a detected cycle
+        if cycles.contains(&(from_struct_name.clone(), field_type_name.clone())) ||
+           // Also check the reverse for bidirectional cycles like Bundle <-> Resource
+           cycles.contains(&(field_type_name.clone(), from_struct_name.clone())) {
+            // Wrap the type in Box<>, handling Option and Vec correctly
+            if type_str.starts_with("Option<Vec<") { // Option<Vec<T>> -> Option<Vec<Box<T>>>
+                let inner = &type_str[12..type_str.len() - 2];
+                type_str = format!("Option<Vec<Box<{}>>>", inner);
+            } else if type_str.starts_with("Option<") { // Option<T> -> Option<Box<T>>
+                let inner = &type_str[7..type_str.len() - 1];
+                type_str = format!("Option<Box<{}>>", inner);
+            } else if type_str.starts_with("Vec<") { // Vec<T> -> Vec<Box<T>>
+                let inner = &type_str[4..type_str.len() - 1];
+                type_str = format!("Vec<Box<{}>>", inner);
+            } else { // T -> Box<T>
+                type_str = format!("Box<{}>", type_str);
             }
         }
 
