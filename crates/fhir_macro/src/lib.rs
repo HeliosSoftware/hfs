@@ -503,7 +503,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Need Deserialize in scope for helper derives
                 use ::serde::Deserialize;
 
-                // Helper types (Field enum, FieldVisitor, ExtensionHelper) are now defined outside
+                // Define helper types (Field enum, FieldVisitor, ExtensionHelper) *inside* the deserialize function scope
+                #field_enum
+                #field_visitor_impl
+                #deserialize_extension_helper_def
 
                 // Define the main visitor struct *inside* the deserialize function scope
                 struct #visitor_struct_name;
@@ -566,6 +569,18 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
     // --- Combine Serialize and Deserialize ---
+    // Define the serialization helper struct definition *before* serialize_impl
+    // Use updated helper name (no __)
+    let serialize_helper_struct_def = quote! {
+        #[derive(::serde::Serialize)] // Use Serialize from the use statement above
+        struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: &'a ::std::option::Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
     let serialize_impl = quote! {
         impl ::serde::Serialize for #name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -577,7 +592,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Need Serialize in scope for the helper derive
                 use ::serde::Serialize;
 
-                // Serialization helper struct is now defined outside
+                // Define the serialization helper struct *inside* the impl block
+                #serialize_helper_struct_def
 
                 // Calculate the number of fields to serialize
                 let mut count = 0;
@@ -594,8 +610,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Serialization helper struct definition is now moved before serialize_impl
-
     // Define the extension helper struct for Deserialize here as well
     // Use updated helper name (no __)
     let deserialize_extension_helper_def = quote! {
@@ -609,16 +623,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
 
-    // Combine implementations, defining helper types directly before the impls
-    // Removed the const _: () = { ... }; block
+    // Combine implementations. Helper types are now defined *inside* the impl blocks.
     let expanded = quote! {
-        // Define all helper types first, directly in the generated code scope
-        #serialize_helper_struct_def
-        #deserialize_extension_helper_def
-        #field_enum
-        #field_visitor_impl
-
-        // Then define the main impls that use these helpers
+        // Define the main impls that use these helpers
         #serialize_impl
         #deserialize_impl
     };
