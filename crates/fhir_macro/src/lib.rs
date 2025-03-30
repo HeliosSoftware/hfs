@@ -583,10 +583,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Combine implementations
+    // Combine implementations, wrapping everything in a const block for isolation
     let expanded = quote! {
-        // Define the moved helper structs/enums here, outside the impl blocks
-        #serialize_helper_struct_def // Use the defined variable
+        const _: () = {
+            // Define the moved helper structs/enums here, inside the const block
+            #serialize_helper_struct_def // Use the defined variable
         #field_enum
         #field_visitor_impl
         // Define the extension helper struct here as well
@@ -598,8 +599,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
              extension: ::std::option::Option<::std::vec::Vec<E>>,
         }
 
-        #serialize_impl
-        #deserialize_impl // Restore Deserialize impl
+            #serialize_impl
+            #deserialize_impl // Restore Deserialize impl
+        }; // End of const block
     };
 
     // For debugging: Print the generated code
