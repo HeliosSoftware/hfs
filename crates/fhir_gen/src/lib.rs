@@ -193,8 +193,8 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    // Use FhirSerde for the Resource enum as well
-    output.push_str("#[derive(Debug, FhirSerde)]\n");
+    // Resource enum should derive standard traits, not FhirSerde
+    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n"); // Add standard derives
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 

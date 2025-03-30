@@ -245,6 +245,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
             where E: ::serde::de::Error,
             {
+                 // Use the unique enum name
                 match value {
                     #(#field_match_arms),*
                 }
