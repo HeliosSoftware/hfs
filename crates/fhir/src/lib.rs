@@ -1,8 +1,9 @@
 use rust_decimal::Decimal;
 use serde::{
+    Deserialize,
+    Serialize,
     de::{self, Deserializer, MapAccess, Visitor}, // Removed Unexpected
-    ser::{Serializer, SerializeStruct}, // Added SerializeStruct
-    Deserialize, Serialize,
+    ser::{SerializeStruct, Serializer},           // Added SerializeStruct
 };
 use std::marker::PhantomData; // Re-added PhantomData
 // Removed unused RawValue import
@@ -52,12 +53,17 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
         match json_value {
             serde_json::Value::String(s) => {
                 // If it's a string, parse it directly
-                s.parse::<Decimal>().map(PreciseDecimal).map_err(de::Error::custom)
+                s.parse::<Decimal>()
+                    .map(PreciseDecimal)
+                    .map_err(de::Error::custom)
             }
             serde_json::Value::Number(n) => {
                 // If it's a number, convert it to a string first, then parse.
                 // This preserves the scale (e.g., 3.0 stays "3.0").
-                n.to_string().parse::<Decimal>().map(PreciseDecimal).map_err(de::Error::custom)
+                n.to_string()
+                    .parse::<Decimal>()
+                    .map(PreciseDecimal)
+                    .map_err(de::Error::custom)
             }
             other => {
                 // Handle other unexpected types
@@ -77,9 +83,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     }
 }
 
-
 // --- End Newtype ---
-
 
 // --- Visitor for Object Deserialization ---
 
@@ -109,29 +113,40 @@ where
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "id" => {
-                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                    if id.is_some() {
+                        return Err(de::Error::duplicate_field("id"));
+                    }
                     id = Some(map.next_value()?);
                 }
                 "extension" => {
-                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
+                    if extension.is_some() {
+                        return Err(de::Error::duplicate_field("extension"));
+                    }
                     extension = Some(map.next_value()?);
                 }
                 "value" => {
-                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                    if value.is_some() {
+                        return Err(de::Error::duplicate_field("value"));
+                    }
                     // Deserialize directly into Option<PreciseDecimal>
                     value = map.next_value()?;
                 }
                 // Ignore any unknown fields encountered
-                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
+                _ => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                }
             }
         }
 
-        Ok(DecimalElement { id, extension, value })
+        Ok(DecimalElement {
+            id,
+            extension,
+            value,
+        })
     }
 }
 
 // --- End Visitor ---
-
 
 #[cfg(feature = "R4")]
 pub mod r4;
@@ -261,24 +276,36 @@ where
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "id" => {
-                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                    if id.is_some() {
+                        return Err(de::Error::duplicate_field("id"));
+                    }
                     id = Some(map.next_value()?);
                 }
                 "extension" => {
-                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
+                    if extension.is_some() {
+                        return Err(de::Error::duplicate_field("extension"));
+                    }
                     extension = Some(map.next_value()?);
                 }
                 "value" => {
-                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                    if value.is_some() {
+                        return Err(de::Error::duplicate_field("value"));
+                    }
                     // Deserialize directly into Option<V>
                     value = Some(map.next_value()?);
                 }
                 // Ignore any unknown fields encountered
-                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
+                _ => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                }
             }
         }
 
-        Ok(Element { id, extension, value })
+        Ok(Element {
+            id,
+            extension,
+            value,
+        })
     }
 }
 // --- End Element Visitor ---
@@ -297,7 +324,7 @@ pub struct Element<V, E> {
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
     V: Deserialize<'de> + PartialEq + Eq, // Keep Eq for V if needed
-    E: Deserialize<'de>, // Remove PartialEq bound for E
+    E: Deserialize<'de>,                  // Remove PartialEq bound for E
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -314,63 +341,171 @@ where
             type Value = Element<V, E>;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a primitive value (string, number, boolean), an object, or null")
+                formatter
+                    .write_str("a primitive value (string, number, boolean), an object, or null")
             }
 
             // Handle primitive types by attempting to deserialize V and wrapping it
-            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> where Er: de::Error {
-                V::deserialize(de::value::BoolDeserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BoolDeserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Bool(v), &self)) // Removed <'_>
+            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::BoolDeserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::BoolDeserializer<Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Bool(v), &self)
+                        },
+                    ) // Removed <'_>
             }
-            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::I64Deserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::I64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Signed(v), &self)) // Removed <'_>
+            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::I64Deserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::I64Deserializer<Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Signed(v), &self)
+                        },
+                    ) // Removed <'_>
             }
-            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::U64Deserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::U64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Unsigned(v), &self)) // Removed <'_>
+            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::U64Deserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::U64Deserializer<Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Unsigned(v), &self)
+                        },
+                    ) // Removed <'_>
             }
-            fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::F64Deserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::F64Deserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Float(v), &self)) // Removed <'_>
+            fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::F64Deserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::F64Deserializer<Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Float(v), &self)
+                        },
+                    ) // Removed <'_>
             }
-            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::StrDeserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::StrDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Str(v), &self)) // Use Er from visit_str
+            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::StrDeserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::StrDeserializer<'_, Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Str(v), &self)
+                        },
+                    ) // Use Er from visit_str
             }
-            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::StringDeserializer::new(v.clone())).map(|value| Element { // Clone v for error message
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::StringDeserializer<Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Str(&v), &self)) // Use Er from visit_string
+            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::StringDeserializer::new(v.clone()))
+                    .map(|value| Element {
+                        // Clone v for error message
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::StringDeserializer<Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Str(&v), &self)
+                        },
+                    ) // Use Er from visit_string
             }
-             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
+            fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
                     id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BorrowedStrDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Str(v), &self)) // Use Er from visit_borrowed_str
+                }).map_err(|_e: <de::value::BorrowedStrDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Str(v), &self))
+                // Use Er from visit_borrowed_str
             }
-            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
-                 V::deserialize(de::value::BytesDeserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Bytes(v), &self)) // Use Er from visit_bytes
+            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                V::deserialize(de::value::BytesDeserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Bytes(v), &self)
+                        },
+                    ) // Use Er from visit_bytes
             }
-            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Use BytesDeserializer with a slice reference &v
-                 V::deserialize(de::value::BytesDeserializer::new(&v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                }).map_err(|_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| de::Error::invalid_type(de::Unexpected::Bytes(&v), &self)) // Use Er from visit_byte_buf
+            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                // Use BytesDeserializer with a slice reference &v
+                V::deserialize(de::value::BytesDeserializer::new(&v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    .map_err(
+                        |_e: <de::value::BytesDeserializer<'_, Er> as Deserializer>::Error| {
+                            de::Error::invalid_type(de::Unexpected::Bytes(&v), &self)
+                        },
+                    ) // Use Er from visit_byte_buf
             }
 
             // Handle null
-            fn visit_none<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
-                Ok(Element { id: None, extension: None, value: None })
+            fn visit_none<Er>(self) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: None,
+                })
             }
-            fn visit_unit<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
-                 Ok(Element { id: None, extension: None, value: None })
+            fn visit_unit<Er>(self) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(Element {
+                    id: None,
+                    extension: None,
+                    value: None,
+                })
             }
 
             // Handle Option<T> by visiting Some
@@ -394,7 +529,10 @@ where
             }
 
             // We don't expect sequences for a single Element
-            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error> where A: de::SeqAccess<'de> {
+            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
                 Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
             }
         }
@@ -409,7 +547,7 @@ where
 impl<V, E> Serialize for Element<V, E>
 where
     V: Serialize + PartialEq + Eq, // Keep Eq for V if needed
-    E: Serialize, // Remove PartialEq bound for E
+    E: Serialize,                  // Remove PartialEq bound for E
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -424,9 +562,15 @@ where
         } else {
             // Otherwise, serialize as an object containing id, extension, value if present
             let mut len = 0;
-            if self.id.is_some() { len += 1; }
-            if self.extension.is_some() { len += 1; }
-            if self.value.is_some() { len += 1; }
+            if self.id.is_some() {
+                len += 1;
+            }
+            if self.extension.is_some() {
+                len += 1;
+            }
+            if self.value.is_some() {
+                len += 1;
+            }
 
             let mut state = serializer.serialize_struct("Element", len)?;
             if let Some(id) = &self.id {
@@ -486,23 +630,69 @@ where
                 Ok(serde_json::Value::Object(map_value))
             }
 
-            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> { Ok(serde_json::Value::Bool(v)) }
-            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> { Ok(serde_json::Number::from(v).into()) }
-            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> { Ok(serde_json::Number::from(v).into()) }
+            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> {
+                Ok(serde_json::Value::Bool(v))
+            }
+            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> {
+                Ok(serde_json::Number::from(v).into())
+            }
+            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> {
+                Ok(serde_json::Number::from(v).into())
+            }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> {
-                Ok(serde_json::Number::from_f64(v).map(serde_json::Value::Number)
+                Ok(serde_json::Number::from_f64(v)
+                    .map(serde_json::Value::Number)
                     .unwrap_or(serde_json::Value::Null)) // Handle non-finite floats
             }
-            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error { Ok(serde_json::Value::String(v.to_owned())) }
-            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> { Ok(serde_json::Value::String(v)) }
-            fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error { Ok(serde_json::Value::String(v.to_owned())) }
-            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error { Ok(serde_json::Value::String(String::from_utf8_lossy(v).into_owned())) }
-            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er> where Er: de::Error { Ok(serde_json::Value::String(String::from_utf8_lossy(&v).into_owned())) }
-            fn visit_none<Er>(self) -> Result<Self::Value, Er> { Ok(serde_json::Value::Null) }
-            fn visit_some<De>(self, deserializer: De) -> Result<Self::Value, De::Error> where De: Deserializer<'de> { Deserialize::deserialize(deserializer) }
-            fn visit_unit<Er>(self) -> Result<Self::Value, Er> { Ok(serde_json::Value::Null) }
-            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error> where A: de::SeqAccess<'de> {
-                let vec: Vec<serde_json::Value> = Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(serde_json::Value::String(v.to_owned()))
+            }
+            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> {
+                Ok(serde_json::Value::String(v))
+            }
+            fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(serde_json::Value::String(v.to_owned()))
+            }
+            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(serde_json::Value::String(
+                    String::from_utf8_lossy(v).into_owned(),
+                ))
+            }
+            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
+            where
+                Er: de::Error,
+            {
+                Ok(serde_json::Value::String(
+                    String::from_utf8_lossy(&v).into_owned(),
+                ))
+            }
+            fn visit_none<Er>(self) -> Result<Self::Value, Er> {
+                Ok(serde_json::Value::Null)
+            }
+            fn visit_some<De>(self, deserializer: De) -> Result<Self::Value, De::Error>
+            where
+                De: Deserializer<'de>,
+            {
+                Deserialize::deserialize(deserializer)
+            }
+            fn visit_unit<Er>(self) -> Result<Self::Value, Er> {
+                Ok(serde_json::Value::Null)
+            }
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let vec: Vec<serde_json::Value> =
+                    Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
                 Ok(serde_json::Value::Array(vec))
             }
         }
@@ -513,14 +703,15 @@ where
             serde_json::Value::Object(map) => {
                 // If it's an object, deserialize using the DecimalElementObjectVisitor
                 let map_deserializer = de::value::MapDeserializer::new(map.into_iter());
-                map_deserializer.deserialize_map(DecimalElementObjectVisitor(PhantomData))
+                map_deserializer
+                    .deserialize_map(DecimalElementObjectVisitor(PhantomData))
                     .map_err(de::Error::custom)
             }
             // If it's a number or string, deserialize directly into PreciseDecimal
             value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
                 // Deserialize the primitive Value using PreciseDecimal's Deserialize impl
-                let precise_decimal = PreciseDecimal::deserialize(value)
-                    .map_err(de::Error::custom)?;
+                let precise_decimal =
+                    PreciseDecimal::deserialize(value).map_err(de::Error::custom)?;
 
                 Ok(DecimalElement {
                     id: None,
@@ -550,7 +741,6 @@ where
 }
 
 // Note: The custom Deserialize impl below handles both object and primitive cases.
-
 
 // Helper extension trait for serde_json::Value to get Unexpected type
 // Used in the custom Deserialize implementation below.
@@ -608,9 +798,15 @@ where
         // Otherwise, serialize as a struct with all present fields
         // Calculate the number of fields that are NOT None
         let mut len = 0;
-        if self.id.is_some() { len += 1; }
-        if self.extension.is_some() { len += 1; }
-        if self.value.is_some() { len += 1; }
+        if self.id.is_some() {
+            len += 1;
+        }
+        if self.extension.is_some() {
+            len += 1;
+        }
+        if self.value.is_some() {
+            len += 1;
+        }
 
         // Start serializing a struct with the calculated length
         let mut state = serializer.serialize_struct("DecimalElement", len)?;
@@ -627,7 +823,7 @@ where
 
         // Serialize 'value' field if it's Some
         if let Some(value) = &self.value {
-             // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
+            // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
             state.serialize_field("value", value)?;
         }
 
@@ -666,9 +862,9 @@ pub enum FhirDate {
 mod tests {
     // Keep existing imports
     use super::*;
+    use fhir_macro::FhirSerde;
     use rust_decimal_macros::dec;
-    use serde_json;
-    use fhir_macro::FhirSerde; // Import the derive macro
+    use serde_json; // Import the derive macro
 
     // Add Eq, Default derives
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -855,12 +1051,15 @@ mod tests {
             serde_json::from_value(json_value.clone()).expect("Deserialization from number failed");
 
         // Serialize back to string
-        let reserialized_string = serde_json::to_string(&element).expect("Serialization to string failed");
+        let reserialized_string =
+            serde_json::to_string(&element).expect("Serialization to string failed");
 
         // Verify the string representation is the JSON number 3.0 (as string "3.0")
-        assert_eq!(reserialized_string, expected_string,
+        assert_eq!(
+            reserialized_string, expected_string,
             "Original JSON Value: {:?}\nExpected String: {}\nReserialized String: {}",
-            json_value, expected_string, reserialized_string);
+            json_value, expected_string, reserialized_string
+        );
 
         // Also test with a string representation in the JSON input: "3.0"
         let json_str_input = r#""3.0""#; // Input is a JSON string "3.0"
@@ -871,26 +1070,33 @@ mod tests {
             serde_json::from_str(json_str_input).expect("Deserialization from string failed");
 
         // Serialize back to string
-        let reserialized_string_from_str = serde_json::to_string(&element_from_string).expect("Serialization to string failed");
+        let reserialized_string_from_str =
+            serde_json::to_string(&element_from_string).expect("Serialization to string failed");
 
         // Verify the string representation is the JSON number 3.0 (as string "3.0")
-        assert_eq!(reserialized_string_from_str, expected_string,
+        assert_eq!(
+            reserialized_string_from_str, expected_string,
             "Original JSON String: {}\nExpected String: {}\nReserialized String: {}",
-            json_str_input, expected_string, reserialized_string_from_str);
+            json_str_input, expected_string, reserialized_string_from_str
+        );
 
         // Test case from the failure log: parsing the string "3.0" directly
         let json_str = r#"3.0"#; // Input is bare number 3.0 in a string
         let parsed_value: serde_json::Value = serde_json::from_str(json_str).unwrap(); // Parsed as Number(3.0)
 
         let element_from_bare_string: DecimalElement<UnitTestExtension> =
-            serde_json::from_value(parsed_value.clone()).expect("Deserialization from bare string failed");
+            serde_json::from_value(parsed_value.clone())
+                .expect("Deserialization from bare string failed");
 
-        let reserialized_string_from_bare = serde_json::to_string(&element_from_bare_string).expect("Serialization failed");
+        let reserialized_string_from_bare =
+            serde_json::to_string(&element_from_bare_string).expect("Serialization failed");
 
         // Verify the string representation is the JSON number 3.0 (as string "3.0")
-        assert_eq!(reserialized_string_from_bare, expected_string,
+        assert_eq!(
+            reserialized_string_from_bare, expected_string,
             "Original bare string: {}\nParsed Value: {:?}\nExpected String: {}\nReserialized String: {}",
-            json_str, parsed_value, expected_string, reserialized_string_from_bare);
+            json_str, parsed_value, expected_string, reserialized_string_from_bare
+        );
     }
 
     // --- New tests for Element<V, E> ---
@@ -938,7 +1144,10 @@ mod tests {
     fn test_serialize_element_object() {
         let element = Element::<String, UnitTestExtension> {
             id: Some("elem-id".to_string()),
-            extension: Some(vec![UnitTestExtension { code: "ext1".to_string(), is_valid: true }]),
+            extension: Some(vec![UnitTestExtension {
+                code: "ext1".to_string(),
+                is_valid: true,
+            }]),
             value: Some("test_value".to_string()),
         };
         let json_string = serde_json::to_string(&element).unwrap();
@@ -957,39 +1166,49 @@ mod tests {
         assert_eq!(json_string_id_only, expected_json_id_only);
 
         // Test with only extension
-         let element_ext_only = Element::<String, UnitTestExtension> {
+        let element_ext_only = Element::<String, UnitTestExtension> {
             id: None,
-            extension: Some(vec![UnitTestExtension { code: "ext2".to_string(), is_valid: false }]),
+            extension: Some(vec![UnitTestExtension {
+                code: "ext2".to_string(),
+                is_valid: false,
+            }]),
             value: Some("test_value_ext".to_string()),
         };
         let json_string_ext_only = serde_json::to_string(&element_ext_only).unwrap();
-        let expected_json_ext_only = r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
+        let expected_json_ext_only =
+            r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
         assert_eq!(json_string_ext_only, expected_json_ext_only);
 
         // Test with id, extension, but no value
         let element_no_value = Element::<String, UnitTestExtension> {
             id: Some("elem-id-no-val".to_string()),
-            extension: Some(vec![UnitTestExtension { code: "ext3".to_string(), is_valid: true }]),
+            extension: Some(vec![UnitTestExtension {
+                code: "ext3".to_string(),
+                is_valid: true,
+            }]),
             value: None,
         };
         let json_string_no_value = serde_json::to_string(&element_no_value).unwrap();
         // Should serialize object without the "value" field
-        let expected_json_no_value = r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
-         assert_eq!(json_string_no_value, expected_json_no_value);
+        let expected_json_no_value =
+            r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
+        assert_eq!(json_string_no_value, expected_json_no_value);
     }
 
     #[test]
     fn test_deserialize_element_primitive() {
         // String primitive
         let json_string = r#""test_value""#;
-        let element: Element<String, UnitTestExtension> = serde_json::from_str(json_string).unwrap();
+        let element: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_string).unwrap();
         assert_eq!(element.id, None);
         assert_eq!(element.extension, None);
         assert_eq!(element.value, Some("test_value".to_string()));
 
         // Null primitive
         let json_null = "null";
-        let element_null: Element<String, UnitTestExtension> = serde_json::from_str(json_null).unwrap();
+        let element_null: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_null).unwrap();
         assert_eq!(element_null.id, None);
         assert_eq!(element_null.extension, None);
         assert_eq!(element_null.value, None);
@@ -997,58 +1216,88 @@ mod tests {
         // Number primitive
         let json_num = "123";
         let element_num: Element<i32, UnitTestExtension> = serde_json::from_str(json_num).unwrap();
-         assert_eq!(element_num.id, None);
+        assert_eq!(element_num.id, None);
         assert_eq!(element_num.extension, None);
         assert_eq!(element_num.value, Some(123));
 
         // Boolean primitive
         let json_bool = "true";
-        let element_bool: Element<bool, UnitTestExtension> = serde_json::from_str(json_bool).unwrap();
-         assert_eq!(element_bool.id, None);
+        let element_bool: Element<bool, UnitTestExtension> =
+            serde_json::from_str(json_bool).unwrap();
+        assert_eq!(element_bool.id, None);
         assert_eq!(element_bool.extension, None);
         assert_eq!(element_bool.value, Some(true));
     }
 
-     #[test]
+    #[test]
     fn test_deserialize_element_object() {
         // Full object
         let json_string = r#"{"id":"elem-id","extension":[{"code":"ext1","is_valid":true}],"value":"test_value"}"#;
-        let element: Element<String, UnitTestExtension> = serde_json::from_str(json_string).unwrap();
+        let element: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_string).unwrap();
         assert_eq!(element.id, Some("elem-id".to_string()));
-        assert_eq!(element.extension, Some(vec![UnitTestExtension { code: "ext1".to_string(), is_valid: true }]));
+        assert_eq!(
+            element.extension,
+            Some(vec![UnitTestExtension {
+                code: "ext1".to_string(),
+                is_valid: true
+            }])
+        );
         assert_eq!(element.value, Some("test_value".to_string()));
 
         // Object with missing value
-        let json_missing_value = r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
-        let element_missing_value: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_value).unwrap();
+        let json_missing_value =
+            r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
+        let element_missing_value: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_missing_value).unwrap();
         assert_eq!(element_missing_value.id, Some("elem-id-no-val".to_string()));
-        assert_eq!(element_missing_value.extension, Some(vec![UnitTestExtension { code: "ext3".to_string(), is_valid: true }]));
+        assert_eq!(
+            element_missing_value.extension,
+            Some(vec![UnitTestExtension {
+                code: "ext3".to_string(),
+                is_valid: true
+            }])
+        );
         assert_eq!(element_missing_value.value, None); // Value should be None
 
         // Object with missing extension
         let json_missing_ext = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
-        let element_missing_ext: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_ext).unwrap();
+        let element_missing_ext: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_missing_ext).unwrap();
         assert_eq!(element_missing_ext.id, Some("elem-id-only".to_string()));
         assert_eq!(element_missing_ext.extension, None);
         assert_eq!(element_missing_ext.value, Some("test_value_id".to_string()));
 
         // Object with missing id
-        let json_missing_id = r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
-        let element_missing_id: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_id).unwrap();
+        let json_missing_id =
+            r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
+        let element_missing_id: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_missing_id).unwrap();
         assert_eq!(element_missing_id.id, None);
-        assert_eq!(element_missing_id.extension, Some(vec![UnitTestExtension { code: "ext2".to_string(), is_valid: false }]));
+        assert_eq!(
+            element_missing_id.extension,
+            Some(vec![UnitTestExtension {
+                code: "ext2".to_string(),
+                is_valid: false
+            }])
+        );
         assert_eq!(element_missing_id.value, Some("test_value_ext".to_string()));
 
         // Object with only value
         let json_only_value_obj = r#"{"value":"test_value_only"}"#;
-        let element_only_value: Element<String, UnitTestExtension> = serde_json::from_str(json_only_value_obj).unwrap();
+        let element_only_value: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_only_value_obj).unwrap();
         assert_eq!(element_only_value.id, None);
         assert_eq!(element_only_value.extension, None);
-        assert_eq!(element_only_value.value, Some("test_value_only".to_string()));
+        assert_eq!(
+            element_only_value.value,
+            Some("test_value_only".to_string())
+        );
 
         // Empty object
         let json_empty_obj = r#"{}"#;
-        let element_empty_obj: Element<String, UnitTestExtension> = serde_json::from_str(json_empty_obj).unwrap();
+        let element_empty_obj: Element<String, UnitTestExtension> =
+            serde_json::from_str(json_empty_obj).unwrap();
         assert_eq!(element_empty_obj.id, None);
         assert_eq!(element_empty_obj.extension, None);
         assert_eq!(element_empty_obj.value, None); // Value is None when deserializing from empty object
@@ -1064,39 +1313,64 @@ mod tests {
 
         // Boolean when expecting i32 (primitive case)
         let json_bool = r#"true"#;
-        let result_bool: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_bool);
+        let result_bool: Result<Element<i32, UnitTestExtension>, _> =
+            serde_json::from_str(json_bool);
         assert!(result_bool.is_err());
         // Error comes from V::deserialize failing inside the visitor
-        assert!(result_bool.unwrap_err().to_string().contains("invalid type: boolean `true`, expected i32"));
+        assert!(
+            result_bool
+                .unwrap_err()
+                .to_string()
+                .contains("invalid type: boolean `true`, expected i32")
+        );
 
         // Object containing a boolean value when expecting Element<i32, _>
         let json_obj_bool_val = r#"{"value": true}"#;
-        let result_obj_bool: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_obj_bool_val);
+        let result_obj_bool: Result<Element<i32, UnitTestExtension>, _> =
+            serde_json::from_str(json_obj_bool_val);
         assert!(result_obj_bool.is_err());
         // Error comes from trying to deserialize the "value": true into Option<i32>
-        assert!(result_obj_bool.unwrap_err().to_string().contains("invalid type: boolean `true`, expected i32"));
+        assert!(
+            result_obj_bool
+                .unwrap_err()
+                .to_string()
+                .contains("invalid type: boolean `true`, expected i32")
+        );
 
         // Define a simple struct that CANNOT deserialize from primitive types
         // Add Eq derive
         #[derive(Deserialize, Debug, PartialEq, Eq)]
-        struct NonPrimitive { field: String }
+        struct NonPrimitive {
+            field: String,
+        }
 
         // Try deserializing a primitive string into Element<NonPrimitive, _>
         let json_prim_str = r#""hello""#;
-        let result_prim_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> = serde_json::from_str(json_prim_str);
+        let result_prim_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> =
+            serde_json::from_str(json_prim_str);
         assert!(result_prim_nonprim.is_err());
         // Error comes from V::deserialize failing inside the visitor
-        assert!(result_prim_nonprim.unwrap_err().to_string().contains("invalid type: string \"hello\", expected struct NonPrimitive"));
+        assert!(
+            result_prim_nonprim
+                .unwrap_err()
+                .to_string()
+                .contains("invalid type: string \"hello\", expected struct NonPrimitive")
+        );
 
         // Try deserializing an object into Element<NonPrimitive, _> (this should work if object has correct field)
         let json_obj_nonprim = r#"{"value": {"field": "world"}}"#;
-        let result_obj_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> = serde_json::from_str(json_obj_nonprim);
+        let result_obj_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> =
+            serde_json::from_str(json_obj_nonprim);
         assert!(result_obj_nonprim.is_ok());
         let element_obj_nonprim = result_obj_nonprim.unwrap();
         assert_eq!(element_obj_nonprim.id, None);
         assert_eq!(element_obj_nonprim.extension, None);
-        assert_eq!(element_obj_nonprim.value, Some(NonPrimitive{ field: "world".to_string() }));
-
+        assert_eq!(
+            element_obj_nonprim.value,
+            Some(NonPrimitive {
+                field: "world".to_string()
+            })
+        );
     }
 
     // --- Tests for FhirSerde derive macro (_fieldName logic) ---
@@ -1110,11 +1384,11 @@ mod tests {
 
         // Field with potential extension (_birthDate)
         // The FhirSerde macro should handle the 'birthDate'/'_birthDate' logic.
-        birth_date: Option<Element<String, UnitTestExtension>>,
+        birth_date: Option::<Element::<String, UnitTestExtension>>,
 
         // Another potentially extended field
         // The FhirSerde macro should handle the 'isActive'/'_isActive' logic.
-        is_active: Option<Element<bool, UnitTestExtension>>,
+        is_active: Option::<Element::<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
         count: Option<i32>,
@@ -1142,7 +1416,10 @@ mod tests {
             name: Some("Test2".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id".to_string()),
-                extension: Some(vec![UnitTestExtension { code: "note".to_string(), is_valid: true }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "note".to_string(),
+                    is_valid: true,
+                }]),
                 value: None,
             }),
             is_active: None,
@@ -1157,10 +1434,14 @@ mod tests {
             name: Some("Test3".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id-3".to_string()),
-                extension: Some(vec![UnitTestExtension { code:"text".to_string(), is_valid:false }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "text".to_string(),
+                    is_valid: false,
+                }]),
                 value: Some("1970-03-30".to_string()),
             }),
-            is_active: Some(Element { // Also test is_active field
+            is_active: Some(Element {
+                // Also test is_active field
                 id: None,
                 extension: None,
                 value: Some(true),
@@ -1175,15 +1456,20 @@ mod tests {
         let s4 = FhirSerdeTestStruct {
             name: Some("Test4".to_string()),
             birth_date: None,
-            is_active: Some(Element { // is_active has only extension
+            is_active: Some(Element {
+                // is_active has only extension
                 id: None,
-                extension: Some(vec![UnitTestExtension { code: "flag".to_string(), is_valid: true }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "flag".to_string(),
+                    is_valid: true,
+                }]),
                 value: None,
             }),
             count: None,
         };
         let json4 = serde_json::to_string(&s4).unwrap();
-        let expected4 = r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
+        let expected4 =
+            r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
         assert_eq!(json4, expected4);
 
         // Case 5: All optional fields are None
@@ -1221,7 +1507,10 @@ mod tests {
             name: Some("Test2".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id".to_string()),
-                extension: Some(vec![UnitTestExtension { code: "note".to_string(), is_valid: true }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "note".to_string(),
+                    is_valid: true,
+                }]),
                 value: None,
             }),
             is_active: None,
@@ -1236,7 +1525,10 @@ mod tests {
             name: Some("Test3".to_string()),
             birth_date: Some(Element {
                 id: Some("bd-id-3".to_string()),
-                extension: Some(vec![UnitTestExtension { code:"text".to_string(), is_valid:false }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "text".to_string(),
+                    is_valid: false,
+                }]),
                 value: Some("1970-03-30".to_string()),
             }),
             is_active: Some(Element {
@@ -1250,13 +1542,17 @@ mod tests {
         assert_eq!(s3, expected3); // Uncomment assertion
 
         // Case 4: birthDate field is missing, isActive has only extension
-        let json4 = r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
+        let json4 =
+            r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
         let expected4 = FhirSerdeTestStruct {
             name: Some("Test4".to_string()),
             birth_date: None,
             is_active: Some(Element {
                 id: None,
-                extension: Some(vec![UnitTestExtension { code: "flag".to_string(), is_valid: true }]),
+                extension: Some(vec![UnitTestExtension {
+                    code: "flag".to_string(),
+                    is_valid: true,
+                }]),
                 value: None,
             }),
             count: None,
@@ -1290,7 +1586,7 @@ mod tests {
         let s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap();
         assert_eq!(s6, expected6); // Uncomment assertion
 
-         // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
+        // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
         let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
         let expected7 = FhirSerdeTestStruct {
             name: None,
@@ -1309,13 +1605,20 @@ mod tests {
         let json8 = r#"{"birthDate":"1970-03-30", "birthDate":"1971-04-01"}"#;
         let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
         assert!(res8.is_err());
-        assert!(res8.unwrap_err().to_string().contains("duplicate field `birthDate`"));
+        assert!(
+            res8.unwrap_err()
+                .to_string()
+                .contains("duplicate field `birthDate`")
+        );
 
         // Case 9: Duplicate extension field (should error)
         let json9 = r#"{"_birthDate":{"id":"a"}, "_birthDate":{"id":"b"}}"#;
         let res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9);
         assert!(res9.is_err());
-        assert!(res9.unwrap_err().to_string().contains("duplicate field `_birthDate`"));
-
+        assert!(
+            res9.unwrap_err()
+                .to_string()
+                .contains("duplicate field `_birthDate`")
+        );
     }
 }
