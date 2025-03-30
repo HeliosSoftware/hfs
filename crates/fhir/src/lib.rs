@@ -1379,11 +1379,11 @@ mod tests {
 
         // Field with potential extension (_birthDate)
         // FhirSerde should handle the 'birthDate'/'_birthDate' logic based on the field name.
-        birth_date: Option<Element<String, UnitTestExtension>>,
+        birth_date: Option<Element::<String, UnitTestExtension>>, // Use turbofish as suggested by compiler
 
         // Another potentially extended field
         // FhirSerde should handle the 'isActive'/'_isActive' logic based on the field name.
-        is_active: Option<Element<bool, UnitTestExtension>>,
+        is_active: Option<Element::<bool, UnitTestExtension>>, // Use turbofish as suggested by compiler
 
         // A non-element field for good measure
         count: Option<i32>,
