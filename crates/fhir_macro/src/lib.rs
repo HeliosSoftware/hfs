@@ -553,14 +553,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Add use statements for serde traits/types needed within the impl
                 use serde::ser::{SerializeStruct, Serializer};
 
-                // Define the serialization helper struct ONCE here
-                #[derive(::serde::Serialize)]
-                struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    id: &'a ::std::option::Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
-                    extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
-                }
+                // Serialization helper struct is now defined outside this impl block
 
                 // Calculate the number of fields to serialize
                 let mut count = 0;
@@ -577,10 +570,21 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Define the serialization helper struct definition here
+    let serialize_helper_struct_def = quote! {
+        #[derive(::serde::Serialize)]
+        struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: &'a ::std::option::Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
     // Combine implementations
     let expanded = quote! {
         // Define the moved helper structs/enums here, outside the impl blocks
-        #serialize_helper_struct_def // From previous step
+        #serialize_helper_struct_def // Use the defined variable
         #field_enum
         #field_visitor_impl
         // Define the extension helper struct here as well
