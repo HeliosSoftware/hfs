@@ -487,41 +487,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Construct Element fields from parts *after* the loop
-                        #( // Iterate through field_infos with index
-                            {
-                                // Use #idx from enumerate() below
-                                let info = &field_infos[#idx];
-                                let field_ident = info.ident;
-                                if info.is_element {
-                                    let inner_ty = info.inner_ty;
-                                    let val_field = format_ident!("{}_value", field_ident);
-                                    let id_field = format_ident!("{}_id", field_ident);
-                                    let ext_field = format_ident!("{}_extension", field_ident);
-
-                                    quote! {
-                                        // Assign to the final #field_ident variable declared at the top
-                                        #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
-                                            Some(#inner_ty { // Use the inner type (Element<V,E> or DecimalElement<E>)
-                                                value: #val_field,
-                                                id: #id_field,
-                                                extension: #ext_field,
-                                            })
-                                        } else {
-                                            None // Assign None if no parts were found
-                                        };
-                                    }
-                                } else {
-                                    quote! {} // No construction needed for non-elements
-                                }
-                            }
-                        // Add .iter().enumerate().map(|(idx, _)| idx) to generate indices
-                        let construction_indices = (0..field_infos.len()).map(|idx| quote!{#idx});
-                        let element_construction_logic = quote! {
-                             #( #construction_indices => { /* generated code from above block */ } )*
-                        };
-
-                         // Construct the final struct using the final field variables
+                        // Element construction logic will be generated and placed *after* this loop.
                         Ok(#name {
                             #(#final_struct_fields),*
                         })
