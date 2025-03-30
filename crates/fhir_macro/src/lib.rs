@@ -404,8 +404,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             });
         } else {
             // Regular field (might be Option<T> or just T)
-            // Declare a mutable Option in the visitor scope
-            visitor_field_defs.push(quote! { mut #field_ident: Option<#inner_ty> = None; });
+            // Declare a mutable Option in the visitor scope using 'let mut'
+            visitor_field_defs.push(quote! { let mut #field_ident: Option<#inner_ty> = None; });
             // Create LitStr for field name interpolation in error messages
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
