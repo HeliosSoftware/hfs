@@ -179,11 +179,40 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let original_name = get_original_field_name(field);
         let underscore_name = format!("_{}", original_name);
 
-        // Sanitize field name for enum variant (remove r#)
+        // Sanitize field name for enum variant (remove r#, convert to UpperCamelCase)
         let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
-        let field_ident_enum = format_ident!("{}", clean_field_ident_str.to_uppercase());
-        // Use a unique prefix based on the struct name for the underscore enum variant
-        let underscore_ident_enum = format_ident!("{}__{}", name, clean_field_ident_str.to_uppercase());
+        // Convert snake_case or camelCase to UpperCamelCase for the base enum variant name
+        let field_ident_enum_str = {
+            let mut camel_case = String::new();
+            let mut capitalize = true;
+            for c in clean_field_ident_str.chars() {
+                if c == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    camel_case.push(c.to_ascii_uppercase());
+                    capitalize = false;
+                } else {
+                    camel_case.push(c);
+                }
+            }
+            // Ensure first char is uppercase even if original starts with non-alphabetic
+             if let Some(first) = camel_case.chars().next() {
+                 if !first.is_uppercase() {
+                     // This case is less likely with typical field names but handles edge cases
+                     camel_case.insert(0, first.to_ascii_uppercase());
+                     camel_case.remove(1);
+                 }
+             } else {
+                 // Handle empty or unusual field names if necessary, though unlikely
+                 camel_case = format!("Field{}", field_ident); // Fallback name
+             }
+
+            camel_case
+        };
+        let field_ident_enum = format_ident!("{}", field_ident_enum_str);
+        // Append "Underscore" for the underscore variant name
+        let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
+
 
         let (is_option, inner_ty) = match get_option_inner_type(field_ty) {
             Some(inner) => (true, inner),
@@ -375,7 +404,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             });
         } else {
             // Regular field (might be Option<T> or just T)
-            visitor_field_defs.push(quote! { #field_ident: Option<#inner_ty> = None }); // Always use Option<Inner> in visitor for simplicity
+            // Declare a mutable Option in the visitor scope
+            visitor_field_defs.push(quote! { mut #field_ident: Option<#inner_ty> = None; });
             // Create LitStr for field name interpolation in error messages
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
@@ -385,24 +415,30 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                    #field_ident = Some(map.next_value()?);
                }
             });
-            // No build step needed, just use the value directly
-            // If the original field was not Option, we need to unwrap or handle None later
-            if info.is_option {
-                visitor_build_steps.push(quote! { let #field_ident = #field_ident; }); // Already Option<T>
-            } else {
-                // If original field was T, unwrap the Option<T> from visitor or error if None
-                // Create LitStr for field name interpolation in error messages
-                let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
-                visitor_build_steps.push(quote! {
-                     // Use the LitStr for missing_field
-                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_lit))?;
-                 });
-            }
+            // No specific build step needed here, the final struct construction handles Option/Required
         }
     }
 
-    // Collect field identifiers separately for struct construction
-    let field_idents: Vec<&Ident> = field_infos.iter().map(|info| info.ident).collect();
+    // Generate the final struct construction logic
+    let mut final_struct_fields = Vec::new();
+    for info in &field_infos {
+        let field_ident = info.ident;
+        let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
+
+        if info.is_element {
+             // Element fields are always Option<Element<...>> in the struct
+             final_struct_fields.push(quote! { #field_ident: #field_ident });
+        } else if info.is_option {
+            // Non-element Option<T> fields
+            final_struct_fields.push(quote! { #field_ident: #field_ident });
+        } else {
+            // Non-element required T fields
+            final_struct_fields.push(quote! {
+                #field_ident: #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_lit))?
+            });
+        }
+    }
+
 
     // visitor_struct_name already defined above with unique name
 
@@ -455,12 +491,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Combine parts for Element fields and check required fields
+                        // Combine parts for Element fields
                         #(#visitor_build_steps)*
 
-                        // Construct the final struct using the collected identifiers
+                        // Construct the final struct, handling required fields
                         Ok(#name {
-                            #(#field_idents),*
+                            #(#final_struct_fields),*
                         })
                     }
                 }
