@@ -125,7 +125,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
-                            // Use the helper struct defined inside this impl block
+                            // Use the updated helper name (no __)
                             let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
