@@ -93,7 +93,19 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
             if is_fhir_element_type(inner_ty) {
                 // This is a potentially extended primitive field (like Option<Element<String, Extension>>)
-                // Need special handling for fieldName and _fieldName
+
+                // Extract E type *here* in the macro scope
+                let ext_ty = if let Type::Path(type_path) = inner_ty {
+                    if type_path.path.segments.len() == 1 {
+                        let segment = &type_path.path.segments[0];
+                        if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                            if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
+                                let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
+                                match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") }
+                            } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
+                        } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
+                    } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
+                } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
 
                 // Calculate contribution to field count
                 field_count_calculation.push(quote! {
@@ -114,7 +126,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
-                            // Extract E type (ensure this logic exists and is correct)
+                            // Extract E type *before* the quote block
                             let ext_ty = if let Type::Path(type_path) = inner_ty {
                                 if type_path.path.segments.len() == 1 {
                                     let segment = &type_path.path.segments[0];
@@ -127,8 +139,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                                 } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
                             } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
 
-                            // Use the pre-defined helper struct
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Specify lifetime and generic E
+                            // Use the pre-defined helper struct with the extracted ext_ty
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
                             };
