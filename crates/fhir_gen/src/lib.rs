@@ -111,58 +111,75 @@ fn is_primitive_type(def: &StructureDefinition) -> bool {
 }
 
 fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
-    let mut all_elements = Vec::new();
-    let mut all_resources = Vec::new();
+    let mut all_elements: Vec<&ElementDefinition> = Vec::new(); // Store references
     let mut generated_structs_code = String::new(); // Accumulate struct code
 
+    // Define the list of types we want to generate (Patient and its core dependencies)
+    // This list might need adjustment based on the specific FHIR version and Patient definition.
+    let allowed_types: std::collections::HashSet<String> = [
+        "Patient", "Identifier", "HumanName", "Address", "Reference", "Extension",
+        "CodeableConcept", "Coding", "ContactPoint", "Period", "Meta", "Narrative",
+        "DomainResource", "Resource", "Element", "BackboneElement",
+        // Primitives (handled by generate_primitive_type, but good to list)
+        "string", "boolean", "integer", "decimal", "uri", "code", "dateTime", "date",
+        "instant", "time", "base64Binary", "canonical", "id", "markdown", "oid",
+        "positiveInt", "unsignedInt", "url", "uuid", "xhtml", "integer64",
+        // Other potentially required complex types for Patient
+        "Attachment", "Quantity", "Age", "Count", "Distance", "Duration", "Money",
+        "SimpleQuantity", "Range", "Ratio", "SampledData", "Signature", "Timing",
+        "ContactDetail", "Contributor", "DataRequirement", "Expression", "ParameterDefinition",
+        "RelatedArtifact", "TriggerDefinition", "UsageContext", "Annotation",
+        // Add any other types found necessary during testing
+    ].iter().map(|s| s.to_string()).collect();
+
     if let Some(entries) = bundle.entry.as_ref() {
-        // First pass: collect elements and resource names
+        // First pass: collect elements ONLY for allowed types
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 if let Resource::StructureDefinition(def) = resource {
-                    if is_valid_structure_definition(def) {
+                    // Only consider definitions for allowed types
+                    if is_valid_structure_definition(def) && allowed_types.contains(&def.name) {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().map(|e| e));
+                                // Store references to elements
+                                all_elements.extend(elements.iter());
                             }
                         }
-                        if def.kind == "resource" && def.r#abstract == false {
-                            all_resources.push(&def.name);
-                        }
+                        // We will handle the Resource enum generation separately below
                     }
                 }
             }
         }
 
-        // Detect cycles
-        let element_refs: Vec<&ElementDefinition> = all_elements;
+        // Detect cycles using the collected element references
+        let element_refs: Vec<&ElementDefinition> = all_elements.clone(); // Clone references for cycle detection
         let cycles = detect_struct_cycles(&element_refs);
 
-        // Second pass: generate struct/type code into the string buffer
+        // Second pass: generate struct/type code ONLY for allowed types
         for entry in entries {
             if let Some(resource) = &entry.resource {
                 match resource {
                     Resource::StructureDefinition(def) => {
-                        if is_valid_structure_definition(def) {
-                            let content = structure_definition_to_rust(def, &cycles);
+                        // Only generate code for allowed types
+                        if is_valid_structure_definition(def) && allowed_types.contains(&def.name) {
+                            // Pass references to all elements of allowed types for context
+                            let content = structure_definition_to_rust(def, &cycles, &all_elements);
                             generated_structs_code.push_str(&content); // Append to buffer
                             generated_structs_code.push('\n'); // Add newline between definitions
                         }
                     }
-                    // Skip SearchParameter, OperationDefinition, etc. for now
+                    // Skip SearchParameter, OperationDefinition, etc.
                     _ => {}
                 }
             }
         }
 
-        // Generate the Resource enum code into the string buffer
-        if !all_resources.is_empty() {
-            let resource_enum_code =
-                generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
-            generated_structs_code.push_str(&resource_enum_code); // Append enum to buffer
-        }
+        // Generate the Resource enum code, hardcoded to only include Patient
+        let resource_enum_code = generate_resource_enum(vec!["Patient".to_string()]);
+        generated_structs_code.push_str(&resource_enum_code); // Append enum to buffer
 
-        // Append the generated code to the file (opened once)
+
+        // Append the generated code to the file
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -218,19 +235,24 @@ fn capitalize_first_letter(s: &str) -> String {
 fn structure_definition_to_rust(
     sd: &StructureDefinition,
     cycles: &std::collections::HashSet<(String, String)>,
+    all_allowed_elements: &[&ElementDefinition], // Pass all relevant elements for context
 ) -> String {
     let mut output = String::new();
 
     // Handle primitive types differently
     if is_primitive_type(sd) {
+        // Ensure primitive types are handled even if not explicitly in allowed_types set initially
+        // as they are fundamental.
         return generate_primitive_type(sd);
     }
 
     // Process elements for complex types and resources
     if let Some(snapshot) = &sd.snapshot {
         if let Some(elements) = &snapshot.element {
-            let mut processed_types = std::collections::HashSet::new();
-            process_elements(elements, &mut output, &mut processed_types, cycles);
+            // We are generating code for a specific StructureDefinition (sd),
+            // so we don't need the processed_types check here as generate_code filters calls.
+            // We pass all_allowed_elements for context lookups (e.g., contentReference).
+            process_struct_elements(sd, elements, &mut output, cycles, all_allowed_elements);
         }
     }
     output
@@ -326,115 +348,118 @@ fn detect_struct_cycles(
     cycles
 }
 
-fn process_elements(
-    elements: &[ElementDefinition],
+// Renamed from process_elements to avoid confusion, processes elements for a *single* struct/type
+fn process_struct_elements(
+    struct_def: &StructureDefinition, // The definition of the struct being generated
+    elements: &[ElementDefinition], // Elements belonging to this struct definition
     output: &mut String,
-    processed_types: &mut std::collections::HashSet<String>,
     cycles: &std::collections::HashSet<(String, String)>,
+    all_allowed_elements: &[&ElementDefinition], // All elements from allowed types for context
 ) {
-    // Group elements by their parent path
-    let mut element_groups: std::collections::HashMap<String, Vec<&ElementDefinition>> =
-        std::collections::HashMap::new();
+    let type_name = &struct_def.name; // Use the struct name directly
 
-    // First pass - collect all type names that will be generated
-    for element in elements {
-        let path_parts: Vec<&str> = element.path.split('.').collect();
-        if path_parts.len() > 1 {
-            let parent_path = path_parts[..path_parts.len() - 1].join(".");
-            element_groups.entry(parent_path).or_default().push(element);
-        }
-    }
+    // Filter elements that belong directly to this type (path starts with type_name and has one dot)
+    // or are the base element itself (path == type_name).
+    let direct_elements: Vec<&ElementDefinition> = elements
+        .iter()
+        .filter(|e| {
+            let path_parts: Vec<&str> = e.path.split('.').collect();
+            // Include the base element itself (e.g., "Patient")
+            if path_parts.len() == 1 && path_parts[0] == type_name.as_str() {
+                // Skip the base element itself, we only want fields
+                return false;
+            }
+            // Include direct children (e.g., "Patient.identifier")
+            path_parts.len() > 1 && path_parts[0] == type_name.as_str()
+        })
+        .cloned() // Clone the references
+        .collect();
 
-    // Process each group
-    for (path, group) in element_groups {
-        let type_name = generate_type_name(&path);
 
-        // Skip if we've already processed this type
-        if processed_types.contains(&type_name) {
+    // Process choice types first for this specific struct
+    let choice_fields: Vec<_> = direct_elements.iter().filter(|e| e.path.ends_with("[x]")).collect();
+    let mut processed_choice_enums = std::collections::HashSet::new(); // Track enums generated for this struct
+
+    for choice in choice_fields {
+        let base_name = choice
+            .path
+            .split('.')
+            .last()
+            .unwrap()
+            .trim_end_matches("[x]");
+
+        let enum_name = format!(
+            "{}{}",
+            capitalize_first_letter(type_name),
+            capitalize_first_letter(base_name)
+        );
+
+        // Skip if we've already generated this enum for this struct
+        if processed_choice_enums.contains(&enum_name) {
             continue;
         }
+        processed_choice_enums.insert(enum_name.clone());
 
-        processed_types.insert(type_name.clone());
-
-        // Process choice types first
-        let choice_fields: Vec<_> = group.iter().filter(|e| e.path.ends_with("[x]")).collect();
-        for choice in choice_fields {
-            let base_name = choice
-                .path
-                .split('.')
-                .last()
-                .unwrap()
-                .trim_end_matches("[x]");
-
-            let enum_name = format!(
-                "{}{}",
-                capitalize_first_letter(&type_name),
-                capitalize_first_letter(base_name)
-            );
-
-            // Skip if we've already processed this enum
-            if processed_types.contains(&enum_name) {
-                continue;
-            }
-            processed_types.insert(enum_name.clone());
-
-            // Add documentation comment for the enum
-            output.push_str(&format!(
-                "/// Choice of types for the {}[x] field in {}\n",
-                base_name,
-                capitalize_first_letter(&type_name)
-            ));
-
-            output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-            output.push_str("#[serde(rename_all = \"camelCase\")]\n");
-            output.push_str(&format!("pub enum {} {{\n", enum_name));
-
-            if let Some(types) = &choice.r#type {
-                for ty in types {
-                    let type_code = capitalize_first_letter(&ty.code);
-                    let rename_value = format!("{}{}", base_name, type_code);
-
-                    // Add documentation for each variant
-                    output.push_str(&format!(
-                        "    /// Variant accepting the {} type.\n",
-                        type_code
-                    ));
-                    output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
-                    output.push_str(&format!("    {}({}),\n", type_code, type_code));
-                }
-            }
-            output.push_str("}\n\n");
-        }
-
-        // Generate struct - Use FhirSerde derive and remove deny_unknown_fields
-        output.push_str("#[derive(Debug, FhirSerde)]\n");
-        // output.push_str("#[serde(deny_unknown_fields)]\n"); // Removed: Macro will handle this if needed
+        // Add documentation comment for the enum
         output.push_str(&format!(
-            "pub struct {} {{\n",
-            capitalize_first_letter(&type_name)
+            "/// Choice of types for the {}[x] field in {}\n",
+            base_name,
+            capitalize_first_letter(type_name)
         ));
 
-        for element in &group {
-            if let Some(field_name) = element.path.split('.').last() {
-                if !field_name.contains("[x]") {
-                    generate_element_definition(element, &type_name, output, cycles, elements);
-                } else {
-                    // For choice types, we've already created an enum, so we just need to add the field
-                    // that uses that enum type. We don't need to expand each choice type into separate fields.
-                    generate_element_definition(element, &type_name, output, cycles, elements);
-                }
+        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n"); // Keep Serialize, Deserialize for choice enums
+        output.push_str("#[serde(rename_all = \"camelCase\")]\n");
+        output.push_str(&format!("pub enum {} {{\n", enum_name));
+
+        if let Some(types) = &choice.r#type {
+            for ty in types {
+                let type_code = capitalize_first_letter(&ty.code);
+                let rename_value = format!("{}{}", base_name, type_code);
+
+                // Add documentation for each variant
+                output.push_str(&format!(
+                    "    /// Variant accepting the {} type.\n",
+                    type_code
+                ));
+                output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
+                // Assume the type itself (e.g., String, Reference) is generated elsewhere
+                output.push_str(&format!("    {}({}),\n", type_code, type_code));
             }
         }
         output.push_str("}\n\n");
     }
+
+
+    // Generate struct - Use FhirSerde derive
+    output.push_str("#[derive(Debug, FhirSerde)]\n");
+    output.push_str(&format!(
+        "pub struct {} {{\n",
+        capitalize_first_letter(type_name)
+    ));
+
+    // Keep track of fields added to avoid duplicates from slicing
+    let mut added_fields = std::collections::HashSet::new();
+
+    for element in &direct_elements {
+        if let Some(field_name) = element.path.split('.').last() {
+             // Use the cleaned field name (without [x]) for tracking
+            let clean_field_name = field_name.trim_end_matches("[x]");
+            if !added_fields.contains(clean_field_name) {
+                 generate_element_definition(element, type_name, output, cycles, all_allowed_elements);
+                 added_fields.insert(clean_field_name.to_string());
+            }
+        }
+    }
+    output.push_str("}\n\n");
 }
+
 
 fn generate_element_definition(
     element: &ElementDefinition,
-    type_name: &String,
+    type_name: &String, // Name of the struct this field belongs to
     output: &mut String,
     cycles: &std::collections::HashSet<(String, String)>,
-    elements: &[ElementDefinition],
+    all_allowed_elements: &[&ElementDefinition], // Pass all relevant elements for context lookups
 ) {
     if let Some(field_name) = element.path.split('.').last() {
         let rust_field_name = make_rust_safe(field_name);
@@ -457,13 +482,14 @@ fn generate_element_definition(
             Some(ty) => ty,
             None => {
                 if let Some(content_ref) = &element.content_reference {
-                    let ref_id = &content_ref[1..];
-                    if let Some(referenced_element) = elements
+                    let ref_id = &content_ref[1..]; // e.g., "Patient.contact.name"
+                    // Search in all allowed elements passed for context
+                    if let Some(referenced_element) = all_allowed_elements
                         .iter()
                         .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
                     {
-                        if let Some(ref_ty) =
-                            referenced_element.r#type.as_ref().and_then(|t| t.first())
+                        // Use the type from the referenced element
+                        if let Some(ref_ty) = referenced_element.r#type.as_ref().and_then(|t| t.first())
                         {
                             ref_ty
                         } else {
