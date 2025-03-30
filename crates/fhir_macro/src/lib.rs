@@ -114,15 +114,21 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
-                            // Create a temporary struct holding only id and extension
-                            #[derive(::serde::Serialize)] // Use ::serde::
-                            struct ExtensionHelper<'a, E: ::serde::Serialize> { // Use ::serde::
-                                #[serde(skip_serializing_if = "Option::is_none")] // This is an attribute macro arg, keep as is
-                                id: &'a Option<String>,
-                                #[serde(skip_serializing_if = "Option::is_none")] // This is an attribute macro arg, keep as is
-                                extension: &'a Option<Vec<E>>,
-                            }
-                            let helper = ExtensionHelper {
+                            // Extract E type (ensure this logic exists and is correct)
+                            let ext_ty = if let Type::Path(type_path) = inner_ty {
+                                if type_path.path.segments.len() == 1 {
+                                    let segment = &type_path.path.segments[0];
+                                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                                        if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
+                                            let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
+                                            match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") }
+                                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
+                                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
+                                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
+                            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
+
+                            // Use the pre-defined helper struct
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Specify lifetime and generic E
                                 id: &element.id,
                                 extension: &element.extension,
                             };
@@ -166,6 +172,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let field_visitor_name = format_ident!("{}FieldVisitor", name);
     let visitor_struct_name = format_ident!("{}Visitor", name);
     let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
+    // Unique name for the serialization helper struct
+    let serialize_extension_helper_name = format_ident!("__{}SerializeExtensionHelper", name);
 
     // Temporary struct to hold field info for deserialization generation
     struct FieldInfo<'a> {
@@ -548,13 +556,22 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // --- Combine Serialize and Deserialize ---
     let serialize_impl = quote! {
-        impl ::serde::Serialize for #name { // Revert to ::serde::
+        impl ::serde::Serialize for #name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
-                S: ::serde::Serializer, // Revert to ::serde::
+                S: ::serde::Serializer,
             {
                 // Add use statements for serde traits/types needed within the impl
-                use serde::ser::{SerializeStruct, Serializer}; // Add use statement
+                use serde::ser::{SerializeStruct, Serializer};
+
+                // Define the serialization helper struct ONCE here
+                #[derive(::serde::Serialize)]
+                struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    id: &'a ::std::option::Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
+                }
 
                 // Calculate the number of fields to serialize
                 let mut count = 0;
