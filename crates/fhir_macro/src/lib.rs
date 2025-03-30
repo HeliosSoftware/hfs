@@ -304,12 +304,54 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // 3. Generate parts needed for the Visitor struct implementation
     let mut visitor_field_defs = Vec::new();
     let mut visitor_map_assignments = Vec::new();
-    let mut visitor_build_steps = Vec::new();
+    // Remove visitor_build_steps, construction happens after the loop
     let struct_name_str = name.to_string();
 
+    // Declare ALL final field variables and temporary element parts at the top
     for info in &field_infos {
         let field_ident = info.ident;
-        let _field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>) - Prefix with _
+        let field_ty = info.ty; // Use the original field type (Option<...> or T)
+
+        // Declare the final variable matching the struct field type
+        visitor_field_defs.push(quote! { let mut #field_ident: #field_ty = None; });
+
+        if info.is_element {
+            // Declare temporary variables for element parts
+            let inner_ty = info.inner_ty; // Element<V, E> or DecimalElement<E>
+             // Extract V and E types from Element<V, E> or DecimalElement<E>
+            let (val_ty, ext_ty) = if let Type::Path(type_path) = inner_ty {
+                if type_path.path.segments.len() == 1 {
+                    let segment = &type_path.path.segments[0];
+                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if segment.ident == "Element" && args.args.len() == 2 {
+                            let v_arg = &args.args[0]; let e_arg = &args.args[1];
+                            let v_type = match v_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") };
+                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            (v_type.clone(), e_type.clone())
+                        } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
+                            let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                            let e_arg = &args.args[0];
+                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            (precise_decimal_type, e_type.clone())
+                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
+                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
+                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
+            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
+
+            let val_field = format_ident!("{}_value", field_ident);
+            let id_field = format_ident!("{}_id", field_ident);
+            let ext_field = format_ident!("{}_extension", field_ident);
+
+            visitor_field_defs.push(quote! { let mut #val_field: Option<#val_ty> = None; });
+            visitor_field_defs.push(quote! { let mut #id_field: Option<String> = None; });
+            visitor_field_defs.push(quote! { let mut #ext_field: Option<Vec<#ext_ty>> = None; });
+        }
+    }
+
+
+    // Generate map assignments (assign to temp vars or final vars)
+    for info in &field_infos {
+        let field_ident = info.ident;
         let inner_ty = info.inner_ty; // Type inside Option (e.g., Element<String, E>)
 
         // Get the correct UpperCamelCase enum variant names generated earlier
@@ -337,110 +379,57 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         if info.is_element {
             // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
             let id_field = format_ident!("{}_id", field_ident);
+            let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
 
-            // Extract V and E from Element<V, E> or DecimalElement<E>
-            // Extract V and E types from Element<V, E> or DecimalElement<E>
-            let (val_ty, ext_ty) = if let Type::Path(type_path) = inner_ty {
+             // Extract E type for the helper struct
+            let ext_ty = if let Type::Path(type_path) = inner_ty {
                 if type_path.path.segments.len() == 1 {
                     let segment = &type_path.path.segments[0];
                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if segment.ident == "Element" && args.args.len() == 2 {
-                            // Extract Type from GenericArgument
-                            let v_arg = &args.args[0];
-                            let e_arg = &args.args[1];
-                            let v_type = match v_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") };
-                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
-                            (v_type.clone(), e_type.clone())
-                        } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
-                            // For DecimalElement, value type is PreciseDecimal
-                            let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
-                            // Extract E Type from GenericArgument
-                            let e_arg = &args.args[0];
-                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
-                            (precise_decimal_type, e_type.clone())
-                        } else {
-                             panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
-                        }
-                    } else {
-                         // Use quote!(...).to_string() for formatting Type
-                         panic!("Element type missing generics: {}", quote!(#inner_ty).to_string());
-                    }
-                } else {
-                     // Use quote!(...).to_string() for formatting Type
-                     panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string());
-                }
-            } else {
-                 // Use quote!(...).to_string() for formatting Type
-                 panic!(
-                    "Expected Element or DecimalElement type, found: {}",
-                    quote!(#inner_ty).to_string()
-                );
-            };
+                         if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
+                            let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
+                            match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") }
+                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
+                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
+                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
+            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
 
-            // Use the correct Type variables val_ty and ext_ty and add 'let mut'
-            visitor_field_defs.push(quote! { let mut #val_field: Option<#val_ty> = None; });
-            visitor_field_defs.push(quote! { let mut #id_field: Option<String> = None; });
-            visitor_field_defs.push(quote! { let mut #ext_field: Option<Vec<#ext_ty>> = None; });
 
-            // Deserialize the value part (fieldName)
-            // Create LitStr for field name interpolation in error messages
+            // Assign to temporary _value field
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-               #field_enum_name::#field_ident_enum => { // Use unique enum name
-                   // Use the LitStr for duplicate_field
+               #field_enum_name::#field_ident_enum => {
                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #val_field = Some(map.next_value()?);
                }
             });
 
-            // Deserialize the extension part (_fieldName)
-            // Create LitStr for field name interpolation in error messages
+            // Assign to temporary _id and _extension fields
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
-            // Use the extracted Type 'ext_ty' here, no need to clone it separately for quote!
             visitor_map_assignments.push(quote! {
-                 #field_enum_name::#underscore_ident_enum => { // Use unique enum name
-                    // Deserialize the helper struct directly using the type defined outside visit_map
-                    let helper: #extension_helper_name<#ext_ty> = map.next_value()?; // Use unique helper name and ext_ty
-                    // Check for duplicates before assigning
-                    // Use the LitStr for duplicate_field
+                 #field_enum_name::#underscore_ident_enum => {
+                    let helper: #extension_helper_name<#ext_ty> = map.next_value()?;
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                     #id_field = helper.id;
                     #ext_field = helper.extension;
                 }
             });
 
-            // Build the final Element/DecimalElement
-            visitor_build_steps.push(quote! {
-                let #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
-                    Some(#inner_ty {
-                        value: #val_field,
-                        id: #id_field,
-                        extension: #ext_field,
-                    })
-                } else {
-                    None
-                };
-            });
         } else {
-            // Regular field (might be Option<T> or just T)
-            // Declare a mutable Option in the visitor scope using 'let mut'
-            visitor_field_defs.push(quote! { let mut #field_ident: Option<#inner_ty> = None; });
-            // Create LitStr for field name interpolation in error messages
+            // Assign directly to the final field variable for non-elements
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-               #field_enum_name::#field_ident_enum => { // Use unique enum name
-                   // Use the LitStr for duplicate_field
+               #field_enum_name::#field_ident_enum => {
                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
-                   #field_ident = Some(map.next_value()?);
+                   #field_ident = Some(map.next_value()?); // Assign to final variable #field_ident
                }
             });
-            // No specific build step needed here, the final struct construction handles Option/Required
         }
     }
 
-    // Generate the final struct construction logic - just use the field idents directly
+    // Generate the final struct construction logic (remains the same)
     let final_struct_fields: Vec<_> = field_infos.iter().map(|info| {
         let field_ident = info.ident;
         quote! { #field_ident: #field_ident }
@@ -498,10 +487,41 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Combine parts for Element fields
-                        #(#visitor_build_steps)*
+                        // Construct Element fields from parts *after* the loop
+                        #( // Iterate through field_infos with index
+                            {
+                                // Use #idx from enumerate() below
+                                let info = &field_infos[#idx];
+                                let field_ident = info.ident;
+                                if info.is_element {
+                                    let inner_ty = info.inner_ty;
+                                    let val_field = format_ident!("{}_value", field_ident);
+                                    let id_field = format_ident!("{}_id", field_ident);
+                                    let ext_field = format_ident!("{}_extension", field_ident);
 
-                        // Construct the final struct, handling required fields
+                                    quote! {
+                                        // Assign to the final #field_ident variable declared at the top
+                                        #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
+                                            Some(#inner_ty { // Use the inner type (Element<V,E> or DecimalElement<E>)
+                                                value: #val_field,
+                                                id: #id_field,
+                                                extension: #ext_field,
+                                            })
+                                        } else {
+                                            None // Assign None if no parts were found
+                                        };
+                                    }
+                                } else {
+                                    quote! {} // No construction needed for non-elements
+                                }
+                            }
+                        // Add .iter().enumerate().map(|(idx, _)| idx) to generate indices
+                        let construction_indices = (0..field_infos.len()).map(|idx| quote!{#idx});
+                        let element_construction_logic = quote! {
+                             #( #construction_indices => { /* generated code from above block */ } )*
+                        };
+
+                         // Construct the final struct using the final field variables
                         Ok(#name {
                             #(#final_struct_fields),*
                         })
