@@ -82,6 +82,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let mut serialize_fields = Vec::new();
     let mut field_count_calculation = Vec::new();
 
+    // Define the serialization helper name *before* the loop that uses it
+    let serialize_extension_helper_name = format_ident!("__{}SerializeExtensionHelper", name);
+
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
@@ -171,8 +174,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let field_visitor_name = format_ident!("{}FieldVisitor", name);
     let visitor_struct_name = format_ident!("{}Visitor", name);
     let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
-    // Unique name for the serialization helper struct
-    let serialize_extension_helper_name = format_ident!("__{}SerializeExtensionHelper", name);
+    // Serialization helper name is now defined before the serialization loop
 
     // Temporary struct to hold field info for deserialization generation
     struct FieldInfo<'a> {
