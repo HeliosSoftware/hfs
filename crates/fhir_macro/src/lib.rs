@@ -37,33 +37,27 @@ fn is_fhir_element_type(ty: &Type) -> bool {
     false
 }
 
-// Helper function to get the original field name from serde attributes
-fn get_original_field_name(field: &syn::Field) -> String {
-    for attr in &field.attrs {
-        // Use attr.path directly (it's a field)
-        if attr.path.is_ident("serde") {
-            // Use parse_meta to get the Meta item inside the attribute
-            if let Ok(Meta::List(meta_list)) = attr.parse_meta() {
-                // Iterate over the nested meta items
-                for nested in meta_list.nested {
-                    // Check if the nested item is a Meta::NameValue pair
-                    if let NestedMeta::Meta(Meta::NameValue(nv)) = nested {
-                        // Check if the path of the name-value pair is "rename"
-                        if nv.path.is_ident("rename") {
-                            // Check if the literal is a string literal
-                            if let syn::Lit::Str(lit_str) = nv.lit {
-                                // Return the value of the string literal
-                                return lit_str.value();
-                            }
-                        }
-                    }
-                }
-            }
+// Helper function to convert Rust field name (snake_case) to FHIR JSON name (camelCase)
+fn rust_to_fhir_name(ident: &Ident) -> String {
+    let name = ident.to_string();
+    let name = name.trim_start_matches("r#"); // Handle raw identifiers like r#type
+
+    let mut camel_case = String::new();
+    let mut capitalize_next = false;
+
+    for c in name.chars() {
+        if c == '_' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            camel_case.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            camel_case.push(c);
         }
     }
-    // If no rename attribute, use the field identifier
-    field.ident.as_ref().unwrap().to_string()
+    camel_case
 }
+
 
 #[proc_macro_derive(FhirSerde)]
 pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
@@ -88,7 +82,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     for field in fields {
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
-        let original_name = get_original_field_name(field);
+        // Convert Rust field name to FHIR JSON name (camelCase)
+        let original_name = rust_to_fhir_name(field_ident);
         let original_name_lit = LitStr::new(&original_name, Span::call_site());
         let underscore_name_lit = LitStr::new(&format!("_{}", original_name), Span::call_site());
 
@@ -191,7 +186,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     for (_idx, field) in fields.iter().enumerate() { // Prefix idx with _
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
-        let original_name = get_original_field_name(field);
+        // Convert Rust field name to FHIR JSON name (camelCase)
+        let original_name = rust_to_fhir_name(field_ident);
         let underscore_name = format!("_{}", original_name);
         // Get the field name as a string, removing raw identifier prefix if present
         let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
