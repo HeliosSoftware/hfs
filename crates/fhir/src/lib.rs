@@ -1102,7 +1102,8 @@ mod tests {
     // --- Tests for FhirSerde derive macro (_fieldName logic) ---
 
     // Define a test struct that uses the FhirSerde derive
-    #[derive(Debug, FhirSerde, PartialEq)] // Re-add PartialEq
+    // Try placing FhirSerde last in the derive list
+    #[derive(Debug, PartialEq, FhirSerde)]
     struct FhirSerdeTestStruct {
         // Regular field
         #[serde(skip_serializing_if = "Option::is_none")]
