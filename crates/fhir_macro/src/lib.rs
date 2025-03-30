@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{format_ident, quote}; // Added format_ident back
 use syn::{
-    Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, Meta, NestedMeta, PathArguments,
+    Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, PathArguments, // Removed Meta, NestedMeta
     Type, parse_macro_input,
 }; // Added Ident back
 // Removed unused HashMap import
@@ -609,11 +609,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         // Define all helper types first
         #serialize_helper_struct_def
+        #deserialize_extension_helper_def // Moved deserialize helper def earlier
         #field_enum
         #field_visitor_impl
-        #deserialize_extension_helper_def
 
-        // Then define the main impls
+        // Then define the main impls that use these helpers
         #serialize_impl
         #deserialize_impl
     };

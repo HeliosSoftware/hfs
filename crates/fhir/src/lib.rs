@@ -862,8 +862,8 @@ pub enum FhirDate {
 mod tests {
     // Keep existing imports
     use super::*;
-    // Removed unused FhirSerde import as the test struct uses standard derives now
-    // use fhir_macro::FhirSerde;
+    // Re-add FhirSerde import as the test struct uses the derive macro again
+    use fhir_macro::FhirSerde;
     use rust_decimal_macros::dec;
     use serde_json;
 
