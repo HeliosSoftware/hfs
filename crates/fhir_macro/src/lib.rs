@@ -325,23 +325,27 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let val_field = format_ident!("{}_value", field_ident);
 
             // Extract V and E from Element<V, E> or DecimalElement<E>
-            let (val_ty_token, ext_ty_token) = if let Type::Path(type_path) = inner_ty {
+            // Extract V and E types from Element<V, E> or DecimalElement<E>
+            let (val_ty, ext_ty) = if let Type::Path(type_path) = inner_ty {
                 if type_path.path.segments.len() == 1 {
                     let segment = &type_path.path.segments[0];
                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
                         if segment.ident == "Element" && args.args.len() == 2 {
-                            (args.args[0].clone(), args.args[1].clone())
+                            // Extract Type from GenericArgument
+                            let v_arg = &args.args[0];
+                            let e_arg = &args.args[1];
+                            let v_type = match v_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") };
+                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            (v_type.clone(), e_type.clone())
                         } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
                             // For DecimalElement, value type is PreciseDecimal
-                            let precise_decimal_type =
-                                syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
-                            (
-                                GenericArgument::Type(precise_decimal_type),
-                                args.args[0].clone(),
-                            )
+                            let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                            // Extract E Type from GenericArgument
+                            let e_arg = &args.args[0];
+                            let e_type = match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") };
+                            (precise_decimal_type, e_type.clone())
                         } else {
-                            // Use quote!(...).to_string() for formatting Type
-                            panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
+                             panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
                         }
                     } else {
                          // Use quote!(...).to_string() for formatting Type
