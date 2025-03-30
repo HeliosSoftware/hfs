@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
-use quote::{quote, format_ident};
-use syn::{parse_macro_input, DeriveInput, Data, Fields, Type, PathArguments, GenericArgument, Ident, LitStr};
+use quote::quote; // Removed format_ident
+use syn::{parse_macro_input, DeriveInput, Data, Fields, Type, PathArguments, GenericArgument, LitStr, Meta, NestedMeta}; // Removed Ident, Added Meta, NestedMeta
 use proc_macro2::Span;
 
 // Helper function to check if a type is Option<T> and return T
@@ -36,12 +36,19 @@ fn is_fhir_element_type(ty: &Type) -> bool {
 // Helper function to get the original field name from serde attributes
 fn get_original_field_name(field: &syn::Field) -> String {
     for attr in &field.attrs {
-        if attr.path().is_ident("serde") {
-            if let Ok(list) = attr.parse_args_with(syn::AttributeArgs::parse_terminated) {
-                for nested in list {
-                    if let syn::NestedMeta::Meta(syn::Meta::NameValue(nv)) = nested {
+        // Use attr.path directly (it's a field)
+        if attr.path.is_ident("serde") {
+            // Use parse_meta to get the Meta item inside the attribute
+            if let Ok(Meta::List(meta_list)) = attr.parse_meta() {
+                // Iterate over the nested meta items
+                for nested in meta_list.nested {
+                    // Check if the nested item is a Meta::NameValue pair
+                    if let NestedMeta::Meta(Meta::NameValue(nv)) = nested {
+                        // Check if the path of the name-value pair is "rename"
                         if nv.path.is_ident("rename") {
+                            // Check if the literal is a string literal
                             if let syn::Lit::Str(lit_str) = nv.lit {
+                                // Return the value of the string literal
                                 return lit_str.value();
                             }
                         }
@@ -169,7 +176,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // --- Generate Deserialize Implementation (Placeholder for now) ---
     // TODO: Implement the complex deserialization logic
-    let deserialize_impl = quote! {
+    // Mark as unused for now
+    let _deserialize_impl = quote! {
          // Placeholder - Use standard derive for now until custom logic is implemented
          // This will NOT handle the _fieldName correctly yet.
          #[derive(::serde::Deserialize)]
@@ -185,7 +193,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Combine implementations
     let expanded = quote! {
         #serialize_impl
-        // #deserialize_impl // Add this back once implemented
+        // #_deserialize_impl // Add this back once implemented
     };
 
     expanded.into()
