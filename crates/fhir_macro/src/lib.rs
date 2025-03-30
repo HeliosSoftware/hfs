@@ -601,71 +601,66 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     };
 
     // --- Generate Deserialize Implementation ---
-    // Note: Helper types will be defined *inside* the impl block below
 
-    let deserialize_impl = quote! {
-        impl<'de> ::serde::Deserialize<'de> for #name {
-            // FIELDS constant will be defined inside the function body below
+    // Define the main visitor struct and its implementation
+    let visitor_impl = quote! {
+        // Define the main visitor struct
+        struct #visitor_struct_name;
 
-            // Main Visitor struct and its impl will be defined *inside* the deserialize function below
+        impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+            type Value = #name; // Use #name directly as it's in the outer scope
 
-            // Now define the deserialize function
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(concat!("struct ", #struct_name_str))
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
             where
-                D: ::serde::Deserializer<'de>,
+                V: ::serde::de::MapAccess<'de>,
             {
                 // Bring necessary serde items into scope for generated code
                 use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
                 use ::serde::Deserialize;
 
-                // Define helper types (Field enum, FieldVisitor, ExtensionHelper) *inside* the deserialize function scope
-                #field_enum
-                #field_visitor_impl
-                #deserialize_extension_helper_def
+                // Define helper types (Field enum, FieldVisitor, ExtensionHelper) *inside* the visit_map scope
+                // This ensures they are unique per struct and avoids polluting the outer scope,
+                // but requires them to be accessible when map.next_key/value is called.
+                // Let's keep them defined *outside* the impl block for simplicity and clarity.
 
-                // Define the main visitor struct *inside* the deserialize function scope
-                struct #visitor_struct_name;
+                // Initialize Option fields for the visitor
+                #(#visitor_field_defs;)*
 
-                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
-                    type Value = #name; // Use #name directly as it's in the outer scope
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        formatter.write_str(concat!("struct ", #struct_name_str))
-                    }
-
-                    fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
-                    where
-                        V: ::serde::de::MapAccess<'de>,
-                    {
-                        // Initialize Option fields for the visitor
-                        #(#visitor_field_defs;)*
-
-                        // Loop through fields in the JSON map
-                        // Use #field_enum_name directly (defined inside impl block)
-                        while let Some(key) = map.next_key::<#field_enum_name>()? {
-                            match key {
-                                #(#visitor_map_assignments)*
-                                // Use #field_enum_name directly (defined inside impl block)
-                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
-                            }
-                        }
-
-                        // Construct Element fields *after* the loop using temp variables
-                        #(#element_construction_logic)*
-
-                        // Construct the final struct using the final field variables
-                        Ok(#name {
-                            #(#final_struct_fields),*
-                        })
+                // Loop through fields in the JSON map
+                // Use #field_enum_name directly (defined outside impl block)
+                while let Some(key) = map.next_key::<#field_enum_name>()? {
+                    match key {
+                        #(#visitor_map_assignments)*
+                        // Use #field_enum_name directly (defined outside impl block)
+                        #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
                     }
                 }
 
+                // Construct Element fields *after* the loop using temp variables
+                #(#element_construction_logic)*
 
-                // Define the fields Serde should expect *inside* the function body
+                // Construct the final struct using the final field variables
+                Ok(#name {
+                    #(#final_struct_fields),*
+                })
+            }
+        }
+    };
+
+    let deserialize_impl = quote! {
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                // Define the fields Serde should expect
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
-                // Start deserialization using the main visitor struct defined above
-                // Use #visitor_struct_name directly (defined inside impl block)
+                // Start deserialization using the main visitor struct defined outside
                 deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
             }
         }
@@ -673,7 +668,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
 
     // --- Combine Serialize and Deserialize ---
-    // Define the serialization helper struct definition *before* serialize_impl
+    // Define the serialization helper struct definition
     // Use updated helper name (no __)
     let serialize_helper_struct_def = quote! {
         #[derive(::serde::Serialize)] // Use Serialize from the use statement above
@@ -696,8 +691,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Need Serialize in scope for the helper derive
                 use ::serde::Serialize;
 
-                // Define the serialization helper struct *inside* the impl block
-                #serialize_helper_struct_def
+                // Serialization helper struct is defined outside the impl block now
 
                 // Calculate the number of fields to serialize
                 let mut count = 0;
@@ -714,8 +708,17 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Combine implementations. Helper types are now defined *inside* the impl blocks.
+    // Combine implementations. Helper types are defined *before* the impl blocks.
     let expanded = quote! {
+        // Define ALL helper types first
+        #field_enum
+        #field_visitor_impl
+        #deserialize_extension_helper_def
+        #serialize_helper_struct_def
+
+        // Define the main visitor struct and its implementation
+        #visitor_impl
+
         // Define the main impls that use these helpers
         #serialize_impl
         #deserialize_impl
