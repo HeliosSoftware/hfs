@@ -634,7 +634,7 @@ fn generate_element_definition(
             } else { // T -> Box<T>
                 type_str = format!("Box<{}>", type_str);
             }
-        } else if from_struct_name == "Parameters" && clean_field_name == "resource" {
+        } else if from_struct_name == "Parameters" && field_name == "resource" { // Use field_name here
              // Explicitly Box Parameters.resource to break cycle with Resource enum
              type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource" here
         }
