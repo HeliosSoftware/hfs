@@ -483,21 +483,65 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     }).collect();
 
 
-    // Generate a minimal Deserialize impl for testing
+    // --- Generate Deserialize Implementation ---
+    // Note: Helper types (Field enum, visitors, extension helper) are defined *outside* the impl block below
+
     let deserialize_impl = quote! {
         impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
                 D: ::serde::Deserializer<'de>,
             {
-                 // Immediately return an error or a default value to bypass complex logic
-                 // This helps isolate if the impl block itself causes parsing issues
-                 Err(::serde::de::Error::custom("FhirSerde Deserialize not fully generated (debugging)"))
-                 // Or, if the struct implements Default:
-                 // Ok(#name::default())
+                // Bring necessary serde items into scope for generated code
+                // No longer need `use ::serde::Deserialize;` here as helper structs are outside
+                use ::serde::de; // Needed for de::Error
+
+                // Helper types are now defined outside this impl block
+
+                // Define the main visitor struct *inside* the deserialize function scope
+                // This ensures it has access to generic parameters if needed
+                struct #visitor_struct_name;
+
+                impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+                    type Value = #name;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!("struct ", #struct_name_str))
+                    }
+
+                    fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+                    where
+                        V: ::serde::de::MapAccess<'de>,
+                    {
+                        // Initialize Option fields for the visitor
+                        #(#visitor_field_defs;)*
+
+                        // Loop through fields in the JSON map
+                        while let Some(key) = map.next_key::<#field_enum_name>()? { // Use unique enum name defined outside
+                            match key {
+                                #(#visitor_map_assignments)*
+                                #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; } // Use unique enum name
+                            }
+                        }
+
+                        // Construct Element fields *after* the loop using temp variables
+                        #(#element_construction_logic)*
+
+                        // Construct the final struct using the final field variables
+                        Ok(#name {
+                            #(#final_struct_fields),*
+                        })
+                    }
+                }
+
+                // Define the fields Serde should expect
+                const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
+                // Start deserialization using the main visitor struct defined above
+                deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
             }
         }
     };
+
 
     // --- Combine Serialize and Deserialize ---
     let serialize_impl = quote! {
@@ -535,8 +579,21 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Combine implementations
     let expanded = quote! {
-        #serialize_impl // Restore Serialize impl
-        // #deserialize_impl // Temporarily comment out Deserialize impl
+        // Define the moved helper structs/enums here, outside the impl blocks
+        #serialize_helper_struct_def // From previous step
+        #field_enum
+        #field_visitor_impl
+        // Define the extension helper struct here as well
+        #[derive(::serde::Deserialize)]
+        struct #extension_helper_name<E> {
+             #[serde(default)]
+             id: ::std::option::Option<String>,
+             #[serde(default)]
+             extension: ::std::option::Option<::std::vec::Vec<E>>,
+        }
+
+        #serialize_impl
+        #deserialize_impl // Restore Deserialize impl
     };
 
     // For debugging: Print the generated code
