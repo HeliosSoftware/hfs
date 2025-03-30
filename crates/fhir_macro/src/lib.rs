@@ -487,7 +487,29 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             }
                         }
 
-                        // Element construction logic will be generated and placed *after* this loop.
+                        // Generate construction logic for all element fields here
+                        let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
+                            if info.is_element {
+                                let field_ident = info.ident;
+                                let inner_ty = info.inner_ty;
+                                let val_field = format_ident!("{}_value", field_ident);
+                                let id_field = format_ident!("{}_id", field_ident);
+                                let ext_field = format_ident!("{}_extension", field_ident);
+                                Some(quote! {
+                                    // Assign to the final #field_ident variable declared at the top
+                                    #field_ident = if #val_field.is_some() || #id_field.is_some() || #ext_field.is_some() {
+                                        Some(#inner_ty { value: #val_field, id: #id_field, extension: #ext_field })
+                                    } else { None };
+                                })
+                            } else {
+                                None
+                            }
+                        }).collect();
+
+                        // Execute the construction logic
+                        #(#element_construction_logic)*
+
+                        // Construct the final struct using the final field variables
                         Ok(#name {
                             #(#final_struct_fields),*
                         })
