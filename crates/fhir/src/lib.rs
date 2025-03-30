@@ -141,9 +141,7 @@ pub mod r5;
 #[cfg(feature = "R6")]
 pub mod r6;
 
-pub trait FhirSerde {
-    fn fhir_derive_macro(&self);
-}
+// Removed the FhirSerde trait definition
 
 /// Enum representing a FHIR resource from any supported version
 #[derive(Debug)]

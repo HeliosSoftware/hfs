@@ -22,9 +22,10 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
         .join(&format!("{}.rs", version.as_str().to_lowercase()));
 
     // Create the version-specific output file with initial content
+    // Add use fhir_macro::FhirSerde;
     std::fs::write(
         &version_path,
-        "use serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
+        "use serde::{Serialize, Deserialize};\nuse fhir_macro::FhirSerde;\nuse crate::{Element, DecimalElement};\n\n",
     )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -411,9 +412,9 @@ fn process_elements(
             output.push_str("}\n\n");
         }
 
-        // Generate struct
-        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
-        output.push_str("#[serde(deny_unknown_fields)]\n");
+        // Generate struct - Use FhirSerde derive and remove deny_unknown_fields
+        output.push_str("#[derive(Debug, FhirSerde)]\n");
+        // output.push_str("#[serde(deny_unknown_fields)]\n"); // Removed: Macro will handle this if needed
         output.push_str(&format!(
             "pub struct {} {{\n",
             capitalize_first_letter(&type_name)
