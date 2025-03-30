@@ -292,18 +292,22 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                                 args.args[0].clone(),
                             )
                         } else {
-                            panic!("Unsupported Element type structure: {:?}", inner_ty);
+                            // Use quote!(...).to_string() for formatting Type
+                            panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
                         }
                     } else {
-                        panic!("Element type missing generics: {:?}", inner_ty);
+                         // Use quote!(...).to_string() for formatting Type
+                         panic!("Element type missing generics: {}", quote!(#inner_ty).to_string());
                     }
                 } else {
-                    panic!("Unsupported Element type path: {:?}", inner_ty);
+                     // Use quote!(...).to_string() for formatting Type
+                     panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string());
                 }
             } else {
-                panic!(
-                    "Expected Element or DecimalElement type, found: {:?}",
-                    inner_ty
+                 // Use quote!(...).to_string() for formatting Type
+                 panic!(
+                    "Expected Element or DecimalElement type, found: {}",
+                    quote!(#inner_ty).to_string()
                 );
             };
 
@@ -312,19 +316,19 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             visitor_field_defs.push(quote! { #ext_field: Option<Vec<#ext_ty_token>> = None });
 
             // Deserialize the value part (fieldName)
-            // Extract field names needed in the quote! macro
-            let original_name_str = &info.original_name;
+            // Create LitStr for field name interpolation in error messages
+            let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
                Field::#field_ident_enum => {
-                   // Interpolate the string directly
-                   if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_str)); }
+                   // Use the LitStr for duplicate_field
+                   if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #val_field = Some(map.next_value()?);
                }
             });
 
             // Deserialize the extension part (_fieldName)
-            // Extract field names needed in the quote! macro
-            let underscore_name_str = &info.underscore_name;
+            // Create LitStr for field name interpolation in error messages
+            let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
             let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use in helper struct definition
             visitor_map_assignments.push(quote! {
                  Field::#underscore_ident_enum => {
@@ -339,8 +343,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     // Deserialize the helper struct
                     let helper: ExtensionHelper<#ext_ty_token_clone> = map.next_value()?; // Use #ext_ty_token_clone here too
                     // Check for duplicates before assigning
-                    // Interpolate the string directly
-                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_str)); }
+                    // Use the LitStr for duplicate_field
+                    if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                     #id_field = helper.id;
                     #ext_field = helper.extension;
                 }
@@ -360,13 +364,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             });
         } else {
             // Regular field (might be Option<T> or just T)
-            visitor_field_defs.push(quote! { #field_ident: #field_ty = None }); // Initialize Option<T> or T = None/Default? Let's stick to Option<T> for simplicity in visitor
-            // Extract field name needed in the quote! macro
-            let original_name_str = &info.original_name;
+            visitor_field_defs.push(quote! { #field_ident: Option<#inner_ty> = None }); // Always use Option<Inner> in visitor for simplicity
+            // Create LitStr for field name interpolation in error messages
+            let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
                Field::#field_ident_enum => {
-                   // Interpolate the string directly
-                   if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_str)); }
+                   // Use the LitStr for duplicate_field
+                   if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #field_ident = Some(map.next_value()?);
                }
             });
@@ -376,11 +380,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 visitor_build_steps.push(quote! { let #field_ident = #field_ident; }); // Already Option<T>
             } else {
                 // If original field was T, unwrap the Option<T> from visitor or error if None
-                // Extract field name needed in the quote! macro
-                let original_name_str = &info.original_name;
+                // Create LitStr for field name interpolation in error messages
+                let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
                 visitor_build_steps.push(quote! {
-                     // Interpolate the string directly
-                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_str))?;
+                     // Use the LitStr for missing_field
+                     let #field_ident = #field_ident.ok_or_else(|| ::serde::de::Error::missing_field(#original_name_lit))?;
                  });
             }
         }
