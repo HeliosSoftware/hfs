@@ -390,6 +390,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     }
 
+    // Collect field identifiers separately for struct construction
+    let field_idents: Vec<&Ident> = field_infos.iter().map(|info| info.ident).collect();
+
     let visitor_struct_name = format_ident!("{}Visitor", name);
 
     let deserialize_impl = quote! {
@@ -423,9 +426,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 // Combine parts for Element fields and check required fields
                 #(#visitor_build_steps)*
 
-                // Construct the final struct
+                // Construct the final struct using the collected identifiers
                 Ok(#name {
-                    #(#field_infos.iter().map(|info| info.ident)),*
+                    #(#field_idents),*
                 })
             }
         }
