@@ -126,20 +126,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                         // Serialize id and extension under the underscore name, if present
                         if element.id.is_some() || element.extension.is_some() {
-                            // Extract E type *before* the quote block
-                            let ext_ty = if let Type::Path(type_path) = inner_ty {
-                                if type_path.path.segments.len() == 1 {
-                                    let segment = &type_path.path.segments[0];
-                                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                                        if (segment.ident == "Element" && args.args.len() == 2) || (segment.ident == "DecimalElement" && args.args.len() == 1) {
-                                            let e_arg = if segment.ident == "Element" { &args.args[1] } else { &args.args[0] };
-                                            match e_arg { GenericArgument::Type(t) => t, _ => panic!("Expected Type for E") }
-                                        } else { panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string()); }
-                                    } else { panic!("Element type missing generics: {}", quote!(#inner_ty).to_string()); }
-                                } else { panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string()); }
-                            } else { panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string()); };
-
-                            // Use the pre-defined helper struct with the extracted ext_ty
+                            // Use the pre-defined helper struct and the ext_ty extracted outside this quote block
                             let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
