@@ -56,7 +56,6 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     write!(file, "{}", resource_enum_code)?;
     // --- End Resource enum generation ---
 
-
     Ok(())
 }
 
@@ -130,7 +129,8 @@ fn generate_code(
     bundle: Bundle,
     output_path: impl AsRef<Path>,
     resource_names: &mut std::collections::HashSet<String>, // Add parameter to collect resource names
-) -> io::Result<()> { // Signature already returns io::Result<()>
+) -> io::Result<()> {
+    // Signature already returns io::Result<()>
     let mut all_elements: Vec<&ElementDefinition> = Vec::new(); // Store references
     let mut generated_structs_code = String::new(); // Accumulate struct code
 
@@ -379,7 +379,7 @@ fn process_struct_elements(
 
             // Include the root element definition itself (e.g., "Patient") - needed for metadata but not fields.
             if path_parts.len() == 1 && path_parts[0] == type_name.as_str() {
-                 return true; // Keep the root element for potential metadata access if needed later
+                return true; // Keep the root element for potential metadata access if needed later
             }
             // Include direct children (e.g., "Patient.identifier")
             if path_parts.len() > 1 && path_parts[0] == type_name.as_str() {
@@ -400,7 +400,6 @@ fn process_struct_elements(
         .cloned() // Clone the references
         .collect();
 
-
     let choice_fields: Vec<_> = field_elements // Use field_elements here
         .iter()
         .filter(|e| e.path.ends_with("[x]"))
@@ -408,7 +407,8 @@ fn process_struct_elements(
         .collect();
     let mut processed_choice_enums = std::collections::HashSet::new(); // Track enums generated for this struct
 
-    for choice in &choice_fields { // Iterate over references
+    for choice in &choice_fields {
+        // Iterate over references
         let base_name = choice
             .path
             .split('.')
@@ -423,7 +423,6 @@ fn process_struct_elements(
         );
         // Use UpperCamelCase for the choice enum name
         let enum_name = format!("{}Choice", enum_name);
-
 
         // Skip if we've already generated this enum for this struct
         if processed_choice_enums.contains(&enum_name) {
@@ -462,12 +461,12 @@ fn process_struct_elements(
 
     // Only add FhirSerde derive for complex-types and resources (structs)
     if struct_def.kind == "complex-type" || struct_def.kind == "resource" {
-         // Add standard derives first, then FhirSerde
-         output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
+        // Add standard derives first, then FhirSerde
+        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
     } else {
-         // For other kinds like BackboneElement (if treated differently) or potentially others
-         // just add standard derives. Enums are handled separately.
-         output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
+        // For other kinds like BackboneElement (if treated differently) or potentially others
+        // just add standard derives. Enums are handled separately.
+        output.push_str("#[derive(Debug, Serialize, Deserialize, PartialEq)]\n");
     }
     output.push_str(&format!(
         "pub struct {} {{\n",
@@ -477,7 +476,8 @@ fn process_struct_elements(
     // Keep track of fields added to avoid duplicates (e.g., from slicing or choice types)
     let mut added_fields = std::collections::HashSet::new();
 
-    for element in &field_elements { // Use field_elements here
+    for element in &field_elements {
+        // Use field_elements here
         // Skip elements that don't directly define a field (e.g., intermediate BackboneElement paths)
         // A simple check is if the path has more parts than the base type name path.
         let base_path_parts = type_name.split('.').count();
@@ -488,9 +488,8 @@ fn process_struct_elements(
         // We primarily want elements like "Patient.identifier" or "Patient.contact.gender".
         // Elements like "Patient.contact" itself (if it's a BackboneElement) are handled by their type definition.
         if element_path_parts <= base_path_parts {
-             continue; // Skip elements that are not fields of the current struct
+            continue; // Skip elements that are not fields of the current struct
         }
-
 
         if let Some(field_name) = element.path.split('.').last() {
             // Use the cleaned field name (without [x]) for tracking duplicates
@@ -578,7 +577,7 @@ fn generate_element_definition(
 
         let base_type = if let Some(content_ref) = &element.content_reference {
             if content_ref.starts_with('#') {
-                 // If it's a contentReference, generate the type name from the reference path
+                // If it's a contentReference, generate the type name from the reference path
                 generate_type_name(&content_ref[1..])
             } else {
                 base_type.to_string()
@@ -620,25 +619,30 @@ fn generate_element_definition(
         // Check if this specific field relationship is part of a detected cycle
         if cycles.contains(&(from_struct_name.clone(), field_type_name.clone())) ||
            // Also check the reverse for bidirectional cycles like Bundle <-> Resource
-           cycles.contains(&(field_type_name.clone(), from_struct_name.clone())) {
+           cycles.contains(&(field_type_name.clone(), from_struct_name.clone()))
+        {
             // Wrap the type in Box<>, handling Option and Vec correctly
-            if type_str.starts_with("Option<Vec<") { // Option<Vec<T>> -> Option<Vec<Box<T>>>
+            if type_str.starts_with("Option<Vec<") {
+                // Option<Vec<T>> -> Option<Vec<Box<T>>>
                 let inner = &type_str[12..type_str.len() - 2];
                 type_str = format!("Option<Vec<Box<{}>>>", inner);
-            } else if type_str.starts_with("Option<") { // Option<T> -> Option<Box<T>>
+            } else if type_str.starts_with("Option<") {
+                // Option<T> -> Option<Box<T>>
                 let inner = &type_str[7..type_str.len() - 1];
                 type_str = format!("Option<Box<{}>>", inner);
-            } else if type_str.starts_with("Vec<") { // Vec<T> -> Vec<Box<T>>
+            } else if type_str.starts_with("Vec<") {
+                // Vec<T> -> Vec<Box<T>>
                 let inner = &type_str[4..type_str.len() - 1];
                 type_str = format!("Vec<Box<{}>>", inner);
-            } else { // T -> Box<T>
+            } else {
+                // T -> Box<T>
                 type_str = format!("Box<{}>", type_str);
             }
-        } else if from_struct_name == "Parameters" && field_name == "resource" { // Use field_name here
-             // Explicitly Box Parameters.resource to break cycle with Resource enum
-             type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource" here
+        } else if from_struct_name == "Parameters" && field_name == "resource" {
+            // Use field_name here
+            // Explicitly Box Parameters.resource to break cycle with Resource enum
+            type_str = format!("Option<Box<{}>>", base_type); // base_type should be "Resource" here
         }
-
 
         // Output consolidated serde attributes if any exist
         if !serde_attrs.is_empty() {
