@@ -1106,19 +1106,17 @@ mod tests {
     #[derive(Debug, PartialEq, FhirSerde)] // Use FhirSerde derive
     struct FhirSerdeTestStruct {
         // Regular field
-        #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
 
         // Field with potential extension (_birthDate)
-        #[serde(rename = "birthDate", skip_serializing_if = "Option::is_none")]
+        // The FhirSerde macro should handle the 'birthDate'/'_birthDate' logic.
         birth_date: Option<Element<String, UnitTestExtension>>,
 
         // Another potentially extended field
-        #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
+        // The FhirSerde macro should handle the 'isActive'/'_isActive' logic.
         is_active: Option<Element<bool, UnitTestExtension>>,
 
         // A non-element field for good measure
-        #[serde(skip_serializing_if = "Option::is_none")]
         count: Option<i32>,
     }
 
