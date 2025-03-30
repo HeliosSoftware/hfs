@@ -514,10 +514,40 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             // Assign to temporary _value field
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
+            // Extract the value type V from the temporary variable's Option<V> type
+            // This needs the type of the temporary variable #val_field, which is Option<#val_ty>
+            let val_ty = &if let Type::Path(type_path) = inner_ty { // inner_ty is Element<V, E> or DecimalElement<E>
+                 if type_path.path.segments.len() == 1 {
+                     let segment = &type_path.path.segments[0];
+                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                         if segment.ident == "Element" && args.args.len() == 2 {
+                             // V is the first generic argument
+                             match &args.args[0] { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") }
+                         } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
+                             // For DecimalElement, V is crate::PreciseDecimal
+                             // Need to parse this type correctly. Using syn::parse_str is okay here.
+                             &syn::parse_str::<Type>("crate::PreciseDecimal").expect("Failed to parse PreciseDecimal type")
+                         } else {
+                             panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
+                         }
+                     } else {
+                         panic!("Element type missing generics: {}", quote!(#inner_ty).to_string());
+                     }
+                 } else {
+                     panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string());
+                 }
+             } else {
+                 panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string());
+             };
+
             visitor_map_assignments.push(quote! {
                #field_enum_name::#field_ident_enum => {
                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
-                   #val_field = Some(map.next_value()?);
+                   // Deserialize into Option<V> first to handle explicit nulls for the primitive value
+                   // #val_ty is V (e.g., String, bool, crate::PreciseDecimal)
+                   let primitive_value: ::std::option::Option<#val_ty> = map.next_value()?;
+                   // Assign the deserialized Option<V> directly to the temporary variable #val_field (which is also Option<V>)
+                   #val_field = primitive_value;
                }
             });
 
