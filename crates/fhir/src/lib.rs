@@ -293,11 +293,11 @@ pub struct Element<V, E> {
 }
 
 // Custom Deserialize for Element<V, E>
-// Add PartialEq + Eq bounds for V and E
+// Add PartialEq bounds for V and E (Eq removed for E)
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
-    V: Deserialize<'de> + PartialEq + Eq,
-    E: Deserialize<'de> + PartialEq + Eq,
+    V: Deserialize<'de> + PartialEq + Eq, // Keep Eq for V if needed, depends on primitive types
+    E: Deserialize<'de> + PartialEq, // Remove Eq bound for E
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -405,11 +405,11 @@ where
 }
 
 // Custom Serialize for Element<V, E>
-// Add PartialEq + Eq bounds for V and E
+// Add PartialEq bounds for V and E (Eq removed for E)
 impl<V, E> Serialize for Element<V, E>
 where
-    V: Serialize + PartialEq + Eq,
-    E: Serialize + PartialEq + Eq,
+    V: Serialize + PartialEq + Eq, // Keep Eq for V if needed
+    E: Serialize + PartialEq, // Remove Eq bound for E
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -456,10 +456,10 @@ pub struct DecimalElement<E> {
 }
 
 // Reinstate custom Deserialize implementation
-// Add PartialEq + Eq bound for E
+// Add PartialEq bound for E (Eq removed)
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
-    E: Deserialize<'de> + PartialEq + Eq,
+    E: Deserialize<'de> + PartialEq, // Remove Eq bound for E
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -584,10 +584,10 @@ impl UnexpectedValue for serde_json::Value {
 */ // Trait is unused currently
 
 // Reinstate custom Serialize implementation for DecimalElement
-// Add PartialEq + Eq bound for E
+// Add PartialEq bound for E (Eq removed)
 impl<E> Serialize for DecimalElement<E>
 where
-    E: Serialize + PartialEq + Eq,
+    E: Serialize + PartialEq, // Remove Eq bound for E
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

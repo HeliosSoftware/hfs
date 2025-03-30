@@ -179,8 +179,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let original_name = get_original_field_name(field);
         let underscore_name = format!("_{}", original_name);
 
-        let field_ident_enum = format_ident!("{}", field_ident.to_string().to_uppercase());
-        let underscore_ident_enum = format_ident!("__{}", field_ident.to_string().to_uppercase()); // Prefix with __ to avoid clashes if field starts with _
+        // Sanitize field name for enum variant (remove r#)
+        let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
+        let field_ident_enum = format_ident!("{}", clean_field_ident_str.to_uppercase());
+        // Use a unique prefix based on the struct name for the underscore enum variant
+        let underscore_ident_enum = format_ident!("{}__{}", name, clean_field_ident_str.to_uppercase());
 
         let (is_option, inner_ty) = match get_option_inner_type(field_ty) {
             Some(inner) => (true, inner),
@@ -211,20 +214,29 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     }
     // Add Ignore variant for unknown fields
     field_enum_variants.push(quote! { Ignore });
-    // Add catch-all arm for unknown fields
     field_match_arms.push(quote! { _ => Ok(Field::Ignore) });
+
+    // Generate unique names for helper types
+    let field_enum_name = format_ident!("{}Field", name);
+    let field_visitor_name = format_ident!("{}FieldVisitor", name);
+    let visitor_struct_name = format_ident!("{}Visitor", name);
+    let extension_helper_name = format_ident!("__{}FhirSerdeExtensionHelper", name);
+
 
     let field_enum = quote! {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum Field { #(#field_enum_variants),* }
+        // Use the unique name
+        enum #field_enum_name { #(#field_enum_variants),* }
     };
 
     // 2. Implement Visitor trait for Field enum
     let field_visitor_impl = quote! {
-        struct FieldVisitor;
+        // Use the unique name
+        struct #field_visitor_name;
 
-        impl<'de> ::serde::de::Visitor<'de> for FieldVisitor {
-            type Value = Field;
+        // Use the unique names
+        impl<'de> ::serde::de::Visitor<'de> for #field_visitor_name {
+            type Value = #field_enum_name;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("a field identifier")
@@ -242,16 +254,19 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where E: ::serde::de::Error,
             {
                  match value {
+                    // Use the unique enum name here
                     #(#field_match_arms),*
                 }
             }
         }
 
-        impl<'de> ::serde::Deserialize<'de> for Field {
+        // Use the unique enum name
+        impl<'de> ::serde::Deserialize<'de> for #field_enum_name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where D: ::serde::Deserializer<'de>,
             {
-                deserializer.deserialize_identifier(FieldVisitor)
+                 // Use the unique visitor name
+                deserializer.deserialize_identifier(#field_visitor_name)
             }
         }
     };
@@ -266,12 +281,15 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let field_ident = info.ident;
         let _field_ty = info.ty; // Original type (e.g., Option<Element<String, E>>) - Prefix with _
         let inner_ty = info.inner_ty; // Type inside Option (e.g., Element<String, E>)
-        let field_ident_enum = format_ident!("{}", field_ident.to_string().to_uppercase());
+        // Sanitize field name for enum variant
+        let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
+        let field_ident_enum = format_ident!("{}", clean_field_ident_str.to_uppercase());
 
         if info.is_element {
             // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
+            // Use the unique prefix for the underscore enum variant
             let underscore_ident_enum =
-                format_ident!("__{}", field_ident.to_string().to_uppercase());
+                format_ident!("{}__{}", name, clean_field_ident_str.to_uppercase());
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
@@ -319,7 +337,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Create LitStr for field name interpolation in error messages
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-               Field::#field_ident_enum => {
+               #field_enum_name::#field_ident_enum => { // Use unique enum name
                    // Use the LitStr for duplicate_field
                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #val_field = Some(map.next_value()?);
@@ -331,9 +349,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
             let ext_ty_token_clone = ext_ty_token.clone(); // Clone for use outside the quote! macro
             visitor_map_assignments.push(quote! {
-                 Field::#underscore_ident_enum => {
+                 #field_enum_name::#underscore_ident_enum => { // Use unique enum name
                     // Deserialize the helper struct directly using the type defined outside visit_map
-                    let helper: __FhirSerdeExtensionHelper<#ext_ty_token_clone> = map.next_value()?;
+                    let helper: #extension_helper_name<#ext_ty_token_clone> = map.next_value()?; // Use unique helper name
                     // Check for duplicates before assigning
                     // Use the LitStr for duplicate_field
                     if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
@@ -360,7 +378,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Create LitStr for field name interpolation in error messages
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
             visitor_map_assignments.push(quote! {
-               Field::#field_ident_enum => {
+               #field_enum_name::#field_ident_enum => { // Use unique enum name
                    // Use the LitStr for duplicate_field
                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
                    #field_ident = Some(map.next_value()?);
@@ -385,16 +403,16 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Collect field identifiers separately for struct construction
     let field_idents: Vec<&Ident> = field_infos.iter().map(|info| info.ident).collect();
 
-    let visitor_struct_name = format_ident!("{}Visitor", name);
+    // visitor_struct_name already defined above with unique name
 
     let deserialize_impl = quote! {
         #field_enum
         #field_visitor_impl
 
         // Define the helper struct for deserializing extensions outside the visitor implementation
-        // Use a unique name to avoid conflicts
+        // Use the unique name
         #[derive(::serde::Deserialize)] // Use ::serde::
-        struct __FhirSerdeExtensionHelper<E> {
+        struct #extension_helper_name<E> { // Use unique helper name
              #[serde(default)] // This is an attribute macro arg, keep as is
              id: Option<String>,
              #[serde(default)] // This is an attribute macro arg, keep as is
@@ -418,10 +436,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #(#visitor_field_defs;)*
 
                 // Loop through fields in the JSON map
-                while let Some(key) = map.next_key::<Field>()? {
+                while let Some(key) = map.next_key::<#field_enum_name>()? { // Use unique enum name
                     match key {
                         #(#visitor_map_assignments)*
-                        Field::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                        #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; } // Use unique enum name
                     }
                 }
 
