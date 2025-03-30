@@ -236,45 +236,208 @@ impl clap::ValueEnum for FhirVersion {
     }
 }
 
+// --- Visitor for Element Object Deserialization ---
+struct ElementObjectVisitor<V, E>(PhantomData<(V, E)>);
+
+impl<'de, V, E> Visitor<'de> for ElementObjectVisitor<V, E>
+where
+    V: Deserialize<'de>,
+    E: Deserialize<'de>,
+{
+    type Value = Element<V, E>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("an Element object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut id: Option<String> = None;
+        let mut extension: Option<Vec<E>> = None;
+        let mut value: Option<V> = None;
+
+        // Manually deserialize fields from the map
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => {
+                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                    id = Some(map.next_value()?);
+                }
+                "extension" => {
+                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
+                    extension = Some(map.next_value()?);
+                }
+                "value" => {
+                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                    // Deserialize directly into Option<V>
+                    value = Some(map.next_value()?);
+                }
+                // Ignore any unknown fields encountered
+                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
+            }
+        }
+
+        Ok(Element { id, extension, value })
+    }
+}
+// --- End Element Visitor ---
+
+
 #[derive(Debug)]
 pub struct Element<V, E> {
+    // Fields are already public
     pub id: Option<String>,
     pub extension: Option<Vec<E>>,
     pub value: Option<V>,
 }
 
+// Custom Deserialize for Element<V, E>
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
     V: Deserialize<'de>,
+    E: Deserialize<'de>, // Add bound for E
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Attempt to deserialize the inner type
-        let result = V::deserialize(deserializer);
-        match result {
-            Ok(value) => Ok(Element {
-                id: None,
-                extension: None,
-                value: Some(value),
-            }),
-            Err(e) => Err(e),
+        // Use the AnyValueVisitor approach to handle different JSON input types
+        struct AnyValueVisitor<V, E>(PhantomData<(V, E)>);
+
+        impl<'de, V, E> Visitor<'de> for AnyValueVisitor<V, E>
+        where
+            V: Deserialize<'de>,
+            E: Deserialize<'de>,
+        {
+            type Value = Element<V, E>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a primitive value (string, number, boolean), an object, or null")
+            }
+
+            // Handle primitive types by attempting to deserialize V and wrapping it
+            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> where Er: de::Error {
+                V::deserialize(de::value::BoolDeserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Bool(v), &self))
+            }
+            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::I64Deserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Signed(v), &self))
+            }
+            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::U64Deserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Unsigned(v), &self))
+            }
+            fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::F64Deserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Float(v), &self))
+            }
+            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::StrDeserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Str(v), &self))
+            }
+            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::StringDeserializer::new(v.clone())).map(|value| Element { // Clone v for error message
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Str(&v), &self))
+            }
+             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Str(v), &self))
+            }
+            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::BytesDeserializer::new(v)).map(|value| Element {
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Bytes(v), &self))
+            }
+            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er> where Er: de::Error {
+                 V::deserialize(de::value::ByteBufDeserializer::new(v.clone())).map(|value| Element { // Clone v for error message
+                    id: None, extension: None, value: Some(value)
+                }).map_err(|_| de::Error::invalid_type(de::Unexpected::Bytes(&v), &self))
+            }
+
+            // Handle null
+            fn visit_none<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
+                Ok(Element { id: None, extension: None, value: None })
+            }
+            fn visit_unit<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
+                 Ok(Element { id: None, extension: None, value: None })
+            }
+
+            // Handle Option<T> by visiting Some
+            fn visit_some<De>(self, deserializer: De) -> Result<Self::Value, De::Error>
+            where
+                De: Deserializer<'de>,
+            {
+                // Re-dispatch to deserialize_any to handle the inner type correctly
+                deserializer.deserialize_any(self)
+            }
+
+            // Handle object
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                // Deserialize the map using ElementObjectVisitor
+                // Need to create a deserializer from the map access
+                let map_deserializer = de::value::MapAccessDeserializer::new(map);
+                map_deserializer.deserialize_map(ElementObjectVisitor(PhantomData))
+            }
+
+            // We don't expect sequences for a single Element
+            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error> where A: de::SeqAccess<'de> {
+                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
+            }
         }
+
+        // Start deserialization using the visitor
+        deserializer.deserialize_any(AnyValueVisitor(PhantomData))
     }
 }
 
+// Custom Serialize for Element<V, E>
 impl<V, E> Serialize for Element<V, E>
 where
     V: Serialize,
+    E: Serialize, // Add bound for E
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match &self.value {
-            Some(val) => val.serialize(serializer),
-            None => serializer.serialize_none(),
+        // If id and extension are None, serialize value directly (or null)
+        if self.id.is_none() && self.extension.is_none() {
+            match &self.value {
+                Some(val) => val.serialize(serializer),
+                None => serializer.serialize_none(),
+            }
+        } else {
+            // Otherwise, serialize as an object containing id, extension, value if present
+            let mut len = 0;
+            if self.id.is_some() { len += 1; }
+            if self.extension.is_some() { len += 1; }
+            if self.value.is_some() { len += 1; }
+
+            let mut state = serializer.serialize_struct("Element", len)?;
+            if let Some(id) = &self.id {
+                state.serialize_field("id", id)?;
+            }
+            if let Some(extension) = &self.extension {
+                state.serialize_field("extension", extension)?;
+            }
+            if let Some(value) = &self.value {
+                // Important: Serialize the value under the "value" key when part of the object
+                state.serialize_field("value", value)?;
+            }
+            state.end()
         }
     }
 }
@@ -496,6 +659,7 @@ pub enum FhirDate {
 
 #[cfg(test)]
 mod tests {
+    // Keep existing imports
     use super::*;
     use rust_decimal_macros::dec;
     use serde_json;
@@ -719,5 +883,210 @@ mod tests {
         assert_eq!(reserialized_string_from_bare, expected_string,
             "Original bare string: {}\nParsed Value: {:?}\nExpected String: {}\nReserialized String: {}",
             json_str, parsed_value, expected_string, reserialized_string_from_bare);
+    }
+
+    // --- New tests for Element<V, E> ---
+
+    #[test]
+    fn test_serialize_element_primitive() {
+        let element = Element::<String, UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: Some("test_value".to_string()),
+        };
+        let json_string = serde_json::to_string(&element).unwrap();
+        // Should serialize as the primitive value directly
+        assert_eq!(json_string, r#""test_value""#);
+
+        let element_null = Element::<String, UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: None,
+        };
+        let json_string_null = serde_json::to_string(&element_null).unwrap();
+        // Should serialize as null
+        assert_eq!(json_string_null, "null");
+
+        // Test with integer
+        let element_int = Element::<i32, UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: Some(123),
+        };
+        let json_string_int = serde_json::to_string(&element_int).unwrap();
+        assert_eq!(json_string_int, "123");
+
+        // Test with boolean
+        let element_bool = Element::<bool, UnitTestExtension> {
+            id: None,
+            extension: None,
+            value: Some(true),
+        };
+        let json_string_bool = serde_json::to_string(&element_bool).unwrap();
+        assert_eq!(json_string_bool, "true");
+    }
+
+    #[test]
+    fn test_serialize_element_object() {
+        let element = Element::<String, UnitTestExtension> {
+            id: Some("elem-id".to_string()),
+            extension: Some(vec![UnitTestExtension { code: "ext1".to_string(), is_valid: true }]),
+            value: Some("test_value".to_string()),
+        };
+        let json_string = serde_json::to_string(&element).unwrap();
+        // Should serialize as an object because id/extension are present
+        let expected_json = r#"{"id":"elem-id","extension":[{"code":"ext1","is_valid":true}],"value":"test_value"}"#;
+        assert_eq!(json_string, expected_json);
+
+        // Test with only id
+        let element_id_only = Element::<String, UnitTestExtension> {
+            id: Some("elem-id-only".to_string()),
+            extension: None,
+            value: Some("test_value_id".to_string()),
+        };
+        let json_string_id_only = serde_json::to_string(&element_id_only).unwrap();
+        let expected_json_id_only = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
+        assert_eq!(json_string_id_only, expected_json_id_only);
+
+        // Test with only extension
+         let element_ext_only = Element::<String, UnitTestExtension> {
+            id: None,
+            extension: Some(vec![UnitTestExtension { code: "ext2".to_string(), is_valid: false }]),
+            value: Some("test_value_ext".to_string()),
+        };
+        let json_string_ext_only = serde_json::to_string(&element_ext_only).unwrap();
+        let expected_json_ext_only = r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
+        assert_eq!(json_string_ext_only, expected_json_ext_only);
+
+        // Test with id, extension, but no value
+        let element_no_value = Element::<String, UnitTestExtension> {
+            id: Some("elem-id-no-val".to_string()),
+            extension: Some(vec![UnitTestExtension { code: "ext3".to_string(), is_valid: true }]),
+            value: None,
+        };
+        let json_string_no_value = serde_json::to_string(&element_no_value).unwrap();
+        // Should serialize object without the "value" field
+        let expected_json_no_value = r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
+         assert_eq!(json_string_no_value, expected_json_no_value);
+    }
+
+    #[test]
+    fn test_deserialize_element_primitive() {
+        // String primitive
+        let json_string = r#""test_value""#;
+        let element: Element<String, UnitTestExtension> = serde_json::from_str(json_string).unwrap();
+        assert_eq!(element.id, None);
+        assert_eq!(element.extension, None);
+        assert_eq!(element.value, Some("test_value".to_string()));
+
+        // Null primitive
+        let json_null = "null";
+        let element_null: Element<String, UnitTestExtension> = serde_json::from_str(json_null).unwrap();
+        assert_eq!(element_null.id, None);
+        assert_eq!(element_null.extension, None);
+        assert_eq!(element_null.value, None);
+
+        // Number primitive
+        let json_num = "123";
+        let element_num: Element<i32, UnitTestExtension> = serde_json::from_str(json_num).unwrap();
+         assert_eq!(element_num.id, None);
+        assert_eq!(element_num.extension, None);
+        assert_eq!(element_num.value, Some(123));
+
+        // Boolean primitive
+        let json_bool = "true";
+        let element_bool: Element<bool, UnitTestExtension> = serde_json::from_str(json_bool).unwrap();
+         assert_eq!(element_bool.id, None);
+        assert_eq!(element_bool.extension, None);
+        assert_eq!(element_bool.value, Some(true));
+    }
+
+     #[test]
+    fn test_deserialize_element_object() {
+        // Full object
+        let json_string = r#"{"id":"elem-id","extension":[{"code":"ext1","is_valid":true}],"value":"test_value"}"#;
+        let element: Element<String, UnitTestExtension> = serde_json::from_str(json_string).unwrap();
+        assert_eq!(element.id, Some("elem-id".to_string()));
+        assert_eq!(element.extension, Some(vec![UnitTestExtension { code: "ext1".to_string(), is_valid: true }]));
+        assert_eq!(element.value, Some("test_value".to_string()));
+
+        // Object with missing value
+        let json_missing_value = r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
+        let element_missing_value: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_value).unwrap();
+        assert_eq!(element_missing_value.id, Some("elem-id-no-val".to_string()));
+        assert_eq!(element_missing_value.extension, Some(vec![UnitTestExtension { code: "ext3".to_string(), is_valid: true }]));
+        assert_eq!(element_missing_value.value, None); // Value should be None
+
+        // Object with missing extension
+        let json_missing_ext = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
+        let element_missing_ext: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_ext).unwrap();
+        assert_eq!(element_missing_ext.id, Some("elem-id-only".to_string()));
+        assert_eq!(element_missing_ext.extension, None);
+        assert_eq!(element_missing_ext.value, Some("test_value_id".to_string()));
+
+        // Object with missing id
+        let json_missing_id = r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
+        let element_missing_id: Element<String, UnitTestExtension> = serde_json::from_str(json_missing_id).unwrap();
+        assert_eq!(element_missing_id.id, None);
+        assert_eq!(element_missing_id.extension, Some(vec![UnitTestExtension { code: "ext2".to_string(), is_valid: false }]));
+        assert_eq!(element_missing_id.value, Some("test_value_ext".to_string()));
+
+        // Object with only value
+        let json_only_value_obj = r#"{"value":"test_value_only"}"#;
+        let element_only_value: Element<String, UnitTestExtension> = serde_json::from_str(json_only_value_obj).unwrap();
+        assert_eq!(element_only_value.id, None);
+        assert_eq!(element_only_value.extension, None);
+        assert_eq!(element_only_value.value, Some("test_value_only".to_string()));
+
+        // Empty object
+        let json_empty_obj = r#"{}"#;
+        let element_empty_obj: Element<String, UnitTestExtension> = serde_json::from_str(json_empty_obj).unwrap();
+        assert_eq!(element_empty_obj.id, None);
+        assert_eq!(element_empty_obj.extension, None);
+        assert_eq!(element_empty_obj.value, None); // Value is None when deserializing from empty object
+    }
+
+    #[test]
+    fn test_deserialize_element_invalid_type() {
+        // Array is not a valid representation for a single Element
+        let json_array = r#"[1, 2, 3]"#;
+        let result: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_array);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid type: sequence, expected a primitive value (string, number, boolean), an object, or null"));
+
+        // Boolean when expecting i32 (primitive case)
+        let json_bool = r#"true"#;
+        let result_bool: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_bool);
+        assert!(result_bool.is_err());
+        // Error comes from V::deserialize failing inside the visitor
+        assert!(result_bool.unwrap_err().to_string().contains("invalid type: boolean `true`, expected i32"));
+
+        // Object containing a boolean value when expecting Element<i32, _>
+        let json_obj_bool_val = r#"{"value": true}"#;
+        let result_obj_bool: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_obj_bool_val);
+        assert!(result_obj_bool.is_err());
+        // Error comes from trying to deserialize the "value": true into Option<i32>
+        assert!(result_obj_bool.unwrap_err().to_string().contains("invalid type: boolean `true`, expected i32"));
+
+        // Define a simple struct that CANNOT deserialize from primitive types
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct NonPrimitive { field: String }
+
+        // Try deserializing a primitive string into Element<NonPrimitive, _>
+        let json_prim_str = r#""hello""#;
+        let result_prim_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> = serde_json::from_str(json_prim_str);
+        assert!(result_prim_nonprim.is_err());
+        // Error comes from V::deserialize failing inside the visitor
+        assert!(result_prim_nonprim.unwrap_err().to_string().contains("invalid type: string \"hello\", expected struct NonPrimitive"));
+
+        // Try deserializing an object into Element<NonPrimitive, _> (this should work if object has correct field)
+        let json_obj_nonprim = r#"{"value": {"field": "world"}}"#;
+        let result_obj_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> = serde_json::from_str(json_obj_nonprim);
+        assert!(result_obj_nonprim.is_ok());
+        let element_obj_nonprim = result_obj_nonprim.unwrap();
+        assert_eq!(element_obj_nonprim.id, None);
+        assert_eq!(element_obj_nonprim.extension, None);
+        assert_eq!(element_obj_nonprim.value, Some(NonPrimitive{ field: "world".to_string() }));
+
     }
 }
