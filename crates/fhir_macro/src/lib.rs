@@ -591,28 +591,28 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Assign the constructed Option<Element<...>> directly to the final field variable
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
-                    // Construct the correct Element or DecimalElement struct
-                    // Re-check inner_ty name here to be certain
-                    let element_value = if let ::syn::Type::Path(tp) = info.inner_ty { // Use ::syn:: and info.inner_ty
-                        if let Some(seg) = tp.path.segments.last() {
-                            if seg.ident == "DecimalElement" {
-                                // Construct DecimalElement<E> using quote!
-                                quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                    // Construct the Element/DecimalElement directly inside Some()
+                    ::std::option::Option::Some(
+                        // Re-check inner_ty name here to be certain
+                        if let ::syn::Type::Path(tp) = info.inner_ty { // Use ::syn:: and info.inner_ty
+                            if let Some(seg) = tp.path.segments.last() {
+                                if seg.ident == "DecimalElement" {
+                                    // Construct DecimalElement<E> using quote!
+                                    quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                                } else {
+                                    // Assume Element<V, E>
+                                    // Construct Element<V, E> using quote!
+                                    quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                                }
                             } else {
-                                // Assume Element<V, E>
-                                // Construct Element<V, E> using quote!
+                                // Fallback: Assume Element<V, E> if path has no segments (unlikely)
                                 quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                             }
                         } else {
-                            // Fallback: Assume Element<V, E> if path has no segments (unlikely)
+                            // Fallback: Assume Element<V, E> if not Type::Path (unlikely)
                             quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         }
-                    } else {
-                        // Fallback: Assume Element<V, E> if not Type::Path (unlikely)
-                        quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
-                    };
-                    // Wrap the constructed element in Some
-                    ::std::option::Option::Some(#element_value)
+                    ) // End of Some(...)
                 } else {
                     // If no value, id, or extension were found, the final field is None
                     ::std::option::Option::None
