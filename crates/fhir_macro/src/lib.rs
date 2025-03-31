@@ -588,12 +588,24 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let v_ty_construct = info.v_ty.as_ref().expect("v_ty missing for element");
             let ext_ty = info.ext_ty.as_ref().expect("ext_ty missing for element");
 
-            // --- New logic ---
-            // Determine if we should construct DecimalElement based on the V type
-            let v_ty_string = quote!(#v_ty_construct).to_string();
-            // Need to handle potential whitespace differences from quote!
-            let should_construct_decimal_element = v_ty_string.replace(" ", "") == "crate::PreciseDecimal";
-            // --- End new logic ---
+            // --- Reverted Logic ---
+            // Determine if we should construct DecimalElement based on the *original inner type name*
+            let inner_ty_ident_str = if let ::syn::Type::Path(type_path) = info.inner_ty {
+                 if let Some(segment) = type_path.path.segments.last() {
+                     segment.ident.to_string()
+                 } else {
+                     // Fallback or error handling if path segment is missing
+                     // This case should ideally not be hit for valid element types
+                     String::new() // Or trigger a compile error
+                 }
+             } else {
+                 // Fallback or error handling if not a TypePath
+                 String::new() // Or trigger a compile error
+             };
+            // Check if the last segment identifier is exactly "Decimal".
+            // This assumes aliases like r4::Decimal resolve to something ending in "Decimal".
+            let should_construct_decimal_element = inner_ty_ident_str == "Decimal";
+            // --- End Reverted Logic ---
 
 
             Some(quote! {
