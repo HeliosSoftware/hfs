@@ -1592,10 +1592,11 @@ mod tests {
             count: Some(1),
         };
         let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
-        assert_eq!(s1, expected1); // Uncomment assertion
+        assert_eq!(s1, expected1);
 
         // Case 2: Only extension for birthDate
-        let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
+        // Update json2 to use a valid r4::Extension structure
+        let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]}}"#;
         // Use r4::Date
         let _expected2 = FhirSerdeTestStruct {
             // Prefixed unused variable
@@ -1603,7 +1604,17 @@ mod tests {
             birth_date: Some(r4::Date {
                 // Construct using the alias type
                 id: Some("bd-id".to_string()),
-                extension: None, // AI! This is wrong - we are expecting an extension value
+                // Expect the valid extension based on corrected json2
+                extension: Some(vec![r4::Extension {
+                    id: None,
+                    extension: None,
+                    url: "http://example.com/note".to_string(),
+                    value: Some(r4::ExtensionValue::String(r4::String {
+                        id: None,
+                        extension: None,
+                        value: Some("some note".to_string()),
+                    })),
+                }]),
                 value: None,
             }),
             is_active: None,
