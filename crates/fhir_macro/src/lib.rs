@@ -589,12 +589,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
-                    // The quote! macro generates the code tokens
+                    // Re-introduce quote! here to generate the conditional construction code
                     ::std::option::Option::Some(
                         if #is_decimal_element {
-                             crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
+                            quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         } else {
-                             crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
+                            quote! { crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         }
                     ) // End of Some(...)
                 } else {
