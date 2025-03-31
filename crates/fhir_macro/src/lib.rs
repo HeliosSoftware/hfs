@@ -33,23 +33,13 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
-fn is_fhir_primitive_element_type(ty: &Type) -> bool {
+// Helper function to check if a type is specifically Element or DecimalElement (by name)
+fn is_element_or_decimal_element(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
-        // Allow multi-segment paths like crate::r4::Date, but only check the last segment's identifier
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
-                // Check for direct Element/DecimalElement or known R4 primitive type aliases
-                match ident_str.as_str() {
-                    "Element" | "DecimalElement" |
-                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
-                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
-                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
-                    "Uuid" | "Xhtml" => return true,
-                    // Add other versions' aliases if needed
-                    _ => return false,
-                }
+                return ident_str == "Element" || ident_str == "DecimalElement";
             }
         }
     }
@@ -160,13 +150,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let original_name_lit = LitStr::new(&original_name, Span::call_site());
         let underscore_name_lit = LitStr::new(&format!("_{}", original_name), Span::call_site());
 
-        // Check if the field is Option<Element<...>> or Option<DecimalElement<...>> or a primitive alias
+        // Check if the field is Option<T>
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            // Use the renamed function here
-            if is_fhir_primitive_element_type(inner_ty) {
-                // This is a potentially extended primitive field (like Option<Element<String, Extension>>)
-
-                // --- Moved ext_ty extraction inside this block ---
+            // Check if the inner type T is specifically Element or DecimalElement
+            if is_element_or_decimal_element(inner_ty) {
+                // This field is Option<Element<V, E>> or Option<DecimalElement<E>>
                 // Extract E type using get_element_generics
                 // We only need E for the serialization helper generic argument
                 let (_v_ty, ext_ty) = get_element_generics(inner_ty);
@@ -592,20 +580,38 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the correct Element or DecimalElement struct
-                    // Need to pass the correct generics <V, E> or <E>
-                    let element_value = if stringify!(#element_struct_ident) == "DecimalElement" {
-                         // Construct DecimalElement<E>
-                         #element_struct_ident::<#_ext_ty> { // Use _ext_ty
-                             value: #val_field_ident, // Assign the temporary value field
-                             id: #id_field_ident, // Assign the temporary id field
-                             extension: #final_ext_field_ident, // Assign the final deserialized extension field
-                         }
+                    // Re-check inner_ty name here to be certain
+                    let element_value = if let Type::Path(tp) = inner_ty {
+                        if let Some(seg) = tp.path.segments.last() {
+                            if seg.ident == "DecimalElement" {
+                                // Construct DecimalElement<E>
+                                format_ident!("DecimalElement")::<#_ext_ty> { // Use _ext_ty
+                                    value: #val_field_ident,
+                                    id: #id_field_ident,
+                                    extension: #final_ext_field_ident,
+                                }
+                            } else {
+                                // Assume Element<V, E>
+                                format_ident!("Element")::<#v_ty_construct, #_ext_ty> { // Use v_ty_construct and _ext_ty
+                                    value: #val_field_ident,
+                                    id: #id_field_ident,
+                                    extension: #final_ext_field_ident,
+                                }
+                            }
+                        } else {
+                            // Fallback: Assume Element<V, E> if path has no segments (unlikely)
+                            format_ident!("Element")::<#v_ty_construct, #_ext_ty> {
+                                value: #val_field_ident,
+                                id: #id_field_ident,
+                                extension: #final_ext_field_ident,
+                            }
+                        }
                     } else {
-                         // Construct Element<V, E>
-                         #element_struct_ident::<#v_ty_construct, #_ext_ty> { // Use v_ty_construct and _ext_ty
-                             value: #val_field_ident, // Assign the temporary value field
-                             id: #id_field_ident, // Assign the temporary id field
-                             extension: #final_ext_field_ident, // Assign the final deserialized extension field
+                        // Fallback: Assume Element<V, E> if not Type::Path (unlikely)
+                        format_ident!("Element")::<#v_ty_construct, #_ext_ty> {
+                            value: #val_field_ident,
+                            id: #id_field_ident,
+                            extension: #final_ext_field_ident,
                          }
                     };
                     ::std::option::Option::Some(element_value)
