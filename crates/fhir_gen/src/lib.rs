@@ -437,7 +437,7 @@ fn process_elements(
         }
 
         // Generate struct derives - Add Clone, PartialEq, Eq to all structs
-        let derives = vec![
+        let mut derives = vec![ // Added 'mut' here
             "Debug",
             "Serialize",
             "Deserialize",
