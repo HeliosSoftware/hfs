@@ -1160,8 +1160,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext1".to_string(),
-                // Construct r4::Boolean explicitly
-                value: Some(r4::ExtensionValue::Boolean(r4::Boolean { value: Some(true), ..Default::default() })),
+                // Construct r4::Boolean explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::Boolean(r4::Boolean { id: None, extension: None, value: Some(true) })),
             }]),
             value: Some("test_value".to_string()),
         };
@@ -1189,8 +1189,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext2".to_string(),
-                // Construct r4::String explicitly
-                value: Some(r4::ExtensionValue::String(r4::String { value: Some("val2".to_string()), ..Default::default() })),
+                // Construct r4::String explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::String(r4::String { id: None, extension: None, value: Some("val2".to_string()) })),
             }]),
             value: Some("test_value_ext".to_string()),
         };
@@ -1207,8 +1207,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext3".to_string(),
-                // Construct r4::Integer explicitly
-                value: Some(r4::ExtensionValue::Integer(r4::Integer { value: Some(123), ..Default::default() })),
+                // Construct r4::Integer explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::Integer(r4::Integer { id: None, extension: None, value: Some(123) })),
             }]),
             value: None,
         };
@@ -1517,8 +1517,8 @@ mod tests {
                     id: None,
                     extension: None,
                     url: "http://example.com/flag".to_string(),
-                    // Construct r4::Boolean explicitly
-                    value: Some(r4::ExtensionValue::Boolean(r4::Boolean { value: Some(true), ..Default::default() })),
+                    // Construct r4::Boolean explicitly, initializing all fields
+                    value: Some(r4::ExtensionValue::Boolean(r4::Boolean { id: None, extension: None, value: Some(true) })),
                 }]),
                 value: None,
             }),
@@ -1604,8 +1604,8 @@ mod tests {
                     id: None,
                     extension: None,
                     url: "http://example.com/test".to_string(),
-                    // Construct r4::String explicitly
-                    value: Some(r4::ExtensionValue::String(r4::String { value: Some("some-ext-val".to_string()), ..Default::default() })),
+                    // Construct r4::String explicitly, initializing all fields
+                    value: Some(r4::ExtensionValue::String(r4::String { id: None, extension: None, value: Some("some-ext-val".to_string()) })),
                 }]),
                 value: Some("1970-03-30".to_string()),
             }),

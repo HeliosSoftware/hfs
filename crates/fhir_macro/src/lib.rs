@@ -607,9 +607,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Define the extension helper struct for Deserialize here as well
     // Use updated helper name (no __)
     let deserialize_extension_helper_def = quote! {
-        // Add lifetime 'de and bind E to it
+        // Remove 'de lifetime from helper struct definition
         #[derive(::serde::Deserialize)] // Use Deserialize from use statement
-        struct #extension_helper_name<'de, E: ::serde::Deserialize<'de>> { // Add 'de lifetime and bound
+        struct #extension_helper_name<E: for<'de2> ::serde::Deserialize<'de2>> { // Use higher-ranked trait bound for E
              #[serde(default)]
              id: ::std::option::Option<String>,
              #[serde(default)]
