@@ -108,20 +108,6 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
 
     panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
 }
-                    let e_arg = &args.args[1];
-                    let v_type = match v_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for V") };
-                    let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
-                    return (v_type, e_type);
-                } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
-                    // V is crate::PreciseDecimal for DecimalElement
-                    let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
-                    let e_arg = &args.args[0];
-                    let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
-                    return (precise_decimal_type, e_type);
-                }
-            }
-        }
-    }
     // Fallback or error - this shouldn't happen if called after is_fhir_primitive_element_type
     // For now, let's panic, but a better approach might be needed depending on how type aliases are handled.
     // *** Correction: We need to handle the aliases here! ***
