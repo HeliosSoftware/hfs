@@ -324,36 +324,20 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         // Append "Underscore" for the underscore variant name
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
-        // Determine if the field is Option<T> and get the inner type T
-        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
-            Some(inner) => (true, inner),
-            None => (false, field_ty),
-        };
-        // Use the updated helper function
-        let is_element = is_fhir_primitive_element_type(inner_ty);
+        // is_element was already determined in the previous loop
+        let is_element = field_infos.last().unwrap().is_element; // Get from stored info
 
-        field_infos.push(FieldInfo {
-            ident: field_ident,
-            ty: field_ty,
-            original_name: original_name.clone(),
-            underscore_name: underscore_name.clone(),
-            is_element,
-            // is_option, // Removed unused field
-            inner_ty,
-        });
-
-        // For Field enum and match arms
-        field_enum_variants.push(quote! { #field_ident_enum });
-        // Use #field_enum_name instead of Field
-        field_match_arms.push(quote! { #original_name => Ok(#field_enum_name::#field_ident_enum) });
-        field_strings.push(original_name.clone()); // Add original name
-
+        // ... (keep Field enum variant and match arm generation) ...
+        // Make sure to add the underscore variant *only* if is_element is true
         if is_element {
             field_enum_variants.push(quote! { #underscore_ident_enum });
             // Use #field_enum_name instead of Field
             field_match_arms
                 .push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
             field_strings.push(underscore_name); // Add underscore name only for element types
+        } else {
+             // If not an element type, ensure we don't add the underscore variant/match arm
+             // (This prevents errors if a field coincidentally starts with _)
         }
     }
     // Add Ignore variant for unknown fields
@@ -428,58 +412,423 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             .push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
 
         if info.is_element {
-            // Declare temporary variables for element parts
-            let inner_ty = info.inner_ty; // Element<V, E> or DecimalElement<E>
-            // Extract V and E types from Element<V, E> or DecimalElement<E>
-            let (val_ty, ext_ty) = if let Type::Path(type_path) = inner_ty {
-                if type_path.path.segments.len() == 1 {
-                    let segment = &type_path.path.segments[0];
-                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if segment.ident == "Element" && args.args.len() == 2 {
-                            let v_arg = &args.args[0];
-                            let e_arg = &args.args[1];
-                            let v_type = match v_arg {
-                                GenericArgument::Type(t) => t,
-                                _ => panic!("Expected Type for V"),
-                            };
-                            let e_type = match e_arg {
-                                GenericArgument::Type(t) => t,
-                                _ => panic!("Expected Type for E"),
-                            };
-                            (v_type.clone(), e_type.clone())
-                        } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
-                            let precise_decimal_type =
-                                syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
-                            let e_arg = &args.args[0];
-                            let e_type = match e_arg {
-                                GenericArgument::Type(t) => t,
-                                _ => panic!("Expected Type for E"),
-                            };
-                            (precise_decimal_type, e_type.clone())
-                        } else {
-                            panic!(
-                                "Unsupported Element type structure: {}",
-                                quote!(#inner_ty).to_string()
-                            );
-                        }
-                    } else {
-                        panic!(
-                            "Element type missing generics: {}",
-                            quote!(#inner_ty).to_string()
-                        );
-                    }
+            // Use the new helper to get V and E types from the inner_ty
+            let (val_ty, ext_ty) = get_element_generics(info.inner_ty); // Use inner_ty here
+
+            let val_field = format_ident!("{}_value", field_ident);
+            let id_field = format_ident!("{}_id", field_ident);
+            let ext_field = format_ident!("{}_extension", field_ident);
+
+            // Use fully qualified paths for Option and Vec
+            visitor_field_defs
+                .push(quote! { let mut #val_field: ::std::option::Option<#val_ty> = None; });
+            visitor_field_defs
+                .push(quote! { let mut #id_field: ::std::option::Option<String> = None; });
+            visitor_field_defs.push(quote! { let mut #ext_field: ::std::option::Option<::std::vec::Vec<#ext_ty>> = None; });
+        }
+    }
+
+    // Generate map assignments (assign to temp vars or final vars)
+    for info in &field_infos {
+        let field_ident = info.ident;
+        let inner_ty = info.inner_ty; // Use inner_ty
+
+        // Get the correct UpperCamelCase enum variant names generated earlier
+        let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
+        let field_ident_enum_str = {
+            let mut camel_case = String::new();
+            let mut capitalize = true;
+            for c in clean_field_ident_str.chars() {
+                if c == '_' {
+                    capitalize = true;
+                } else if capitalize {
+                    camel_case.push(c.to_ascii_uppercase());
+                    capitalize = false;
                 } else {
-                    panic!(
-                        "Unsupported Element type path: {}",
-                        quote!(#inner_ty).to_string()
-                    );
+                    camel_case.push(c);
+                }
+            }
+            if let Some(first) = camel_case.chars().next() {
+                if !first.is_uppercase() {
+                    camel_case.insert(0, first.to_ascii_uppercase());
+                    camel_case.remove(1);
                 }
             } else {
-                panic!(
-                    "Expected Element or DecimalElement type, found: {}",
-                    quote!(#inner_ty).to_string()
-                );
-            };
+                camel_case = format!("Field{}", field_ident);
+            }
+            camel_case
+        };
+        let field_ident_enum = format_ident!("{}", field_ident_enum_str); // e.g., BirthDate
+        let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
+
+        if info.is_element {
+            // Use the new helper to get V and E types from the inner_ty
+            let (val_ty, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+            let id_field = format_ident!("{}_id", field_ident);
+            let ext_field = format_ident!("{}_extension", field_ident);
+            let val_field = format_ident!("{}_value", field_ident);
+            let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
+            let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
+
+            // Assignment for the primitive value (fieldName)
+            visitor_map_assignments.push(quote! {
+               #field_enum_name::#field_ident_enum => {
+                   if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
+                   // Deserialize into Option<V> using the extracted val_ty
+                   let primitive_value: ::std::option::Option<#val_ty> = map.next_value()?;
+                   #val_field = primitive_value;
+               }
+            });
+
+            // Assignment for the extension object (_fieldName)
+            visitor_map_assignments.push(quote! {
+                 // Use #field_enum_name directly (defined outside impl block)
+                 #field_enum_name::#underscore_ident_enum => {
+                    // Deserialize into Value first to check for null
+                    let value = map.next_value::<::serde_json::Value>()?;
+                    if !value.is_null() {
+                        // If not null, deserialize the Value into the helper
+                        // Use updated #extension_helper_name (no __) directly (defined outside impl block)
+                        // Use the extracted ext_ty for the helper
+                        let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
+                            .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
+                        if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
+                        #id_field = helper.id;
+                        #ext_field = helper.extension;
+                    }
+                    // If value was null, do nothing, fields remain None
+                }
+            });
+        } else {
+            // Assign directly to the final field variable for non-elements
+            let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
+            visitor_map_assignments.push(quote! {
+               // Use #field_enum_name directly (defined inside impl block)
+               #field_enum_name::#field_ident_enum => {
+                   if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
+                   // Deserialize directly into the final Option<T> field
+                   #field_ident = map.next_value()?; // Use map.next_value() which returns Result<T, Error>
+               }
+            });
+        }
+    }
+
+    // Generate the final struct construction logic (remains the same)
+    let final_struct_fields: Vec<_> = field_infos
+        .iter()
+        .map(|info| {
+            let field_ident = info.ident;
+            quote! { #field_ident: #field_ident }
+        })
+        .collect();
+
+    // visitor_struct_name already defined above with unique name
+
+    // Element construction logic generation (moved back outside)
+    let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
+        if info.is_element {
+            let field_ident = info.ident; // Final field ident (e.g., birth_date)
+            let inner_ty = info.inner_ty; // Use inner_ty (e.g., Code, Element<String, E>)
+            // Idents for temporary variables *inside* visit_map
+            let val_field_ident = format_ident!("{}_value", field_ident);
+            let id_field_ident = format_ident!("{}_id", field_ident);
+            let ext_field_ident = format_ident!("{}_extension", field_ident);
+
+            // Determine the actual struct type to construct (Element or DecimalElement)
+            // based on the inner_ty name
+            let element_struct_ident = if let Type::Path(type_path) = inner_ty {
+                 if type_path.path.segments.len() == 1 {
+                     let segment = &type_path.path.segments[0];
+                     if segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal" {
+                         format_ident!("DecimalElement") // Construct DecimalElement
+                     } else {
+                         format_ident!("Element") // Construct Element for others
+                     }
+                 } else {
+                     format_ident!("Element") // Default fallback
+                 }
+             } else {
+                 format_ident!("Element") // Default fallback
+             };
+
+             // Get V and E again for the construction
+             let (v_ty_construct, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+
+            Some(quote! {
+                // This generated code will be placed inside visit_map
+                // It references #field_ident (final variable) and the temporary variables
+                 // Assign the constructed Option<Element<...>> directly to the final field variable
+                #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
+                    // Construct the correct Element or DecimalElement struct
+                    // Need to pass the correct generics <V, E> or <E>
+                    let element_value = if stringify!(#element_struct_ident) == "DecimalElement" {
+                         // Construct DecimalElement<E>
+                         #element_struct_ident::<#ext_ty> {
+                             value: #val_field_ident, // Already Option<PreciseDecimal>
+                             id: #id_field_ident,
+                             extension: #ext_field_ident,
+                         }
+                    } else {
+                         // Construct Element<V, E>
+                         // Need V type here again!
+                         #element_struct_ident::<#v_ty_construct, #ext_ty> {
+                             value: #val_field_ident, // Already Option<V>
+                             id: #id_field_ident,
+                             extension: #ext_field_ident,
+                         }
+                    };
+                    ::std::option::Option::Some(element_value)
+                } else {
+                    ::std::option::Option::None
+                };
+            })
+        } else {
+            None
+        }
+    }).collect();
+
+    // Define the extension helper struct for Deserialize here as well
+    // Use updated helper name (no __)
+    let deserialize_extension_helper_def = quote! {
+        // Add generic parameter E bound by Deserialize
+        #[derive(::serde::Deserialize)] // Use Deserialize from use statement
+        struct #extension_helper_name<E: ::serde::Deserialize<'de>> { // Add Deserialize bound
+             #[serde(default)]
+             id: ::std::option::Option<String>,
+             #[serde(default)]
+             extension: ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
+    // --- Generate Deserialize Implementation ---
+
+    // Define the main visitor struct and its implementation
+    let visitor_impl = quote! {
+        // Define the main visitor struct
+        struct #visitor_struct_name;
+
+        impl<'de> ::serde::de::Visitor<'de> for #visitor_struct_name {
+            type Value = #name; // Use #name directly as it's in the outer scope
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(concat!("struct ", #struct_name_str))
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
+            where
+                V: ::serde::de::MapAccess<'de>,
+            {
+                // Bring necessary serde items into scope for generated code
+                use ::serde::de; // Needed for de::Error
+                // Need Deserialize in scope for helper derives
+                use ::serde::Deserialize;
+
+                // Define helper types (Field enum, FieldVisitor, ExtensionHelper) *inside* the visit_map scope
+                // This ensures they are unique per struct and avoids polluting the outer scope,
+                // but requires them to be accessible when map.next_key/value is called.
+                // Let's keep them defined *outside* the impl block for simplicity and clarity.
+
+                // Initialize Option fields for the visitor
+                #(#visitor_field_defs;)*
+
+                // Loop through fields in the JSON map
+                // Use #field_enum_name directly (defined outside impl block)
+                while let Some(key) = map.next_key::<#field_enum_name>()? {
+                    match key {
+                        #(#visitor_map_assignments)*
+                        // Use #field_enum_name directly (defined outside impl block)
+                        #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                    }
+                }
+
+                // Construct Element fields *after* the loop using temp variables
+                #(#element_construction_logic)*
+
+                // Construct the final struct using the final field variables
+                Ok(#name {
+                    #(#final_struct_fields),*
+                })
+            }
+        }
+    };
+
+    let deserialize_impl = quote! {
+        impl<'de> ::serde::Deserialize<'de> for #name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: ::serde::Deserializer<'de>,
+            {
+                // Define the fields Serde should expect
+                const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
+                // Start deserialization using the main visitor struct defined outside
+                deserializer.deserialize_struct(#struct_name_str, FIELDS, #visitor_struct_name)
+            }
+        }
+    };
+
+
+    // --- Combine Serialize and Deserialize ---
+    // Define the serialization helper struct definition
+    // Use updated helper name (no __)
+    let serialize_helper_struct_def = quote! {
+        #[derive(::serde::Serialize)] // Use Serialize from the use statement above
+        struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: &'a ::std::option::Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            extension: &'a ::std::option::Option<::std::vec::Vec<E>>,
+        }
+    };
+
+    let serialize_impl = quote! {
+        impl ::serde::Serialize for #name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                // Add use statements for serde traits/types needed within the impl
+                use serde::ser::{SerializeStruct, Serializer};
+                // Need Serialize in scope for the helper derive
+                use ::serde::Serialize;
+
+                // Serialization helper struct is defined outside the impl block now
+
+                // Calculate the number of fields to serialize
+                let mut count = 0;
+                #(#field_count_calculation)*
+
+                // Start serialization
+                let mut state = serializer.serialize_struct(stringify!(#name), count)?;
+
+                // Serialize each field
+                #(#serialize_fields)*
+
+                state.end()
+            }
+        }
+    };
+
+    // Combine implementations. Helper types are defined *before* the impl blocks.
+    let expanded = quote! {
+        // Define ALL helper types first
+        #field_enum
+        #field_visitor_impl
+        #deserialize_extension_helper_def
+        #serialize_helper_struct_def
+
+        // Define the main visitor struct and its implementation
+        #visitor_impl
+
+        // Define the main impls that use these helpers
+        #serialize_impl
+        #deserialize_impl
+    };
+
+    // For debugging: Print the generated code
+    // println!("{}", expanded.to_string());
+
+    expanded.into()
+}
+            ty: field_ty,
+            original_name: original_name.clone(),
+            underscore_name: underscore_name.clone(),
+            is_element,
+            // is_option, // Removed unused field
+            inner_ty, // Store the inner type T
+        });
+
+        // For Field enum and match arms
+        field_enum_variants.push(quote! { #field_ident_enum });
+        // Use #field_enum_name instead of Field
+        field_match_arms.push(quote! { #original_name => Ok(#field_enum_name::#field_ident_enum) });
+        field_strings.push(original_name.clone()); // Add original name
+
+        // Make sure to add the underscore variant *only* if is_element is true
+        if is_element {
+            field_enum_variants.push(quote! { #underscore_ident_enum });
+            // Use #field_enum_name instead of Field
+            field_match_arms
+                .push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
+            field_strings.push(underscore_name);
+        } else {
+             // If not an element type, ensure we don't add the underscore variant/match arm
+             // (This prevents errors if a field coincidentally starts with _)
+        }
+    }
+    // Add Ignore variant for unknown fields
+    field_enum_variants.push(quote! { Ignore });
+    // Use #field_enum_name instead of Field
+    field_match_arms.push(quote! { _ => Ok(#field_enum_name::Ignore) });
+
+    // Unique names are now generated before the loop
+
+    let field_enum = quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        // Use the unique name
+        enum #field_enum_name { #(#field_enum_variants),* }
+    };
+
+    // 2. Implement Visitor trait for Field enum
+    let field_visitor_impl = quote! {
+        // Use the unique name
+        struct #field_visitor_name;
+
+        // Use the unique names
+        impl<'de> ::serde::de::Visitor<'de> for #field_visitor_name {
+            type Value = #field_enum_name;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a field identifier")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where E: ::serde::de::Error,
+            {
+                 // Use the unique enum name
+                match value {
+                    #(#field_match_arms),*
+                }
+            }
+             // Handle borrowed strings as well
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+            where E: ::serde::de::Error,
+            {
+                 match value {
+                    // Use the unique enum name here
+                    #(#field_match_arms),*
+                }
+            }
+        }
+
+        // Use the unique enum name
+        impl<'de> ::serde::Deserialize<'de> for #field_enum_name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where D: ::serde::Deserializer<'de>,
+            {
+                 // Use the unique visitor name
+                deserializer.deserialize_identifier(#field_visitor_name)
+            }
+        }
+    };
+
+    // 3. Generate parts needed for the Visitor struct implementation
+    let mut visitor_field_defs = Vec::new();
+    let mut visitor_map_assignments = Vec::new();
+    // Remove visitor_build_steps, construction happens after the loop
+    let struct_name_str = name.to_string();
+
+    // Declare ALL final field variables and temporary element parts at the top
+    for info in &field_infos {
+        let field_ident = info.ident;
+        let field_ty = info.ty; // Use the original field type (Option<...> or T)
+
+        // Declare the final variable matching the struct field type, explicitly using None path
+        visitor_field_defs
+            .push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
+
+        if info.is_element {
+            // Use the new helper to get V and E types from the inner_ty
+            let (val_ty, ext_ty) = get_element_generics(info.inner_ty); // Use inner_ty here
 
             let val_field = format_ident!("{}_value", field_ident);
             let id_field = format_ident!("{}_id", field_ident);
@@ -528,95 +877,25 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
 
         if info.is_element {
-            // For Element types, we need Option<Value>, Option<Id>, Option<Extension>
-            let id_field = format_ident!("{}_id", field_ident); // Keep one definition
-            // let id_field = format_ident!("{}_id", field_ident); // Remove duplicate definition
+            // Use the new helper to get V and E types from the inner_ty
+            let (val_ty, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+            let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
-
-            // Extract E type for the helper struct
-            let ext_ty = if let Type::Path(type_path) = inner_ty {
-                if type_path.path.segments.len() == 1 {
-                    let segment = &type_path.path.segments[0];
-                    if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                        if (segment.ident == "Element" && args.args.len() == 2)
-                            || (segment.ident == "DecimalElement" && args.args.len() == 1)
-                        {
-                            let e_arg = if segment.ident == "Element" {
-                                &args.args[1]
-                            } else {
-                                &args.args[0]
-                            };
-                            match e_arg {
-                                GenericArgument::Type(t) => t.clone(),
-                                _ => panic!("Expected Type for E"),
-                            }
-                        } else {
-                            panic!(
-                                "Unsupported Element type structure: {}",
-                                quote!(#inner_ty).to_string()
-                            );
-                        }
-                    } else {
-                        panic!(
-                            "Element type missing generics: {}",
-                            quote!(#inner_ty).to_string()
-                        );
-                    }
-                } else {
-                    panic!(
-                        "Unsupported Element type path: {}",
-                        quote!(#inner_ty).to_string()
-                    );
-                }
-            } else {
-                panic!(
-                    "Expected Element or DecimalElement type, found: {}",
-                    quote!(#inner_ty).to_string()
-                );
-            };
-
-            // Assign to temporary _value field
             let original_name_lit = LitStr::new(&info.original_name, Span::call_site());
-            // Extract the value type V from the temporary variable's Option<V> type
-            // This needs the type of the temporary variable #val_field, which is Option<#val_ty>
-            let val_ty = &if let Type::Path(type_path) = inner_ty { // inner_ty is Element<V, E> or DecimalElement<E>
-                 if type_path.path.segments.len() == 1 {
-                     let segment = &type_path.path.segments[0];
-                     if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                         if segment.ident == "Element" && args.args.len() == 2 {
-                             // V is the first generic argument
-                             match &args.args[0] { GenericArgument::Type(t) => t, _ => panic!("Expected Type for V") }
-                         } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
-                             // For DecimalElement, V is crate::PreciseDecimal
-                             // Need to parse this type correctly. Using syn::parse_str is okay here.
-                             &syn::parse_str::<Type>("crate::PreciseDecimal").expect("Failed to parse PreciseDecimal type")
-                         } else {
-                             panic!("Unsupported Element type structure: {}", quote!(#inner_ty).to_string());
-                         }
-                     } else {
-                         panic!("Element type missing generics: {}", quote!(#inner_ty).to_string());
-                     }
-                 } else {
-                     panic!("Unsupported Element type path: {}", quote!(#inner_ty).to_string());
-                 }
-             } else {
-                 panic!("Expected Element or DecimalElement type, found: {}", quote!(#inner_ty).to_string());
-             };
+            let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
 
+            // Assignment for the primitive value (fieldName)
             visitor_map_assignments.push(quote! {
                #field_enum_name::#field_ident_enum => {
                    if #val_field.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
-                   // Deserialize into Option<V> first to handle explicit nulls for the primitive value
-                   // #val_ty is V (e.g., String, bool, crate::PreciseDecimal)
+                   // Deserialize into Option<V> using the extracted val_ty
                    let primitive_value: ::std::option::Option<#val_ty> = map.next_value()?;
-                   // Assign the deserialized Option<V> directly to the temporary variable #val_field (which is also Option<V>)
                    #val_field = primitive_value;
                }
             });
 
-            // Assign to temporary _id and _extension fields
-            let underscore_name_lit = LitStr::new(&info.underscore_name, Span::call_site());
+            // Assignment for the extension object (_fieldName)
             visitor_map_assignments.push(quote! {
                  // Use #field_enum_name directly (defined outside impl block)
                  #field_enum_name::#underscore_ident_enum => {
@@ -625,6 +904,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     if !value.is_null() {
                         // If not null, deserialize the Value into the helper
                         // Use updated #extension_helper_name (no __) directly (defined outside impl block)
+                        // Use the extracted ext_ty for the helper
                         let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
                             .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
                         if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
@@ -641,7 +921,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                // Use #field_enum_name directly (defined inside impl block)
                #field_enum_name::#field_ident_enum => {
                    if #field_ident.is_some() { return Err(::serde::de::Error::duplicate_field(#original_name_lit)); }
-                   #field_ident = Some(map.next_value()?); // Assign to final variable #field_ident
+                   // Deserialize directly into the final Option<T> field
+                   #field_ident = map.next_value()?; // Use map.next_value() which returns Result<T, Error>
                }
             });
         }
