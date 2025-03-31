@@ -33,28 +33,15 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
-// Renamed back from is_element_or_decimal_element
-fn is_fhir_primitive_element_type(ty: &Type) -> bool {
+// Helper function to check if a type is specifically Element or DecimalElement (by name)
+// Renamed back from is_fhir_primitive_element_type
+fn is_element_or_decimal_element(ty: &Type) -> bool {
     if let ::syn::Type::Path(type_path) = ty { // Use ::syn::
-        // Allow multi-segment paths like crate::r4::Date, but only check the last segment's identifier
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
-                // Check for direct Element/DecimalElement or known R4 primitive type aliases
-                // IMPORTANT: Do NOT include base types like "String", "bool", "i32" here.
-                // Only include types that are structurally Element or DecimalElement.
-                match ident_str.as_str() {
-                    "Element" | "DecimalElement" |
-                    // R4 Aliases (assuming they are Element<V, E> or DecimalElement<E>)
-                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
-                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
-                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
-                    "Uuid" | "Xhtml"
-                    // Add other versions' aliases if needed (e.g., R5 Integer64)
-                         => return true,
-                    _ => return false, // Return false for base types (like std::string::String, bool, i32) and unknown types
-                }
+                // Check only for the literal struct names
+                return ident_str == "Element" || ident_str == "DecimalElement";
             }
         }
     }
@@ -169,9 +156,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         // Check if the field is Option<T>
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            // Check if the inner type T is a FHIR primitive element (Element, DecimalElement, or alias)
-            if is_fhir_primitive_element_type(inner_ty) {
-                // This field is a FHIR primitive element type (e.g., Option<r4::Date>, Option<Element<...>>)
+            // Check if the inner type T is specifically Element or DecimalElement
+            if is_element_or_decimal_element(inner_ty) {
+                // This field is Option<Element<V, E>> or Option<DecimalElement<E>>
                 // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
                 // Extract E type for the serialization helper generic
                 let (_v_ty, ext_ty) = get_element_generics(inner_ty);
@@ -315,7 +302,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             None => (false, field_ty),
         };
         // Use the renamed helper function
-        let is_element = is_fhir_primitive_element_type(inner_ty);
+        let is_element = is_element_or_decimal_element(inner_ty);
 
         // *** Move field_infos population here ***
         field_infos.push(FieldInfo {
@@ -650,7 +637,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // quote is now available from the outer macro scope
+                // Bring quote into scope for generated code inside visit_map
+                use quote::quote;
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
