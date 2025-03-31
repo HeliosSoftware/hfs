@@ -243,16 +243,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     state.serialize_field(#original_name_lit, &self.#field_ident)?;
                 });
             }
-        } else { // Original field was not Option<T>
-            // Non-optional field (handle as simple value)
-            // We already determined it's not element-like if element_generics failed
-            field_count_calculation.push(quote! {
-                count += 1; // Always count non-optional fields
-            });
-            serialize_fields.push(quote! {
-                state.serialize_field(#original_name_lit, &self.#field_ident)?;
-            });
-        }
+        } // Removed the incorrect 'else' block that started on line 246
     }
 
     // --- Generate Deserialize Implementation ---
