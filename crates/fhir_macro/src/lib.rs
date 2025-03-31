@@ -211,20 +211,26 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         let has_value = element.value.is_some();
                         let has_extension_data = element.id.is_some() || element.extension.is_some();
 
-                        // Serialize value under fieldName if present
-                        if let Some(value) = &element.value {
-                            state.serialize_field(#original_name_lit, value)?;
-                        }
-
-                        // Serialize id/extension under _fieldName if present
-                        if has_extension_data {
-                            // Use the updated helper name (no __)
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
+                        if has_value && !has_extension_data {
+                            // Case 1: Only value -> "fieldName": value
+                            state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
+                        } else if !has_value && has_extension_data {
+                            // Case 2: Only id/extension -> "_fieldName": { ... }
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Use ext_ty here
+                                id: &element.id,
+                                extension: &element.extension,
+                            };
+                            state.serialize_field(#underscore_name_lit, &helper)?;
+                        } else if has_value && has_extension_data {
+                            // Case 3: Both value and id/extension -> "fieldName": value, "_fieldName": { ... }
+                            state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Use ext_ty here
                                 id: &element.id,
                                 extension: &element.extension,
                             };
                             state.serialize_field(#underscore_name_lit, &helper)?;
                         }
+                        // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
                     }
                 });
             } else {
