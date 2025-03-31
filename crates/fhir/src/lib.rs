@@ -83,6 +83,58 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     }
 }
 
+// --- Newtype wrapper for FHIR primitive Elements ---
+// This wrapper is used for FHIR primitives so that when serializing
+// they output only the underlying value (or null) and the FhirSerde macro
+// can handle metadata (_fieldName) separately.
+pub struct PrimitiveElement<V, E>(pub Element<V, E>);
+
+impl<V, E> std::ops::Deref for PrimitiveElement<V, E> {
+    type Target = Element<V, E>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<V, E> std::ops::DerefMut for PrimitiveElement<V, E> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<V, E> Serialize for PrimitiveElement<V, E>
+where
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // For FHIR primitives, output only the underlying value (or null)
+        match &self.0.value {
+            Some(val) => val.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de, V, E> Deserialize<'de> for PrimitiveElement<V, E>
+where
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A simplified deserialization: parse the primitive value,
+        // leaving metadata (id/extension) as None.
+        Ok(PrimitiveElement(Element {
+            id: None,
+            extension: None,
+            value: V::deserialize(deserializer).ok(),
+        }))
+    }
+}
 // --- End Newtype ---
 
 // --- Visitor for Object Deserialization ---
