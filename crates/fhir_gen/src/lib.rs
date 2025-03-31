@@ -183,7 +183,7 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
     // Add Clone to the derives for the Resource enum
-    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone)]\n");
+    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
@@ -392,7 +392,14 @@ fn process_elements(
             ));
 
             // Generate enum derives - Add Clone, PartialEq, Eq to all enums
-            let enum_derives = vec!["Debug", "Serialize", "Deserialize", "Clone", "PartialEq", "Eq"];
+            let enum_derives = vec![
+                "Debug",
+                "Serialize",
+                "Deserialize",
+                "Clone",
+                "PartialEq",
+                "Eq",
+            ];
             output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
 
             // Add other serde attributes and enum definition
@@ -417,7 +424,14 @@ fn process_elements(
         }
 
         // Generate struct derives - Add Clone, PartialEq, Eq to all structs
-        let derives = vec!["Debug", "Serialize", "Deserialize", "Clone", "PartialEq", "Eq"];
+        let derives = vec![
+            "Debug",
+            "Serialize",
+            "Deserialize",
+            "Clone",
+            "PartialEq",
+            "Eq",
+        ];
         output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
 
         // Add other serde attributes and struct definition
