@@ -506,8 +506,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         // If not null, deserialize the Value into the helper
                         // Use updated #extension_helper_name (no __) directly (defined outside impl block)
                         // Use the extracted ext_ty for the helper
-                        // No explicit lifetime needed here when using the helper, as E uses HRTB
-                        let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
+                        // Add the 'de lifetime when using the helper struct type
+                        let helper: #extension_helper_name<'de, #ext_ty> = ::serde_json::from_value(value)
                             .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
                         if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                         #id_field = helper.id;
@@ -607,9 +607,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Define the extension helper struct for Deserialize here as well
     // Use updated helper name (no __)
     let deserialize_extension_helper_def = quote! {
-        // Use HRTB (for<'de2>) for the E bound in the helper struct definition
+        // Add 'de lifetime parameter to the helper struct and bind E to it
         #[derive(::serde::Deserialize)] // Use Deserialize from use statement
-        struct #extension_helper_name<E: for<'de2> ::serde::Deserialize<'de2>> { // Use HRTB
+        struct #extension_helper_name<'de, E: ::serde::Deserialize<'de>> { // Add 'de and bind E to it
              #[serde(default)]
              id: ::std::option::Option<String>,
              #[serde(default)]
