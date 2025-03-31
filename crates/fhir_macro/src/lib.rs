@@ -588,24 +588,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let v_ty_construct = info.v_ty.as_ref().expect("v_ty missing for element");
             let ext_ty = info.ext_ty.as_ref().expect("ext_ty missing for element");
 
-            // --- Reverted Logic ---
-            // Determine if we should construct DecimalElement based on the *original inner type name*
-            let inner_ty_ident_str = if let ::syn::Type::Path(type_path) = info.inner_ty {
-                 if let Some(segment) = type_path.path.segments.last() {
-                     segment.ident.to_string()
-                 } else {
-                     // Fallback or error handling if path segment is missing
-                     // This case should ideally not be hit for valid element types
-                     String::new() // Or trigger a compile error
-                 }
-             } else {
-                 // Fallback or error handling if not a TypePath
-                 String::new() // Or trigger a compile error
-             };
-            // Check if the last segment identifier is exactly "Decimal".
-            // This assumes aliases like r4::Decimal resolve to something ending in "Decimal".
-            let should_construct_decimal_element = inner_ty_ident_str == "Decimal";
-            // --- End Reverted Logic ---
+            // --- New Robust Check ---
+            // Parse the target type `crate::PreciseDecimal` once for comparison
+            let precise_decimal_target_type = syn::parse_str::<Type>("crate::PreciseDecimal")
+                .expect("Internal Macro Error: Failed to parse PreciseDecimal type for comparison");
+            // Compare the resolved V type (stored in v_ty_construct) with the target type directly
+            let should_construct_decimal_element = *v_ty_construct == precise_decimal_target_type;
+            // --- End New Robust Check ---
 
 
             Some(quote! {
