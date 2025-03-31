@@ -310,8 +310,10 @@ where
 }
 // --- End Element Visitor ---
 
-// Add PartialEq, Eq derives
-#[derive(Debug, PartialEq, Eq)]
+// Add PartialEq, Eq, Clone, Copy derives where applicable
+// Note: Cannot add Copy if V or E are not Copy (like String, Vec)
+// Add Clone derive
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Element<V, E> {
     // Fields are already public
     pub id: Option<String>,
@@ -320,11 +322,11 @@ pub struct Element<V, E> {
 }
 
 // Custom Deserialize for Element<V, E>
-// Add PartialEq bound for V only
+// Remove PartialEq/Eq bounds for V and E as they are not needed for deserialization itself
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
-    V: Deserialize<'de> + PartialEq + Eq, // Keep Eq for V if needed
-    E: Deserialize<'de>,                  // Remove PartialEq bound for E
+    V: Deserialize<'de>, // Removed PartialEq + Eq
+    E: Deserialize<'de>, // Removed PartialEq
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -523,11 +525,11 @@ where
 }
 
 // Custom Serialize for Element<V, E>
-// Add PartialEq bound for V only
+// Remove PartialEq/Eq bounds for V and E as they are not needed for serialization itself
 impl<V, E> Serialize for Element<V, E>
 where
-    V: Serialize + PartialEq + Eq, // Keep Eq for V if needed
-    E: Serialize,                  // Remove PartialEq bound for E
+    V: Serialize, // Removed PartialEq + Eq
+    E: Serialize, // Removed PartialEq
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -568,9 +570,8 @@ where
     }
 }
 
-// Remove derive Serialize as we implement it manually below
-// Add PartialEq, Eq derives
-#[derive(Debug, PartialEq, Eq)]
+// Add Clone derive
+#[derive(Debug, PartialEq, Eq, Clone)]
 // Remove serde attributes as they are not used without derive
 pub struct DecimalElement<E> {
     pub id: Option<String>,
@@ -583,7 +584,7 @@ pub struct DecimalElement<E> {
 // Remove PartialEq bound for E
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
-    E: Deserialize<'de>, // Remove PartialEq bound for E
+    E: Deserialize<'de>, // Removed PartialEq bound for E
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -757,7 +758,7 @@ impl UnexpectedValue for serde_json::Value {
 // Remove PartialEq bound for E
 impl<E> Serialize for DecimalElement<E>
 where
-    E: Serialize, // Remove PartialEq bound for E
+    E: Serialize, // Removed PartialEq bound for E
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -848,6 +849,7 @@ mod tests {
     use serde_json;
 
     // Add Eq, Default derives
+    // Add Serialize derive back since it's used in tests directly now
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
     struct UnitTestExtension {
         code: String,
@@ -1359,15 +1361,15 @@ mod tests {
         // Regular field
         name: Option<String>,
 
-        // Field with potential extension (_birthDate)
+        // Field with potential extension (_birthDate) using type alias
         // FhirSerde should handle the 'birthDate'/'_birthDate' logic based on the field name.
         #[rustfmt::skip]
-        birth_date: Option<Element::<String, UnitTestExtension>>, // Use turbofish as suggested by compiler
+        birth_date: Option<r4::Date>, // Use type alias like in Patient
 
-        // Another potentially extended field
+        // Another potentially extended field using type alias
         // FhirSerde should handle the 'isActive'/'_isActive' logic based on the field name.
         #[rustfmt::skip]
-        is_active: Option<Element::<bool, UnitTestExtension>>, // Use turbofish as suggested by compiler
+        is_active: Option<r4::Boolean>, // Use type alias
 
         // A non-element field for good measure
         count: Option<i32>,
@@ -1376,9 +1378,10 @@ mod tests {
     #[test]
     fn test_fhir_serde_serialize() {
         // Case 1: Only primitive value for birthDate
+        // Use r4::Date which is Element<String, Extension>
         let s1 = FhirSerdeTestStruct {
             name: Some("Test1".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: None,
                 extension: None,
                 value: Some("1970-03-30".to_string()),
@@ -1391,11 +1394,12 @@ mod tests {
         assert_eq!(json1, expected1);
 
         // Case 2: Only extension for birthDate
+        // Use r4::Date which is Element<String, Extension>
         let s2 = FhirSerdeTestStruct {
             name: Some("Test2".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-id".to_string()),
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "note".to_string(),
                     is_valid: true,
                 }]),
@@ -1410,17 +1414,18 @@ mod tests {
         assert_eq!(json2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate
+        // Use r4::Date and r4::Boolean
         let s3 = FhirSerdeTestStruct {
             name: Some("Test3".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-id-3".to_string()),
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "text".to_string(),
                     is_valid: false,
                 }]),
                 value: Some("1970-03-30".to_string()),
             }),
-            is_active: Some(Element {
+            is_active: Some(r4::Boolean { // Construct using the alias type
                 // Also test is_active field
                 id: None,
                 extension: None,
@@ -1436,13 +1441,14 @@ mod tests {
         assert_eq!(json3, expected3);
 
         // Case 4: birthDate field is None
+        // Use r4::Boolean
         let s4 = FhirSerdeTestStruct {
             name: Some("Test4".to_string()),
             birth_date: None,
-            is_active: Some(Element {
+            is_active: Some(r4::Boolean { // Construct using the alias type
                 // is_active has only extension
                 id: None,
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "flag".to_string(),
                     is_valid: true,
                 }]),
@@ -1472,9 +1478,10 @@ mod tests {
     fn test_fhir_serde_deserialize() {
         // Case 1: Only primitive value for birthDate
         let json1 = r#"{"name":"Test1","birthDate":"1970-03-30","count":1}"#;
+        // Use r4::Date
         let expected1 = FhirSerdeTestStruct {
             name: Some("Test1".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: None,
                 extension: None,
                 value: Some("1970-03-30".to_string()),
@@ -1487,12 +1494,13 @@ mod tests {
 
         // Case 2: Only extension for birthDate
         let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
+        // Use r4::Date
         let _expected2 = FhirSerdeTestStruct {
             // Prefixed unused variable
             name: Some("Test2".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-id".to_string()),
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "note".to_string(),
                     is_valid: true,
                 }]),
@@ -1506,18 +1514,19 @@ mod tests {
 
         // Case 3: Both primitive value and extension for birthDate and isActive
         let json3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"code":"text","is_valid":false}]},"isActive":true,"_isActive":{"id":"active-id"},"count":3}"#;
+        // Use r4::Date and r4::Boolean
         let _expected3 = FhirSerdeTestStruct {
             // Prefixed unused variable
             name: Some("Test3".to_string()),
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-id-3".to_string()),
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "text".to_string(),
                     is_valid: false,
                 }]),
                 value: Some("1970-03-30".to_string()),
             }),
-            is_active: Some(Element {
+            is_active: Some(r4::Boolean { // Construct using the alias type
                 id: Some("active-id".to_string()), // Merged from _isActive
                 extension: None,                   // Merged from _isActive
                 value: Some(true),                 // From isActive
@@ -1530,13 +1539,14 @@ mod tests {
         // Case 4: birthDate field is missing, isActive has only extension
         let json4 =
             r#"{"name":"Test4","_isActive":{"extension":[{"code":"flag","is_valid":true}]}}"#;
+        // Use r4::Boolean
         let _expected4 = FhirSerdeTestStruct {
             // Prefixed unused variable
             name: Some("Test4".to_string()),
             birth_date: None,
-            is_active: Some(Element {
+            is_active: Some(r4::Boolean { // Construct using the alias type
                 id: None,
-                extension: Some(vec![UnitTestExtension {
+                extension: Some(vec![UnitTestExtension { // Use the test extension type
                     code: "flag".to_string(),
                     is_valid: true,
                 }]),
@@ -1560,10 +1570,11 @@ mod tests {
 
         // Case 6: Primitive value is null, but extension exists
         let json6 = r#"{"birthDate":null,"_birthDate":{"id":"bd-null"}}"#;
+        // Use r4::Date
         let _expected6 = FhirSerdeTestStruct {
             // Prefixed unused variable
             name: None,
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-null".to_string()),
                 extension: None,
                 value: None, // Value is None because input was null
@@ -1576,10 +1587,11 @@ mod tests {
 
         // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
         let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
+        // Use r4::Date
         let _expected7 = FhirSerdeTestStruct {
             // Prefixed unused variable
             name: None,
-            birth_date: Some(Element {
+            birth_date: Some(r4::Date { // Construct using the alias type
                 id: None,
                 extension: None,
                 value: Some("1999-09-09".to_string()),

@@ -33,16 +33,79 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is Element<V, E> or DecimalElement<E>
-fn is_fhir_element_type(ty: &Type) -> bool {
+// List of known FHIR primitive type aliases that wrap Element or DecimalElement
+const FHIR_PRIMITIVE_ALIASES: &[&str] = &[
+    "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime",
+    "Id", "Instant", "Integer", "Markdown", "Oid", "PositiveInt", "String",
+    "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
+    // Note: Decimal is handled separately as it maps to DecimalElement
+];
+
+// Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
+fn is_fhir_primitive_element_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
         if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
             let segment = &type_path.path.segments[0];
-            return segment.ident == "Element" || segment.ident == "DecimalElement";
+            let ident_str = segment.ident.to_string();
+            // Check for direct Element/DecimalElement or known aliases
+            return ident_str == "Element"
+                || ident_str == "DecimalElement"
+                || FHIR_PRIMITIVE_ALIASES.contains(&ident_str.as_str());
         }
     }
     false
 }
+
+// Helper function to get the V and E types from Element<V, E> or DecimalElement<E>
+// Returns (V_Type, E_Type)
+fn get_element_generics(ty: &Type) -> (Type, Type) {
+     if let Type::Path(type_path) = ty {
+        if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+            let segment = &type_path.path.segments[0];
+            if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                if segment.ident == "Element" && args.args.len() == 2 {
+                    let v_arg = &args.args[0];
+                    let e_arg = &args.args[1];
+                    let v_type = match v_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for V") };
+                    let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
+                    return (v_type, e_type);
+                } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
+                    // V is crate::PreciseDecimal for DecimalElement
+                    let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                    let e_arg = &args.args[0];
+                    let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
+                    return (precise_decimal_type, e_type);
+                }
+            }
+        }
+    }
+    // Fallback or error - this shouldn't happen if called after is_fhir_primitive_element_type
+    // For now, let's panic, but a better approach might be needed depending on how type aliases are handled.
+    // *** Correction: We need to handle the aliases here! ***
+
+    // If it's an alias, we need to *infer* V and E based on the alias name.
+     if let Type::Path(type_path) = ty {
+        if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
+            let segment = &type_path.path.segments[0];
+            let ident_str = segment.ident.to_string();
+            // Attempt to parse Extension type relative to the crate where the macro is used
+            let extension_type = syn::parse_str::<Type>("crate::Extension").expect("Failed to parse Extension type");
+
+            let value_type_str = match ident_str.as_str() {
+                 "Boolean" => "bool",
+                 "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
+                 "Integer64" => "std::primitive::i64", // Assuming R6 might be used
+                 "Decimal" => "crate::PreciseDecimal", // Special case handled above, but include for completeness
+                 _ => "std::string::String", // Default for string-based types like Code, Uri, String, Date, DateTime etc.
+            };
+            let value_type = syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
+            return (value_type, extension_type);
+        }
+    }
+
+    panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
+}
+
 
 // Helper function to convert Rust field name (snake_case) to FHIR JSON name (camelCase)
 fn rust_to_fhir_name(ident: &Ident) -> String {
@@ -261,12 +324,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         // Append "Underscore" for the underscore variant name
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
-        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) {
-            // Prefix is_option with _
+        // Determine if the field is Option<T> and get the inner type T
+        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
             Some(inner) => (true, inner),
-            None => (false, field_ty), // If not Option, inner_ty is the same as ty
+            None => (false, field_ty),
         };
-        let is_element = is_fhir_element_type(inner_ty);
+        // Use the updated helper function
+        let is_element = is_fhir_primitive_element_type(inner_ty);
 
         field_infos.push(FieldInfo {
             ident: field_ident,
@@ -603,21 +667,53 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let val_field_ident = format_ident!("{}_value", field_ident);
             let id_field_ident = format_ident!("{}_id", field_ident);
             let ext_field_ident = format_ident!("{}_extension", field_ident);
+
+            // Determine the actual struct type to construct (Element or DecimalElement)
+            // based on the inner_ty name
+            let element_struct_ident = if let Type::Path(type_path) = inner_ty {
+                 if type_path.path.segments.len() == 1 {
+                     let segment = &type_path.path.segments[0];
+                     if segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal" {
+                         format_ident!("DecimalElement") // Construct DecimalElement
+                     } else {
+                         format_ident!("Element") // Construct Element for others
+                     }
+                 } else {
+                     format_ident!("Element") // Default fallback
+                 }
+             } else {
+                 format_ident!("Element") // Default fallback
+             };
+
+             // Get V and E again for the construction
+             let (v_ty_construct, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+
             Some(quote! {
                 // This generated code will be placed inside visit_map
                 // It references #field_ident (final variable) and the temporary variables
                  // Assign the constructed Option<Element<...>> directly to the final field variable
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
-                    // Create the Element instance with an explicit type annotation first
-                    let element_value: #inner_ty = #inner_ty {
-                        value: #val_field_ident,
-                        id: #id_field_ident,
-                        extension: #ext_field_ident,
+                    // Construct the correct Element or DecimalElement struct
+                    // Need to pass the correct generics <V, E> or <E>
+                    let element_value = if stringify!(#element_struct_ident) == "DecimalElement" {
+                         // Construct DecimalElement<E>
+                         #element_struct_ident::<#ext_ty> {
+                             value: #val_field_ident, // Already Option<PreciseDecimal>
+                             id: #id_field_ident,
+                             extension: #ext_field_ident,
+                         }
+                    } else {
+                         // Construct Element<V, E>
+                         // Need V type here again!
+                         #element_struct_ident::<#v_ty_construct, #ext_ty> {
+                             value: #val_field_ident, // Already Option<V>
+                             id: #id_field_ident,
+                             extension: #ext_field_ident,
+                         }
                     };
-                    // Then wrap it in Some using fully qualified path
                     ::std::option::Option::Some(element_value)
                 } else {
-                    ::std::option::Option::None // Use fully qualified path
+                    ::std::option::Option::None
                 };
             })
         } else {
@@ -628,8 +724,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Define the extension helper struct for Deserialize here as well
     // Use updated helper name (no __)
     let deserialize_extension_helper_def = quote! {
+        // Add generic parameter E bound by Deserialize
         #[derive(::serde::Deserialize)] // Use Deserialize from use statement
-        struct #extension_helper_name<E> {
+        struct #extension_helper_name<E: ::serde::Deserialize<'de>> { // Add Deserialize bound
              #[serde(default)]
              id: ::std::option::Option<String>,
              #[serde(default)]
