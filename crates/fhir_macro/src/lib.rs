@@ -536,7 +536,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
         if info.is_element {
             let field_ident = info.ident; // Final field ident (e.g., birth_date)
-            let inner_ty = info.inner_ty; // Use inner_ty (e.g., Code, Element<String, E>)
+            // Determine if it's DecimalElement *before* generating the quote block
+            let is_decimal_element = if let Type::Path(type_path) = info.inner_ty {
+                 if let Some(segment) = type_path.path.segments.last() {
+                     segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal"
+                 } else { false }
+             } else { false };
+
             // Idents for temporary variables *inside* visit_map
             let val_field_ident = format_ident!("{}_value", field_ident);
             let id_field_ident = format_ident!("{}_id", field_ident);
@@ -544,15 +550,15 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let final_ext_field_ident = format_ident!("{}_final_extension", field_ident); // New var for Option<Vec<E>>
 
             // Re-determine V and E types *inside* this loop's scope based on info.inner_ty
-            let (v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
+            // Prefix v_ty_construct with _ here as it's not directly used in this outer scope
+            let (_v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
+            // Use the non-prefixed v_ty_construct inside the quote! block below
 
             // Determine the actual struct type to construct (Element or DecimalElement)
-            // based on the inner_ty name
+            // based on the inner_ty name (This logic is moved outside the quote block)
             // Prefix with _ as it's unused now
-            let _element_struct_ident = if let ::syn::Type::Path(type_path) = info.inner_ty { // Use ::syn:: and info.inner_ty
-                 if let Some(segment) = type_path.path.segments.last() { // Check last segment
-                     if segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal" {
-                         format_ident!("DecimalElement") // Construct DecimalElement
+            let _element_struct_ident = if is_decimal_element { // Use the pre-calculated boolean
+                         format_ident!("DecimalElement")
                      } else {
                          format_ident!("Element") // Construct Element for others
                      }
@@ -565,7 +571,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
              // Get V and E again for the construction, ensuring it's only called on the element type
              // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
-             let (v_ty_construct, _ext_ty) = get_element_generics(inner_ty); // Use _ext_ty here
+             // Use the non-prefixed v_ty_construct inside the quote! block
+             let (_v_ty_construct, _ext_ty) = get_element_generics(inner_ty);
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
@@ -593,24 +600,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
                     ::std::option::Option::Some(
-                        // Re-check inner_ty name here to be certain
-                        if let ::syn::Type::Path(tp) = info.inner_ty { // Use ::syn:: and info.inner_ty
-                            if let Some(seg) = tp.path.segments.last() {
-                                if seg.ident == "DecimalElement" {
-                                    // Construct DecimalElement<E> using quote!
-                                    quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
-                                } else {
-                                    // Assume Element<V, E>
-                                    // Construct Element<V, E> using quote!
-                                    quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
-                                }
-                            } else {
-                                // Fallback: Assume Element<V, E> if path has no segments (unlikely)
-                                quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
-                            }
+                        // Use the pre-calculated boolean is_decimal_element
+                        if #is_decimal_element {
+                            // Construct DecimalElement<E> using quote!
+                            quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         } else {
-                            // Fallback: Assume Element<V, E> if not Type::Path (unlikely)
-                            quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                            // Construct Element<V, E> using quote!
+                            // Use the non-prefixed v_ty_construct here
+                            quote! { crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         }
                     ) // End of Some(...)
                 } else {
@@ -655,7 +652,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // Bring necessary serde items into scope for generated code
+                // Bring quote into scope for generated code
+                use quote::quote;
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
