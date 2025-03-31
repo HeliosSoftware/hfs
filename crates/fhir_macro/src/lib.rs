@@ -205,15 +205,19 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     }
                 });
 
-                // Generate serialization logic
+                // Generate serialization logic according to FHIR JSON rules
                 serialize_fields.push(quote! {
                     if let Some(element) = &self.#field_ident {
-                        // Serialize the value under the original name, if present
+                        let has_value = element.value.is_some();
+                        let has_extension_data = element.id.is_some() || element.extension.is_some();
+
+                        // Serialize value under fieldName if present
                         if let Some(value) = &element.value {
                             state.serialize_field(#original_name_lit, value)?;
                         }
-                        // Serialize id and extension under the underscore name, if present
-                        if element.id.is_some() || element.extension.is_some() {
+
+                        // Serialize id/extension under _fieldName if present
+                        if has_extension_data {
                             // Use the updated helper name (no __)
                             let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
@@ -224,7 +228,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     }
                 });
             } else {
-                // Regular Option<T> field
+                // Regular Option<T> field (unchanged)
                 field_count_calculation.push(quote! {
                     if self.#field_ident.is_some() { count += 1; }
                 });
@@ -571,7 +575,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
              };
 
              // Get V and E again for the construction, ensuring it's only called on the element type
-             let (v_ty_construct, ext_ty) = get_element_generics(inner_ty);
+             // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
+             let (v_ty_construct, _ext_ty) = get_element_generics(inner_ty); // Use _ext_ty here
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
