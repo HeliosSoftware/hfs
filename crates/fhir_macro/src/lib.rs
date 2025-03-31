@@ -33,24 +33,14 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
-// Renamed back from is_element_or_decimal_element
-fn is_fhir_primitive_element_type(ty: &Type) -> bool {
-    if let Type::Path(type_path) = ty {
-        // Allow multi-segment paths like crate::r4::Date, but only check the last segment's identifier
+// Helper function to check if a type is specifically Element or DecimalElement (by name)
+// Renamed back from is_fhir_primitive_element_type
+fn is_element_or_decimal_element(ty: &Type) -> bool {
+    if let ::syn::Type::Path(type_path) = ty { // Use ::syn::
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
-                // Check for direct Element/DecimalElement or known R4 primitive type aliases
-                match ident_str.as_str() {
-                    "Element" | "DecimalElement" |
-                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
-                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
-                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
-                    "Uuid" | "Xhtml" => return true,
-                    // Add other versions' aliases if needed
-                    _ => return false,
-                }
+                return ident_str == "Element" || ident_str == "DecimalElement";
             }
         }
     }
@@ -309,7 +299,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             None => (false, field_ty),
         };
         // Use the renamed helper function
-        let is_element = is_fhir_primitive_element_type(inner_ty);
+        let is_element = is_element_or_decimal_element(inner_ty);
 
         // *** Move field_infos population here ***
         field_infos.push(FieldInfo {
@@ -537,9 +527,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         if info.is_element {
             let field_ident = info.ident; // Final field ident (e.g., birth_date)
             // Determine if it's DecimalElement *before* generating the quote block
-            let is_decimal_element = if let Type::Path(type_path) = info.inner_ty {
+            let is_decimal_element = if let ::syn::Type::Path(type_path) = info.inner_ty { // Use ::syn::
                  if let Some(segment) = type_path.path.segments.last() {
-                     segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal"
+                     segment.ident == "DecimalElement" // Only check for DecimalElement struct name
                  } else { false }
              } else { false };
 
@@ -552,7 +542,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Re-determine V and E types *inside* this loop's scope based on info.inner_ty
             // Prefix v_ty_construct with _ here as it's not directly used in this outer scope
             let (_v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
-            // Use the non-prefixed v_ty_construct inside the quote! block below
+            // Use the non-prefixed _v_ty_construct inside the quote! block below
 
             // Determine the actual struct type to construct (Element or DecimalElement)
             // based on the inner_ty name (This logic is moved outside the quote block)
@@ -571,7 +561,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
              // Get V and E again for the construction, ensuring it's only called on the element type
              // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
-             // Use the non-prefixed v_ty_construct inside the quote! block
+             // Use the non-prefixed _v_ty_construct inside the quote! block
              let (_v_ty_construct, _ext_ty) = get_element_generics(inner_ty);
 
             Some(quote! {
@@ -599,15 +589,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
+                    // The quote! macro generates the code tokens
                     ::std::option::Option::Some(
-                        // Use the pre-calculated boolean is_decimal_element
                         if #is_decimal_element {
-                            // Construct DecimalElement<E> using quote!
-                            quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                             crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         } else {
-                            // Construct Element<V, E> using quote!
-                            // Use the non-prefixed v_ty_construct here
-                            quote! { crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                             crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         }
                     ) // End of Some(...)
                 } else {
