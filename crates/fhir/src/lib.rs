@@ -312,8 +312,8 @@ where
 
 // Add PartialEq, Eq, Clone, Copy derives where applicable
 // Note: Cannot add Copy if V or E are not Copy (like String, Vec)
-// Add Clone derive
-#[derive(Debug, PartialEq, Eq, Clone)]
+// Add Clone and Default derives
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Element<V, E> {
     // Fields are already public
     pub id: Option<String>,
