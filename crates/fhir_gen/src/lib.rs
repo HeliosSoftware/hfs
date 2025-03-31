@@ -391,12 +391,8 @@ fn process_elements(
                 capitalize_first_letter(&type_name)
             ));
 
-            // Generate enum derives
-            let mut enum_derives = vec!["Debug", "Serialize", "Deserialize"];
-            // Check if the enum being generated is ExtensionValue
-            if enum_name == "ExtensionValue" {
-                enum_derives.extend(["Clone", "PartialEq", "Eq"]);
-            }
+            // Generate enum derives - Add Clone, PartialEq, Eq to all enums
+            let enum_derives = vec!["Debug", "Serialize", "Deserialize", "Clone", "PartialEq", "Eq"];
             output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
 
             // Add other serde attributes and enum definition
