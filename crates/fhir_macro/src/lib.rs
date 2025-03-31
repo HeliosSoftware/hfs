@@ -36,11 +36,21 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
 // Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
 fn is_fhir_primitive_element_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-            let segment = &type_path.path.segments[0];
-            let ident_str = segment.ident.to_string();
-            // Check only for direct Element/DecimalElement
-            return ident_str == "Element" || ident_str == "DecimalElement";
+        // Allow multi-segment paths like crate::r4::Date, but only check the last segment's identifier
+        if type_path.qself.is_none() {
+            if let Some(segment) = type_path.path.segments.last() {
+                let ident_str = segment.ident.to_string();
+                // Check for direct Element/DecimalElement or known R4 primitive type aliases
+                match ident_str.as_str() {
+                    "Element" | "DecimalElement" |
+                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
+                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
+                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
+                    "Uuid" | "Xhtml" => return true,
+                    // Add other versions' aliases if needed
+                    _ => return false,
+                }
+            }
         }
     }
     false
@@ -439,7 +449,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         if info.is_element {
             // Ensure get_element_generics is only called on the actual element type (inner_ty)
-            let (val_ty, ext_ty) = get_element_generics(info.inner_ty);
+            // Prefix ext_ty with _ as it might be unused in this specific block
+            let (val_ty, _ext_ty) = get_element_generics(info.inner_ty); // Use _ext_ty
 
             let val_field = format_ident!("{}_value", field_ident);
             let id_field = format_ident!("{}_id", field_ident);
@@ -490,7 +501,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         if info.is_element {
             // Ensure get_element_generics is only called on the actual element type (inner_ty)
-            let (val_ty, ext_ty) = get_element_generics(inner_ty);
+            // Prefix ext_ty with _ as it might be unused in this specific block
+            let (val_ty, _ext_ty) = get_element_generics(inner_ty); // Use _ext_ty
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
