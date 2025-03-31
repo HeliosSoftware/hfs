@@ -157,9 +157,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let original_name_lit = LitStr::new(&original_name, Span::call_site());
         let underscore_name_lit = LitStr::new(&format!("_{}", original_name), Span::call_site());
 
-        // Check if the field is Option<Element<...>> or Option<DecimalElement<...>>
+        // Check if the field is Option<Element<...>> or Option<DecimalElement<...>> or a primitive alias
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            if is_fhir_element_type(inner_ty) {
+            // Use the renamed function here
+            if is_fhir_primitive_element_type(inner_ty) {
                 // This is a potentially extended primitive field (like Option<Element<String, Extension>>)
 
                 // Extract E type *here* in the macro scope
