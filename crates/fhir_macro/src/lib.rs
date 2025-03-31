@@ -41,7 +41,16 @@ fn is_fhir_primitive_element_type(ty: &Type) -> bool {
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
-                return ident_str == "Element" || ident_str == "DecimalElement";
+                // Check for direct Element/DecimalElement or known R4 primitive type aliases
+                match ident_str.as_str() {
+                    "Element" | "DecimalElement" |
+                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
+                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
+                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
+                    "Uuid" | "Xhtml" => return true,
+                    // Add other versions' aliases if needed
+                    _ => return false,
+                }
             }
         }
     }
