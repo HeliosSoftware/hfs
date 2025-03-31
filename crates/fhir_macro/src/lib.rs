@@ -55,7 +55,7 @@ fn try_get_element_generics(ty: &Type) -> Result<(Type, Type), ()> {
                             GenericArgument::Type(t) => t.clone(),
                             _ => panic!("Expected Type for E"),
                         };
-                        return (v_type, e_type);
+                        return Ok((v_type, e_type));
                     // Handle DecimalElement<E> (potentially multi-segment path)
                     } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
                         // V is crate::PreciseDecimal for DecimalElement
@@ -66,7 +66,7 @@ fn try_get_element_generics(ty: &Type) -> Result<(Type, Type), ()> {
                             GenericArgument::Type(t) => t.clone(),
                             _ => panic!("Expected Type for E"),
                         };
-                        return (precise_decimal_type, e_type);
+                        return Ok((precise_decimal_type, e_type));
                     }
                     // If it has generics but isn't Element/DecimalElement, fall through to panic below.
                 }
@@ -92,7 +92,7 @@ fn try_get_element_generics(ty: &Type) -> Result<(Type, Type), ()> {
                 if let Some(value_type_str) = value_type_str_opt {
                     let value_type =
                         syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
-                    return (value_type, extension_type);
+                    return Ok((value_type, extension_type));
                 }
                 // else: Fall through to panic if not Element/DecimalElement and not a known alias.
             }
@@ -466,7 +466,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Generate map assignments (assign to temp vars or final vars)
     for info in &field_infos {
         let field_ident = info.ident;
-        let inner_ty = info.inner_ty; // Use inner_ty
+        let _inner_ty = info.inner_ty; // Use inner_ty (prefixed as unused)
 
         // Get the correct UpperCamelCase enum variant names generated earlier
         let clean_field_ident_str = field_ident.to_string().trim_start_matches("r#").to_string();
