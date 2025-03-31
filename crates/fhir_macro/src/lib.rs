@@ -324,22 +324,45 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         // Append "Underscore" for the underscore variant name
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
-        // is_element was already determined in the previous loop
-        let is_element = field_infos.last().unwrap().is_element; // Get from stored info
+        // Determine if the field is Option<T> and get the inner type T
+        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
+            Some(inner) => (true, inner),
+            None => (false, field_ty),
+        };
+        // Use the updated helper function
+        let is_element = is_fhir_primitive_element_type(inner_ty);
 
-        // ... (keep Field enum variant and match arm generation) ...
+        field_infos.push(FieldInfo {
+            ident: field_ident,
+            ty: field_ty,
+            original_name: original_name.clone(),
+            underscore_name: underscore_name.clone(),
+            is_element,
+            // is_option, // Removed unused field
+            inner_ty, // Store the inner type T
+        });
+
+        // For Field enum and match arms
+        field_enum_variants.push(quote! { #field_ident_enum });
+        // Use #field_enum_name instead of Field
+        field_match_arms.push(quote! { #original_name => Ok(#field_enum_name::#field_ident_enum) });
+        field_strings.push(original_name.clone()); // Add original name
+
         // Make sure to add the underscore variant *only* if is_element is true
         if is_element {
             field_enum_variants.push(quote! { #underscore_ident_enum });
             // Use #field_enum_name instead of Field
             field_match_arms
                 .push(quote! { #underscore_name => Ok(#field_enum_name::#underscore_ident_enum) });
-            field_strings.push(underscore_name); // Add underscore name only for element types
+            field_strings.push(underscore_name);
         } else {
              // If not an element type, ensure we don't add the underscore variant/match arm
              // (This prevents errors if a field coincidentally starts with _)
         }
-    }
+    } // <-- This closing brace marks the end of the first loop
+
+    // --- The code below belongs *after* the first loop ---
+
     // Add Ignore variant for unknown fields
     field_enum_variants.push(quote! { Ignore });
     // Use #field_enum_name instead of Field
