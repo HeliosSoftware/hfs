@@ -1443,8 +1443,13 @@ mod tests {
             is_active: Some(r4::Boolean { // Construct using the alias type
                 // is_active has only extension
                 id: None,
-                 // Use the actual r4::Extension type, or None if simpler
-                extension: None, // Using None for simplicity
+                // Expect the actual r4::Extension based on corrected json4 input
+                extension: Some(vec![r4::Extension {
+                    id: None,
+                    extension: None,
+                    url: "http://example.com/flag".to_string(),
+                    value: Some(r4::ExtensionValue::Boolean(true.into())), // Use r4::Boolean alias
+                }]),
                 value: None,
             }),
             count: None,
