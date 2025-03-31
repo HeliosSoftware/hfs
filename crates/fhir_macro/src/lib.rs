@@ -47,10 +47,8 @@ fn is_fhir_primitive_element_type(ty: &Type) -> bool {
         if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
             let segment = &type_path.path.segments[0];
             let ident_str = segment.ident.to_string();
-            // Check for direct Element/DecimalElement or known aliases
-            return ident_str == "Element"
-                || ident_str == "DecimalElement"
-                || FHIR_PRIMITIVE_ALIASES.contains(&ident_str.as_str());
+            // Check only for direct Element/DecimalElement
+            return ident_str == "Element" || ident_str == "DecimalElement";
         }
     }
     false
