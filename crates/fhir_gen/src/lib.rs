@@ -174,6 +174,28 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                 .append(true)
                 .open(output_path.as_ref())?;
             writeln!(file, "{}", resource_enum)?;
+
+            // Add From<T> implementations for base types ONCE after all types are defined
+            writeln!(file, "// --- From<T> Implementations for Element<T, Extension> ---")?;
+            writeln!(file, "impl From<bool> for Element<bool, Extension> {{")?;
+            writeln!(file, "    fn from(value: bool) -> Self {{")?;
+            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(file, "    }}")?;
+            writeln!(file, "}}")?;
+
+            writeln!(file, "impl From<std::primitive::i32> for Element<std::primitive::i32, Extension> {{")?;
+            writeln!(file, "    fn from(value: std::primitive::i32) -> Self {{")?;
+            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(file, "    }}")?;
+            writeln!(file, "}}")?;
+
+            writeln!(file, "impl From<std::string::String> for Element<std::string::String, Extension> {{")?;
+            writeln!(file, "    fn from(value: std::string::String) -> Self {{")?;
+            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(file, "    }}")?;
+            writeln!(file, "}}")?;
+            writeln!(file, "// --- End From<T> Implementations ---")?;
+
         }
     }
 
@@ -277,21 +299,7 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
             capitalize_first_letter(type_name),
             value_type
         ));
-        // Generate From<value_type> only for the base Rust types to avoid conflicts
-        if value_type == "bool" || value_type == "std::primitive::i32" || value_type == "std::string::String" {
-             // Generate for the specific alias being processed, as it resolves to Element<T, E>
-             // The compiler handles the fact that multiple aliases point to the same impl.
-            output.push_str(&format!(
-                "impl From<{}> for {} {{\n",
-                value_type,
-                capitalize_first_letter(type_name)
-            ));
-            // Use the determined value_type in the function signature
-            output.push_str(&format!("    fn from(value: {}) -> Self {{\n", value_type));
-            output.push_str("        Self { value: Some(value), ..Default::default() }\n"); // Use Default for id/extension
-            output.push_str("    }\n");
-            output.push_str("}\n");
-        }
+        // REMOVED From<T> generation from here to avoid conflicts
     }
 
     output
