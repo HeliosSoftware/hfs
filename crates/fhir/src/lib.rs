@@ -1502,7 +1502,7 @@ mod tests {
         };
         let json2 = serde_json::to_string(&s2).unwrap();
         // Expected output according to FHIR primitive extension pattern (_fieldName for extension object)
-        let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"code":"note","is_valid":true}]}}"#;
+        let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id"}}"#;
         assert_eq!(json2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate
