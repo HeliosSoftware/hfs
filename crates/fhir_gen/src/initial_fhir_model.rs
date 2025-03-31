@@ -260,7 +260,8 @@ pub struct StructureDefinitionContext {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct StructureDefinitionSnapshot { // Added this struct definition
+pub struct StructureDefinitionSnapshot {
+    // Added this struct definition
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension")]
@@ -699,7 +700,7 @@ pub struct Element {
     pub extension: Option<Vec<Extension>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)] // Added Clone
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ElementDefinition {
     pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,

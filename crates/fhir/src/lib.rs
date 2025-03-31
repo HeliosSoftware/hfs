@@ -311,7 +311,7 @@ where
 // --- End Element Visitor ---
 
 // Add PartialEq, Eq derives
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, FhirSerde)]
 pub struct Element<V, E> {
     // Fields are already public
     pub id: Option<String>,
@@ -429,11 +429,14 @@ where
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
-                    id: None, extension: None, value: Some(value)
-                })
-                // Propagate the error from V::deserialize directly
-                .map_err(|e| e)
+                V::deserialize(de::value::BorrowedStrDeserializer::new(v))
+                    .map(|value| Element {
+                        id: None,
+                        extension: None,
+                        value: Some(value),
+                    })
+                    // Propagate the error from V::deserialize directly
+                    .map_err(|e| e)
             }
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
             where
@@ -1298,9 +1301,9 @@ mod tests {
         let err_string = result_bool.unwrap_err().to_string();
         assert!(
             err_string.contains("invalid type: boolean `true`, expected i32"),
-            "Unexpected error message: {}", err_string // Add message for easier debugging
+            "Unexpected error message: {}",
+            err_string // Add message for easier debugging
         );
-
 
         // Object containing a boolean value when expecting Element<i32, _>
         let json_obj_bool_val = r#"{"value": true}"#;
@@ -1358,10 +1361,12 @@ mod tests {
 
         // Field with potential extension (_birthDate)
         // FhirSerde should handle the 'birthDate'/'_birthDate' logic based on the field name.
+        #[rustfmt::skip]
         birth_date: Option<Element::<String, UnitTestExtension>>, // Use turbofish as suggested by compiler
 
         // Another potentially extended field
         // FhirSerde should handle the 'isActive'/'_isActive' logic based on the field name.
+        #[rustfmt::skip]
         is_active: Option<Element::<bool, UnitTestExtension>>, // Use turbofish as suggested by compiler
 
         // A non-element field for good measure
