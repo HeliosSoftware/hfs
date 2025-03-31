@@ -153,10 +153,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         // Check if the field is Option<T>
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            // Check if the inner type T is a FHIR primitive element (Element, DecimalElement, or alias)
-            if is_fhir_primitive_element_type(inner_ty) {
-                // This field is a FHIR primitive element type (e.g., Option<r4::Date>, Option<Element<...>>)
-
+            // Check if the inner type T is specifically Element or DecimalElement
+            if is_element_or_decimal_element(inner_ty) {
+                // This field is Option<Element<V, E>> or Option<DecimalElement<E>>
+                // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
                 // Extract E type for the serialization helper generic
                 let (_v_ty, ext_ty) = get_element_generics(inner_ty);
 
