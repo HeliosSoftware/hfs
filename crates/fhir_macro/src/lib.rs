@@ -211,16 +211,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         }
                     }
                 });
-                    // AI!  Can you add this last case back where it belongs?
                     // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
-                    /*
-                                        if let Some(element) = &self.#field_ident {
-                                                // Add 1 if value is present
-                                                if element.value.is_some() { count += 1; }
-                                                // Add 1 if id or extension is present (for the underscore field)
-                                                if element.id.is_some() || element.extension.is_some() { count += 1; }
-                                            }
-                    */
 
                     // Case: Non-optional Element-like (e.g., Element<String, Extension>)
                     // This is less common with the FHIR generator but should be handled.
