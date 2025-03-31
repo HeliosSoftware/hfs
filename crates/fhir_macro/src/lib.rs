@@ -41,8 +41,20 @@ fn is_fhir_primitive_element_type(ty: &Type) -> bool {
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
-                // Check only for the literal struct names
-                return ident_str == "Element" || ident_str == "DecimalElement";
+                // Check for direct Element/DecimalElement or known R4 primitive type aliases
+                // IMPORTANT: Do NOT include base types like "String", "bool", "i32" here.
+                // Only include types that are structurally Element or DecimalElement.
+                match ident_str.as_str() {
+                    "Element" | "DecimalElement" |
+                    // R4 Aliases (assuming they are Element<V, E> or DecimalElement<E>)
+                    "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
+                    "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
+                    "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
+                    "Uuid" | "Xhtml"
+                    // Add other versions' aliases if needed (e.g., R5 Integer64)
+                         => return true,
+                    _ => return false, // Return false for base types (like std::string::String, bool, i32) and unknown types
+                }
             }
         }
     }
