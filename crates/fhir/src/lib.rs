@@ -859,7 +859,8 @@ mod tests {
     fn test_serialize_decimal_with_value_present() {
         // Use the dec! macro
         let decimal_val = dec!(1050.00);
-        let element = DecimalElement::<UnitTestExtension> {
+        // Use r4::Extension instead of UnitTestExtension
+        let element = DecimalElement::<r4::Extension> {
             id: None,
             extension: None,
             // Wrap the Decimal in PreciseDecimal
@@ -886,7 +887,8 @@ mod tests {
 
     #[test]
     fn test_serialize_decimal_with_value_absent() {
-        let element = DecimalElement::<UnitTestExtension> {
+        // Use r4::Extension instead of UnitTestExtension
+        let element = DecimalElement::<r4::Extension> {
             id: Some("test-id-123".to_string()),
             extension: None,
             value: None,
@@ -912,16 +914,22 @@ mod tests {
     fn test_serialize_decimal_with_all_fields() {
         // Use the dec! macro
         let decimal_val = dec!(-987.654321);
-        let element = DecimalElement::<UnitTestExtension> {
+        // Use r4::Extension instead of UnitTestExtension
+        let element = DecimalElement::<r4::Extension> {
             id: Some("all-fields-present".to_string()),
+            // Use r4::Extension for the extension field
             extension: Some(vec![
-                UnitTestExtension {
-                    code: "C1".to_string(),
-                    is_valid: true,
+                r4::Extension {
+                    id: None,
+                    extension: None,
+                    url: "http://example.com/ext1".to_string(),
+                    value: Some(r4::ExtensionValue::Boolean(true.into())),
                 },
-                UnitTestExtension {
-                    code: "C2".to_string(),
-                    is_valid: false,
+                r4::Extension {
+                    id: None,
+                    extension: None,
+                    url: "http://example.com/ext2".to_string(),
+                    value: Some(r4::ExtensionValue::String("val2".to_string().into())),
                 },
             ]),
             // Wrap the Decimal in PreciseDecimal
@@ -945,18 +953,20 @@ mod tests {
             json_string
         );
         assert!(json_value.get("extension").is_some());
+        // Update expected JSON for r4::Extension
         assert_eq!(
             json_value["extension"],
             serde_json::json!([
-                { "code": "C1", "is_valid": true },
-                { "code": "C2", "is_valid": false }
+                { "url": "http://example.com/ext1", "valueBoolean": true },
+                { "url": "http://example.com/ext2", "valueString": "val2" }
             ])
         );
     }
 
     #[test]
     fn test_serialize_decimal_with_no_fields() {
-        let element = DecimalElement::<UnitTestExtension> {
+        // Use r4::Extension instead of UnitTestExtension
+        let element = DecimalElement::<r4::Extension> {
             id: None,
             extension: None,
             value: None,
@@ -973,7 +983,8 @@ mod tests {
     fn test_deserialize_decimal_from_integer() {
         // Test with an integer value in an object
         let json_string = r#"{"value": 10}"#;
-        let element: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element: DecimalElement<r4::Extension> =
             serde_json::from_str(json_string).expect("Deserialization failed");
 
         // Compare against PreciseDecimal
@@ -981,7 +992,8 @@ mod tests {
 
         // Test with a bare integer - this needs to be parsed as a JSON value first
         let json_value = serde_json::json!(10);
-        let element: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element: DecimalElement<r4::Extension> =
             serde_json::from_value(json_value).expect("Deserialization from value failed");
 
         // Compare against PreciseDecimal
@@ -994,7 +1006,8 @@ mod tests {
         let json_value = serde_json::json!(10);
 
         // Deserialize to our type
-        let element: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element: DecimalElement<r4::Extension> =
             serde_json::from_value(json_value.clone()).expect("Deserialization failed");
 
         // Serialize back to JSON
@@ -1011,7 +1024,8 @@ mod tests {
         let json_value = serde_json::json!(123.456);
 
         // Deserialize to our type
-        let element: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element: DecimalElement<r4::Extension> =
             serde_json::from_value(json_value.clone()).expect("Deserialization failed");
 
         // Serialize back to JSON
@@ -1029,7 +1043,8 @@ mod tests {
         let expected_string = "3.0";
 
         // Deserialize to our type
-        let element: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element: DecimalElement<r4::Extension> =
             serde_json::from_value(json_value.clone()).expect("Deserialization from number failed");
 
         // Serialize back to string
@@ -1048,7 +1063,8 @@ mod tests {
                                          // Note: Deserializing a JSON string "3.0" into DecimalElement should still work
                                          // because the visitor handles visit_str/visit_borrowed_str.
                                          // The serialized output should still be the bare number 3.0.
-        let element_from_string: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element_from_string: DecimalElement<r4::Extension> =
             serde_json::from_str(json_str_input).expect("Deserialization from string failed");
 
         // Serialize back to string
@@ -1066,7 +1082,8 @@ mod tests {
         let json_str = r#"3.0"#; // Input is bare number 3.0 in a string
         let parsed_value: serde_json::Value = serde_json::from_str(json_str).unwrap(); // Parsed as Number(3.0)
 
-        let element_from_bare_string: DecimalElement<UnitTestExtension> =
+        // Use r4::Extension instead of UnitTestExtension
+        let element_from_bare_string: DecimalElement<r4::Extension> =
             serde_json::from_value(parsed_value.clone())
                 .expect("Deserialization from bare string failed");
 
@@ -1083,9 +1100,18 @@ mod tests {
 
     // --- New tests for Element<V, E> ---
 
+    // Define a simple extension type for these tests, as UnitTestExtension was removed
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    struct SimpleExtension {
+        url: String,
+        valueString: Option<String>,
+    }
+
+
     #[test]
     fn test_serialize_element_primitive() {
-        let element = Element::<String, UnitTestExtension> {
+        // Use r4::Extension or a simple test extension
+        let element = Element::<String, r4::Extension> {
             id: None,
             extension: None,
             value: Some("test_value".to_string()),
@@ -1094,7 +1120,8 @@ mod tests {
         // Should serialize as the primitive value directly
         assert_eq!(json_string, r#""test_value""#);
 
-        let element_null = Element::<String, UnitTestExtension> {
+        // Use r4::Extension or a simple test extension
+        let element_null = Element::<String, r4::Extension> {
             id: None,
             extension: None,
             value: None,
@@ -1104,7 +1131,8 @@ mod tests {
         assert_eq!(json_string_null, "null");
 
         // Test with integer
-        let element_int = Element::<i32, UnitTestExtension> {
+        // Use r4::Extension or a simple test extension
+        let element_int = Element::<i32, r4::Extension> {
             id: None,
             extension: None,
             value: Some(123),
@@ -1113,7 +1141,8 @@ mod tests {
         assert_eq!(json_string_int, "123");
 
         // Test with boolean
-        let element_bool = Element::<bool, UnitTestExtension> {
+        // Use r4::Extension or a simple test extension
+        let element_bool = Element::<bool, r4::Extension> {
             id: None,
             extension: None,
             value: Some(true),
@@ -1124,21 +1153,25 @@ mod tests {
 
     #[test]
     fn test_serialize_element_object() {
-        let element = Element::<String, UnitTestExtension> {
+        // Use r4::Extension
+        let element = Element::<String, r4::Extension> {
             id: Some("elem-id".to_string()),
-            extension: Some(vec![UnitTestExtension {
-                code: "ext1".to_string(),
-                is_valid: true,
+            extension: Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext1".to_string(),
+                value: Some(r4::ExtensionValue::Boolean(true.into())),
             }]),
             value: Some("test_value".to_string()),
         };
         let json_string = serde_json::to_string(&element).unwrap();
         // Should serialize as an object because id/extension are present
-        let expected_json = r#"{"id":"elem-id","extension":[{"code":"ext1","is_valid":true}],"value":"test_value"}"#;
+        let expected_json = r#"{"id":"elem-id","extension":[{"url":"http://example.com/ext1","valueBoolean":true}],"value":"test_value"}"#;
         assert_eq!(json_string, expected_json);
 
         // Test with only id
-        let element_id_only = Element::<String, UnitTestExtension> {
+        // Use r4::Extension
+        let element_id_only = Element::<String, r4::Extension> {
             id: Some("elem-id-only".to_string()),
             extension: None,
             value: Some("test_value_id".to_string()),
@@ -1148,32 +1181,38 @@ mod tests {
         assert_eq!(json_string_id_only, expected_json_id_only);
 
         // Test with only extension
-        let element_ext_only = Element::<String, UnitTestExtension> {
+        // Use r4::Extension
+        let element_ext_only = Element::<String, r4::Extension> {
             id: None,
-            extension: Some(vec![UnitTestExtension {
-                code: "ext2".to_string(),
-                is_valid: false,
+            extension: Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext2".to_string(),
+                value: Some(r4::ExtensionValue::String("val2".to_string().into())),
             }]),
             value: Some("test_value_ext".to_string()),
         };
         let json_string_ext_only = serde_json::to_string(&element_ext_only).unwrap();
         let expected_json_ext_only =
-            r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
+            r#"{"extension":[{"url":"http://example.com/ext2","valueString":"val2"}],"value":"test_value_ext"}"#;
         assert_eq!(json_string_ext_only, expected_json_ext_only);
 
         // Test with id, extension, but no value
-        let element_no_value = Element::<String, UnitTestExtension> {
+        // Use r4::Extension
+        let element_no_value = Element::<String, r4::Extension> {
             id: Some("elem-id-no-val".to_string()),
-            extension: Some(vec![UnitTestExtension {
-                code: "ext3".to_string(),
-                is_valid: true,
+            extension: Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext3".to_string(),
+                value: Some(r4::ExtensionValue::Integer(123.into())),
             }]),
             value: None,
         };
         let json_string_no_value = serde_json::to_string(&element_no_value).unwrap();
         // Should serialize object without the "value" field
         let expected_json_no_value =
-            r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
+            r#"{"id":"elem-id-no-val","extension":[{"url":"http://example.com/ext3","valueInteger":123}]}"#;
         assert_eq!(json_string_no_value, expected_json_no_value);
     }
 
@@ -1181,7 +1220,8 @@ mod tests {
     fn test_deserialize_element_primitive() {
         // String primitive
         let json_string = r#""test_value""#;
-        let element: Element<String, UnitTestExtension> =
+        // Use r4::Extension
+        let element: Element<String, r4::Extension> =
             serde_json::from_str(json_string).unwrap();
         assert_eq!(element.id, None);
         assert_eq!(element.extension, None);
@@ -1189,7 +1229,8 @@ mod tests {
 
         // Null primitive
         let json_null = "null";
-        let element_null: Element<String, UnitTestExtension> =
+        // Use r4::Extension
+        let element_null: Element<String, r4::Extension> =
             serde_json::from_str(json_null).unwrap();
         assert_eq!(element_null.id, None);
         assert_eq!(element_null.extension, None);
@@ -1197,14 +1238,16 @@ mod tests {
 
         // Number primitive
         let json_num = "123";
-        let element_num: Element<i32, UnitTestExtension> = serde_json::from_str(json_num).unwrap();
+        // Use r4::Extension
+        let element_num: Element<i32, r4::Extension> = serde_json::from_str(json_num).unwrap();
         assert_eq!(element_num.id, None);
         assert_eq!(element_num.extension, None);
         assert_eq!(element_num.value, Some(123));
 
         // Boolean primitive
         let json_bool = "true";
-        let element_bool: Element<bool, UnitTestExtension> =
+        // Use r4::Extension
+        let element_bool: Element<bool, r4::Extension> =
             serde_json::from_str(json_bool).unwrap();
         assert_eq!(element_bool.id, None);
         assert_eq!(element_bool.extension, None);
@@ -1214,60 +1257,74 @@ mod tests {
     #[test]
     fn test_deserialize_element_object() {
         // Full object
-        let json_string = r#"{"id":"elem-id","extension":[{"code":"ext1","is_valid":true}],"value":"test_value"}"#;
-        let element: Element<String, UnitTestExtension> =
+        // Use valid r4::Extension JSON
+        let json_string = r#"{"id":"elem-id","extension":[{"url":"http://example.com/ext1","valueBoolean":true}],"value":"test_value"}"#;
+        // Use r4::Extension
+        let element: Element<String, r4::Extension> =
             serde_json::from_str(json_string).unwrap();
         assert_eq!(element.id, Some("elem-id".to_string()));
         assert_eq!(
             element.extension,
-            Some(vec![UnitTestExtension {
-                code: "ext1".to_string(),
-                is_valid: true
+            Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext1".to_string(),
+                value: Some(r4::ExtensionValue::Boolean(true.into())),
             }])
         );
         assert_eq!(element.value, Some("test_value".to_string()));
 
         // Object with missing value
+        // Use valid r4::Extension JSON
         let json_missing_value =
-            r#"{"id":"elem-id-no-val","extension":[{"code":"ext3","is_valid":true}]}"#;
-        let element_missing_value: Element<String, UnitTestExtension> =
+            r#"{"id":"elem-id-no-val","extension":[{"url":"http://example.com/ext3","valueInteger":123}]}"#;
+        // Use r4::Extension
+        let element_missing_value: Element<String, r4::Extension> =
             serde_json::from_str(json_missing_value).unwrap();
         assert_eq!(element_missing_value.id, Some("elem-id-no-val".to_string()));
         assert_eq!(
             element_missing_value.extension,
-            Some(vec![UnitTestExtension {
-                code: "ext3".to_string(),
-                is_valid: true
+            Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext3".to_string(),
+                value: Some(r4::ExtensionValue::Integer(123.into())),
             }])
         );
         assert_eq!(element_missing_value.value, None); // Value should be None
 
         // Object with missing extension
         let json_missing_ext = r#"{"id":"elem-id-only","value":"test_value_id"}"#;
-        let element_missing_ext: Element<String, UnitTestExtension> =
+        // Use r4::Extension
+        let element_missing_ext: Element<String, r4::Extension> =
             serde_json::from_str(json_missing_ext).unwrap();
         assert_eq!(element_missing_ext.id, Some("elem-id-only".to_string()));
         assert_eq!(element_missing_ext.extension, None);
         assert_eq!(element_missing_ext.value, Some("test_value_id".to_string()));
 
         // Object with missing id
+        // Use valid r4::Extension JSON
         let json_missing_id =
-            r#"{"extension":[{"code":"ext2","is_valid":false}],"value":"test_value_ext"}"#;
-        let element_missing_id: Element<String, UnitTestExtension> =
+            r#"{"extension":[{"url":"http://example.com/ext2","valueString":"val2"}],"value":"test_value_ext"}"#;
+        // Use r4::Extension
+        let element_missing_id: Element<String, r4::Extension> =
             serde_json::from_str(json_missing_id).unwrap();
         assert_eq!(element_missing_id.id, None);
         assert_eq!(
             element_missing_id.extension,
-            Some(vec![UnitTestExtension {
-                code: "ext2".to_string(),
-                is_valid: false
+            Some(vec![r4::Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/ext2".to_string(),
+                value: Some(r4::ExtensionValue::String("val2".to_string().into())),
             }])
         );
         assert_eq!(element_missing_id.value, Some("test_value_ext".to_string()));
 
         // Object with only value
         let json_only_value_obj = r#"{"value":"test_value_only"}"#;
-        let element_only_value: Element<String, UnitTestExtension> =
+        // Use r4::Extension
+        let element_only_value: Element<String, r4::Extension> =
             serde_json::from_str(json_only_value_obj).unwrap();
         assert_eq!(element_only_value.id, None);
         assert_eq!(element_only_value.extension, None);
@@ -1278,7 +1335,8 @@ mod tests {
 
         // Empty object
         let json_empty_obj = r#"{}"#;
-        let element_empty_obj: Element<String, UnitTestExtension> =
+        // Use r4::Extension
+        let element_empty_obj: Element<String, r4::Extension> =
             serde_json::from_str(json_empty_obj).unwrap();
         assert_eq!(element_empty_obj.id, None);
         assert_eq!(element_empty_obj.extension, None);
@@ -1289,13 +1347,15 @@ mod tests {
     fn test_deserialize_element_invalid_type() {
         // Array is not a valid representation for a single Element
         let json_array = r#"[1, 2, 3]"#;
-        let result: Result<Element<i32, UnitTestExtension>, _> = serde_json::from_str(json_array);
+        // Use r4::Extension
+        let result: Result<Element<i32, r4::Extension>, _> = serde_json::from_str(json_array);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid type: sequence, expected a primitive value (string, number, boolean), an object, or null"));
 
         // Boolean when expecting i32 (primitive case)
         let json_bool = r#"true"#;
-        let result_bool: Result<Element<i32, UnitTestExtension>, _> =
+        // Use r4::Extension
+        let result_bool: Result<Element<i32, r4::Extension>, _> =
             serde_json::from_str(json_bool);
         assert!(result_bool.is_err());
         // Error should now come directly from V::deserialize (i32 failing on bool)
@@ -1308,7 +1368,8 @@ mod tests {
 
         // Object containing a boolean value when expecting Element<i32, _>
         let json_obj_bool_val = r#"{"value": true}"#;
-        let result_obj_bool: Result<Element<i32, UnitTestExtension>, _> =
+        // Use r4::Extension
+        let result_obj_bool: Result<Element<i32, r4::Extension>, _> =
             serde_json::from_str(json_obj_bool_val);
         assert!(result_obj_bool.is_err());
         // Error comes from trying to deserialize the "value": true into Option<i32>
@@ -1326,7 +1387,8 @@ mod tests {
 
         // Try deserializing a primitive string into Element<NonPrimitive, _>
         let json_prim_str = r#""hello""#;
-        let result_prim_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> =
+        // Use r4::Extension
+        let result_prim_nonprim: Result<Element<NonPrimitive, r4::Extension>, _> =
             serde_json::from_str(json_prim_str);
         assert!(result_prim_nonprim.is_err());
         // Error comes from V::deserialize failing inside the visitor
@@ -1337,7 +1399,8 @@ mod tests {
 
         // Try deserializing an object into Element<NonPrimitive, _> (this should work if object has correct field)
         let json_obj_nonprim = r#"{"value": {"field": "world"}}"#;
-        let result_obj_nonprim: Result<Element<NonPrimitive, UnitTestExtension>, _> =
+        // Use r4::Extension
+        let result_obj_nonprim: Result<Element<NonPrimitive, r4::Extension>, _> =
             serde_json::from_str(json_obj_nonprim);
         assert!(result_obj_nonprim.is_ok());
         let element_obj_nonprim = result_obj_nonprim.unwrap();
