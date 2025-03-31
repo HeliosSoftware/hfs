@@ -277,17 +277,19 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
             capitalize_first_letter(type_name),
             value_type
         ));
-        // Add From<value_type> implementation for the alias
-        output.push_str(&format!(
-            "impl From<{}> for {} {{\n",
-            value_type,
-            capitalize_first_letter(type_name)
-        ));
-        // Use the determined value_type in the function signature
-        output.push_str(&format!("    fn from(value: {}) -> Self {{\n", value_type));
-        output.push_str("        Self { value: Some(value), ..Default::default() }\n"); // Use Default for id/extension
-        output.push_str("    }\n");
-        output.push_str("}\n");
+        // Only generate From<String> for the base String alias to avoid conflicts
+        if type_name == "string" {
+            output.push_str(&format!(
+                "impl From<{}> for {} {{\n",
+                value_type,
+                capitalize_first_letter(type_name)
+            ));
+            // Use the determined value_type in the function signature
+            output.push_str(&format!("    fn from(value: {}) -> Self {{\n", value_type));
+            output.push_str("        Self { value: Some(value), ..Default::default() }\n"); // Use Default for id/extension
+            output.push_str("    }\n");
+            output.push_str("}\n");
+        }
     }
 
     output
