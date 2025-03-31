@@ -587,12 +587,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
-                    // Re-introduce quote! here to generate the conditional construction code
                     ::std::option::Option::Some(
                         if #is_decimal_element {
-                            quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                            crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         } else {
-                            quote! { crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
+                            crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         }
                     ) // End of Some(...)
                 } else {
@@ -637,8 +636,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // Bring quote into scope for generated code inside visit_map
-                use quote::quote;
+                // No need to bring quote into scope for generated code inside visit_map
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
