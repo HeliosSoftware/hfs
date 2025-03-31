@@ -577,12 +577,6 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     let element_construction_logic: Vec<_> = field_infos.iter().filter_map(|info| {
         if info.is_element {
             let field_ident = info.ident; // Final field ident (e.g., birth_date)
-            // Determine if it's DecimalElement *before* generating the quote block
-            let is_decimal_element = if let ::syn::Type::Path(type_path) = info.inner_ty { // Use ::syn::
-                 if let Some(segment) = type_path.path.segments.last() {
-                     segment.ident == "DecimalElement" // Only check for DecimalElement struct name
-                 } else { false }
-             } else { false };
 
             // Idents for temporary variables *inside* visit_map
             let val_field_ident = format_ident!("{}_value", field_ident);
@@ -594,16 +588,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let v_ty_construct = info.v_ty.as_ref().expect("v_ty missing for element");
             let ext_ty = info.ext_ty.as_ref().expect("ext_ty missing for element");
 
-            // Determine the actual struct type to construct (Element or DecimalElement)
-            // based on the inner_ty name
-            // Prefix with _ as it's unused now
-            let _element_struct_ident = if is_decimal_element { // Use the pre-calculated boolean
-                         format_ident!("DecimalElement")
-                     } else {
-                         format_ident!("Element") // Construct Element for others
-                     }; // Removed extra else clauses
+            // --- New logic ---
+            // Determine if we should construct DecimalElement based on the V type
+            let v_ty_string = quote!(#v_ty_construct).to_string();
+            // Need to handle potential whitespace differences from quote!
+            let should_construct_decimal_element = v_ty_string.replace(" ", "") == "crate::PreciseDecimal";
+            // --- End new logic ---
 
-             // V and E types (_v_ty_construct, _ext_ty) are now retrieved from info above
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
@@ -631,7 +622,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
                     ::std::option::Option::Some(
-                        if #is_decimal_element {
+                        // Use the new boolean flag directly based on V type
+                        if #should_construct_decimal_element {
                             // Use stored #ext_ty
                             crate::DecimalElement::<#ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         } else {
