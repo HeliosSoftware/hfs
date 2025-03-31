@@ -80,33 +80,33 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
                     }
                 }
             }
-        }
-    }
-    // Fallback or error - this shouldn't happen if called after is_fhir_primitive_element_type
-    // *** Correction: We need to handle the aliases here! ***
-
-    // If it's an alias (potentially multi-segment like r4::Date), infer V and E based on the *last* segment.
-     if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() { // Allow multi-segment paths
-            if let Some(segment) = type_path.path.segments.last() { // Get the last segment
+                    // else: It has generics but isn't Element/DecimalElement - fall through to alias check/panic.
+                }
+                // Check 2: If not Element/DecimalElement with generics, try matching known aliases based on the last segment name.
                 let ident_str = segment.ident.to_string();
                 // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
-                // This might need adjustment if supporting multiple FHIR versions simultaneously in one struct.
                 let extension_type = syn::parse_str::<Type>("crate::r4::Extension").expect("Failed to parse crate::r4::Extension type");
+                let value_type_str_opt: Option<&str> = match ident_str.as_str() {
+                    "Boolean" => Some("bool"),
+                    "Integer" | "PositiveInt" | "UnsignedInt" => Some("std::primitive::i32"),
+                    "Integer64" => Some("std::primitive::i64"), // R5+
+                    "Decimal" => Some("crate::PreciseDecimal"),
+                    // List known string-based aliases explicitly
+                    "Base64Binary" | "Canonical" | "Code" | "Date" | "DateTime" | "Id" | "Instant" | "Markdown" | "Oid" | "String" | "Time" | "Uri" | "Url" | "Uuid" | "Xhtml"
+                         => Some("std::string::String"),
+                    _ => None, // Not a known alias
+                };
 
-                let value_type_str = match ident_str.as_str() {
-                    "Boolean" => "bool",
-                 "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
-                 "Integer64" => "std::primitive::i64", // Assuming R6 might be used
-                 "Decimal" => "crate::PreciseDecimal", // Special case handled above, but include for completeness
-                 _ => "std::string::String", // Default for string-based types like Code, Uri, String, Date, DateTime etc.
-            };
-            let value_type = syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
-            return (value_type, extension_type);
+                if let Some(value_type_str) = value_type_str_opt {
+                    let value_type = syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
+                    return (value_type, extension_type);
+                }
+                // else: Fall through to panic if not Element/DecimalElement and not a known alias.
+            }
         }
     }
-
-    panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
+    // Panic if initial Type::Path check failed or if it wasn't Element/DecimalElement or a known alias.
+    panic!("Type '{}' recognized as primitive element but cannot determine V/E generics (not Element/DecimalElement or known alias)", quote!(#ty));
 }
 
 
