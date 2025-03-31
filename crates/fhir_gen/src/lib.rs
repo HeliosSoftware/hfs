@@ -390,7 +390,15 @@ fn process_elements(
                 capitalize_first_letter(&type_name)
             ));
 
-            output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+            // Generate enum derives
+            let mut enum_derives = vec!["Debug", "Serialize", "Deserialize"];
+            // Check if the enum being generated is ExtensionValue
+            if enum_name == "ExtensionValue" {
+                enum_derives.extend(["Clone", "PartialEq", "Eq"]);
+            }
+            output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
+
+            // Add other serde attributes and enum definition
             output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
 
