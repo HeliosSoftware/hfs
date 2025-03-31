@@ -108,33 +108,6 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
 
     panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
 }
-    // Fallback or error - this shouldn't happen if called after is_fhir_primitive_element_type
-    // For now, let's panic, but a better approach might be needed depending on how type aliases are handled.
-    // *** Correction: We need to handle the aliases here! ***
-
-    // If it's an alias (potentially multi-segment like r4::Date), infer V and E based on the *last* segment.
-     if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() { // Allow multi-segment paths
-            if let Some(segment) = type_path.path.segments.last() { // Get the last segment
-                let ident_str = segment.ident.to_string();
-                // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
-                // This might need adjustment if supporting multiple FHIR versions simultaneously in one struct.
-                let extension_type = syn::parse_str::<Type>("crate::r4::Extension").expect("Failed to parse crate::r4::Extension type");
-
-                let value_type_str = match ident_str.as_str() {
-                    "Boolean" => "bool",
-                 "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
-                 "Integer64" => "std::primitive::i64", // Assuming R6 might be used
-                 "Decimal" => "crate::PreciseDecimal", // Special case handled above, but include for completeness
-                 _ => "std::string::String", // Default for string-based types like Code, Uri, String, Date, DateTime etc.
-            };
-            let value_type = syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
-            return (value_type, extension_type);
-        }
-    }
-
-    panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
-}
 
 
 // Helper function to convert Rust field name (snake_case) to FHIR JSON name (camelCase)
