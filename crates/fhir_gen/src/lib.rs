@@ -419,11 +419,8 @@ fn process_elements(
             output.push_str("}\n\n");
         }
 
-        // Generate struct derives
-        let mut derives = vec!["Debug", "Serialize", "Deserialize"];
-        if type_name == "Extension" {
-            derives.extend(["Clone", "PartialEq", "Eq"]);
-        }
+        // Generate struct derives - Add Clone, PartialEq, Eq to all structs
+        let derives = vec!["Debug", "Serialize", "Deserialize", "Clone", "PartialEq", "Eq"];
         output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
 
         // Add other serde attributes and struct definition
