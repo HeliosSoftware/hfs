@@ -438,8 +438,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             .push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
 
         if info.is_element {
-            // Use the new helper to get V and E types from the inner_ty
-            let (val_ty, ext_ty) = get_element_generics(info.inner_ty); // Use inner_ty here
+            // Ensure get_element_generics is only called on the actual element type (inner_ty)
+            let (val_ty, ext_ty) = get_element_generics(info.inner_ty);
 
             let val_field = format_ident!("{}_value", field_ident);
             let id_field = format_ident!("{}_id", field_ident);
@@ -488,8 +488,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
 
         if info.is_element {
-            // Use the new helper to get V and E types from the inner_ty
-            let (val_ty, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+            // Ensure get_element_generics is only called on the actual element type (inner_ty)
+            let (val_ty, ext_ty) = get_element_generics(inner_ty);
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
@@ -577,8 +577,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  format_ident!("Element") // Default fallback
              };
 
-             // Get V and E again for the construction
-             let (v_ty_construct, ext_ty) = get_element_generics(inner_ty); // Use inner_ty
+             // Get V and E again for the construction, ensuring it's only called on the element type
+             let (v_ty_construct, ext_ty) = get_element_generics(inner_ty);
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
