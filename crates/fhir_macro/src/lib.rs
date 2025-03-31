@@ -83,16 +83,17 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
     // For now, let's panic, but a better approach might be needed depending on how type aliases are handled.
     // *** Correction: We need to handle the aliases here! ***
 
-    // If it's an alias, we need to *infer* V and E based on the alias name.
+    // If it's an alias (potentially multi-segment like r4::Date), infer V and E based on the *last* segment.
      if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-            let segment = &type_path.path.segments[0];
-            let ident_str = segment.ident.to_string();
-            // Attempt to parse Extension type relative to the crate where the macro is used
-            let extension_type = syn::parse_str::<Type>("crate::Extension").expect("Failed to parse Extension type");
+        if type_path.qself.is_none() { // Allow multi-segment paths
+            if let Some(segment) = type_path.path.segments.last() { // Get the last segment
+                let ident_str = segment.ident.to_string();
+                // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
+                // This might need adjustment if supporting multiple FHIR versions simultaneously in one struct.
+                let extension_type = syn::parse_str::<Type>("crate::r4::Extension").expect("Failed to parse crate::r4::Extension type");
 
-            let value_type_str = match ident_str.as_str() {
-                 "Boolean" => "bool",
+                let value_type_str = match ident_str.as_str() {
+                    "Boolean" => "bool",
                  "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
                  "Integer64" => "std::primitive::i64", // Assuming R6 might be used
                  "Decimal" => "crate::PreciseDecimal", // Special case handled above, but include for completeness
