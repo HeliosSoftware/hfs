@@ -166,11 +166,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Check if the inner type T is a FHIR primitive element (Element, DecimalElement, or alias)
             if is_fhir_primitive_element_type(inner_ty) {
                 // This field is a FHIR primitive element type (e.g., Option<r4::Date>, Option<Element<...>>)
-                // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
-                let (_v_ty, ext_ty) = get_element_generics(inner_ty);
-                // --- End moved block ---
 
-                // Calculate contribution to field count
+                // Extract E type for the serialization helper generic
+                let (_v_ty, ext_ty) = get_element_generics(inner_ty);
+
+                // Calculate contribution to field count (based on element fields)
                 field_count_calculation.push(quote! {
                     if let Some(element) = &self.#field_ident {
                         // Add 1 if value is present
@@ -216,15 +216,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     if self.#field_ident.is_some() { count += 1; }
                 });
                 serialize_fields.push(quote! {
-                    // Use serialize_field_if_some helper or equivalent logic
+                    // Serialize the inner value directly using the original field name
                     if let Some(value) = &self.#field_ident {
                          state.serialize_field(#original_name_lit, value)?;
                     }
-                    // For non-optional fields, handle directly below
                 });
             }
         } else {
-            // Non-optional field (assuming required fields exist based on FHIR spec)
+            // Non-optional field (handle as simple value)
             // Note: FHIR generator seems to make everything Option currently,
             // but handle non-optional just in case.
             field_count_calculation.push(quote! {
@@ -544,12 +543,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let ext_field_ident = format_ident!("{}_extension", field_ident); // This holds Option<Vec<Value>>
             let final_ext_field_ident = format_ident!("{}_final_extension", field_ident); // New var for Option<Vec<E>>
 
+            // Re-determine V and E types *inside* this loop's scope based on info.inner_ty
+            let (v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
+
             // Determine the actual struct type to construct (Element or DecimalElement)
             // based on the inner_ty name
             // Prefix with _ as it's unused now
-            let _element_struct_ident = if let Type::Path(type_path) = inner_ty {
-                 if type_path.path.segments.len() == 1 {
-                     let segment = &type_path.path.segments[0];
+            let _element_struct_ident = if let ::syn::Type::Path(type_path) = info.inner_ty { // Use ::syn:: and info.inner_ty
+                 if let Some(segment) = type_path.path.segments.last() { // Check last segment
                      if segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal" {
                          format_ident!("DecimalElement") // Construct DecimalElement
                      } else {
@@ -592,41 +593,28 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the correct Element or DecimalElement struct
                     // Re-check inner_ty name here to be certain
-                    let element_value = if let Type::Path(tp) = inner_ty {
+                    let element_value = if let ::syn::Type::Path(tp) = info.inner_ty { // Use ::syn:: and info.inner_ty
                         if let Some(seg) = tp.path.segments.last() {
                             if seg.ident == "DecimalElement" {
-                                // Construct DecimalElement<E>
-                                format_ident!("DecimalElement")::<#_ext_ty> { // Use _ext_ty
-                                    value: #val_field_ident,
-                                    id: #id_field_ident,
-                                    extension: #final_ext_field_ident,
-                                }
+                                // Construct DecimalElement<E> using quote!
+                                quote! { crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                             } else {
                                 // Assume Element<V, E>
-                                format_ident!("Element")::<#v_ty_construct, #_ext_ty> { // Use v_ty_construct and _ext_ty
-                                    value: #val_field_ident,
-                                    id: #id_field_ident,
-                                    extension: #final_ext_field_ident,
-                                }
+                                // Construct Element<V, E> using quote!
+                                quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                             }
                         } else {
                             // Fallback: Assume Element<V, E> if path has no segments (unlikely)
-                            format_ident!("Element")::<#v_ty_construct, #_ext_ty> {
-                                value: #val_field_ident,
-                                id: #id_field_ident,
-                                extension: #final_ext_field_ident,
-                            }
+                            quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                         }
                     } else {
                         // Fallback: Assume Element<V, E> if not Type::Path (unlikely)
-                        format_ident!("Element")::<#v_ty_construct, #_ext_ty> {
-                            value: #val_field_ident,
-                            id: #id_field_ident,
-                            extension: #final_ext_field_ident,
-                         }
+                        quote! { crate::Element::<#v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident } }
                     };
-                    ::std::option::Option::Some(element_value)
+                    // Wrap the constructed element in Some
+                    ::std::option::Option::Some(#element_value)
                 } else {
+                    // If no value, id, or extension were found, the final field is None
                     ::std::option::Option::None
                 };
             })
