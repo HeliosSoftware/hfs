@@ -556,7 +556,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
              // Get V and E again for the construction, ensuring it's only called on the element type
              // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
              // Use the non-prefixed _v_ty_construct inside the quote! block
-             let (_v_ty_construct, _ext_ty) = get_element_generics(inner_ty);
+             // Use info.inner_ty here as inner_ty is not in scope
+             let (_v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
