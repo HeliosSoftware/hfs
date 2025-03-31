@@ -440,7 +440,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 .push(quote! { let mut #val_field: ::std::option::Option<#val_ty> = None; });
             visitor_field_defs
                 .push(quote! { let mut #id_field: ::std::option::Option<String> = None; });
-            visitor_field_defs.push(quote! { let mut #ext_field: ::std::option::Option<::std::vec::Vec<#ext_ty>> = None; });
+            // Temporary extension field holds Vec<Value>
+            visitor_field_defs.push(quote! { let mut #ext_field: ::std::option::Option<::std::vec::Vec<::serde_json::Value>> = None; });
         }
     }
 
@@ -549,7 +550,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Idents for temporary variables *inside* visit_map
             let val_field_ident = format_ident!("{}_value", field_ident);
             let id_field_ident = format_ident!("{}_id", field_ident);
-            let ext_field_ident = format_ident!("{}_extension", field_ident);
+            let ext_field_ident = format_ident!("{}_extension", field_ident); // This holds Option<Vec<Value>>
+            let final_ext_field_ident = format_ident!("{}_final_extension", field_ident); // New var for Option<Vec<E>>
 
             // Determine the actual struct type to construct (Element or DecimalElement)
             // based on the inner_ty name
@@ -574,8 +576,25 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             Some(quote! {
                 // This generated code will be placed inside visit_map
                 // It references #field_ident (final variable) and the temporary variables
+                 // Deserialize Vec<Value> into Vec<E> *after* the main loop
+                 let #final_ext_field_ident: ::std::option::Option<::std::vec::Vec<#ext_ty>> =
+                     match #ext_field_ident {
+                         Some(values) => {
+                             let mut deserialized_extensions = ::std::vec::Vec::with_capacity(values.len());
+                             for value in values {
+                                 // Use fully qualified path for Error::custom
+                                 let deserialized_ext: #ext_ty = ::serde_json::from_value(value)
+                                     .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize extension element: {}", e)))?;
+                                 deserialized_extensions.push(deserialized_ext);
+                             }
+                             Some(deserialized_extensions)
+                         }
+                         None => None,
+                     };
+
                  // Assign the constructed Option<Element<...>> directly to the final field variable
-                #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #ext_field_ident.is_some() {
+                 // Use the final_ext_field_ident which holds Option<Vec<E>>
+                #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the correct Element or DecimalElement struct
                     // Need to pass the correct generics <V, E> or <E>
                     let element_value = if stringify!(#element_struct_ident) == "DecimalElement" {
@@ -583,7 +602,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          #element_struct_ident::<#ext_ty> {
                              value: #val_field_ident, // Already Option<PreciseDecimal>
                              id: #id_field_ident,
-                             extension: #ext_field_ident,
+                             extension: #final_ext_field_ident, // Use the final deserialized extensions
                          }
                     } else {
                          // Construct Element<V, E>
@@ -591,7 +610,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          #element_struct_ident::<#v_ty_construct, #ext_ty> {
                              value: #val_field_ident, // Already Option<V>
                              id: #id_field_ident,
-                             extension: #ext_field_ident,
+                             extension: #final_ext_field_ident, // Use the final deserialized extensions
                          }
                     };
                     ::std::option::Option::Some(element_value)
@@ -659,6 +678,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 }
 
                 // Construct Element fields *after* the loop using temp variables
+                // This block now includes the logic to deserialize extensions from Vec<Value>
                 #(#element_construction_logic)*
 
                 // Construct the final struct using the final field variables
