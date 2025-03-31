@@ -590,11 +590,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             // --- New Robust Check ---
             // Parse the target type `crate::PreciseDecimal` once for comparison
-            let precise_decimal_target_type = syn::parse_str::<Type>("crate::PreciseDecimal")
-                .expect("Internal Macro Error: Failed to parse PreciseDecimal type for comparison");
-            // Compare the resolved V type (stored in v_ty_construct) with the target type directly
-            let should_construct_decimal_element = *v_ty_construct == precise_decimal_target_type;
-            // --- End New Robust Check ---
+            // --- String Comparison Check ---
+            // Convert both types to strings and compare them, removing whitespace.
+            let v_ty_string = quote!(#v_ty_construct).to_string().replace(" ", "");
+            let target_string = "crate::PreciseDecimal".replace(" ", ""); // Target string
+            let should_construct_decimal_element = v_ty_string == target_string;
+            // --- End String Comparison Check ---
 
 
             Some(quote! {
