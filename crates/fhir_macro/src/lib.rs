@@ -33,38 +33,10 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is specifically Element or DecimalElement (by name)
-// Renamed back from is_fhir_primitive_element_type
-fn is_element_or_decimal_element(ty: &Type) -> bool {
-    if let ::syn::Type::Path(type_path) = ty {
-        // Use ::syn::
-        if type_path.qself.is_none() {
-            if let Some(segment) = type_path.path.segments.last() {
-                let ident_str = segment.ident.to_string();
-                // Check for literal struct names first
-                let is_direct_element = ident_str == "Element" || ident_str == "DecimalElement";
-                if is_direct_element {
-                    return true;
-                }
-
-                // Check aliases (similar logic to get_element_generics)
-                let is_alias = match ident_str.as_str() {
-                    "Boolean" | "Integer" | "PositiveInt" | "UnsignedInt" | "Integer64"
-                    | "Decimal" | "Base64Binary" | "Canonical" | "Code" | "Date" | "DateTime"
-                    | "Id" | "Instant" | "Markdown" | "Oid" | "String" | "Time" | "Uri" | "Url"
-                    | "Uuid" | "Xhtml" => true,
-                    _ => false,
-                };
-                return is_alias; // Return true if it's a known alias
-            }
-        }
-    }
-    false
-}
-
-// Helper function to get the V and E types from Element<V, E> or DecimalElement<E>
-// Returns (V_Type, E_Type)
-fn get_element_generics(ty: &Type) -> (Type, Type) {
+// Helper function to get the V and E types from Element<V, E>, DecimalElement<E>, or known aliases.
+// Returns Ok((V_Type, E_Type)) or Err(()) if not an element-like type.
+// Replaces both is_element_or_decimal_element and get_element_generics
+fn try_get_element_generics(ty: &Type) -> Result<(Type, Type), ()> {
     if let Type::Path(type_path) = ty {
         if type_path.qself.is_none() {
             // Allow multi-segment paths
@@ -126,11 +98,9 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
             }
         }
     }
-    // Panic if initial Type::Path check failed or if it wasn't Element/DecimalElement or a known alias.
-    panic!(
-        "Type '{}' recognized as primitive element but cannot determine V/E generics (not Element/DecimalElement or known alias)",
-        quote!(#ty)
-    );
+
+    // If initial Type::Path check failed or if it wasn't Element/DecimalElement or a known alias.
+    Err(())
 }
 
 // Helper function to convert Rust field name (snake_case) to FHIR JSON name (camelCase)
@@ -185,27 +155,35 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let original_name_lit = LitStr::new(&original_name, Span::call_site());
         let underscore_name_lit = LitStr::new(&format!("_{}", original_name), Span::call_site());
 
-        // Check if the field is Option<T>
-        if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            // Check if the inner type T is specifically Element or DecimalElement
-            if is_element_or_decimal_element(inner_ty) {
-                // This field is Option<Element<V, E>> or Option<DecimalElement<E>>
-                // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
-                // Extract E type for the serialization helper generic
-                let (_v_ty, ext_ty) = get_element_generics(inner_ty);
+        // Determine if the field is Option<T> and get the inner type
+        let (is_option, inner_ty) = match get_option_inner_type(field_ty) {
+            Some(inner) => (true, inner),
+            None => (false, field_ty), // Treat non-optional as inner_ty = field_ty
+        };
 
-                // Calculate contribution to field count (based on element fields)
-                field_count_calculation.push(quote! {
-                    if let Some(element) = &self.#field_ident {
-                        // Add 1 if value is present
-                        if element.value.is_some() { count += 1; }
-                        // Add 1 if id or extension is present (for the underscore field)
-                        if element.id.is_some() || element.extension.is_some() { count += 1; }
-                    }
-                });
+        // Try to determine if the inner type represents an Element-like structure
+        match try_get_element_generics(inner_ty) {
+            Ok((_v_ty, ext_ty)) => {
+                // Type IS Element-like (Element, DecimalElement, or alias like r4::Date)
 
-                // Generate serialization logic according to FHIR JSON rules
-                serialize_fields.push(quote! {
+                if is_option {
+                    // Case: Option<Element-like>
+                    // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
+
+                    // Calculate contribution to field count (based on element fields)
+                    field_count_calculation.push(quote! {
+
+
+                       if let Some(element) = &self.#field_ident {
+                            // Add 1 if value is present
+                            if element.value.is_some() { count += 1; }
+                            // Add 1 if id or extension is present (for the underscore field)
+                            if element.id.is_some() || element.extension.is_some() { count += 1; }
+                        }
+                    });
+
+                    // Generate serialization logic according to FHIR JSON rules
+                    serialize_fields.push(quote! {
                     if let Some(element) = &self.#field_ident {
                         let has_value = element.value.is_some();
                         let has_extension_data = element.id.is_some() || element.extension.is_some();
@@ -231,35 +209,59 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             };
                             state.serialize_field(#underscore_name_lit, &helper)?;
                         }
-                        // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
                     }
                 });
-            } else {
-                // Regular Option<T> field - Serialize the inner value directly if Some
-                field_count_calculation.push(quote! {
-                    if self.#field_ident.is_some() { count += 1; }
-                });
-                serialize_fields.push(quote! {
-                    // Serialize the inner value directly using the original field name
-                    if let Some(value) = &self.#field_ident {
-                         state.serialize_field(#original_name_lit, value)?;
-                    }
-                });
-            }
-        } else {
-            // Non-optional field (handle as simple value)
-            // Note: FHIR generator seems to make everything Option currently,
-            // but handle non-optional just in case.
-            field_count_calculation.push(quote! {
-                count += 1; // Always count non-optional fields
-            });
-            serialize_fields.push(quote! {
-                state.serialize_field(#original_name_lit, &self.#field_ident)?;
-            });
-        }
-    }
+                    // AI!  Can you add this last case back where it belongs?
+                    // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
+                    /*
+                                        if let Some(element) = &self.#field_ident {
+                                                // Add 1 if value is present
+                                                if element.value.is_some() { count += 1; }
+                                                // Add 1 if id or extension is present (for the underscore field)
+                                                if element.id.is_some() || element.extension.is_some() { count += 1; }
+                                            }
+                    */
 
-    // --- Generate Deserialize Implementation ---
+                    // Case: Non-optional Element-like (e.g., Element<String, Extension>)
+                    // This is less common with the FHIR generator but should be handled.
+                    // Serialize as a full object { id?, extension?, value? }
+                    // Note: This assumes the Element/DecimalElement Serialize impl handles this correctly.
+                    // We just need to count it and add it to the state.
+                    field_count_calculation.push(quote! { count += 1; });
+                    serialize_fields.push(quote! {
+                        state.serialize_field(#original_name_lit, &self.#field_ident)?;
+                    });
+                }
+            }
+            Err(_) => {
+                // Type is NOT Element-like (e.g., String, i32, bool, other struct)
+
+                if is_option {
+                    // Case: Option<Regular T>
+                    field_count_calculation.push(quote! {
+                        if self.#field_ident.is_some() { count += 1; }
+                    });
+                    serialize_fields.push(quote! {
+                        // Serialize the inner value directly using the original field name
+                        if let Some(value) = &self.#field_ident {
+                             state.serialize_field(#original_name_lit, value)?;
+                        }
+                    });
+                } else {
+                    // Case: Regular T (non-optional)
+                    field_count_calculation.push(quote! {
+                        count += 1; // Always count non-optional fields
+                    });
+                    serialize_fields.push(quote! {
+                        state.serialize_field(#original_name_lit, &self.#field_ident)?;
+                    });
+                }
+            }
+        }
+    } // End of loop through fields
+
+    // --- Generate Deserialize Implementation --- (Rest of the macro remains largely the same)
+    // ... existing code ...
 
     // Define Field enum variants and match arms (needed outside the final quote!)
     let mut field_enum_variants = Vec::new();
@@ -281,12 +283,16 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         original_name: String,
         underscore_name: String,
         is_element: bool,
-        // is_option: bool, // Removed unused field
+
         inner_ty: &'a Type, // Type inside Option if applicable, otherwise same as ty
+        // Store V and E types if is_element is true
+        v_ty: Option<Type>,
+        ext_ty: Option<Type>,
     }
     let mut field_infos = Vec::new();
 
-    for (_idx, field) in fields.iter().enumerate() {
+    for field in fields {
+        // Removed _idx as it's unused
         // Prefix idx with _
         let field_ident = field.ident.as_ref().unwrap();
         let field_ty = &field.ty;
@@ -333,20 +339,27 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             Some(inner) => (true, inner),
             None => (false, field_ty),
         };
-        // Use the renamed helper function
-        let is_element = is_element_or_decimal_element(inner_ty);
 
-        // *** Move field_infos population here ***
+        // Try to get generics; determine is_element based on success
+        let (is_element, v_ty_opt, ext_ty_opt) = match try_get_element_generics(inner_ty) {
+            // <-- Use try_get_element_generics
+            Ok((v, e)) => (true, Some(v), Some(e)),
+            Err(_) => (false, None, None),
+        };
+
+        // Populate field_infos
         field_infos.push(FieldInfo {
+            // <-- Populated correctly using try_get_element_generics result
             ident: field_ident,
-            ty: field_ty,
+            ty: field_ty, // Original field type (Option<T> or T)
             original_name: original_name.clone(),
             underscore_name: underscore_name.clone(),
-            is_element,
-            // is_option, // Removed unused field
-            inner_ty, // Store the inner type T
+            is_element, // Use the determined flag
+            inner_ty,   // Store the inner type T (or original type if not Option)
+            // Store V and E types if is_element is true
+            v_ty: v_ty_opt,
+            ext_ty: ext_ty_opt,
         });
-        // *** End moved block ***
 
         // For Field enum and match arms
         field_enum_variants.push(quote! { #field_ident_enum });
@@ -441,9 +454,9 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             .push(quote! { let mut #field_ident: #field_ty = ::std::option::Option::None; });
 
         if info.is_element {
-            // Ensure get_element_generics is only called on the actual element type (inner_ty)
-            // Prefix ext_ty with _ as it might be unused in this specific block
-            let (val_ty, _ext_ty) = get_element_generics(info.inner_ty); // Use _ext_ty
+            // Get V type from stored info (populated using try_get_element_generics)
+            let val_ty = info.v_ty.as_ref().expect("v_ty missing for element");
+            // E type (_ext_ty) is not needed for these definitions
 
             let val_field = format_ident!("{}_value", field_ident);
             let id_field = format_ident!("{}_id", field_ident);
@@ -493,9 +506,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str); // e.g., BirthDateUnderscore
 
         if info.is_element {
-            // Ensure get_element_generics is only called on the actual element type (inner_ty)
-            // Prefix ext_ty with _ as it might be unused in this specific block
-            let (val_ty, _ext_ty) = get_element_generics(inner_ty); // Use _ext_ty
+            // Get V type from stored info (populated using try_get_element_generics)
+            let val_ty = info.v_ty.as_ref().expect("v_ty missing for element");
+            // E type (_ext_ty) is not needed for these assignments
+
             let id_field = format_ident!("{}_id", field_ident);
             let ext_field = format_ident!("{}_extension", field_ident);
             let val_field = format_ident!("{}_value", field_ident);
@@ -574,13 +588,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             let ext_field_ident = format_ident!("{}_extension", field_ident); // This holds Option<Vec<Value>>
             let final_ext_field_ident = format_ident!("{}_final_extension", field_ident); // New var for Option<Vec<E>>
 
-            // Re-determine V and E types *inside* this loop's scope based on info.inner_ty
-            // Prefix v_ty_construct with _ here as it's not directly used in this outer scope
-            let (_v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
-            // Use the non-prefixed _v_ty_construct inside the quote! block below
+            // Get V and E types from the stored info (populated using try_get_element_generics)
+            let v_ty_construct = info.v_ty.as_ref().expect("v_ty missing for element");
+            let ext_ty = info.ext_ty.as_ref().expect("ext_ty missing for element");
 
             // Determine the actual struct type to construct (Element or DecimalElement)
-            // based on the inner_ty name (This logic is moved outside the quote block)
+            // based on the inner_ty name
             // Prefix with _ as it's unused now
             let _element_struct_ident = if is_decimal_element { // Use the pre-calculated boolean
                          format_ident!("DecimalElement")
@@ -588,25 +601,20 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          format_ident!("Element") // Construct Element for others
                      }; // Removed extra else clauses
 
-             // Get V and E again for the construction, ensuring it's only called on the element type
-             // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
-             // Use the non-prefixed _v_ty_construct inside the quote! block
-             // Use info.inner_ty here as inner_ty is not in scope
-             let (_v_ty_construct, _ext_ty) = get_element_generics(info.inner_ty);
+             // V and E types (_v_ty_construct, _ext_ty) are now retrieved from info above
 
             Some(quote! {
                 // This generated code will be placed inside visit_map
                 // It references #field_ident (final variable) and the temporary variables
-                 // Deserialize Vec<Value> into Vec<E> *after* the main loop
-                 // Use the _ext_ty variable defined outside this quote! block
-                 let #final_ext_field_ident: ::std::option::Option<::std::vec::Vec<#_ext_ty>> = // Use #_ext_ty
+                 // Deserialize Vec<Value> into Vec<E> *after* the main loop using the stored #ext_ty
+                 let #final_ext_field_ident: ::std::option::Option<::std::vec::Vec<#ext_ty>> =
                      match #ext_field_ident {
                          Some(values) => {
                              let mut deserialized_extensions = ::std::vec::Vec::with_capacity(values.len());
                              for value in values {
                                  // Use fully qualified path for Error::custom
-                                 // Use the _ext_ty variable defined outside this quote! block
-                                 let deserialized_ext: #_ext_ty = ::serde_json::from_value(value) // Use #_ext_ty
+                                 // Use the stored #ext_ty
+                                 let deserialized_ext: #ext_ty = ::serde_json::from_value(value)
                                      .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize extension element: {}", e)))?;
                                  deserialized_extensions.push(deserialized_ext);
                              }
@@ -615,15 +623,18 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          None => None,
                      };
 
-                 // Assign the constructed Option<Element<...>> directly to the final field variable
+                 // Assign the constructed Option<Element/DecimalElement> directly to the final field variable
                  // Use the final_ext_field_ident which holds Option<Vec<E>>
+                 // Use stored #v_ty_construct and #ext_ty
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
                     ::std::option::Option::Some(
                         if #is_decimal_element {
-                            crate::DecimalElement::<#_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
+                            // Use stored #ext_ty
+                            crate::DecimalElement::<#ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         } else {
-                            crate::Element::<#_v_ty_construct, #_ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
+                            // Use stored #v_ty_construct and #ext_ty
+                            crate::Element::<#v_ty_construct, #ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         }
                     ) // End of Some(...)
                 } else {
