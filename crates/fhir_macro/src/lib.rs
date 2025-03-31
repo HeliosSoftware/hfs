@@ -163,47 +163,11 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             if is_fhir_primitive_element_type(inner_ty) {
                 // This is a potentially extended primitive field (like Option<Element<String, Extension>>)
 
-                // Extract E type *here* in the macro scope
-                let ext_ty = if let Type::Path(type_path) = inner_ty {
-                    if type_path.path.segments.len() == 1 {
-                        let segment = &type_path.path.segments[0];
-                        if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                            if (segment.ident == "Element" && args.args.len() == 2)
-                                || (segment.ident == "DecimalElement" && args.args.len() == 1)
-                            {
-                                let e_arg = if segment.ident == "Element" {
-                                    &args.args[1]
-                                } else {
-                                    &args.args[0]
-                                };
-                                match e_arg {
-                                    GenericArgument::Type(t) => t,
-                                    _ => panic!("Expected Type for E"),
-                                }
-                            } else {
-                                panic!(
-                                    "Unsupported Element type structure: {}",
-                                    quote!(#inner_ty).to_string()
-                                );
-                            }
-                        } else {
-                            panic!(
-                                "Element type missing generics: {}",
-                                quote!(#inner_ty).to_string()
-                            );
-                        }
-                    } else {
-                        panic!(
-                            "Unsupported Element type path: {}",
-                            quote!(#inner_ty).to_string()
-                        );
-                    }
-                } else {
-                    panic!(
-                        "Expected Element or DecimalElement type, found: {}",
-                        quote!(#inner_ty).to_string()
-                    );
-                };
+                // --- Moved ext_ty extraction inside this block ---
+                // Extract E type using get_element_generics
+                // We only need E for the serialization helper generic argument
+                let (_v_ty, ext_ty) = get_element_generics(inner_ty);
+                // --- End moved block ---
 
                 // Calculate contribution to field count
                 field_count_calculation.push(quote! {
@@ -226,7 +190,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                             state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
                         } else if !has_value && has_extension_data {
                             // Case 2: Only id/extension -> "_fieldName": { ... }
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Use ext_ty here
+                            // Use ::serde prefix for Serialize trait bound on E
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
                             };
@@ -234,7 +199,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         } else if has_value && has_extension_data {
                             // Case 3: Both value and id/extension -> "fieldName": value, "_fieldName": { ... }
                             state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> { // Use ext_ty here
+                            // Use ::serde prefix for Serialize trait bound on E
+                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
                                 id: &element.id,
                                 extension: &element.extension,
                             };
@@ -403,7 +369,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where E: ::serde::de::Error,
+            where E: ::serde::de::Error, // Use ::serde path
             {
                  // Use the unique enum name
                 match value {
@@ -412,7 +378,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             }
              // Handle borrowed strings as well
             fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
-            where E: ::serde::de::Error,
+            where E: ::serde::de::Error, // Use ::serde path
             {
                  match value {
                     // Use the unique enum name here
@@ -424,7 +390,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         // Use the unique enum name
         impl<'de> ::serde::Deserialize<'de> for #field_enum_name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where D: ::serde::Deserializer<'de>,
+            where D: ::serde::Deserializer<'de>, // Use ::serde path
             {
                  // Use the unique visitor name
                 deserializer.deserialize_identifier(#field_visitor_name)
@@ -680,12 +646,13 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             fn visit_map<V>(self, mut map: V) -> Result<#name, V::Error>
             where
-                V: ::serde::de::MapAccess<'de>,
+                V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
                 // Bring necessary serde items into scope for generated code
-                use ::serde::de; // Needed for de::Error
+                // Use fully qualified paths instead of use statements inside function
+                // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
-                use ::serde::Deserialize;
+                // use ::serde::Deserialize;
 
                 // Define helper types (Field enum, FieldVisitor, ExtensionHelper) *inside* the visit_map scope
                 // This ensures they are unique per struct and avoids polluting the outer scope,
@@ -701,7 +668,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     match key {
                         #(#visitor_map_assignments)*
                         // Use #field_enum_name directly (defined outside impl block)
-                        #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; }
+                        #field_enum_name::Ignore => { let _ = map.next_value::<::serde::de::IgnoredAny>()?; } // Use ::serde path
                     }
                 }
 
@@ -722,7 +689,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: ::serde::Deserializer<'de>, // 'de is used here by the Deserializer bound
+                D: ::serde::Deserializer<'de>, // Use ::serde path
             {
                 // Define the fields Serde should expect
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
@@ -737,7 +704,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
     // Define the serialization helper struct definition
     // Use updated helper name (no __)
     let serialize_helper_struct_def = quote! {
-        #[derive(::serde::Serialize)] // Use Serialize from the use statement above
+        // Use ::serde::Serialize path for derive and trait bound
+        #[derive(::serde::Serialize)]
         struct #serialize_extension_helper_name<'a, E: ::serde::Serialize> {
             #[serde(skip_serializing_if = "Option::is_none")]
             id: &'a ::std::option::Option<String>,
@@ -750,12 +718,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         impl ::serde::Serialize for #name {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
-                S: ::serde::Serializer,
+                S: ::serde::Serializer, // Use ::serde path
             {
-                // Add use statements for serde traits/types needed within the impl
-                use serde::ser::{SerializeStruct, Serializer};
+                // Use fully qualified paths instead of use statements inside function
+                // use serde::ser::{SerializeStruct, Serializer};
                 // Need Serialize in scope for the helper derive
-                use ::serde::Serialize;
+                // use ::serde::Serialize;
 
                 // Serialization helper struct is defined outside the impl block now
 
@@ -764,6 +732,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                 #(#field_count_calculation)*
 
                 // Start serialization
+                // Use ::serde path for SerializeStruct
                 let mut state = serializer.serialize_struct(stringify!(#name), count)?;
 
                 // Serialize each field
