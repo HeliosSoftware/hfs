@@ -1,7 +1,23 @@
-use crate::{DecimalElement, Element};
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
+use crate::{Element, DecimalElement};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AccountGuarantor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub party: Reference,
+    #[serde(rename = "onHold", skip_serializing_if = "Option::is_none")]
+    pub on_hold: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,23 +59,7 @@ pub struct Account {
     pub part_of: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccountGuarantor {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub party: Reference,
-    #[serde(rename = "onHold", skip_serializing_if = "Option::is_none")]
-    pub on_hold: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AccountCoverage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,36 +73,9 @@ pub struct AccountCoverage {
     pub priority: Option<PositiveInt>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActivityDefinitionDynamicValue {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub expression: Expression,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActivityDefinitionParticipant {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-}
 
 /// Choice of types for the subject[x] field in ActivityDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ActivityDefinitionSubject {
     /// Variant accepting the CodeableConcept type.
@@ -114,7 +87,7 @@ pub enum ActivityDefinitionSubject {
 }
 
 /// Choice of types for the timing[x] field in ActivityDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ActivityDefinitionTiming {
     /// Variant accepting the Timing type.
@@ -138,7 +111,7 @@ pub enum ActivityDefinitionTiming {
 }
 
 /// Choice of types for the product[x] field in ActivityDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ActivityDefinitionProduct {
     /// Variant accepting the Reference type.
@@ -149,7 +122,7 @@ pub enum ActivityDefinitionProduct {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActivityDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,20 +222,11 @@ pub struct ActivityDefinition {
     pub dosage: Option<Vec<Dosage>>,
     #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
     pub body_site: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "specimenRequirement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "specimenRequirement", skip_serializing_if = "Option::is_none")]
     pub specimen_requirement: Option<Vec<Reference>>,
-    #[serde(
-        rename = "observationRequirement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "observationRequirement", skip_serializing_if = "Option::is_none")]
     pub observation_requirement: Option<Vec<Reference>>,
-    #[serde(
-        rename = "observationResultRequirement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "observationResultRequirement", skip_serializing_if = "Option::is_none")]
     pub observation_result_requirement: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<Canonical>,
@@ -270,21 +234,36 @@ pub struct ActivityDefinition {
     pub dynamic_value: Option<Vec<ActivityDefinitionDynamicValue>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AdverseEventSuspectEntity {
+pub struct ActivityDefinitionDynamicValue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub instance: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
+    pub path: String,
+    pub expression: Expression,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityDefinitionParticipant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdverseEventSuspectEntityCausality {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -303,7 +282,7 @@ pub struct AdverseEventSuspectEntityCausality {
     pub method: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdverseEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -354,10 +333,7 @@ pub struct AdverseEvent {
     pub contributor: Option<Vec<Reference>>,
     #[serde(rename = "suspectEntity", skip_serializing_if = "Option::is_none")]
     pub suspect_entity: Option<Vec<AdverseEventSuspectEntity>>,
-    #[serde(
-        rename = "subjectMedicalHistory",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "subjectMedicalHistory", skip_serializing_if = "Option::is_none")]
     pub subject_medical_history: Option<Vec<Reference>>,
     #[serde(rename = "referenceDocument", skip_serializing_if = "Option::is_none")]
     pub reference_document: Option<Vec<Reference>>,
@@ -365,8 +341,23 @@ pub struct AdverseEvent {
     pub study: Option<Vec<Reference>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdverseEventSuspectEntity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub instance: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
+}
+
+
 /// Choice of types for the onset[x] field in AllergyIntolerance
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AllergyIntoleranceOnset {
     /// Variant accepting the DateTime type.
@@ -386,7 +377,7 @@ pub enum AllergyIntoleranceOnset {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllergyIntolerance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,7 +429,7 @@ pub struct AllergyIntolerance {
     pub reaction: Option<Vec<AllergyIntoleranceReaction>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllergyIntoleranceReaction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -463,7 +454,8 @@ pub struct AllergyIntoleranceReaction {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Appointment {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -503,10 +495,7 @@ pub struct Appointment {
     pub priority: Option<UnsignedInt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start: Option<Instant>,
@@ -530,7 +519,7 @@ pub struct Appointment {
     pub requested_period: Option<Vec<Period>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AppointmentParticipant {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -550,7 +539,8 @@ pub struct AppointmentParticipant {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AppointmentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -586,23 +576,8 @@ pub struct AppointmentResponse {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuditEventSource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub site: Option<String>,
-    pub observer: Reference,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<Coding>>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEventEntity {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,7 +607,7 @@ pub struct AuditEventEntity {
 }
 
 /// Choice of types for the value[x] field in AuditEventEntityDetail
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AuditEventEntityDetailValue {
     /// Variant accepting the String type.
@@ -643,7 +618,7 @@ pub enum AuditEventEntityDetailValue {
     Base64Binary(Base64Binary),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEventEntityDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -658,7 +633,7 @@ pub struct AuditEventEntityDetail {
     pub value: Option<AuditEventEntityDetailValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -699,7 +674,23 @@ pub struct AuditEvent {
     pub entity: Option<Vec<AuditEventEntity>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuditEventSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    pub observer: Reference,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<Coding>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEventAgentNetwork {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -714,7 +705,7 @@ pub struct AuditEventAgentNetwork {
     pub r#type: Option<Code>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEventAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -746,7 +737,8 @@ pub struct AuditEventAgent {
     pub purpose_of_use: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Basic {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -776,7 +768,8 @@ pub struct Basic {
     pub author: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Binary {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -795,8 +788,36 @@ pub struct Binary {
     pub data: Option<Base64Binary>,
 }
 
+
+/// Choice of types for the time[x] field in BiologicallyDerivedProductManipulation
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BiologicallyDerivedProductManipulationTime {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timeDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timePeriod")]
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BiologicallyDerivedProductManipulation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub time: Option<BiologicallyDerivedProductManipulationTime>,
+}
+
 /// Choice of types for the collected[x] field in BiologicallyDerivedProductCollection
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum BiologicallyDerivedProductCollectionCollected {
     /// Variant accepting the DateTime type.
@@ -807,7 +828,7 @@ pub enum BiologicallyDerivedProductCollectionCollected {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BiologicallyDerivedProductCollection {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -824,84 +845,7 @@ pub struct BiologicallyDerivedProductCollection {
     pub collected: Option<BiologicallyDerivedProductCollectionCollected>,
 }
 
-/// Choice of types for the time[x] field in BiologicallyDerivedProductProcessing
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BiologicallyDerivedProductProcessingTime {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timeDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timePeriod")]
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BiologicallyDerivedProductProcessing {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub procedure: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additive: Option<Reference>,
-    #[serde(flatten)]
-    pub time: Option<BiologicallyDerivedProductProcessingTime>,
-}
-
-/// Choice of types for the time[x] field in BiologicallyDerivedProductManipulation
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BiologicallyDerivedProductManipulationTime {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timeDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timePeriod")]
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BiologicallyDerivedProductManipulation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(flatten)]
-    pub time: Option<BiologicallyDerivedProductManipulationTime>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BiologicallyDerivedProductStorage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scale: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BiologicallyDerivedProduct {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -944,7 +888,58 @@ pub struct BiologicallyDerivedProduct {
     pub storage: Option<Vec<BiologicallyDerivedProductStorage>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the time[x] field in BiologicallyDerivedProductProcessing
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BiologicallyDerivedProductProcessingTime {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timeDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timePeriod")]
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BiologicallyDerivedProductProcessing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additive: Option<Reference>,
+    #[serde(flatten)]
+    pub time: Option<BiologicallyDerivedProductProcessingTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BiologicallyDerivedProductStorage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Period>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BodyStructure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -980,7 +975,52 @@ pub struct BodyStructure {
     pub patient: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BundleEntryRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub method: Code,
+    pub url: Uri,
+    #[serde(rename = "ifNoneMatch", skip_serializing_if = "Option::is_none")]
+    pub if_none_match: Option<String>,
+    #[serde(rename = "ifModifiedSince", skip_serializing_if = "Option::is_none")]
+    pub if_modified_since: Option<Instant>,
+    #[serde(rename = "ifMatch", skip_serializing_if = "Option::is_none")]
+    pub if_match: Option<String>,
+    #[serde(rename = "ifNoneExist", skip_serializing_if = "Option::is_none")]
+    pub if_none_exist: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BundleEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Vec<BundleLink>>,
+    #[serde(rename = "fullUrl", skip_serializing_if = "Option::is_none")]
+    pub full_url: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Resource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<BundleEntrySearch>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<BundleEntryRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<BundleEntryResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BundleLink {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -993,7 +1033,22 @@ pub struct BundleLink {
     pub url: Uri,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BundleEntrySearch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Bundle {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1020,51 +1075,7 @@ pub struct Bundle {
     pub signature: Option<Signature>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BundleEntry {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub link: Option<Vec<BundleLink>>,
-    #[serde(rename = "fullUrl", skip_serializing_if = "Option::is_none")]
-    pub full_url: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Resource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub search: Option<BundleEntrySearch>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request: Option<BundleEntryRequest>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<BundleEntryResponse>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BundleEntryRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub method: Code,
-    pub url: Uri,
-    #[serde(rename = "ifNoneMatch", skip_serializing_if = "Option::is_none")]
-    pub if_none_match: Option<String>,
-    #[serde(rename = "ifModifiedSince", skip_serializing_if = "Option::is_none")]
-    pub if_modified_since: Option<Instant>,
-    #[serde(rename = "ifMatch", skip_serializing_if = "Option::is_none")]
-    pub if_match: Option<String>,
-    #[serde(rename = "ifNoneExist", skip_serializing_if = "Option::is_none")]
-    pub if_none_exist: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BundleEntryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1084,57 +1095,8 @@ pub struct BundleEntryResponse {
     pub outcome: Option<Resource>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BundleEntrySearch {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<Decimal>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementRestSecurity {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cors: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementRestResourceSearchParam {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definition: Option<Canonical>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatementRestResource {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1179,7 +1141,70 @@ pub struct CapabilityStatementRestResource {
     pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementRestResourceInteraction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementRestSecurity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementRestResourceSearchParam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Canonical>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementRestInteraction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatementMessaging {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1198,37 +1223,59 @@ pub struct CapabilityStatementMessaging {
     pub supported_message: Option<Vec<CapabilityStatementMessagingSupportedMessage>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CapabilityStatementRestInteraction {
+pub struct CapabilityStatementMessagingEndpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
+    pub protocol: Coding,
+    pub address: Url,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementMessagingSupportedMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub definition: Canonical,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityStatementRest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<Markdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<CapabilityStatementRestSecurity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Vec<CapabilityStatementRestResource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
+    #[serde(rename = "searchParam", skip_serializing_if = "Option::is_none")]
+    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compartment: Option<Vec<Canonical>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementImplementation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<Url>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub custodian: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatementRestResourceOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1243,34 +1290,7 @@ pub struct CapabilityStatementRestResourceOperation {
     pub documentation: Option<Markdown>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementMessagingEndpoint {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub protocol: Coding,
-    pub address: Url,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementRestResourceInteraction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatementDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1285,20 +1305,7 @@ pub struct CapabilityStatementDocument {
     pub profile: Canonical,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityStatementMessagingSupportedMessage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub definition: Canonical,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1358,10 +1365,7 @@ pub struct CapabilityStatement {
     pub format: Option<Vec<Code>>,
     #[serde(rename = "patchFormat", skip_serializing_if = "Option::is_none")]
     pub patch_format: Option<Vec<Code>>,
-    #[serde(
-        rename = "implementationGuide",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "implementationGuide", skip_serializing_if = "Option::is_none")]
     pub implementation_guide: Option<Vec<Canonical>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rest: Option<Vec<CapabilityStatementRest>>,
@@ -1371,7 +1375,7 @@ pub struct CapabilityStatement {
     pub document: Option<Vec<CapabilityStatementDocument>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityStatementSoftware {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1387,33 +1391,116 @@ pub struct CapabilityStatementSoftware {
     pub release_date: Option<DateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CapabilityStatementRest {
+pub struct CapabilityStatementImplementation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
+    pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<Markdown>,
+    pub url: Option<Url>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub security: Option<CapabilityStatementRestSecurity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Vec<CapabilityStatementRestResource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
-    #[serde(rename = "searchParam", skip_serializing_if = "Option::is_none")]
-    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compartment: Option<Vec<Canonical>>,
+    pub custodian: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CarePlanActivity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "outcomeCodeableConcept", skip_serializing_if = "Option::is_none")]
+    pub outcome_codeable_concept: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "outcomeReference", skip_serializing_if = "Option::is_none")]
+    pub outcome_reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Vec<Annotation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<CarePlanActivityDetail>,
+}
+
+/// Choice of types for the scheduled[x] field in CarePlanActivityDetail
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CarePlanActivityDetailScheduled {
+    /// Variant accepting the Timing type.
+    #[serde(rename = "scheduledTiming")]
+    Timing(Timing),
+    /// Variant accepting the Period type.
+    #[serde(rename = "scheduledPeriod")]
+    Period(Period),
+    /// Variant accepting the String type.
+    #[serde(rename = "scheduledString")]
+    String(String),
+}
+
+/// Choice of types for the product[x] field in CarePlanActivityDetail
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CarePlanActivityDetailProduct {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "productCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "productReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CarePlanActivityDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Code>,
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
+    pub instantiates_canonical: Option<Vec<Canonical>>,
+    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
+    pub instantiates_uri: Option<Vec<Uri>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
+    pub reason_reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Vec<Reference>>,
+    pub status: Code,
+    #[serde(rename = "statusReason", skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<CodeableConcept>,
+    #[serde(rename = "doNotPerform", skip_serializing_if = "Option::is_none")]
+    pub do_not_perform: Option<Boolean>,
+    #[serde(flatten)]
+    pub scheduled: Option<CarePlanActivityDetailScheduled>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performer: Option<Vec<Reference>>,
+    #[serde(flatten)]
+    pub product: Option<CarePlanActivityDetailProduct>,
+    #[serde(rename = "dailyAmount", skip_serializing_if = "Option::is_none")]
+    pub daily_amount: Option<Quantity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CarePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1434,10 +1521,7 @@ pub struct CarePlan {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -1480,124 +1564,8 @@ pub struct CarePlan {
     pub note: Option<Vec<Annotation>>,
 }
 
-/// Choice of types for the scheduled[x] field in CarePlanActivityDetail
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CarePlanActivityDetailScheduled {
-    /// Variant accepting the Timing type.
-    #[serde(rename = "scheduledTiming")]
-    Timing(Timing),
-    /// Variant accepting the Period type.
-    #[serde(rename = "scheduledPeriod")]
-    Period(Period),
-    /// Variant accepting the String type.
-    #[serde(rename = "scheduledString")]
-    String(String),
-}
 
-/// Choice of types for the product[x] field in CarePlanActivityDetail
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CarePlanActivityDetailProduct {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "productCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "productReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CarePlanActivityDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<Code>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub instantiates_canonical: Option<Vec<Canonical>>,
-    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
-    pub instantiates_uri: Option<Vec<Uri>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
-    pub reason_reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub goal: Option<Vec<Reference>>,
-    pub status: Code,
-    #[serde(rename = "statusReason", skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<CodeableConcept>,
-    #[serde(rename = "doNotPerform", skip_serializing_if = "Option::is_none")]
-    pub do_not_perform: Option<Boolean>,
-    #[serde(flatten)]
-    pub scheduled: Option<CarePlanActivityDetailScheduled>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub performer: Option<Vec<Reference>>,
-    #[serde(flatten)]
-    pub product: Option<CarePlanActivityDetailProduct>,
-    #[serde(rename = "dailyAmount", skip_serializing_if = "Option::is_none")]
-    pub daily_amount: Option<Quantity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CarePlanActivity {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "outcomeCodeableConcept",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub outcome_codeable_concept: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "outcomeReference", skip_serializing_if = "Option::is_none")]
-    pub outcome_reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress: Option<Vec<Annotation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<CarePlanActivityDetail>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CareTeamParticipant {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member: Option<Reference>,
-    #[serde(rename = "onBehalfOf", skip_serializing_if = "Option::is_none")]
-    pub on_behalf_of: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CareTeam {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1636,10 +1604,7 @@ pub struct CareTeam {
     pub reason_code: Option<Vec<CodeableConcept>>,
     #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
     pub reason_reference: Option<Vec<Reference>>,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telecom: Option<Vec<ContactPoint>>,
@@ -1647,7 +1612,40 @@ pub struct CareTeam {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CareTeamParticipant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<Reference>,
+    #[serde(rename = "onBehalfOf", skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogEntryRelatedEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub relationtype: Code,
+    pub item: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1673,10 +1671,7 @@ pub struct CatalogEntry {
     pub orderable: Boolean,
     #[serde(rename = "referencedItem")]
     pub referenced_item: Reference,
-    #[serde(
-        rename = "additionalIdentifier",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "additionalIdentifier", skip_serializing_if = "Option::is_none")]
     pub additional_identifier: Option<Vec<Identifier>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<Vec<CodeableConcept>>,
@@ -1688,35 +1683,17 @@ pub struct CatalogEntry {
     pub valid_to: Option<DateTime>,
     #[serde(rename = "lastUpdated", skip_serializing_if = "Option::is_none")]
     pub last_updated: Option<DateTime>,
-    #[serde(
-        rename = "additionalCharacteristic",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "additionalCharacteristic", skip_serializing_if = "Option::is_none")]
     pub additional_characteristic: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "additionalClassification",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "additionalClassification", skip_serializing_if = "Option::is_none")]
     pub additional_classification: Option<Vec<CodeableConcept>>,
     #[serde(rename = "relatedEntry", skip_serializing_if = "Option::is_none")]
     pub related_entry: Option<Vec<CatalogEntryRelatedEntry>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogEntryRelatedEntry {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub relationtype: Code,
-    pub item: Reference,
-}
 
 /// Choice of types for the occurrence[x] field in ChargeItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ChargeItemOccurrence {
     /// Variant accepting the DateTime type.
@@ -1731,7 +1708,7 @@ pub enum ChargeItemOccurrence {
 }
 
 /// Choice of types for the product[x] field in ChargeItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ChargeItemProduct {
     /// Variant accepting the Reference type.
@@ -1742,7 +1719,7 @@ pub enum ChargeItemProduct {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChargeItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1765,10 +1742,7 @@ pub struct ChargeItem {
     pub identifier: Option<Vec<Identifier>>,
     #[serde(rename = "definitionUri", skip_serializing_if = "Option::is_none")]
     pub definition_uri: Option<Vec<Uri>>,
-    #[serde(
-        rename = "definitionCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "definitionCanonical", skip_serializing_if = "Option::is_none")]
     pub definition_canonical: Option<Vec<Canonical>>,
     pub status: Code,
     #[serde(rename = "partOf", skip_serializing_if = "Option::is_none")]
@@ -1781,15 +1755,9 @@ pub struct ChargeItem {
     pub occurrence: Option<ChargeItemOccurrence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub performer: Option<Vec<ChargeItemPerformer>>,
-    #[serde(
-        rename = "performingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "performingOrganization", skip_serializing_if = "Option::is_none")]
     pub performing_organization: Option<Reference>,
-    #[serde(
-        rename = "requestingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "requestingOrganization", skip_serializing_if = "Option::is_none")]
     pub requesting_organization: Option<Reference>,
     #[serde(rename = "costCenter", skip_serializing_if = "Option::is_none")]
     pub cost_center: Option<Reference>,
@@ -1817,14 +1785,11 @@ pub struct ChargeItem {
     pub account: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<Vec<Annotation>>,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChargeItemPerformer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1838,7 +1803,40 @@ pub struct ChargeItemPerformer {
     pub actor: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChargeItemDefinitionApplicability {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChargeItemDefinitionPropertyGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<Vec<ChargeItemDefinitionApplicability>>,
+    #[serde(rename = "priceComponent", skip_serializing_if = "Option::is_none")]
+    pub price_component: Option<Vec<ChargeItemDefinitionPropertyGroupPriceComponent>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChargeItemDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1903,7 +1901,7 @@ pub struct ChargeItemDefinition {
     pub property_group: Option<Vec<ChargeItemDefinitionPropertyGroup>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChargeItemDefinitionPropertyGroupPriceComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1922,56 +1920,23 @@ pub struct ChargeItemDefinitionPropertyGroupPriceComponent {
     pub amount: Option<Money>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ChargeItemDefinitionApplicability {
+pub struct ClaimPayee {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<String>,
+    pub party: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChargeItemDefinitionPropertyGroup {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applicability: Option<Vec<ChargeItemDefinitionApplicability>>,
-    #[serde(rename = "priceComponent", skip_serializing_if = "Option::is_none")]
-    pub price_component: Option<Vec<ChargeItemDefinitionPropertyGroupPriceComponent>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimRelated {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimItemDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2005,203 +1970,7 @@ pub struct ClaimItemDetail {
     pub sub_detail: Option<Vec<ClaimItemDetailSubDetail>>,
 }
 
-/// Choice of types for the procedure[x] field in ClaimProcedure
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimProcedureProcedure {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "procedureCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "procedureReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimProcedure {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<DateTime>,
-    #[serde(flatten)]
-    pub procedure: Option<ClaimProcedureProcedure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-}
-
-/// Choice of types for the serviced[x] field in ClaimItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimItemServiced {
-    /// Variant accepting the Date type.
-    #[serde(rename = "servicedDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "servicedPeriod")]
-    Period(Period),
-}
-
-/// Choice of types for the location[x] field in ClaimItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimItemLocation {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "locationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "careTeamSequence", skip_serializing_if = "Option::is_none")]
-    pub care_team_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "diagnosisSequence", skip_serializing_if = "Option::is_none")]
-    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "procedureSequence", skip_serializing_if = "Option::is_none")]
-    pub procedure_sequence: Option<Vec<PositiveInt>>,
-    #[serde(
-        rename = "informationSequence",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub information_sequence: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revenue: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(flatten)]
-    pub serviced: Option<ClaimItemServiced>,
-    #[serde(flatten)]
-    pub location: Option<ClaimItemLocation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
-    pub body_site: Option<CodeableConcept>,
-    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
-    pub sub_site: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encounter: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<ClaimItemDetail>>,
-}
-
-/// Choice of types for the timing[x] field in ClaimSupportingInfo
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimSupportingInfoTiming {
-    /// Variant accepting the Date type.
-    #[serde(rename = "timingDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timingPeriod")]
-    Period(Period),
-}
-
-/// Choice of types for the value[x] field in ClaimSupportingInfo
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimSupportingInfoValue {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimSupportingInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub category: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub timing: Option<ClaimSupportingInfoTiming>,
-    #[serde(flatten)]
-    pub value: Option<ClaimSupportingInfoValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<CodeableConcept>,
-}
-
-/// Choice of types for the location[x] field in ClaimAccident
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimAccidentLocation {
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimAccident {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub date: Date,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub location: Option<ClaimAccidentLocation>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimInsurance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2215,10 +1984,7 @@ pub struct ClaimInsurance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Identifier>,
     pub coverage: Reference,
-    #[serde(
-        rename = "businessArrangement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "businessArrangement", skip_serializing_if = "Option::is_none")]
     pub business_arrangement: Option<String>,
     #[serde(rename = "preAuthRef", skip_serializing_if = "Option::is_none")]
     pub pre_auth_ref: Option<Vec<String>>,
@@ -2226,73 +1992,7 @@ pub struct ClaimInsurance {
     pub claim_response: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimCareTeam {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub provider: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub responsible: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub qualification: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimPayee {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub party: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimItemDetailSubDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revenue: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Claim {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2336,10 +2036,7 @@ pub struct Claim {
     pub related: Option<Vec<ClaimRelated>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prescription: Option<Reference>,
-    #[serde(
-        rename = "originalPrescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "originalPrescription", skip_serializing_if = "Option::is_none")]
     pub original_prescription: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payee: Option<ClaimPayee>,
@@ -2365,8 +2062,36 @@ pub struct Claim {
     pub total: Option<Money>,
 }
 
+/// Choice of types for the location[x] field in ClaimAccident
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimAccidentLocation {
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimAccident {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub date: Date,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub location: Option<ClaimAccidentLocation>,
+}
+
 /// Choice of types for the diagnosis[x] field in ClaimDiagnosis
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ClaimDiagnosisDiagnosis {
     /// Variant accepting the CodeableConcept type.
@@ -2377,7 +2102,7 @@ pub enum ClaimDiagnosisDiagnosis {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimDiagnosis {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2397,7 +2122,451 @@ pub struct ClaimDiagnosis {
     pub package_code: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimItemDetailSubDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimRelated {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Identifier>,
+}
+
+/// Choice of types for the timing[x] field in ClaimSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimSupportingInfoTiming {
+    /// Variant accepting the Date type.
+    #[serde(rename = "timingDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timingPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the value[x] field in ClaimSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimSupportingInfoValue {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSupportingInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub category: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub timing: Option<ClaimSupportingInfoTiming>,
+    #[serde(flatten)]
+    pub value: Option<ClaimSupportingInfoValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CodeableConcept>,
+}
+
+/// Choice of types for the procedure[x] field in ClaimProcedure
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimProcedureProcedure {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "procedureCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "procedureReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimProcedure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime>,
+    #[serde(flatten)]
+    pub procedure: Option<ClaimProcedureProcedure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+}
+
+/// Choice of types for the serviced[x] field in ClaimItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimItemServiced {
+    /// Variant accepting the Date type.
+    #[serde(rename = "servicedDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "servicedPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the location[x] field in ClaimItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimItemLocation {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "locationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(rename = "careTeamSequence", skip_serializing_if = "Option::is_none")]
+    pub care_team_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "diagnosisSequence", skip_serializing_if = "Option::is_none")]
+    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "procedureSequence", skip_serializing_if = "Option::is_none")]
+    pub procedure_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "informationSequence", skip_serializing_if = "Option::is_none")]
+    pub information_sequence: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(flatten)]
+    pub serviced: Option<ClaimItemServiced>,
+    #[serde(flatten)]
+    pub location: Option<ClaimItemLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
+    pub body_site: Option<CodeableConcept>,
+    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
+    pub sub_site: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encounter: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<ClaimItemDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimCareTeam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsible: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<CodeableConcept>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseTotal {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub amount: Money,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseProcessNote {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<PositiveInt>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Code>,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemSequence")]
+    pub item_sequence: PositiveInt,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<ClaimResponseItemDetail>>,
+}
+
+/// Choice of types for the serviced[x] field in ClaimResponseAddItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimResponseAddItemServiced {
+    /// Variant accepting the Date type.
+    #[serde(rename = "servicedDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "servicedPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the location[x] field in ClaimResponseAddItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimResponseAddItemLocation {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "locationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseAddItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemSequence", skip_serializing_if = "Option::is_none")]
+    pub item_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "detailSequence", skip_serializing_if = "Option::is_none")]
+    pub detail_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "subdetailSequence", skip_serializing_if = "Option::is_none")]
+    pub subdetail_sequence: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Vec<Reference>>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(flatten)]
+    pub serviced: Option<ClaimResponseAddItemServiced>,
+    #[serde(flatten)]
+    pub location: Option<ClaimResponseAddItemLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
+    pub body_site: Option<CodeableConcept>,
+    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
+    pub sub_site: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<ClaimResponseAddItemDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseItemAdjudication {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseItemDetailSubDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "subDetailSequence")]
+    pub sub_detail_sequence: PositiveInt,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseAddItemDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    #[serde(rename = "subDetail", skip_serializing_if = "Option::is_none")]
+    pub sub_detail: Option<Vec<ClaimResponseAddItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponsePayment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjustment: Option<Money>,
+    #[serde(rename = "adjustmentReason", skip_serializing_if = "Option::is_none")]
+    pub adjustment_reason: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<Date>,
+    pub amount: Money,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Identifier>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2459,10 +2628,7 @@ pub struct ClaimResponse {
     pub form: Option<Attachment>,
     #[serde(rename = "processNote", skip_serializing_if = "Option::is_none")]
     pub process_note: Option<Vec<ClaimResponseProcessNote>>,
-    #[serde(
-        rename = "communicationRequest",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "communicationRequest", skip_serializing_if = "Option::is_none")]
     pub communication_request: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insurance: Option<Vec<ClaimResponseInsurance>>,
@@ -2470,26 +2636,62 @@ pub struct ClaimResponse {
     pub error: Option<Vec<ClaimResponseError>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ClaimResponseItem {
+pub struct ClaimResponseItemDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemSequence")]
-    pub item_sequence: PositiveInt,
+    #[serde(rename = "detailSequence")]
+    pub detail_sequence: PositiveInt,
     #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
     pub note_number: Option<Vec<PositiveInt>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<ClaimResponseItemDetail>>,
+    #[serde(rename = "subDetail", skip_serializing_if = "Option::is_none")]
+    pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "itemSequence", skip_serializing_if = "Option::is_none")]
+    pub item_sequence: Option<PositiveInt>,
+    #[serde(rename = "detailSequence", skip_serializing_if = "Option::is_none")]
+    pub detail_sequence: Option<PositiveInt>,
+    #[serde(rename = "subDetailSequence", skip_serializing_if = "Option::is_none")]
+    pub sub_detail_sequence: Option<PositiveInt>,
+    pub code: CodeableConcept,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimResponseInsurance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    #[serde(rename = "businessArrangement", skip_serializing_if = "Option::is_none")]
+    pub business_arrangement: Option<String>,
+    #[serde(rename = "claimResponse", skip_serializing_if = "Option::is_none")]
+    pub claim_response: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimResponseAddItemDetailSubDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2516,256 +2718,8 @@ pub struct ClaimResponseAddItemDetailSubDetail {
     pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
 }
 
-/// Choice of types for the serviced[x] field in ClaimResponseAddItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimResponseAddItemServiced {
-    /// Variant accepting the Date type.
-    #[serde(rename = "servicedDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "servicedPeriod")]
-    Period(Period),
-}
 
-/// Choice of types for the location[x] field in ClaimResponseAddItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimResponseAddItemLocation {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "locationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseAddItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemSequence", skip_serializing_if = "Option::is_none")]
-    pub item_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "detailSequence", skip_serializing_if = "Option::is_none")]
-    pub detail_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "subdetailSequence", skip_serializing_if = "Option::is_none")]
-    pub subdetail_sequence: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Vec<Reference>>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(flatten)]
-    pub serviced: Option<ClaimResponseAddItemServiced>,
-    #[serde(flatten)]
-    pub location: Option<ClaimResponseAddItemLocation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
-    pub body_site: Option<CodeableConcept>,
-    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
-    pub sub_site: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<ClaimResponseAddItemDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponsePayment {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjustment: Option<Money>,
-    #[serde(rename = "adjustmentReason", skip_serializing_if = "Option::is_none")]
-    pub adjustment_reason: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<Date>,
-    pub amount: Money,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseAddItemDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    #[serde(rename = "subDetail", skip_serializing_if = "Option::is_none")]
-    pub sub_detail: Option<Vec<ClaimResponseAddItemDetailSubDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseItemDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "detailSequence")]
-    pub detail_sequence: PositiveInt,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    #[serde(rename = "subDetail", skip_serializing_if = "Option::is_none")]
-    pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseTotal {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub amount: Money,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseProcessNote {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<PositiveInt>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Code>,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseInsurance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    #[serde(
-        rename = "businessArrangement",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub business_arrangement: Option<String>,
-    #[serde(rename = "claimResponse", skip_serializing_if = "Option::is_none")]
-    pub claim_response: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseError {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "itemSequence", skip_serializing_if = "Option::is_none")]
-    pub item_sequence: Option<PositiveInt>,
-    #[serde(rename = "detailSequence", skip_serializing_if = "Option::is_none")]
-    pub detail_sequence: Option<PositiveInt>,
-    #[serde(rename = "subDetailSequence", skip_serializing_if = "Option::is_none")]
-    pub sub_detail_sequence: Option<PositiveInt>,
-    pub code: CodeableConcept,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseItemAdjudication {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Decimal>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClaimResponseItemDetailSubDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "subDetailSequence")]
-    pub sub_detail_sequence: PositiveInt,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClinicalImpressionInvestigation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2779,7 +2733,7 @@ pub struct ClinicalImpressionInvestigation {
     pub item: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClinicalImpressionFinding {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2788,10 +2742,7 @@ pub struct ClinicalImpressionFinding {
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "itemCodeableConcept",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "itemCodeableConcept", skip_serializing_if = "Option::is_none")]
     pub item_codeable_concept: Option<CodeableConcept>,
     #[serde(rename = "itemReference", skip_serializing_if = "Option::is_none")]
     pub item_reference: Option<Reference>,
@@ -2800,7 +2751,7 @@ pub struct ClinicalImpressionFinding {
 }
 
 /// Choice of types for the effective[x] field in ClinicalImpression
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ClinicalImpressionEffective {
     /// Variant accepting the DateTime type.
@@ -2811,7 +2762,7 @@ pub enum ClinicalImpressionEffective {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClinicalImpression {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2860,10 +2811,7 @@ pub struct ClinicalImpression {
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finding: Option<Vec<ClinicalImpressionFinding>>,
-    #[serde(
-        rename = "prognosisCodeableConcept",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "prognosisCodeableConcept", skip_serializing_if = "Option::is_none")]
     pub prognosis_codeable_concept: Option<Vec<CodeableConcept>>,
     #[serde(rename = "prognosisReference", skip_serializing_if = "Option::is_none")]
     pub prognosis_reference: Option<Vec<Reference>>,
@@ -2873,42 +2821,9 @@ pub struct ClinicalImpression {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CodeSystemProperty {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CodeSystemConceptDesignation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<Code>,
-    #[serde(rename = "use", skip_serializing_if = "Option::is_none")]
-    pub r#use: Option<Coding>,
-    pub value: String,
-}
 
 /// Choice of types for the value[x] field in CodeSystemConceptProperty
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CodeSystemConceptPropertyValue {
     /// Variant accepting the Code type.
@@ -2934,7 +2849,7 @@ pub enum CodeSystemConceptPropertyValue {
     Decimal(Decimal),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeSystemConceptProperty {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2948,7 +2863,7 @@ pub struct CodeSystemConceptProperty {
     pub value: Option<CodeSystemConceptPropertyValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeSystemConcept {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2970,7 +2885,7 @@ pub struct CodeSystemConcept {
     pub concept: Option<Vec<CodeSystemConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeSystemFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2987,7 +2902,25 @@ pub struct CodeSystemFilter {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodeSystemProperty {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeSystem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3058,35 +2991,24 @@ pub struct CodeSystem {
     pub concept: Option<Vec<CodeSystemConcept>>,
 }
 
-/// Choice of types for the content[x] field in CommunicationPayload
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CommunicationPayloadContent {
-    /// Variant accepting the String type.
-    #[serde(rename = "contentString")]
-    String(String),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CommunicationPayload {
+pub struct CodeSystemConceptDesignation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub content: Option<CommunicationPayloadContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<Code>,
+    #[serde(rename = "use", skip_serializing_if = "Option::is_none")]
+    pub r#use: Option<Coding>,
+    pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Communication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3107,10 +3029,7 @@ pub struct Communication {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -3155,8 +3074,37 @@ pub struct Communication {
     pub note: Option<Vec<Annotation>>,
 }
 
+/// Choice of types for the content[x] field in CommunicationPayload
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CommunicationPayloadContent {
+    /// Variant accepting the String type.
+    #[serde(rename = "contentString")]
+    String(String),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommunicationPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub content: Option<CommunicationPayloadContent>,
+}
+
+
 /// Choice of types for the content[x] field in CommunicationRequestPayload
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CommunicationRequestPayloadContent {
     /// Variant accepting the String type.
@@ -3170,7 +3118,7 @@ pub enum CommunicationRequestPayloadContent {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommunicationRequestPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3184,7 +3132,7 @@ pub struct CommunicationRequestPayload {
 }
 
 /// Choice of types for the occurrence[x] field in CommunicationRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CommunicationRequestOccurrence {
     /// Variant accepting the DateTime type.
@@ -3195,7 +3143,7 @@ pub enum CommunicationRequestOccurrence {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommunicationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3259,23 +3207,8 @@ pub struct CommunicationRequest {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompartmentDefinitionResource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub param: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CompartmentDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3319,7 +3252,72 @@ pub struct CompartmentDefinition {
     pub resource: Option<Vec<CompartmentDefinitionResource>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompartmentDefinitionResource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub param: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Narrative>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Code>,
+    #[serde(rename = "orderedBy", skip_serializing_if = "Option::is_none")]
+    pub ordered_by: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<Vec<Reference>>,
+    #[serde(rename = "emptyReason", skip_serializing_if = "Option::is_none")]
+    pub empty_reason: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<Vec<CompositionSection>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Composition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3367,81 +3365,7 @@ pub struct Composition {
     pub section: Option<Vec<CompositionSection>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompositionSection {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub focus: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<Narrative>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Code>,
-    #[serde(rename = "orderedBy", skip_serializing_if = "Option::is_none")]
-    pub ordered_by: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entry: Option<Vec<Reference>>,
-    #[serde(rename = "emptyReason", skip_serializing_if = "Option::is_none")]
-    pub empty_reason: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub section: Option<Vec<CompositionSection>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompositionEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<Reference>>,
-}
-
-/// Choice of types for the target[x] field in CompositionRelatesTo
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CompositionRelatesToTarget {
-    /// Variant accepting the Identifier type.
-    #[serde(rename = "targetIdentifier")]
-    Identifier(Identifier),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "targetReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompositionRelatesTo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    #[serde(flatten)]
-    pub target: Option<CompositionRelatesToTarget>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionAttester {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3457,8 +3381,93 @@ pub struct CompositionAttester {
     pub party: Option<Reference>,
 }
 
+/// Choice of types for the target[x] field in CompositionRelatesTo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CompositionRelatesToTarget {
+    /// Variant accepting the Identifier type.
+    #[serde(rename = "targetIdentifier")]
+    Identifier(Identifier),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "targetReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionRelatesTo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(flatten)]
+    pub target: Option<CompositionRelatesToTarget>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptMapGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Uri>,
+    #[serde(rename = "sourceVersion", skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Uri>,
+    #[serde(rename = "targetVersion", skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element: Option<Vec<ConceptMapGroupElement>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmapped: Option<ConceptMapGroupUnmapped>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptMapGroupElementTargetDependsOn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub property: Uri,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<Canonical>,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptMapGroupUnmapped {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<Canonical>,
+}
+
 /// Choice of types for the source[x] field in ConceptMap
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConceptMapSource {
     /// Variant accepting the Uri type.
@@ -3470,7 +3479,7 @@ pub enum ConceptMapSource {
 }
 
 /// Choice of types for the target[x] field in ConceptMap
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConceptMapTarget {
     /// Variant accepting the Uri type.
@@ -3481,7 +3490,7 @@ pub enum ConceptMapTarget {
     Canonical(Canonical),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConceptMap {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3537,30 +3546,7 @@ pub struct ConceptMap {
     pub group: Option<Vec<ConceptMapGroup>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConceptMapGroup {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Uri>,
-    #[serde(rename = "sourceVersion", skip_serializing_if = "Option::is_none")]
-    pub source_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Uri>,
-    #[serde(rename = "targetVersion", skip_serializing_if = "Option::is_none")]
-    pub target_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub element: Option<Vec<ConceptMapGroupElement>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unmapped: Option<ConceptMapGroupUnmapped>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConceptMapGroupElement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3577,7 +3563,7 @@ pub struct ConceptMapGroupElement {
     pub target: Option<Vec<ConceptMapGroupElementTarget>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConceptMapGroupElementTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3599,75 +3585,9 @@ pub struct ConceptMapGroupElementTarget {
     pub product: Option<Vec<ConceptMapGroupElementTargetDependsOn>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConceptMapGroupUnmapped {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<Canonical>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConceptMapGroupElementTargetDependsOn {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub property: Uri,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<Canonical>,
-    pub value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConditionEvidence {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConditionStage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assessment: Option<Vec<Reference>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-}
 
 /// Choice of types for the onset[x] field in Condition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConditionOnset {
     /// Variant accepting the DateTime type.
@@ -3688,7 +3608,7 @@ pub enum ConditionOnset {
 }
 
 /// Choice of types for the abatement[x] field in Condition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConditionAbatement {
     /// Variant accepting the DateTime type.
@@ -3708,7 +3628,7 @@ pub enum ConditionAbatement {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Condition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3762,66 +3682,40 @@ pub struct Condition {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ConsentProvision {
+pub struct ConditionStage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<Vec<Reference>>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Code>,
+    pub r#type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
+    pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<Vec<ConsentProvisionActor>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "securityLabel", skip_serializing_if = "Option::is_none")]
-    pub security_label: Option<Vec<Coding>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<Vec<Coding>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub class: Option<Vec<Coding>>,
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "dataPeriod", skip_serializing_if = "Option::is_none")]
-    pub data_period: Option<Period>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Vec<ConsentProvisionData>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provision: Option<Vec<ConsentProvision>>,
+    pub detail: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConsentProvisionActor {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: CodeableConcept,
-    pub reference: Reference,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConsentProvisionData {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub meaning: Code,
-    pub reference: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentVerification {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3837,8 +3731,21 @@ pub struct ConsentVerification {
     pub verification_date: Option<DateTime>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentProvisionData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub meaning: Code,
+    pub reference: Reference,
+}
+
 /// Choice of types for the source[x] field in Consent
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConsentSource {
     /// Variant accepting the Attachment type.
@@ -3849,7 +3756,7 @@ pub enum ConsentSource {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Consent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3894,7 +3801,53 @@ pub struct Consent {
     pub provision: Option<ConsentProvision>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentProvision {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<Vec<ConsentProvisionActor>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "securityLabel", skip_serializing_if = "Option::is_none")]
+    pub security_label: Option<Vec<Coding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<Vec<Coding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<Vec<Coding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "dataPeriod", skip_serializing_if = "Option::is_none")]
+    pub data_period: Option<Period>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<ConsentProvisionData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provision: Option<Vec<ConsentProvision>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentProvisionActor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub role: CodeableConcept,
+    pub reference: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3909,277 +3862,9 @@ pub struct ConsentPolicy {
     pub uri: Option<Uri>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermOffer {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub party: Option<Vec<ContractTermOfferParty>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topic: Option<Reference>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decision: Option<CodeableConcept>,
-    #[serde(rename = "decisionMode", skip_serializing_if = "Option::is_none")]
-    pub decision_mode: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer: Option<Vec<ContractTermOfferAnswer>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
-    pub link_id: Option<Vec<String>>,
-    #[serde(
-        rename = "securityLabelNumber",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-}
-
-/// Choice of types for the occurrence[x] field in ContractTermAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractTermActionOccurrence {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "occurrenceDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "occurrencePeriod")]
-    Period(Period),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "occurrenceTiming")]
-    Timing(Timing),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "doNotPerform", skip_serializing_if = "Option::is_none")]
-    pub do_not_perform: Option<Boolean>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<Vec<ContractTermActionSubject>>,
-    pub intent: CodeableConcept,
-    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
-    pub link_id: Option<Vec<String>>,
-    pub status: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<Reference>,
-    #[serde(rename = "contextLinkId", skip_serializing_if = "Option::is_none")]
-    pub context_link_id: Option<Vec<String>>,
-    #[serde(flatten)]
-    pub occurrence: Option<ContractTermActionOccurrence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requester: Option<Vec<Reference>>,
-    #[serde(rename = "requesterLinkId", skip_serializing_if = "Option::is_none")]
-    pub requester_link_id: Option<Vec<String>>,
-    #[serde(rename = "performerType", skip_serializing_if = "Option::is_none")]
-    pub performer_type: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "performerRole", skip_serializing_if = "Option::is_none")]
-    pub performer_role: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub performer: Option<Reference>,
-    #[serde(rename = "performerLinkId", skip_serializing_if = "Option::is_none")]
-    pub performer_link_id: Option<Vec<String>>,
-    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
-    pub reason_reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<Vec<String>>,
-    #[serde(rename = "reasonLinkId", skip_serializing_if = "Option::is_none")]
-    pub reason_link_id: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Vec<Annotation>>,
-    #[serde(
-        rename = "securityLabelNumber",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractContentDefinition {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(rename = "subType", skip_serializing_if = "Option::is_none")]
-    pub sub_type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub publisher: Option<Reference>,
-    #[serde(rename = "publicationDate", skip_serializing_if = "Option::is_none")]
-    pub publication_date: Option<DateTime>,
-    #[serde(rename = "publicationStatus")]
-    pub publication_status: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub copyright: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractSigner {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Coding,
-    pub party: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<Vec<Signature>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermAsset {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<CodeableConcept>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "typeReference", skip_serializing_if = "Option::is_none")]
-    pub type_reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subtype: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<Coding>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<Vec<ContractTermAssetContext>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition: Option<String>,
-    #[serde(rename = "periodType", skip_serializing_if = "Option::is_none")]
-    pub period_type: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Vec<Period>>,
-    #[serde(rename = "usePeriod", skip_serializing_if = "Option::is_none")]
-    pub use_period: Option<Vec<Period>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
-    pub link_id: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer: Option<Vec<ContractTermOfferAnswer>>,
-    #[serde(
-        rename = "securityLabelNumber",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-    #[serde(rename = "valuedItem", skip_serializing_if = "Option::is_none")]
-    pub valued_item: Option<Vec<ContractTermAssetValuedItem>>,
-}
-
-/// Choice of types for the content[x] field in ContractRule
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractRuleContent {
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractRule {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub content: Option<ContractRuleContent>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermActionSubject {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-}
-
-/// Choice of types for the content[x] field in ContractLegal
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractLegalContent {
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractLegal {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub content: Option<ContractLegalContent>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermSecurityLabel {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<Vec<UnsignedInt>>,
-    pub classification: Coding,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<Vec<Coding>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub control: Option<Vec<Coding>>,
-}
 
 /// Choice of types for the value[x] field in ContractTermOfferAnswer
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContractTermOfferAnswerValue {
     /// Variant accepting the Boolean type.
@@ -4220,7 +3905,7 @@ pub enum ContractTermOfferAnswerValue {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContractTermOfferAnswer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4233,9 +3918,9 @@ pub struct ContractTermOfferAnswer {
     pub value: Option<ContractTermOfferAnswerValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ContractTermOfferParty {
+pub struct ContractTermOffer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4243,29 +3928,29 @@ pub struct ContractTermOfferParty {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Vec<Reference>>,
-    pub role: CodeableConcept,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContractTermAssetContext {
+    pub identifier: Option<Vec<Identifier>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
+    pub party: Option<Vec<ContractTermOfferParty>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
+    pub topic: Option<Reference>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Reference>,
+    pub decision: Option<CodeableConcept>,
+    #[serde(rename = "decisionMode", skip_serializing_if = "Option::is_none")]
+    pub decision_mode: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<CodeableConcept>>,
+    pub answer: Option<Vec<ContractTermOfferAnswer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<Vec<String>>,
+    #[serde(rename = "securityLabelNumber", skip_serializing_if = "Option::is_none")]
+    pub security_label_number: Option<Vec<UnsignedInt>>,
 }
 
 /// Choice of types for the entity[x] field in ContractTermAssetValuedItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContractTermAssetValuedItemEntity {
     /// Variant accepting the CodeableConcept type.
@@ -4276,7 +3961,7 @@ pub enum ContractTermAssetValuedItemEntity {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContractTermAssetValuedItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4311,40 +3996,85 @@ pub struct ContractTermAssetValuedItem {
     pub recipient: Option<Reference>,
     #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
     pub link_id: Option<Vec<String>>,
-    #[serde(
-        rename = "securityLabelNumber",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "securityLabelNumber", skip_serializing_if = "Option::is_none")]
     pub security_label_number: Option<Vec<UnsignedInt>>,
 }
 
-/// Choice of types for the content[x] field in ContractFriendly
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractFriendlyContent {
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ContractFriendly {
+pub struct ContractTermAssetContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub content: Option<ContractFriendlyContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractTermActionSubject {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractTermAsset {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CodeableConcept>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "typeReference", skip_serializing_if = "Option::is_none")]
+    pub type_reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtype: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<Coding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Vec<ContractTermAssetContext>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(rename = "periodType", skip_serializing_if = "Option::is_none")]
+    pub period_type: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Vec<Period>>,
+    #[serde(rename = "usePeriod", skip_serializing_if = "Option::is_none")]
+    pub use_period: Option<Vec<Period>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Vec<ContractTermOfferAnswer>>,
+    #[serde(rename = "securityLabelNumber", skip_serializing_if = "Option::is_none")]
+    pub security_label_number: Option<Vec<UnsignedInt>>,
+    #[serde(rename = "valuedItem", skip_serializing_if = "Option::is_none")]
+    pub valued_item: Option<Vec<ContractTermAssetValuedItem>>,
 }
 
 /// Choice of types for the topic[x] field in ContractTerm
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContractTermTopic {
     /// Variant accepting the CodeableConcept type.
@@ -4355,7 +4085,7 @@ pub enum ContractTermTopic {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContractTerm {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4389,8 +4119,51 @@ pub struct ContractTerm {
     pub group: Option<Vec<ContractTerm>>,
 }
 
+/// Choice of types for the content[x] field in ContractFriendly
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractFriendlyContent {
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractFriendly {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub content: Option<ContractFriendlyContent>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractTermSecurityLabel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<Vec<UnsignedInt>>,
+    pub classification: Coding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<Vec<Coding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control: Option<Vec<Coding>>,
+}
+
 /// Choice of types for the topic[x] field in Contract
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContractTopic {
     /// Variant accepting the CodeableConcept type.
@@ -4402,7 +4175,7 @@ pub enum ContractTopic {
 }
 
 /// Choice of types for the legallyBinding[x] field in Contract
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContractLegallyBinding {
     /// Variant accepting the Attachment type.
@@ -4413,7 +4186,7 @@ pub enum ContractLegallyBinding {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Contract {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4442,10 +4215,7 @@ pub struct Contract {
     pub status: Option<Code>,
     #[serde(rename = "legalState", skip_serializing_if = "Option::is_none")]
     pub legal_state: Option<CodeableConcept>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Reference>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Uri>,
@@ -4503,7 +4273,237 @@ pub struct Contract {
     pub legally_binding: Option<ContractLegallyBinding>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the occurrence[x] field in ContractTermAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractTermActionOccurrence {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "occurrenceDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "occurrencePeriod")]
+    Period(Period),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "occurrenceTiming")]
+    Timing(Timing),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractTermAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "doNotPerform", skip_serializing_if = "Option::is_none")]
+    pub do_not_perform: Option<Boolean>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Vec<ContractTermActionSubject>>,
+    pub intent: CodeableConcept,
+    #[serde(rename = "linkId", skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<Vec<String>>,
+    pub status: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<Reference>,
+    #[serde(rename = "contextLinkId", skip_serializing_if = "Option::is_none")]
+    pub context_link_id: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub occurrence: Option<ContractTermActionOccurrence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Vec<Reference>>,
+    #[serde(rename = "requesterLinkId", skip_serializing_if = "Option::is_none")]
+    pub requester_link_id: Option<Vec<String>>,
+    #[serde(rename = "performerType", skip_serializing_if = "Option::is_none")]
+    pub performer_type: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "performerRole", skip_serializing_if = "Option::is_none")]
+    pub performer_role: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performer: Option<Reference>,
+    #[serde(rename = "performerLinkId", skip_serializing_if = "Option::is_none")]
+    pub performer_link_id: Option<Vec<String>>,
+    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
+    pub reason_reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Vec<String>>,
+    #[serde(rename = "reasonLinkId", skip_serializing_if = "Option::is_none")]
+    pub reason_link_id: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "securityLabelNumber", skip_serializing_if = "Option::is_none")]
+    pub security_label_number: Option<Vec<UnsignedInt>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractTermOfferParty {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Vec<Reference>>,
+    pub role: CodeableConcept,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractContentDefinition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(rename = "subType", skip_serializing_if = "Option::is_none")]
+    pub sub_type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<Reference>,
+    #[serde(rename = "publicationDate", skip_serializing_if = "Option::is_none")]
+    pub publication_date: Option<DateTime>,
+    #[serde(rename = "publicationStatus")]
+    pub publication_status: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copyright: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractSigner {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Coding,
+    pub party: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<Signature>>,
+}
+
+/// Choice of types for the content[x] field in ContractLegal
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractLegalContent {
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractLegal {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub content: Option<ContractLegalContent>,
+}
+
+/// Choice of types for the content[x] field in ContractRule
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractRuleContent {
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContractRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub content: Option<ContractRuleContent>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageCostToBeneficiaryException {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+/// Choice of types for the value[x] field in CoverageCostToBeneficiary
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CoverageCostToBeneficiaryValue {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Money type.
+    #[serde(rename = "valueMoney")]
+    Money(Money),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageCostToBeneficiary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub value: Option<CoverageCostToBeneficiaryValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exception: Option<Vec<CoverageCostToBeneficiaryException>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageClass {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Coverage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4556,68 +4556,9 @@ pub struct Coverage {
     pub contract: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageCostToBeneficiaryException {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-}
-
-/// Choice of types for the value[x] field in CoverageCostToBeneficiary
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CoverageCostToBeneficiaryValue {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Money type.
-    #[serde(rename = "valueMoney")]
-    Money(Money),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageCostToBeneficiary {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub value: Option<CoverageCostToBeneficiaryValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exception: Option<Vec<CoverageCostToBeneficiaryException>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageClass {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
 
 /// Choice of types for the serviced[x] field in CoverageEligibilityRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CoverageEligibilityRequestServiced {
     /// Variant accepting the Date type.
@@ -4628,7 +4569,7 @@ pub enum CoverageEligibilityRequestServiced {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4673,7 +4614,22 @@ pub struct CoverageEligibilityRequest {
     pub item: Option<Vec<CoverageEligibilityRequestItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageEligibilityRequestSupportingInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub information: Reference,
+    #[serde(rename = "appliesToAll", skip_serializing_if = "Option::is_none")]
+    pub applies_to_all: Option<Boolean>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityRequestInsurance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4685,14 +4641,11 @@ pub struct CoverageEligibilityRequestInsurance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focal: Option<Boolean>,
     pub coverage: Reference,
-    #[serde(
-        rename = "businessArrangement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "businessArrangement", skip_serializing_if = "Option::is_none")]
     pub business_arrangement: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityRequestItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4701,10 +4654,7 @@ pub struct CoverageEligibilityRequestItem {
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "supportingInfoSequence",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInfoSequence", skip_serializing_if = "Option::is_none")]
     pub supporting_info_sequence: Option<Vec<PositiveInt>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<CodeableConcept>,
@@ -4726,23 +4676,8 @@ pub struct CoverageEligibilityRequestItem {
     pub detail: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageEligibilityRequestSupportingInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub information: Reference,
-    #[serde(rename = "appliesToAll", skip_serializing_if = "Option::is_none")]
-    pub applies_to_all: Option<Boolean>,
-}
-
 /// Choice of types for the diagnosis[x] field in CoverageEligibilityRequestItemDiagnosis
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CoverageEligibilityRequestItemDiagnosisDiagnosis {
     /// Variant accepting the CodeableConcept type.
@@ -4753,7 +4688,7 @@ pub enum CoverageEligibilityRequestItemDiagnosisDiagnosis {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityRequestItemDiagnosis {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4766,7 +4701,8 @@ pub struct CoverageEligibilityRequestItemDiagnosis {
     pub diagnosis: Option<CoverageEligibilityRequestItemDiagnosisDiagnosis>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityResponseInsurance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4784,8 +4720,59 @@ pub struct CoverageEligibilityResponseInsurance {
     pub item: Option<Vec<CoverageEligibilityResponseInsuranceItem>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageEligibilityResponseInsuranceItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService", skip_serializing_if = "Option::is_none")]
+    pub product_or_service: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub term: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benefit: Option<Vec<CoverageEligibilityResponseInsuranceItemBenefit>>,
+    #[serde(rename = "authorizationRequired", skip_serializing_if = "Option::is_none")]
+    pub authorization_required: Option<Boolean>,
+    #[serde(rename = "authorizationSupporting", skip_serializing_if = "Option::is_none")]
+    pub authorization_supporting: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "authorizationUrl", skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<Uri>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageEligibilityResponseError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+}
+
 /// Choice of types for the allowed[x] field in CoverageEligibilityResponseInsuranceItemBenefit
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CoverageEligibilityResponseInsuranceItemBenefitAllowed {
     /// Variant accepting the UnsignedInt type.
@@ -4800,7 +4787,7 @@ pub enum CoverageEligibilityResponseInsuranceItemBenefitAllowed {
 }
 
 /// Choice of types for the used[x] field in CoverageEligibilityResponseInsuranceItemBenefit
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CoverageEligibilityResponseInsuranceItemBenefitUsed {
     /// Variant accepting the UnsignedInt type.
@@ -4814,7 +4801,7 @@ pub enum CoverageEligibilityResponseInsuranceItemBenefitUsed {
     Money(Money),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityResponseInsuranceItemBenefit {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4832,7 +4819,7 @@ pub struct CoverageEligibilityResponseInsuranceItemBenefit {
 }
 
 /// Choice of types for the serviced[x] field in CoverageEligibilityResponse
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CoverageEligibilityResponseServiced {
     /// Variant accepting the Date type.
@@ -4843,7 +4830,7 @@ pub enum CoverageEligibilityResponseServiced {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageEligibilityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4888,65 +4875,9 @@ pub struct CoverageEligibilityResponse {
     pub error: Option<Vec<CoverageEligibilityResponseError>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageEligibilityResponseInsuranceItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService", skip_serializing_if = "Option::is_none")]
-    pub product_or_service: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub excluded: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unit: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub term: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub benefit: Option<Vec<CoverageEligibilityResponseInsuranceItemBenefit>>,
-    #[serde(
-        rename = "authorizationRequired",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub authorization_required: Option<Boolean>,
-    #[serde(
-        rename = "authorizationSupporting",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub authorization_supporting: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "authorizationUrl", skip_serializing_if = "Option::is_none")]
-    pub authorization_url: Option<Uri>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageEligibilityResponseError {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-}
 
 /// Choice of types for the identified[x] field in DetectedIssue
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DetectedIssueIdentified {
     /// Variant accepting the DateTime type.
@@ -4957,7 +4888,7 @@ pub enum DetectedIssueIdentified {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5001,7 +4932,7 @@ pub struct DetectedIssue {
     pub mitigation: Option<Vec<DetectedIssueMitigation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedIssueEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5016,7 +4947,7 @@ pub struct DetectedIssueEvidence {
     pub detail: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedIssueMitigation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5032,7 +4963,45 @@ pub struct DetectedIssueMitigation {
     pub author: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceDeviceName {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceUdiCarrier {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "deviceIdentifier", skip_serializing_if = "Option::is_none")]
+    pub device_identifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jurisdiction: Option<Uri>,
+    #[serde(rename = "carrierAIDC", skip_serializing_if = "Option::is_none")]
+    pub carrier_a_i_d_c: Option<Base64Binary>,
+    #[serde(rename = "carrierHRF", skip_serializing_if = "Option::is_none")]
+    pub carrier_h_r_f: Option<String>,
+    #[serde(rename = "entryType", skip_serializing_if = "Option::is_none")]
+    pub entry_type: Option<Code>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Device {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5105,23 +5074,7 @@ pub struct Device {
     pub parent: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceVersion {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<Identifier>,
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceProperty {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5138,44 +5091,7 @@ pub struct DeviceProperty {
     pub value_code: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceUdiCarrier {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "deviceIdentifier", skip_serializing_if = "Option::is_none")]
-    pub device_identifier: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub jurisdiction: Option<Uri>,
-    #[serde(rename = "carrierAIDC", skip_serializing_if = "Option::is_none")]
-    pub carrier_a_i_d_c: Option<Base64Binary>,
-    #[serde(rename = "carrierHRF", skip_serializing_if = "Option::is_none")]
-    pub carrier_h_r_f: Option<String>,
-    #[serde(rename = "entryType", skip_serializing_if = "Option::is_none")]
-    pub entry_type: Option<Code>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceDeviceName {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceSpecialization {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5190,71 +5106,25 @@ pub struct DeviceSpecialization {
     pub version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceDefinitionMaterial {
+pub struct DeviceVersion {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub substance: CodeableConcept,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub alternate: Option<Boolean>,
-    #[serde(
-        rename = "allergenicIndicator",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub allergenic_indicator: Option<Boolean>,
+    pub component: Option<Identifier>,
+    pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceDefinitionDeviceName {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceDefinitionSpecialization {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "systemType")]
-    pub system_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceDefinitionUdiDeviceIdentifier {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "deviceIdentifier")]
-    pub device_identifier: String,
-    pub issuer: Uri,
-    pub jurisdiction: Uri,
-}
 
 /// Choice of types for the manufacturer[x] field in DeviceDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceDefinitionManufacturer {
     /// Variant accepting the String type.
@@ -5265,7 +5135,7 @@ pub enum DeviceDefinitionManufacturer {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5286,10 +5156,7 @@ pub struct DeviceDefinition {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "udiDeviceIdentifier",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "udiDeviceIdentifier", skip_serializing_if = "Option::is_none")]
     pub udi_device_identifier: Option<Vec<DeviceDefinitionUdiDeviceIdentifier>>,
     #[serde(flatten)]
     pub manufacturer: Option<DeviceDefinitionManufacturer>,
@@ -5307,10 +5174,7 @@ pub struct DeviceDefinition {
     pub safety: Option<Vec<CodeableConcept>>,
     #[serde(rename = "shelfLifeStorage", skip_serializing_if = "Option::is_none")]
     pub shelf_life_storage: Option<Vec<ProductShelfLife>>,
-    #[serde(
-        rename = "physicalCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "physicalCharacteristics", skip_serializing_if = "Option::is_none")]
     pub physical_characteristics: Option<ProdCharacteristic>,
     #[serde(rename = "languageCode", skip_serializing_if = "Option::is_none")]
     pub language_code: Option<Vec<CodeableConcept>>,
@@ -5336,7 +5200,7 @@ pub struct DeviceDefinition {
     pub material: Option<Vec<DeviceDefinitionMaterial>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceDefinitionCapability {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5351,7 +5215,38 @@ pub struct DeviceDefinitionCapability {
     pub description: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceDefinitionMaterial {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub substance: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternate: Option<Boolean>,
+    #[serde(rename = "allergenicIndicator", skip_serializing_if = "Option::is_none")]
+    pub allergenic_indicator: Option<Boolean>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceDefinitionUdiDeviceIdentifier {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "deviceIdentifier")]
+    pub device_identifier: String,
+    pub issuer: Uri,
+    pub jurisdiction: Uri,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceDefinitionProperty {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5368,24 +5263,37 @@ pub struct DeviceDefinitionProperty {
     pub value_code: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceMetricCalibration {
+pub struct DeviceDefinitionDeviceName {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub time: Option<Instant>,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: Code,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceDefinitionSpecialization {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "systemType")]
+    pub system_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceMetric {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5425,41 +5333,26 @@ pub struct DeviceMetric {
     pub calibration: Option<Vec<DeviceMetricCalibration>>,
 }
 
-/// Choice of types for the value[x] field in DeviceRequestParameter
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DeviceRequestParameterValue {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "valueCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "valueRange")]
-    Range(Range),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceRequestParameter {
+pub struct DeviceMetricCalibration {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Code>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub value: Option<DeviceRequestParameterValue>,
+    pub state: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<Instant>,
 }
 
+
 /// Choice of types for the code[x] field in DeviceRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceRequestCode {
     /// Variant accepting the Reference type.
@@ -5471,7 +5364,7 @@ pub enum DeviceRequestCode {
 }
 
 /// Choice of types for the occurrence[x] field in DeviceRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceRequestOccurrence {
     /// Variant accepting the DateTime type.
@@ -5485,7 +5378,7 @@ pub enum DeviceRequestOccurrence {
     Timing(Timing),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5506,10 +5399,7 @@ pub struct DeviceRequest {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -5555,8 +5445,42 @@ pub struct DeviceRequest {
     pub relevant_history: Option<Vec<Reference>>,
 }
 
+/// Choice of types for the value[x] field in DeviceRequestParameter
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceRequestParameterValue {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "valueCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "valueRange")]
+    Range(Range),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRequestParameter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub value: Option<DeviceRequestParameterValue>,
+}
+
+
 /// Choice of types for the timing[x] field in DeviceUseStatement
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DeviceUseStatementTiming {
     /// Variant accepting the Timing type.
@@ -5570,7 +5494,7 @@ pub enum DeviceUseStatementTiming {
     DateTime(DateTime),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceUseStatement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5614,8 +5538,9 @@ pub struct DeviceUseStatement {
     pub note: Option<Vec<Annotation>>,
 }
 
+
 /// Choice of types for the effective[x] field in DiagnosticReport
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DiagnosticReportEffective {
     /// Variant accepting the DateTime type.
@@ -5626,7 +5551,7 @@ pub enum DiagnosticReportEffective {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticReport {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5681,7 +5606,7 @@ pub struct DiagnosticReport {
     pub presented_form: Option<Vec<Attachment>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticReportMedia {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5695,22 +5620,8 @@ pub struct DiagnosticReportMedia {
     pub link: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DocumentManifestRelated {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
-    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
-    pub r#ref: Option<Reference>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5754,20 +5665,23 @@ pub struct DocumentManifest {
     pub related: Option<Vec<DocumentManifestRelated>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct DocumentReferenceRelatesTo {
+pub struct DocumentManifestRelated {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub target: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Identifier>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentReference {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5819,21 +5733,7 @@ pub struct DocumentReference {
     pub context: Option<DocumentReferenceContext>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DocumentReferenceContent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub attachment: Attachment,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<Coding>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentReferenceContext {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5858,7 +5758,35 @@ pub struct DocumentReferenceContext {
     pub related: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentReferenceContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub attachment: Attachment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<Coding>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentReferenceRelatesTo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub target: Reference,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5875,30 +5803,7 @@ pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffectEvidenceSynthesisEffectEstimate {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "variantState", skip_serializing_if = "Option::is_none")]
-    pub variant_state: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Decimal>,
-    #[serde(rename = "unitOfMeasure", skip_serializing_if = "Option::is_none")]
-    pub unit_of_measure: Option<CodeableConcept>,
-    #[serde(rename = "precisionEstimate", skip_serializing_if = "Option::is_none")]
-    pub precision_estimate: Option<Vec<EffectEvidenceSynthesisEffectEstimatePrecisionEstimate>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EffectEvidenceSynthesis {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5981,47 +5886,7 @@ pub struct EffectEvidenceSynthesis {
     pub certainty: Option<Vec<EffectEvidenceSynthesisCertainty>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffectEvidenceSynthesisSampleSize {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "numberOfStudies", skip_serializing_if = "Option::is_none")]
-    pub number_of_studies: Option<Integer>,
-    #[serde(
-        rename = "numberOfParticipants",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub number_of_participants: Option<Integer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EffectEvidenceSynthesisCertainty {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rating: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Vec<Annotation>>,
-    #[serde(
-        rename = "certaintySubcomponent",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub certainty_subcomponent: Option<Vec<EffectEvidenceSynthesisCertaintyCertaintySubcomponent>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EffectEvidenceSynthesisResultsByExposure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6040,7 +5905,24 @@ pub struct EffectEvidenceSynthesisResultsByExposure {
     pub risk_evidence_synthesis: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EffectEvidenceSynthesisSampleSize {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "numberOfStudies", skip_serializing_if = "Option::is_none")]
+    pub number_of_studies: Option<Integer>,
+    #[serde(rename = "numberOfParticipants", skip_serializing_if = "Option::is_none")]
+    pub number_of_participants: Option<Integer>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6059,73 +5941,48 @@ pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
     pub to: Option<Decimal>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct EncounterHospitalization {
+pub struct EffectEvidenceSynthesisCertainty {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "preAdmissionIdentifier",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub pre_admission_identifier: Option<Identifier>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<Reference>,
-    #[serde(rename = "admitSource", skip_serializing_if = "Option::is_none")]
-    pub admit_source: Option<CodeableConcept>,
-    #[serde(rename = "reAdmission", skip_serializing_if = "Option::is_none")]
-    pub re_admission: Option<CodeableConcept>,
-    #[serde(rename = "dietPreference", skip_serializing_if = "Option::is_none")]
-    pub diet_preference: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "specialCourtesy", skip_serializing_if = "Option::is_none")]
-    pub special_courtesy: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "specialArrangement", skip_serializing_if = "Option::is_none")]
-    pub special_arrangement: Option<Vec<CodeableConcept>>,
+    pub rating: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub destination: Option<Reference>,
-    #[serde(
-        rename = "dischargeDisposition",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub discharge_disposition: Option<CodeableConcept>,
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "certaintySubcomponent", skip_serializing_if = "Option::is_none")]
+    pub certainty_subcomponent: Option<Vec<EffectEvidenceSynthesisCertaintyCertaintySubcomponent>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct EncounterLocation {
+pub struct EffectEvidenceSynthesisEffectEstimate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub location: Reference,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<Code>,
-    #[serde(rename = "physicalType", skip_serializing_if = "Option::is_none")]
-    pub physical_type: Option<CodeableConcept>,
+    pub description: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "variantState", skip_serializing_if = "Option::is_none")]
+    pub variant_state: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
+    pub value: Option<Decimal>,
+    #[serde(rename = "unitOfMeasure", skip_serializing_if = "Option::is_none")]
+    pub unit_of_measure: Option<CodeableConcept>,
+    #[serde(rename = "precisionEstimate", skip_serializing_if = "Option::is_none")]
+    pub precision_estimate: Option<Vec<EffectEvidenceSynthesisEffectEstimatePrecisionEstimate>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EncounterStatusHistory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: Code,
-    pub period: Period,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EncounterClassHistory {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6138,7 +5995,20 @@ pub struct EncounterClassHistory {
     pub period: Period,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncounterStatusHistory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub status: Code,
+    pub period: Period,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EncounterParticipant {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6155,7 +6025,36 @@ pub struct EncounterParticipant {
     pub individual: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncounterHospitalization {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "preAdmissionIdentifier", skip_serializing_if = "Option::is_none")]
+    pub pre_admission_identifier: Option<Identifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Reference>,
+    #[serde(rename = "admitSource", skip_serializing_if = "Option::is_none")]
+    pub admit_source: Option<CodeableConcept>,
+    #[serde(rename = "reAdmission", skip_serializing_if = "Option::is_none")]
+    pub re_admission: Option<CodeableConcept>,
+    #[serde(rename = "dietPreference", skip_serializing_if = "Option::is_none")]
+    pub diet_preference: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "specialCourtesy", skip_serializing_if = "Option::is_none")]
+    pub special_courtesy: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "specialArrangement", skip_serializing_if = "Option::is_none")]
+    pub special_arrangement: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Reference>,
+    #[serde(rename = "dischargeDisposition", skip_serializing_if = "Option::is_none")]
+    pub discharge_disposition: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Encounter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6220,7 +6119,7 @@ pub struct Encounter {
     pub part_of: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EncounterDiagnosis {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6236,7 +6135,26 @@ pub struct EncounterDiagnosis {
     pub rank: Option<PositiveInt>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EncounterLocation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub location: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Code>,
+    #[serde(rename = "physicalType", skip_serializing_if = "Option::is_none")]
+    pub physical_type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6262,10 +6180,7 @@ pub struct Endpoint {
     pub connection_type: Coding,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contact: Option<Vec<ContactPoint>>,
@@ -6280,7 +6195,8 @@ pub struct Endpoint {
     pub header: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6315,7 +6231,8 @@ pub struct EnrollmentRequest {
     pub coverage: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6352,7 +6269,37 @@ pub struct EnrollmentResponse {
     pub request_provider: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EpisodeOfCareStatusHistory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub status: Code,
+    pub period: Period,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EpisodeOfCareDiagnosis {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub condition: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rank: Option<PositiveInt>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EpisodeOfCare {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6381,10 +6328,7 @@ pub struct EpisodeOfCare {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnosis: Option<Vec<EpisodeOfCareDiagnosis>>,
     pub patient: Reference,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub period: Option<Period>,
@@ -6398,37 +6342,9 @@ pub struct EpisodeOfCare {
     pub account: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EpisodeOfCareStatusHistory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: Code,
-    pub period: Period,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EpisodeOfCareDiagnosis {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub condition: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rank: Option<PositiveInt>,
-}
 
 /// Choice of types for the subject[x] field in EventDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EventDefinitionSubject {
     /// Variant accepting the CodeableConcept type.
@@ -6439,7 +6355,7 @@ pub enum EventDefinitionSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EventDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6515,7 +6431,8 @@ pub struct EventDefinition {
     pub trigger: Option<Vec<TriggerDefinition>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6591,7 +6508,8 @@ pub struct Evidence {
     pub outcome: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceVariable {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6666,7 +6584,7 @@ pub struct EvidenceVariable {
 }
 
 /// Choice of types for the definition[x] field in EvidenceVariableCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EvidenceVariableCharacteristicDefinition {
     /// Variant accepting the Reference type.
@@ -6690,7 +6608,7 @@ pub enum EvidenceVariableCharacteristicDefinition {
 }
 
 /// Choice of types for the participantEffective[x] field in EvidenceVariableCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum EvidenceVariableCharacteristicParticipantEffective {
     /// Variant accepting the DateTime type.
@@ -6707,7 +6625,7 @@ pub enum EvidenceVariableCharacteristicParticipantEffective {
     Timing(Timing),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceVariableCharacteristic {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6732,27 +6650,42 @@ pub struct EvidenceVariableCharacteristic {
     pub group_measure: Option<Code>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ExampleScenarioProcess {
+pub struct ExampleScenarioProcessStep {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<Markdown>,
-    #[serde(rename = "preConditions", skip_serializing_if = "Option::is_none")]
-    pub pre_conditions: Option<Markdown>,
-    #[serde(rename = "postConditions", skip_serializing_if = "Option::is_none")]
-    pub post_conditions: Option<Markdown>,
+    pub process: Option<Vec<ExampleScenarioProcess>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub step: Option<Vec<ExampleScenarioProcessStep>>,
+    pub pause: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<ExampleScenarioProcessStepOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternative: Option<Vec<ExampleScenarioProcessStepAlternative>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExampleScenarioInstanceContainedInstance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "resourceId")]
+    pub resource_id: String,
+    #[serde(rename = "versionId", skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExampleScenarioProcessStepOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6782,26 +6715,7 @@ pub struct ExampleScenarioProcessStepOperation {
     pub response: Option<ExampleScenarioInstanceContainedInstance>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExampleScenarioActor {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "actorId")]
-    pub actor_id: String,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExampleScenario {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6855,7 +6769,46 @@ pub struct ExampleScenario {
     pub workflow: Option<Vec<Canonical>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExampleScenarioActor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "actorId")]
+    pub actor_id: String,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExampleScenarioProcess {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<Markdown>,
+    #[serde(rename = "preConditions", skip_serializing_if = "Option::is_none")]
+    pub pre_conditions: Option<Markdown>,
+    #[serde(rename = "postConditions", skip_serializing_if = "Option::is_none")]
+    pub post_conditions: Option<Markdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<Vec<ExampleScenarioProcessStep>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExampleScenarioInstance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6878,7 +6831,7 @@ pub struct ExampleScenarioInstance {
     pub contained_instance: Option<Vec<ExampleScenarioInstanceContainedInstance>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExampleScenarioInstanceVersion {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6892,41 +6845,7 @@ pub struct ExampleScenarioInstanceVersion {
     pub description: Markdown,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExampleScenarioInstanceContainedInstance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "resourceId")]
-    pub resource_id: String,
-    #[serde(rename = "versionId", skip_serializing_if = "Option::is_none")]
-    pub version_id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExampleScenarioProcessStep {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub process: Option<Vec<ExampleScenarioProcess>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pause: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<ExampleScenarioProcessStepOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub alternative: Option<Vec<ExampleScenarioProcessStepAlternative>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExampleScenarioProcessStepAlternative {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6942,25 +6861,67 @@ pub struct ExampleScenarioProcessStepAlternative {
     pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitItemAdjudication {
+pub struct ExplanationOfBenefitAddItemDetailSubDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<CodeableConcept>,
+    pub modifier: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<Money>,
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Decimal>,
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the procedure[x] field in ExplanationOfBenefitProcedure
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitProcedureProcedure {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "procedureCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "procedureReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitProcedure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime>,
+    #[serde(flatten)]
+    pub procedure: Option<ExplanationOfBenefitProcedureProcedure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplanationOfBenefitItemDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6998,43 +6959,7 @@ pub struct ExplanationOfBenefitItemDetail {
     pub sub_detail: Option<Vec<ExplanationOfBenefitItemDetailSubDetail>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitTotal {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub amount: Money,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitPayment {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjustment: Option<Money>,
-    #[serde(rename = "adjustmentReason", skip_serializing_if = "Option::is_none")]
-    pub adjustment_reason: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<Date>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplanationOfBenefit {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7072,10 +6997,7 @@ pub struct ExplanationOfBenefit {
     pub provider: Reference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<CodeableConcept>,
-    #[serde(
-        rename = "fundsReserveRequested",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "fundsReserveRequested", skip_serializing_if = "Option::is_none")]
     pub funds_reserve_requested: Option<CodeableConcept>,
     #[serde(rename = "fundsReserve", skip_serializing_if = "Option::is_none")]
     pub funds_reserve: Option<CodeableConcept>,
@@ -7083,10 +7005,7 @@ pub struct ExplanationOfBenefit {
     pub related: Option<Vec<ExplanationOfBenefitRelated>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prescription: Option<Reference>,
-    #[serde(
-        rename = "originalPrescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "originalPrescription", skip_serializing_if = "Option::is_none")]
     pub original_prescription: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payee: Option<ExplanationOfBenefitPayee>,
@@ -7141,8 +7060,361 @@ pub struct ExplanationOfBenefit {
     pub benefit_balance: Option<Vec<ExplanationOfBenefitBenefitBalance>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitProcessNote {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<PositiveInt>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitBenefitBalance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub term: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitInsurance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    #[serde(rename = "preAuthRef", skip_serializing_if = "Option::is_none")]
+    pub pre_auth_ref: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitCareTeam {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsible: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<CodeableConcept>,
+}
+
+/// Choice of types for the location[x] field in ExplanationOfBenefitAccident
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitAccidentLocation {
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitAccident {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<Date>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub location: Option<ExplanationOfBenefitAccidentLocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitPayee {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<Reference>,
+}
+
+/// Choice of types for the allowed[x] field in ExplanationOfBenefitBenefitBalanceFinancial
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "allowedUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "allowedString")]
+    String(String),
+    /// Variant accepting the Money type.
+    #[serde(rename = "allowedMoney")]
+    Money(Money),
+}
+
+/// Choice of types for the used[x] field in ExplanationOfBenefitBenefitBalanceFinancial
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "usedUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the Money type.
+    #[serde(rename = "usedMoney")]
+    Money(Money),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitBenefitBalanceFinancial {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(flatten)]
+    pub allowed: Option<ExplanationOfBenefitBenefitBalanceFinancialAllowed>,
+    #[serde(flatten)]
+    pub used: Option<ExplanationOfBenefitBenefitBalanceFinancialUsed>,
+}
+
+/// Choice of types for the diagnosis[x] field in ExplanationOfBenefitDiagnosis
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitDiagnosisDiagnosis {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "diagnosisCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "diagnosisReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitDiagnosis {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(flatten)]
+    pub diagnosis: Option<ExplanationOfBenefitDiagnosisDiagnosis>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "onAdmission", skip_serializing_if = "Option::is_none")]
+    pub on_admission: Option<CodeableConcept>,
+    #[serde(rename = "packageCode", skip_serializing_if = "Option::is_none")]
+    pub package_code: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitRelated {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<Identifier>,
+}
+
+/// Choice of types for the serviced[x] field in ExplanationOfBenefitItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitItemServiced {
+    /// Variant accepting the Date type.
+    #[serde(rename = "servicedDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "servicedPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the location[x] field in ExplanationOfBenefitItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitItemLocation {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "locationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(rename = "careTeamSequence", skip_serializing_if = "Option::is_none")]
+    pub care_team_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "diagnosisSequence", skip_serializing_if = "Option::is_none")]
+    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "procedureSequence", skip_serializing_if = "Option::is_none")]
+    pub procedure_sequence: Option<Vec<PositiveInt>>,
+    #[serde(rename = "informationSequence", skip_serializing_if = "Option::is_none")]
+    pub information_sequence: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(flatten)]
+    pub serviced: Option<ExplanationOfBenefitItemServiced>,
+    #[serde(flatten)]
+    pub location: Option<ExplanationOfBenefitItemLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
+    pub body_site: Option<CodeableConcept>,
+    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
+    pub sub_site: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encounter: Option<Vec<Reference>>,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Vec<ExplanationOfBenefitItemDetail>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitItemAdjudication {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Decimal>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplanationOfBenefitItemDetailSubDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revenue: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    #[serde(rename = "productOrService")]
+    pub product_or_service: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
+    pub program_code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factor: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub udi: Option<Vec<Reference>>,
+    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
+    pub note_number: Option<Vec<PositiveInt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+}
+
 /// Choice of types for the serviced[x] field in ExplanationOfBenefitAddItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ExplanationOfBenefitAddItemServiced {
     /// Variant accepting the Date type.
@@ -7154,7 +7426,7 @@ pub enum ExplanationOfBenefitAddItemServiced {
 }
 
 /// Choice of types for the location[x] field in ExplanationOfBenefitAddItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ExplanationOfBenefitAddItemLocation {
     /// Variant accepting the CodeableConcept type.
@@ -7168,7 +7440,7 @@ pub enum ExplanationOfBenefitAddItemLocation {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplanationOfBenefitAddItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7215,88 +7487,44 @@ pub struct ExplanationOfBenefitAddItem {
     pub detail: Option<Vec<ExplanationOfBenefitAddItemDetail>>,
 }
 
-/// Choice of types for the allowed[x] field in ExplanationOfBenefitBenefitBalanceFinancial
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "allowedUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "allowedString")]
-    String(String),
-    /// Variant accepting the Money type.
-    #[serde(rename = "allowedMoney")]
-    Money(Money),
-}
-
-/// Choice of types for the used[x] field in ExplanationOfBenefitBenefitBalanceFinancial
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "usedUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the Money type.
-    #[serde(rename = "usedMoney")]
-    Money(Money),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitBenefitBalanceFinancial {
+pub struct ExplanationOfBenefitTotal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(flatten)]
-    pub allowed: Option<ExplanationOfBenefitBenefitBalanceFinancialAllowed>,
-    #[serde(flatten)]
-    pub used: Option<ExplanationOfBenefitBenefitBalanceFinancialUsed>,
+    pub category: CodeableConcept,
+    pub amount: Money,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitRelated {
+pub struct ExplanationOfBenefitPayment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim: Option<Reference>,
+    pub adjustment: Option<Money>,
+    #[serde(rename = "adjustmentReason", skip_serializing_if = "Option::is_none")]
+    pub adjustment_reason: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<CodeableConcept>,
+    pub date: Option<Date>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitCareTeam {
+    pub amount: Option<Money>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub provider: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub responsible: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub qualification: Option<CodeableConcept>,
+    pub identifier: Option<Identifier>,
 }
 
 /// Choice of types for the timing[x] field in ExplanationOfBenefitSupportingInfo
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ExplanationOfBenefitSupportingInfoTiming {
     /// Variant accepting the Date type.
@@ -7308,7 +7536,7 @@ pub enum ExplanationOfBenefitSupportingInfoTiming {
 }
 
 /// Choice of types for the value[x] field in ExplanationOfBenefitSupportingInfo
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ExplanationOfBenefitSupportingInfoValue {
     /// Variant accepting the Boolean type.
@@ -7328,7 +7556,7 @@ pub enum ExplanationOfBenefitSupportingInfoValue {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplanationOfBenefitSupportingInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7349,246 +7577,7 @@ pub struct ExplanationOfBenefitSupportingInfo {
     pub reason: Option<Coding>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitPayee {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub party: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitBenefitBalance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub excluded: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unit: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub term: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
-}
-
-/// Choice of types for the location[x] field in ExplanationOfBenefitAccident
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitAccidentLocation {
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitAccident {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<Date>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub location: Option<ExplanationOfBenefitAccidentLocation>,
-}
-
-/// Choice of types for the serviced[x] field in ExplanationOfBenefitItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitItemServiced {
-    /// Variant accepting the Date type.
-    #[serde(rename = "servicedDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "servicedPeriod")]
-    Period(Period),
-}
-
-/// Choice of types for the location[x] field in ExplanationOfBenefitItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitItemLocation {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "locationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "careTeamSequence", skip_serializing_if = "Option::is_none")]
-    pub care_team_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "diagnosisSequence", skip_serializing_if = "Option::is_none")]
-    pub diagnosis_sequence: Option<Vec<PositiveInt>>,
-    #[serde(rename = "procedureSequence", skip_serializing_if = "Option::is_none")]
-    pub procedure_sequence: Option<Vec<PositiveInt>>,
-    #[serde(
-        rename = "informationSequence",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub information_sequence: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revenue: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(flatten)]
-    pub serviced: Option<ExplanationOfBenefitItemServiced>,
-    #[serde(flatten)]
-    pub location: Option<ExplanationOfBenefitItemLocation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "bodySite", skip_serializing_if = "Option::is_none")]
-    pub body_site: Option<CodeableConcept>,
-    #[serde(rename = "subSite", skip_serializing_if = "Option::is_none")]
-    pub sub_site: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encounter: Option<Vec<Reference>>,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Vec<ExplanationOfBenefitItemDetail>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitInsurance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    #[serde(rename = "preAuthRef", skip_serializing_if = "Option::is_none")]
-    pub pre_auth_ref: Option<Vec<String>>,
-}
-
-/// Choice of types for the procedure[x] field in ExplanationOfBenefitProcedure
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitProcedureProcedure {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "procedureCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "procedureReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitProcedure {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<DateTime>,
-    #[serde(flatten)]
-    pub procedure: Option<ExplanationOfBenefitProcedureProcedure>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitItemDetailSubDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revenue: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "programCode", skip_serializing_if = "Option::is_none")]
-    pub program_code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udi: Option<Vec<Reference>>,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExplanationOfBenefitAddItemDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7617,86 +7606,9 @@ pub struct ExplanationOfBenefitAddItemDetail {
     pub sub_detail: Option<Vec<ExplanationOfBenefitAddItemDetailSubDetail>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitAddItemDetailSubDetail {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "productOrService")]
-    pub product_or_service: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-    #[serde(rename = "unitPrice", skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub factor: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<Money>,
-    #[serde(rename = "noteNumber", skip_serializing_if = "Option::is_none")]
-    pub note_number: Option<Vec<PositiveInt>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitProcessNote {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<PositiveInt>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<CodeableConcept>,
-}
-
-/// Choice of types for the diagnosis[x] field in ExplanationOfBenefitDiagnosis
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitDiagnosisDiagnosis {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "diagnosisCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "diagnosisReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExplanationOfBenefitDiagnosis {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    #[serde(flatten)]
-    pub diagnosis: Option<ExplanationOfBenefitDiagnosisDiagnosis>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "onAdmission", skip_serializing_if = "Option::is_none")]
-    pub on_admission: Option<CodeableConcept>,
-    #[serde(rename = "packageCode", skip_serializing_if = "Option::is_none")]
-    pub package_code: Option<CodeableConcept>,
-}
 
 /// Choice of types for the onset[x] field in FamilyMemberHistoryCondition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FamilyMemberHistoryConditionOnset {
     /// Variant accepting the Age type.
@@ -7713,7 +7625,7 @@ pub enum FamilyMemberHistoryConditionOnset {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FamilyMemberHistoryCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7734,7 +7646,7 @@ pub struct FamilyMemberHistoryCondition {
 }
 
 /// Choice of types for the born[x] field in FamilyMemberHistory
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FamilyMemberHistoryBorn {
     /// Variant accepting the Period type.
@@ -7749,7 +7661,7 @@ pub enum FamilyMemberHistoryBorn {
 }
 
 /// Choice of types for the age[x] field in FamilyMemberHistory
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FamilyMemberHistoryAge {
     /// Variant accepting the Age type.
@@ -7764,7 +7676,7 @@ pub enum FamilyMemberHistoryAge {
 }
 
 /// Choice of types for the deceased[x] field in FamilyMemberHistory
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FamilyMemberHistoryDeceased {
     /// Variant accepting the Boolean type.
@@ -7784,7 +7696,7 @@ pub enum FamilyMemberHistoryDeceased {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FamilyMemberHistory {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7805,10 +7717,7 @@ pub struct FamilyMemberHistory {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -7841,7 +7750,8 @@ pub struct FamilyMemberHistory {
     pub condition: Option<Vec<FamilyMemberHistoryCondition>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Flag {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7875,8 +7785,65 @@ pub struct Flag {
     pub author: Option<Reference>,
 }
 
+
+/// Choice of types for the detail[x] field in GoalTarget
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalTargetDetail {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "detailQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "detailRange")]
+    Range(Range),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "detailCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the String type.
+    #[serde(rename = "detailString")]
+    String(String),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "detailBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "detailInteger")]
+    Integer(Integer),
+    /// Variant accepting the Ratio type.
+    #[serde(rename = "detailRatio")]
+    Ratio(Ratio),
+}
+
+/// Choice of types for the due[x] field in GoalTarget
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GoalTargetDue {
+    /// Variant accepting the Date type.
+    #[serde(rename = "dueDate")]
+    Date(Date),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "dueDuration")]
+    Duration(Duration),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GoalTarget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measure: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub detail: Option<GoalTargetDetail>,
+    #[serde(flatten)]
+    pub due: Option<GoalTargetDue>,
+}
+
 /// Choice of types for the start[x] field in Goal
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum GoalStart {
     /// Variant accepting the Date type.
@@ -7887,7 +7854,7 @@ pub enum GoalStart {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7938,48 +7905,10 @@ pub struct Goal {
     pub outcome_reference: Option<Vec<Reference>>,
 }
 
-/// Choice of types for the detail[x] field in GoalTarget
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum GoalTargetDetail {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "detailQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "detailRange")]
-    Range(Range),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "detailCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the String type.
-    #[serde(rename = "detailString")]
-    String(String),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "detailBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "detailInteger")]
-    Integer(Integer),
-    /// Variant accepting the Ratio type.
-    #[serde(rename = "detailRatio")]
-    Ratio(Ratio),
-}
 
-/// Choice of types for the due[x] field in GoalTarget
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum GoalTargetDue {
-    /// Variant accepting the Date type.
-    #[serde(rename = "dueDate")]
-    Date(Date),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "dueDuration")]
-    Duration(Duration),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct GoalTarget {
+pub struct GraphDefinitionLink {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7987,14 +7916,20 @@ pub struct GoalTarget {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub measure: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub detail: Option<GoalTargetDetail>,
-    #[serde(flatten)]
-    pub due: Option<GoalTargetDue>,
+    pub path: Option<String>,
+    #[serde(rename = "sliceName", skip_serializing_if = "Option::is_none")]
+    pub slice_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8042,7 +7977,7 @@ pub struct GraphDefinition {
     pub link: Option<Vec<GraphDefinitionLink>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDefinitionLinkTargetCompartment {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8061,7 +7996,7 @@ pub struct GraphDefinitionLinkTargetCompartment {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GraphDefinitionLinkTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8082,47 +8017,9 @@ pub struct GraphDefinitionLinkTarget {
     pub link: Option<Vec<GraphDefinitionLink>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GraphDefinitionLink {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(rename = "sliceName", skip_serializing_if = "Option::is_none")]
-    pub slice_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GroupMember {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub entity: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inactive: Option<Boolean>,
-}
 
 /// Choice of types for the value[x] field in GroupCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum GroupCharacteristicValue {
     /// Variant accepting the CodeableConcept type.
@@ -8142,7 +8039,7 @@ pub enum GroupCharacteristicValue {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GroupCharacteristic {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8159,7 +8056,23 @@ pub struct GroupCharacteristic {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMember {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub entity: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<Boolean>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8199,8 +8112,9 @@ pub struct Group {
     pub member: Option<Vec<GroupMember>>,
 }
 
+
 /// Choice of types for the module[x] field in GuidanceResponse
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum GuidanceResponseModule {
     /// Variant accepting the Uri type.
@@ -8214,7 +8128,7 @@ pub enum GuidanceResponseModule {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GuidanceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8264,7 +8178,8 @@ pub struct GuidanceResponse {
     pub data_requirement: Option<Vec<DataRequirement>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthcareService {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8309,10 +8224,7 @@ pub struct HealthcareService {
     pub telecom: Option<Vec<ContactPoint>>,
     #[serde(rename = "coverageArea", skip_serializing_if = "Option::is_none")]
     pub coverage_area: Option<Vec<Reference>>,
-    #[serde(
-        rename = "serviceProvisionCode",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "serviceProvisionCode", skip_serializing_if = "Option::is_none")]
     pub service_provision_code: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eligibility: Option<Vec<HealthcareServiceEligibility>>,
@@ -8324,25 +8236,34 @@ pub struct HealthcareService {
     pub communication: Option<Vec<CodeableConcept>>,
     #[serde(rename = "referralMethod", skip_serializing_if = "Option::is_none")]
     pub referral_method: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "appointmentRequired",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "appointmentRequired", skip_serializing_if = "Option::is_none")]
     pub appointment_required: Option<Boolean>,
     #[serde(rename = "availableTime", skip_serializing_if = "Option::is_none")]
     pub available_time: Option<Vec<HealthcareServiceAvailableTime>>,
     #[serde(rename = "notAvailable", skip_serializing_if = "Option::is_none")]
     pub not_available: Option<Vec<HealthcareServiceNotAvailable>>,
-    #[serde(
-        rename = "availabilityExceptions",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "availabilityExceptions", skip_serializing_if = "Option::is_none")]
     pub availability_exceptions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthcareServiceEligibility {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<Markdown>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthcareServiceAvailableTime {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8361,22 +8282,7 @@ pub struct HealthcareServiceAvailableTime {
     pub available_end_time: Option<Time>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HealthcareServiceEligibility {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HealthcareServiceNotAvailable {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8390,21 +8296,26 @@ pub struct HealthcareServiceNotAvailable {
     pub during: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ImagingStudySeriesPerformer {
+pub struct ImagingStudySeriesInstance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    pub uid: Id,
+    #[serde(rename = "sopClass")]
+    pub sop_class: Coding,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
+    pub number: Option<UnsignedInt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImagingStudySeries {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8437,25 +8348,21 @@ pub struct ImagingStudySeries {
     pub instance: Option<Vec<ImagingStudySeriesInstance>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ImagingStudySeriesInstance {
+pub struct ImagingStudySeriesPerformer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub uid: Id,
-    #[serde(rename = "sopClass")]
-    pub sop_class: Coding,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub number: Option<UnsignedInt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImagingStudy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8514,8 +8421,54 @@ pub struct ImagingStudy {
     pub series: Option<Vec<ImagingStudySeries>>,
 }
 
+
+/// Choice of types for the doseNumber[x] field in ImmunizationProtocolApplied
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedDoseNumber {
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "doseNumberPositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "doseNumberString")]
+    String(String),
+}
+
+/// Choice of types for the seriesDoses[x] field in ImmunizationProtocolApplied
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedSeriesDoses {
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "seriesDosesPositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "seriesDosesString")]
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImmunizationProtocolApplied {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<Reference>,
+    #[serde(rename = "targetDisease", skip_serializing_if = "Option::is_none")]
+    pub target_disease: Option<Vec<CodeableConcept>>,
+    #[serde(flatten)]
+    pub dose_number: Option<ImmunizationProtocolAppliedDoseNumber>,
+    #[serde(flatten)]
+    pub series_doses: Option<ImmunizationProtocolAppliedSeriesDoses>,
+}
+
 /// Choice of types for the occurrence[x] field in Immunization
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationOccurrence {
     /// Variant accepting the DateTime type.
@@ -8526,7 +8479,7 @@ pub enum ImmunizationOccurrence {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Immunization {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8601,66 +8554,7 @@ pub struct Immunization {
     pub protocol_applied: Option<Vec<ImmunizationProtocolApplied>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImmunizationPerformer {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-/// Choice of types for the doseNumber[x] field in ImmunizationProtocolApplied
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedDoseNumber {
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "doseNumberPositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "doseNumberString")]
-    String(String),
-}
-
-/// Choice of types for the seriesDoses[x] field in ImmunizationProtocolApplied
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedSeriesDoses {
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "seriesDosesPositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "seriesDosesString")]
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImmunizationProtocolApplied {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub series: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authority: Option<Reference>,
-    #[serde(rename = "targetDisease", skip_serializing_if = "Option::is_none")]
-    pub target_disease: Option<Vec<CodeableConcept>>,
-    #[serde(flatten)]
-    pub dose_number: Option<ImmunizationProtocolAppliedDoseNumber>,
-    #[serde(flatten)]
-    pub series_doses: Option<ImmunizationProtocolAppliedSeriesDoses>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImmunizationReaction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8677,7 +8571,7 @@ pub struct ImmunizationReaction {
     pub reported: Option<Boolean>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImmunizationEducation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8696,8 +8590,23 @@ pub struct ImmunizationEducation {
     pub presentation_date: Option<DateTime>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImmunizationPerformer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+
 /// Choice of types for the doseNumber[x] field in ImmunizationEvaluation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationEvaluationDoseNumber {
     /// Variant accepting the PositiveInt type.
@@ -8709,7 +8618,7 @@ pub enum ImmunizationEvaluationDoseNumber {
 }
 
 /// Choice of types for the seriesDoses[x] field in ImmunizationEvaluation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationEvaluationSeriesDoses {
     /// Variant accepting the PositiveInt type.
@@ -8720,7 +8629,7 @@ pub enum ImmunizationEvaluationSeriesDoses {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImmunizationEvaluation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8765,8 +8674,9 @@ pub struct ImmunizationEvaluation {
     pub series_doses: Option<ImmunizationEvaluationSeriesDoses>,
 }
 
+
 /// Choice of types for the doseNumber[x] field in ImmunizationRecommendationRecommendation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationRecommendationRecommendationDoseNumber {
     /// Variant accepting the PositiveInt type.
@@ -8778,7 +8688,7 @@ pub enum ImmunizationRecommendationRecommendationDoseNumber {
 }
 
 /// Choice of types for the seriesDoses[x] field in ImmunizationRecommendationRecommendation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImmunizationRecommendationRecommendationSeriesDoses {
     /// Variant accepting the PositiveInt type.
@@ -8789,7 +8699,7 @@ pub enum ImmunizationRecommendationRecommendationSeriesDoses {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImmunizationRecommendationRecommendation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8802,10 +8712,7 @@ pub struct ImmunizationRecommendationRecommendation {
     pub vaccine_code: Option<Vec<CodeableConcept>>,
     #[serde(rename = "targetDisease", skip_serializing_if = "Option::is_none")]
     pub target_disease: Option<CodeableConcept>,
-    #[serde(
-        rename = "contraindicatedVaccineCode",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "contraindicatedVaccineCode", skip_serializing_if = "Option::is_none")]
     pub contraindicated_vaccine_code: Option<Vec<CodeableConcept>>,
     #[serde(rename = "forecastStatus")]
     pub forecast_status: CodeableConcept,
@@ -8821,19 +8728,26 @@ pub struct ImmunizationRecommendationRecommendation {
     pub dose_number: Option<ImmunizationRecommendationRecommendationDoseNumber>,
     #[serde(flatten)]
     pub series_doses: Option<ImmunizationRecommendationRecommendationSeriesDoses>,
-    #[serde(
-        rename = "supportingImmunization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingImmunization", skip_serializing_if = "Option::is_none")]
     pub supporting_immunization: Option<Vec<Reference>>,
-    #[serde(
-        rename = "supportingPatientInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingPatientInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_patient_information: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImmunizationRecommendationRecommendationDateCriterion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub value: DateTime,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImmunizationRecommendation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8862,68 +8776,8 @@ pub struct ImmunizationRecommendation {
     pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImmunizationRecommendationRecommendationDateCriterion {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub value: DateTime,
-}
 
-/// Choice of types for the example[x] field in ImplementationGuideDefinitionResource
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ImplementationGuideDefinitionResourceExample {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "exampleBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Canonical type.
-    #[serde(rename = "exampleCanonical")]
-    Canonical(Canonical),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideDefinitionResource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Reference,
-    #[serde(rename = "fhirVersion", skip_serializing_if = "Option::is_none")]
-    pub fhir_version: Option<Vec<Code>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(flatten)]
-    pub example: Option<ImplementationGuideDefinitionResourceExample>,
-    #[serde(rename = "groupingId", skip_serializing_if = "Option::is_none")]
-    pub grouping_id: Option<Id>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideDefinitionGrouping {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationGuideGlobal {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8937,97 +8791,8 @@ pub struct ImplementationGuideGlobal {
     pub profile: Canonical,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideManifestPage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideDefinition {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<ImplementationGuideDefinitionPage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideDefinitionTemplate {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideManifest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rendering: Option<Url>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Vec<ImplementationGuideManifestResource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page: Option<Vec<ImplementationGuideManifestPage>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub other: Option<Vec<String>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImplementationGuideDependsOn {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uri: Canonical,
-    #[serde(rename = "packageId", skip_serializing_if = "Option::is_none")]
-    pub package_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-}
-
 /// Choice of types for the name[x] field in ImplementationGuideDefinitionPage
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImplementationGuideDefinitionPageName {
     /// Variant accepting the Url type.
@@ -9038,7 +8803,7 @@ pub enum ImplementationGuideDefinitionPageName {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationGuideDefinitionPage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9055,7 +8820,7 @@ pub struct ImplementationGuideDefinitionPage {
     pub page: Option<Vec<ImplementationGuideDefinitionPage>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationGuide {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9113,7 +8878,72 @@ pub struct ImplementationGuide {
     pub manifest: Option<ImplementationGuideManifest>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideDefinitionTemplate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideManifestPage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Vec<String>>,
+}
+
+/// Choice of types for the example[x] field in ImplementationGuideDefinitionResource
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImplementationGuideDefinitionResourceExample {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "exampleBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Canonical type.
+    #[serde(rename = "exampleCanonical")]
+    Canonical(Canonical),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideDefinitionResource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Reference,
+    #[serde(rename = "fhirVersion", skip_serializing_if = "Option::is_none")]
+    pub fhir_version: Option<Vec<Code>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub example: Option<ImplementationGuideDefinitionResourceExample>,
+    #[serde(rename = "groupingId", skip_serializing_if = "Option::is_none")]
+    pub grouping_id: Option<Id>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationGuideDefinitionParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9126,8 +8956,59 @@ pub struct ImplementationGuideDefinitionParameter {
     pub value: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideManifest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendering: Option<Url>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Vec<ImplementationGuideManifestResource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<Vec<ImplementationGuideManifestPage>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideDefinitionGrouping {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationGuideDependsOn {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uri: Canonical,
+    #[serde(rename = "packageId", skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 /// Choice of types for the example[x] field in ImplementationGuideManifestResource
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ImplementationGuideManifestResourceExample {
     /// Variant accepting the Boolean type.
@@ -9138,7 +9019,7 @@ pub enum ImplementationGuideManifestResourceExample {
     Canonical(Canonical),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImplementationGuideManifestResource {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9154,40 +9035,44 @@ pub struct ImplementationGuideManifestResource {
     pub relative_path: Option<Url>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct InsurancePlanPlanSpecificCost {
+pub struct ImplementationGuideDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub benefit: Option<Vec<InsurancePlanPlanSpecificCostBenefit>>,
+    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<ImplementationGuideDefinitionPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct InsurancePlanPlanGeneralCost {
+pub struct InsurancePlanPlanSpecificCostBenefit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "groupSize", skip_serializing_if = "Option::is_none")]
-    pub group_size: Option<PositiveInt>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<Money>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
+    pub cost: Option<Vec<InsurancePlanPlanSpecificCostBenefitCost>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InsurancePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9236,90 +9121,7 @@ pub struct InsurancePlan {
     pub plan: Option<Vec<InsurancePlanPlan>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InsurancePlanPlanSpecificCostBenefit {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost: Option<Vec<InsurancePlanPlanSpecificCostBenefitCost>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InsurancePlanCoverage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub benefit: Option<Vec<InsurancePlanCoverageBenefit>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InsurancePlanCoverageBenefitLimit {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Quantity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InsurancePlanPlanSpecificCostBenefitCost {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applicability: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub qualifiers: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<Quantity>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InsurancePlanCoverageBenefit {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requirement: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InsurancePlanContact {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9338,7 +9140,94 @@ pub struct InsurancePlanContact {
     pub address: Option<Address>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InsurancePlanCoverageBenefit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requirement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InsurancePlanPlanSpecificCostBenefitCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualifiers: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InsurancePlanCoverage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benefit: Option<Vec<InsurancePlanCoverageBenefit>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InsurancePlanCoverageBenefitLimit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Quantity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InsurancePlanPlanGeneralCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "groupSize", skip_serializing_if = "Option::is_none")]
+    pub group_size: Option<PositiveInt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Money>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InsurancePlanPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9361,36 +9250,22 @@ pub struct InsurancePlanPlan {
     pub specific_cost: Option<Vec<InsurancePlanPlanSpecificCost>>,
 }
 
-/// Choice of types for the chargeItem[x] field in InvoiceLineItem
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum InvoiceLineItemChargeItem {
-    /// Variant accepting the Reference type.
-    #[serde(rename = "chargeItemReference")]
-    Reference(Reference),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "chargeItemCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct InvoiceLineItem {
+pub struct InsurancePlanPlanSpecificCost {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence: Option<PositiveInt>,
-    #[serde(flatten)]
-    pub charge_item: Option<InvoiceLineItemChargeItem>,
-    #[serde(rename = "priceComponent", skip_serializing_if = "Option::is_none")]
-    pub price_component: Option<Vec<InvoiceLineItemPriceComponent>>,
+    pub benefit: Option<Vec<InsurancePlanPlanSpecificCostBenefit>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Invoice {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9430,10 +9305,7 @@ pub struct Invoice {
     pub account: Option<Reference>,
     #[serde(rename = "lineItem", skip_serializing_if = "Option::is_none")]
     pub line_item: Option<Vec<InvoiceLineItem>>,
-    #[serde(
-        rename = "totalPriceComponent",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "totalPriceComponent", skip_serializing_if = "Option::is_none")]
     pub total_price_component: Option<Vec<InvoiceLineItemPriceComponent>>,
     #[serde(rename = "totalNet", skip_serializing_if = "Option::is_none")]
     pub total_net: Option<Money>,
@@ -9445,7 +9317,21 @@ pub struct Invoice {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InvoiceParticipant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InvoiceLineItemPriceComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9464,9 +9350,21 @@ pub struct InvoiceLineItemPriceComponent {
     pub amount: Option<Money>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the chargeItem[x] field in InvoiceLineItem
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum InvoiceLineItemChargeItem {
+    /// Variant accepting the Reference type.
+    #[serde(rename = "chargeItemReference")]
+    Reference(Reference),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "chargeItemCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct InvoiceParticipant {
+pub struct InvoiceLineItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9474,12 +9372,16 @@ pub struct InvoiceParticipant {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-    pub actor: Reference,
+    pub sequence: Option<PositiveInt>,
+    #[serde(flatten)]
+    pub charge_item: Option<InvoiceLineItemChargeItem>,
+    #[serde(rename = "priceComponent", skip_serializing_if = "Option::is_none")]
+    pub price_component: Option<Vec<InvoiceLineItemPriceComponent>>,
 }
 
+
 /// Choice of types for the subject[x] field in Library
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum LibrarySubject {
     /// Variant accepting the CodeableConcept type.
@@ -9490,7 +9392,7 @@ pub enum LibrarySubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Library {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9572,21 +9474,8 @@ pub struct Library {
     pub content: Option<Vec<Attachment>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LinkageItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub resource: Reference,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Linkage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9613,7 +9502,22 @@ pub struct Linkage {
     pub item: Option<Vec<LinkageItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkageItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub resource: Reference,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct List {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9658,7 +9562,7 @@ pub struct List {
     pub empty_reason: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ListEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9676,7 +9580,8 @@ pub struct ListEntry {
     pub item: Reference,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9719,40 +9624,19 @@ pub struct Location {
     pub physical_type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<LocationPosition>,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Reference>,
     #[serde(rename = "partOf", skip_serializing_if = "Option::is_none")]
     pub part_of: Option<Reference>,
     #[serde(rename = "hoursOfOperation", skip_serializing_if = "Option::is_none")]
     pub hours_of_operation: Option<Vec<LocationHoursOfOperation>>,
-    #[serde(
-        rename = "availabilityExceptions",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "availabilityExceptions", skip_serializing_if = "Option::is_none")]
     pub availability_exceptions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocationPosition {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub longitude: Decimal,
-    pub latitude: Decimal,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub altitude: Option<Decimal>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocationHoursOfOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9771,7 +9655,42 @@ pub struct LocationHoursOfOperation {
     pub closing_time: Option<Time>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocationPosition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub longitude: Decimal,
+    pub latitude: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<Decimal>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub population: Option<Vec<MeasureGroupPopulation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stratifier: Option<Vec<MeasureGroupStratifier>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeasureGroupStratifierComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9787,7 +9706,25 @@ pub struct MeasureGroupStratifierComponent {
     pub criteria: Expression,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureSupplementalData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub criteria: Expression,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeasureGroupStratifier {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9806,42 +9743,8 @@ pub struct MeasureGroupStratifier {
     pub component: Option<Vec<MeasureGroupStratifierComponent>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureSupplementalData {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub criteria: Expression,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureGroupPopulation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub criteria: Expression,
-}
-
 /// Choice of types for the subject[x] field in Measure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MeasureSubject {
     /// Variant accepting the CodeableConcept type.
@@ -9852,7 +9755,7 @@ pub enum MeasureSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Measure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9940,15 +9843,9 @@ pub struct Measure {
     pub rate_aggregation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rationale: Option<Markdown>,
-    #[serde(
-        rename = "clinicalRecommendationStatement",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "clinicalRecommendationStatement", skip_serializing_if = "Option::is_none")]
     pub clinical_recommendation_statement: Option<Markdown>,
-    #[serde(
-        rename = "improvementNotation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "improvementNotation", skip_serializing_if = "Option::is_none")]
     pub improvement_notation: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition: Option<Vec<Markdown>>,
@@ -9960,9 +9857,9 @@ pub struct Measure {
     pub supplemental_data: Option<Vec<MeasureSupplementalData>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MeasureGroup {
+pub struct MeasureGroupPopulation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9973,13 +9870,30 @@ pub struct MeasureGroup {
     pub code: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub population: Option<Vec<MeasureGroupPopulation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stratifier: Option<Vec<MeasureGroupStratifier>>,
+    pub criteria: Expression,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureReportGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub population: Option<Vec<MeasureReportGroupPopulation>>,
+    #[serde(rename = "measureScore", skip_serializing_if = "Option::is_none")]
+    pub measure_score: Option<Quantity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeasureReportGroupPopulation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -9996,7 +9910,71 @@ pub struct MeasureReportGroupPopulation {
     pub subject_results: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureReportGroupStratifierStratum {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
+    #[serde(rename = "measureScore", skip_serializing_if = "Option::is_none")]
+    pub measure_score: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureReportGroupStratifierStratumPopulation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<Integer>,
+    #[serde(rename = "subjectResults", skip_serializing_if = "Option::is_none")]
+    pub subject_results: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureReportGroupStratifier {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MeasureReportGroupStratifierStratumComponent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub value: CodeableConcept,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MeasureReport {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10028,10 +10006,7 @@ pub struct MeasureReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reporter: Option<Reference>,
     pub period: Period,
-    #[serde(
-        rename = "improvementNotation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "improvementNotation", skip_serializing_if = "Option::is_none")]
     pub improvement_notation: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<Vec<MeasureReportGroup>>,
@@ -10039,91 +10014,9 @@ pub struct MeasureReport {
     pub evaluated_resource: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureReportGroupStratifierStratumComponent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub value: CodeableConcept,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureReportGroupStratifierStratumPopulation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count: Option<Integer>,
-    #[serde(rename = "subjectResults", skip_serializing_if = "Option::is_none")]
-    pub subject_results: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureReportGroup {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub population: Option<Vec<MeasureReportGroupPopulation>>,
-    #[serde(rename = "measureScore", skip_serializing_if = "Option::is_none")]
-    pub measure_score: Option<Quantity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureReportGroupStratifier {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeasureReportGroupStratifierStratum {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
-    #[serde(rename = "measureScore", skip_serializing_if = "Option::is_none")]
-    pub measure_score: Option<Quantity>,
-}
 
 /// Choice of types for the created[x] field in Media
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MediaCreated {
     /// Variant accepting the DateTime type.
@@ -10134,7 +10027,7 @@ pub enum MediaCreated {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Media {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10197,7 +10090,37 @@ pub struct Media {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+/// Choice of types for the item[x] field in MedicationIngredient
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationIngredientItem {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "itemCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "itemReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationIngredient {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub item: Option<MedicationIngredientItem>,
+    #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strength: Option<Ratio>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Medication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10234,36 +10157,7 @@ pub struct Medication {
     pub batch: Option<MedicationBatch>,
 }
 
-/// Choice of types for the item[x] field in MedicationIngredient
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationIngredientItem {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "itemCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "itemReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationIngredient {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub item: Option<MedicationIngredientItem>,
-    #[serde(rename = "isActive", skip_serializing_if = "Option::is_none")]
-    pub is_active: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strength: Option<Ratio>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationBatch {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10278,8 +10172,23 @@ pub struct MedicationBatch {
     pub expiration_date: Option<DateTime>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationAdministrationPerformer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
 /// Choice of types for the rate[x] field in MedicationAdministrationDosage
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationAdministrationDosageRate {
     /// Variant accepting the Ratio type.
@@ -10290,7 +10199,7 @@ pub enum MedicationAdministrationDosageRate {
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationAdministrationDosage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10313,22 +10222,8 @@ pub struct MedicationAdministrationDosage {
     pub rate: Option<MedicationAdministrationDosageRate>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationAdministrationPerformer {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
 /// Choice of types for the medication[x] field in MedicationAdministration
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationAdministrationMedication {
     /// Variant accepting the CodeableConcept type.
@@ -10340,7 +10235,7 @@ pub enum MedicationAdministrationMedication {
 }
 
 /// Choice of types for the effective[x] field in MedicationAdministration
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationAdministrationEffective {
     /// Variant accepting the DateTime type.
@@ -10351,7 +10246,7 @@ pub enum MedicationAdministrationEffective {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationAdministration {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10386,10 +10281,7 @@ pub struct MedicationAdministration {
     pub subject: Reference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Reference>,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<Vec<Reference>>,
     #[serde(flatten)]
     pub effective: Option<MedicationAdministrationEffective>,
@@ -10411,7 +10303,8 @@ pub struct MedicationAdministration {
     pub event_history: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationDispenseSubstitution {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10430,8 +10323,22 @@ pub struct MedicationDispenseSubstitution {
     pub responsible_party: Option<Vec<Reference>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationDispensePerformer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
 /// Choice of types for the statusReason[x] field in MedicationDispense
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationDispenseStatusReason {
     /// Variant accepting the CodeableConcept type.
@@ -10443,7 +10350,7 @@ pub enum MedicationDispenseStatusReason {
 }
 
 /// Choice of types for the medication[x] field in MedicationDispense
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationDispenseMedication {
     /// Variant accepting the CodeableConcept type.
@@ -10454,7 +10361,7 @@ pub enum MedicationDispenseMedication {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationDispense {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10488,19 +10395,13 @@ pub struct MedicationDispense {
     pub subject: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Reference>,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub performer: Option<Vec<MedicationDispensePerformer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Reference>,
-    #[serde(
-        rename = "authorizingPrescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "authorizingPrescription", skip_serializing_if = "Option::is_none")]
     pub authorizing_prescription: Option<Vec<Reference>>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<CodeableConcept>,
@@ -10528,99 +10429,9 @@ pub struct MedicationDispense {
     pub event_history: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationDispensePerformer {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeMonitoringProgram {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgePackaging {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Quantity>,
-}
-
-/// Choice of types for the indication[x] field in MedicationKnowledgeAdministrationGuidelines
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationKnowledgeAdministrationGuidelinesIndication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "indicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "indicationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeAdministrationGuidelines {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dosage: Option<Vec<MedicationKnowledgeAdministrationGuidelinesDosage>>,
-    #[serde(flatten)]
-    pub indication: Option<MedicationKnowledgeAdministrationGuidelinesIndication>,
-    #[serde(
-        rename = "patientCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub patient_characteristics:
-        Option<Vec<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeRegulatoryMaxDispense {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub quantity: Quantity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Duration>,
-}
 
 /// Choice of types for the item[x] field in MedicationKnowledgeIngredient
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationKnowledgeIngredientItem {
     /// Variant accepting the CodeableConcept type.
@@ -10631,7 +10442,7 @@ pub enum MedicationKnowledgeIngredientItem {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationKnowledgeIngredient {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10648,7 +10459,186 @@ pub struct MedicationKnowledgeIngredient {
     pub strength: Option<Ratio>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeMonitoringProgram {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeRegulatorySchedule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub schedule: CodeableConcept,
+}
+
+/// Choice of types for the indication[x] field in MedicationKnowledgeAdministrationGuidelines
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationKnowledgeAdministrationGuidelinesIndication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "indicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "indicationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeAdministrationGuidelines {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dosage: Option<Vec<MedicationKnowledgeAdministrationGuidelinesDosage>>,
+    #[serde(flatten)]
+    pub indication: Option<MedicationKnowledgeAdministrationGuidelinesIndication>,
+    #[serde(rename = "patientCharacteristics", skip_serializing_if = "Option::is_none")]
+    pub patient_characteristics: Option<Vec<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeRegulatorySubstitution {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    pub allowed: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dosage: Option<Vec<Dosage>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeRegulatory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "regulatoryAuthority")]
+    pub regulatory_authority: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub substitution: Option<Vec<MedicationKnowledgeRegulatorySubstitution>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Vec<MedicationKnowledgeRegulatorySchedule>>,
+    #[serde(rename = "maxDispense", skip_serializing_if = "Option::is_none")]
+    pub max_dispense: Option<MedicationKnowledgeRegulatoryMaxDispense>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeCost {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub cost: Money,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeMonograph {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgePackaging {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Quantity>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeMedicineClassification {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<Vec<CodeableConcept>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationKnowledgeRegulatoryMaxDispense {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub quantity: Quantity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Duration>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationKnowledge {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10679,15 +10669,9 @@ pub struct MedicationKnowledge {
     pub amount: Option<Quantity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synonym: Option<Vec<String>>,
-    #[serde(
-        rename = "relatedMedicationKnowledge",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "relatedMedicationKnowledge", skip_serializing_if = "Option::is_none")]
     pub related_medication_knowledge: Option<Vec<MedicationKnowledgeRelatedMedicationKnowledge>>,
-    #[serde(
-        rename = "associatedMedication",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "associatedMedication", skip_serializing_if = "Option::is_none")]
     pub associated_medication: Option<Vec<Reference>>,
     #[serde(rename = "productType", skip_serializing_if = "Option::is_none")]
     pub product_type: Option<Vec<CodeableConcept>>,
@@ -10695,10 +10679,7 @@ pub struct MedicationKnowledge {
     pub monograph: Option<Vec<MedicationKnowledgeMonograph>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingredient: Option<Vec<MedicationKnowledgeIngredient>>,
-    #[serde(
-        rename = "preparationInstruction",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "preparationInstruction", skip_serializing_if = "Option::is_none")]
     pub preparation_instruction: Option<Markdown>,
     #[serde(rename = "intendedRoute", skip_serializing_if = "Option::is_none")]
     pub intended_route: Option<Vec<CodeableConcept>>,
@@ -10706,15 +10687,9 @@ pub struct MedicationKnowledge {
     pub cost: Option<Vec<MedicationKnowledgeCost>>,
     #[serde(rename = "monitoringProgram", skip_serializing_if = "Option::is_none")]
     pub monitoring_program: Option<Vec<MedicationKnowledgeMonitoringProgram>>,
-    #[serde(
-        rename = "administrationGuidelines",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "administrationGuidelines", skip_serializing_if = "Option::is_none")]
     pub administration_guidelines: Option<Vec<MedicationKnowledgeAdministrationGuidelines>>,
-    #[serde(
-        rename = "medicineClassification",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "medicineClassification", skip_serializing_if = "Option::is_none")]
     pub medicine_classification: Option<Vec<MedicationKnowledgeMedicineClassification>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub packaging: Option<MedicationKnowledgePackaging>,
@@ -10728,22 +10703,7 @@ pub struct MedicationKnowledge {
     pub kinetics: Option<Vec<MedicationKnowledgeKinetics>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeMedicineClassification {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub classification: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationKnowledgeRelatedMedicationKnowledge {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10758,81 +10718,8 @@ pub struct MedicationKnowledgeRelatedMedicationKnowledge {
     pub reference: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeRegulatorySubstitution {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    pub allowed: Boolean,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeMonograph {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeRegulatorySchedule {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub schedule: CodeableConcept,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeKinetics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "areaUnderCurve", skip_serializing_if = "Option::is_none")]
-    pub area_under_curve: Option<Vec<Quantity>>,
-    #[serde(rename = "lethalDose50", skip_serializing_if = "Option::is_none")]
-    pub lethal_dose50: Option<Vec<Quantity>>,
-    #[serde(rename = "halfLifePeriod", skip_serializing_if = "Option::is_none")]
-    pub half_life_period: Option<Duration>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dosage: Option<Vec<Dosage>>,
-}
-
 /// Choice of types for the characteristic[x] field in MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic {
     /// Variant accepting the CodeableConcept type.
@@ -10843,7 +10730,7 @@ pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharac
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10853,14 +10740,13 @@ pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(flatten)]
-    pub characteristic:
-        Option<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic>,
+    pub characteristic: Option<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Vec<String>>,
 }
 
 /// Choice of types for the value[x] field in MedicationKnowledgeDrugCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationKnowledgeDrugCharacteristicValue {
     /// Variant accepting the CodeableConcept type.
@@ -10877,7 +10763,7 @@ pub enum MedicationKnowledgeDrugCharacteristicValue {
     Base64Binary(Base64Binary),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationKnowledgeDrugCharacteristic {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10892,43 +10778,26 @@ pub struct MedicationKnowledgeDrugCharacteristic {
     pub value: Option<MedicationKnowledgeDrugCharacteristicValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeCost {
+pub struct MedicationKnowledgeKinetics {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    pub cost: Money,
+    #[serde(rename = "areaUnderCurve", skip_serializing_if = "Option::is_none")]
+    pub area_under_curve: Option<Vec<Quantity>>,
+    #[serde(rename = "lethalDose50", skip_serializing_if = "Option::is_none")]
+    pub lethal_dose50: Option<Vec<Quantity>>,
+    #[serde(rename = "halfLifePeriod", skip_serializing_if = "Option::is_none")]
+    pub half_life_period: Option<Duration>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationKnowledgeRegulatory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "regulatoryAuthority")]
-    pub regulatory_authority: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub substitution: Option<Vec<MedicationKnowledgeRegulatorySubstitution>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<Vec<MedicationKnowledgeRegulatorySchedule>>,
-    #[serde(rename = "maxDispense", skip_serializing_if = "Option::is_none")]
-    pub max_dispense: Option<MedicationKnowledgeRegulatoryMaxDispense>,
-}
 
 /// Choice of types for the reported[x] field in MedicationRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationRequestReported {
     /// Variant accepting the Boolean type.
@@ -10940,7 +10809,7 @@ pub enum MedicationRequestReported {
 }
 
 /// Choice of types for the medication[x] field in MedicationRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationRequestMedication {
     /// Variant accepting the CodeableConcept type.
@@ -10951,7 +10820,7 @@ pub enum MedicationRequestMedication {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10989,10 +10858,7 @@ pub struct MedicationRequest {
     pub subject: Reference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encounter: Option<Reference>,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<Vec<Reference>>,
     #[serde(rename = "authoredOn", skip_serializing_if = "Option::is_none")]
     pub authored_on: Option<DateTime>,
@@ -11008,10 +10874,7 @@ pub struct MedicationRequest {
     pub reason_code: Option<Vec<CodeableConcept>>,
     #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
     pub reason_reference: Option<Vec<Reference>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -11019,10 +10882,7 @@ pub struct MedicationRequest {
     pub based_on: Option<Vec<Reference>>,
     #[serde(rename = "groupIdentifier", skip_serializing_if = "Option::is_none")]
     pub group_identifier: Option<Identifier>,
-    #[serde(
-        rename = "courseOfTherapyType",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "courseOfTherapyType", skip_serializing_if = "Option::is_none")]
     pub course_of_therapy_type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insurance: Option<Vec<Reference>>,
@@ -11042,34 +10902,7 @@ pub struct MedicationRequest {
     pub event_history: Option<Vec<Reference>>,
 }
 
-/// Choice of types for the allowed[x] field in MedicationRequestSubstitution
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationRequestSubstitutionAllowed {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "allowedBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "allowedCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicationRequestSubstitution {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub allowed: Option<MedicationRequestSubstitutionAllowed>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationRequestDispenseRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11084,23 +10917,44 @@ pub struct MedicationRequestDispenseRequest {
     pub dispense_interval: Option<Duration>,
     #[serde(rename = "validityPeriod", skip_serializing_if = "Option::is_none")]
     pub validity_period: Option<Period>,
-    #[serde(
-        rename = "numberOfRepeatsAllowed",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "numberOfRepeatsAllowed", skip_serializing_if = "Option::is_none")]
     pub number_of_repeats_allowed: Option<UnsignedInt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantity: Option<Quantity>,
-    #[serde(
-        rename = "expectedSupplyDuration",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "expectedSupplyDuration", skip_serializing_if = "Option::is_none")]
     pub expected_supply_duration: Option<Duration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub performer: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the allowed[x] field in MedicationRequestSubstitution
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationRequestSubstitutionAllowed {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "allowedBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "allowedCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicationRequestSubstitution {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub allowed: Option<MedicationRequestSubstitutionAllowed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationRequestDispenseRequestInitialFill {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11115,8 +10969,9 @@ pub struct MedicationRequestDispenseRequestInitialFill {
     pub duration: Option<Duration>,
 }
 
+
 /// Choice of types for the medication[x] field in MedicationStatement
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationStatementMedication {
     /// Variant accepting the CodeableConcept type.
@@ -11128,7 +10983,7 @@ pub enum MedicationStatementMedication {
 }
 
 /// Choice of types for the effective[x] field in MedicationStatement
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicationStatementEffective {
     /// Variant accepting the DateTime type.
@@ -11139,7 +10994,7 @@ pub enum MedicationStatementEffective {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicationStatement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11192,21 +11047,8 @@ pub struct MedicationStatement {
     pub dosage: Option<Vec<Dosage>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductNameNamePart {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub part: String,
-    #[serde(rename = "type")]
-    pub r#type: Coding,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductNameCountryLanguage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11221,7 +11063,30 @@ pub struct MedicinalProductNameCountryLanguage {
     pub language: CodeableConcept,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductManufacturingBusinessOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "operationType", skip_serializing_if = "Option::is_none")]
+    pub operation_type: Option<CodeableConcept>,
+    #[serde(rename = "authorisationReferenceNumber", skip_serializing_if = "Option::is_none")]
+    pub authorisation_reference_number: Option<Identifier>,
+    #[serde(rename = "effectiveDate", skip_serializing_if = "Option::is_none")]
+    pub effective_date: Option<DateTime>,
+    #[serde(rename = "confidentialityIndicator", skip_serializing_if = "Option::is_none")]
+    pub confidentiality_indicator: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regulator: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductName {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11238,73 +11103,21 @@ pub struct MedicinalProductName {
     pub country_language: Option<Vec<MedicinalProductNameCountryLanguage>>,
 }
 
-/// Choice of types for the indication[x] field in MedicinalProductSpecialDesignation
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductSpecialDesignationIndication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "indicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "indicationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MedicinalProductSpecialDesignation {
+pub struct MedicinalProductNameNamePart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "intendedUse", skip_serializing_if = "Option::is_none")]
-    pub intended_use: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub indication: Option<MedicinalProductSpecialDesignationIndication>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<DateTime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub species: Option<CodeableConcept>,
+    pub part: String,
+    #[serde(rename = "type")]
+    pub r#type: Coding,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductManufacturingBusinessOperation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "operationType", skip_serializing_if = "Option::is_none")]
-    pub operation_type: Option<CodeableConcept>,
-    #[serde(
-        rename = "authorisationReferenceNumber",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub authorisation_reference_number: Option<Identifier>,
-    #[serde(rename = "effectiveDate", skip_serializing_if = "Option::is_none")]
-    pub effective_date: Option<DateTime>,
-    #[serde(
-        rename = "confidentialityIndicator",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub confidentiality_indicator: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub manufacturer: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub regulator: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProduct {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11329,44 +11142,23 @@ pub struct MedicinalProduct {
     pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<Coding>,
-    #[serde(
-        rename = "combinedPharmaceuticalDoseForm",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "combinedPharmaceuticalDoseForm", skip_serializing_if = "Option::is_none")]
     pub combined_pharmaceutical_dose_form: Option<CodeableConcept>,
-    #[serde(
-        rename = "legalStatusOfSupply",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "legalStatusOfSupply", skip_serializing_if = "Option::is_none")]
     pub legal_status_of_supply: Option<CodeableConcept>,
-    #[serde(
-        rename = "additionalMonitoringIndicator",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "additionalMonitoringIndicator", skip_serializing_if = "Option::is_none")]
     pub additional_monitoring_indicator: Option<CodeableConcept>,
     #[serde(rename = "specialMeasures", skip_serializing_if = "Option::is_none")]
     pub special_measures: Option<Vec<String>>,
-    #[serde(
-        rename = "paediatricUseIndicator",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "paediatricUseIndicator", skip_serializing_if = "Option::is_none")]
     pub paediatric_use_indicator: Option<CodeableConcept>,
-    #[serde(
-        rename = "productClassification",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "productClassification", skip_serializing_if = "Option::is_none")]
     pub product_classification: Option<Vec<CodeableConcept>>,
     #[serde(rename = "marketingStatus", skip_serializing_if = "Option::is_none")]
     pub marketing_status: Option<Vec<MarketingStatus>>,
-    #[serde(
-        rename = "pharmaceuticalProduct",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "pharmaceuticalProduct", skip_serializing_if = "Option::is_none")]
     pub pharmaceutical_product: Option<Vec<Reference>>,
-    #[serde(
-        rename = "packagedMedicinalProduct",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "packagedMedicinalProduct", skip_serializing_if = "Option::is_none")]
     pub packaged_medicinal_product: Option<Vec<Reference>>,
     #[serde(rename = "attachedDocument", skip_serializing_if = "Option::is_none")]
     pub attached_document: Option<Vec<Reference>>,
@@ -11380,18 +11172,52 @@ pub struct MedicinalProduct {
     pub name: Option<Vec<MedicinalProductName>>,
     #[serde(rename = "crossReference", skip_serializing_if = "Option::is_none")]
     pub cross_reference: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "manufacturingBusinessOperation",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub manufacturing_business_operation:
-        Option<Vec<MedicinalProductManufacturingBusinessOperation>>,
+    #[serde(rename = "manufacturingBusinessOperation", skip_serializing_if = "Option::is_none")]
+    pub manufacturing_business_operation: Option<Vec<MedicinalProductManufacturingBusinessOperation>>,
     #[serde(rename = "specialDesignation", skip_serializing_if = "Option::is_none")]
     pub special_designation: Option<Vec<MedicinalProductSpecialDesignation>>,
 }
 
+/// Choice of types for the indication[x] field in MedicinalProductSpecialDesignation
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductSpecialDesignationIndication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "indicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "indicationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductSpecialDesignation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "intendedUse", skip_serializing_if = "Option::is_none")]
+    pub intended_use: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub indication: Option<MedicinalProductSpecialDesignationIndication>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<DateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub species: Option<CodeableConcept>,
+}
+
+
 /// Choice of types for the date[x] field in MedicinalProductAuthorizationProcedure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicinalProductAuthorizationProcedureDate {
     /// Variant accepting the Period type.
@@ -11402,7 +11228,7 @@ pub enum MedicinalProductAuthorizationProcedureDate {
     DateTime(DateTime),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductAuthorizationProcedure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11421,7 +11247,7 @@ pub struct MedicinalProductAuthorizationProcedure {
     pub application: Option<Vec<MedicinalProductAuthorizationProcedure>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductAuthorization {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11456,29 +11282,16 @@ pub struct MedicinalProductAuthorization {
     pub restore_date: Option<DateTime>,
     #[serde(rename = "validityPeriod", skip_serializing_if = "Option::is_none")]
     pub validity_period: Option<Period>,
-    #[serde(
-        rename = "dataExclusivityPeriod",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "dataExclusivityPeriod", skip_serializing_if = "Option::is_none")]
     pub data_exclusivity_period: Option<Period>,
-    #[serde(
-        rename = "dateOfFirstAuthorization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "dateOfFirstAuthorization", skip_serializing_if = "Option::is_none")]
     pub date_of_first_authorization: Option<DateTime>,
-    #[serde(
-        rename = "internationalBirthDate",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "internationalBirthDate", skip_serializing_if = "Option::is_none")]
     pub international_birth_date: Option<DateTime>,
     #[serde(rename = "legalBasis", skip_serializing_if = "Option::is_none")]
     pub legal_basis: Option<CodeableConcept>,
-    #[serde(
-        rename = "jurisdictionalAuthorization",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub jurisdictional_authorization:
-        Option<Vec<MedicinalProductAuthorizationJurisdictionalAuthorization>>,
+    #[serde(rename = "jurisdictionalAuthorization", skip_serializing_if = "Option::is_none")]
+    pub jurisdictional_authorization: Option<Vec<MedicinalProductAuthorizationJurisdictionalAuthorization>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holder: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11487,7 +11300,7 @@ pub struct MedicinalProductAuthorization {
     pub procedure: Option<MedicinalProductAuthorizationProcedure>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductAuthorizationJurisdictionalAuthorization {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11502,43 +11315,14 @@ pub struct MedicinalProductAuthorizationJurisdictionalAuthorization {
     pub country: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jurisdiction: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "legalStatusOfSupply",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "legalStatusOfSupply", skip_serializing_if = "Option::is_none")]
     pub legal_status_of_supply: Option<CodeableConcept>,
     #[serde(rename = "validityPeriod", skip_serializing_if = "Option::is_none")]
     pub validity_period: Option<Period>,
 }
 
-/// Choice of types for the medication[x] field in MedicinalProductContraindicationOtherTherapy
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductContraindicationOtherTherapyMedication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "medicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "medicationReference")]
-    Reference(Reference),
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductContraindicationOtherTherapy {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "therapyRelationshipType")]
-    pub therapy_relationship_type: CodeableConcept,
-    #[serde(flatten)]
-    pub medication: Option<MedicinalProductContraindicationOtherTherapyMedication>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductContraindication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11565,10 +11349,7 @@ pub struct MedicinalProductContraindication {
     pub disease_status: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comorbidity: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "therapeuticIndication",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "therapeuticIndication", skip_serializing_if = "Option::is_none")]
     pub therapeutic_indication: Option<Vec<Reference>>,
     #[serde(rename = "otherTherapy", skip_serializing_if = "Option::is_none")]
     pub other_therapy: Option<Vec<MedicinalProductContraindicationOtherTherapy>>,
@@ -11576,7 +11357,35 @@ pub struct MedicinalProductContraindication {
     pub population: Option<Vec<Population>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the medication[x] field in MedicinalProductContraindicationOtherTherapy
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductContraindicationOtherTherapyMedication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "medicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "medicationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductContraindicationOtherTherapy {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "therapyRelationshipType")]
+    pub therapy_relationship_type: CodeableConcept,
+    #[serde(flatten)]
+    pub medication: Option<MedicinalProductContraindicationOtherTherapyMedication>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductIndication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11597,10 +11406,7 @@ pub struct MedicinalProductIndication {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Vec<Reference>>,
-    #[serde(
-        rename = "diseaseSymptomProcedure",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "diseaseSymptomProcedure", skip_serializing_if = "Option::is_none")]
     pub disease_symptom_procedure: Option<CodeableConcept>,
     #[serde(rename = "diseaseStatus", skip_serializing_if = "Option::is_none")]
     pub disease_status: Option<CodeableConcept>,
@@ -11619,7 +11425,7 @@ pub struct MedicinalProductIndication {
 }
 
 /// Choice of types for the medication[x] field in MedicinalProductIndicationOtherTherapy
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicinalProductIndicationOtherTherapyMedication {
     /// Variant accepting the CodeableConcept type.
@@ -11630,7 +11436,7 @@ pub enum MedicinalProductIndicationOtherTherapyMedication {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductIndicationOtherTherapy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11645,7 +11451,32 @@ pub struct MedicinalProductIndicationOtherTherapy {
     pub medication: Option<MedicinalProductIndicationOtherTherapyMedication>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub presentation: Ratio,
+    #[serde(rename = "presentationLowLimit", skip_serializing_if = "Option::is_none")]
+    pub presentation_low_limit: Option<Ratio>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concentration: Option<Ratio>,
+    #[serde(rename = "concentrationLowLimit", skip_serializing_if = "Option::is_none")]
+    pub concentration_low_limit: Option<Ratio>,
+    #[serde(rename = "measurementPoint", skip_serializing_if = "Option::is_none")]
+    pub measurement_point: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "referenceStrength", skip_serializing_if = "Option::is_none")]
+    pub reference_strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductIngredientSubstance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11659,24 +11490,7 @@ pub struct MedicinalProductIngredientSubstance {
     pub strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrength>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductIngredientSpecifiedSubstance {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub group: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidentiality: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrength>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11696,7 +11510,7 @@ pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength
     pub country: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductIngredient {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11718,10 +11532,7 @@ pub struct MedicinalProductIngredient {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Identifier>,
     pub role: CodeableConcept,
-    #[serde(
-        rename = "allergenicIndicator",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "allergenicIndicator", skip_serializing_if = "Option::is_none")]
     pub allergenic_indicator: Option<Boolean>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manufacturer: Option<Vec<Reference>>,
@@ -11731,39 +11542,26 @@ pub struct MedicinalProductIngredient {
     pub substance: Option<MedicinalProductIngredientSubstance>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
+pub struct MedicinalProductIngredientSpecifiedSubstance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub presentation: Ratio,
-    #[serde(
-        rename = "presentationLowLimit",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub presentation_low_limit: Option<Ratio>,
+    pub code: CodeableConcept,
+    pub group: CodeableConcept,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub concentration: Option<Ratio>,
-    #[serde(
-        rename = "concentrationLowLimit",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub concentration_low_limit: Option<Ratio>,
-    #[serde(rename = "measurementPoint", skip_serializing_if = "Option::is_none")]
-    pub measurement_point: Option<String>,
+    pub confidentiality: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub country: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "referenceStrength", skip_serializing_if = "Option::is_none")]
-    pub reference_strength:
-        Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
+    pub strength: Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrength>>,
 }
 
+
 /// Choice of types for the item[x] field in MedicinalProductInteractionInteractant
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MedicinalProductInteractionInteractantItem {
     /// Variant accepting the Reference type.
@@ -11774,7 +11572,7 @@ pub enum MedicinalProductInteractionInteractantItem {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductInteractionInteractant {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11787,7 +11585,7 @@ pub struct MedicinalProductInteractionInteractant {
     pub item: Option<MedicinalProductInteractionInteractantItem>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductInteraction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11822,7 +11620,8 @@ pub struct MedicinalProductInteraction {
     pub management: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductManufactured {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11850,19 +11649,14 @@ pub struct MedicinalProductManufactured {
     pub manufacturer: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingredient: Option<Vec<Reference>>,
-    #[serde(
-        rename = "physicalCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "physicalCharacteristics", skip_serializing_if = "Option::is_none")]
     pub physical_characteristics: Option<ProdCharacteristic>,
-    #[serde(
-        rename = "otherCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "otherCharacteristics", skip_serializing_if = "Option::is_none")]
     pub other_characteristics: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductPackagedPackageItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11886,15 +11680,9 @@ pub struct MedicinalProductPackagedPackageItem {
     pub manufactured_item: Option<Vec<Reference>>,
     #[serde(rename = "packageItem", skip_serializing_if = "Option::is_none")]
     pub package_item: Option<Vec<MedicinalProductPackagedPackageItem>>,
-    #[serde(
-        rename = "physicalCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "physicalCharacteristics", skip_serializing_if = "Option::is_none")]
     pub physical_characteristics: Option<ProdCharacteristic>,
-    #[serde(
-        rename = "otherCharacteristics",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "otherCharacteristics", skip_serializing_if = "Option::is_none")]
     pub other_characteristics: Option<Vec<CodeableConcept>>,
     #[serde(rename = "shelfLifeStorage", skip_serializing_if = "Option::is_none")]
     pub shelf_life_storage: Option<Vec<ProductShelfLife>>,
@@ -11902,22 +11690,7 @@ pub struct MedicinalProductPackagedPackageItem {
     pub manufacturer: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductPackagedBatchIdentifier {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "outerPackaging")]
-    pub outer_packaging: Identifier,
-    #[serde(rename = "immediatePackaging", skip_serializing_if = "Option::is_none")]
-    pub immediate_packaging: Option<Identifier>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductPackaged {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11942,17 +11715,11 @@ pub struct MedicinalProductPackaged {
     pub subject: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(
-        rename = "legalStatusOfSupply",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "legalStatusOfSupply", skip_serializing_if = "Option::is_none")]
     pub legal_status_of_supply: Option<CodeableConcept>,
     #[serde(rename = "marketingStatus", skip_serializing_if = "Option::is_none")]
     pub marketing_status: Option<Vec<MarketingStatus>>,
-    #[serde(
-        rename = "marketingAuthorization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "marketingAuthorization", skip_serializing_if = "Option::is_none")]
     pub marketing_authorization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manufacturer: Option<Vec<Reference>>,
@@ -11962,7 +11729,75 @@ pub struct MedicinalProductPackaged {
     pub package_item: Option<Vec<MedicinalProductPackagedPackageItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductPackagedBatchIdentifier {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "outerPackaging")]
+    pub outer_packaging: Identifier,
+    #[serde(rename = "immediatePackaging", skip_serializing_if = "Option::is_none")]
+    pub immediate_packaging: Option<Identifier>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    #[serde(rename = "withdrawalPeriod", skip_serializing_if = "Option::is_none")]
+    pub withdrawal_period: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    #[serde(rename = "firstDose", skip_serializing_if = "Option::is_none")]
+    pub first_dose: Option<Quantity>,
+    #[serde(rename = "maxSingleDose", skip_serializing_if = "Option::is_none")]
+    pub max_single_dose: Option<Quantity>,
+    #[serde(rename = "maxDosePerDay", skip_serializing_if = "Option::is_none")]
+    pub max_dose_per_day: Option<Quantity>,
+    #[serde(rename = "maxDosePerTreatmentPeriod", skip_serializing_if = "Option::is_none")]
+    pub max_dose_per_treatment_period: Option<Ratio>,
+    #[serde(rename = "maxTreatmentPeriod", skip_serializing_if = "Option::is_none")]
+    pub max_treatment_period: Option<Duration>,
+    #[serde(rename = "targetSpecies", skip_serializing_if = "Option::is_none")]
+    pub target_species: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MedicinalProductPharmaceuticalCharacteristics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductPharmaceutical {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11993,44 +11828,11 @@ pub struct MedicinalProductPharmaceutical {
     pub device: Option<Vec<Reference>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub characteristics: Option<Vec<MedicinalProductPharmaceuticalCharacteristics>>,
-    #[serde(
-        rename = "routeOfAdministration",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "routeOfAdministration", skip_serializing_if = "Option::is_none")]
     pub route_of_administration: Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministration>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductPharmaceuticalCharacteristics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(rename = "withdrawalPeriod", skip_serializing_if = "Option::is_none")]
-    pub withdrawal_period: Option<
-        Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>,
-    >,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12041,42 +11843,12 @@ pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithd
     pub modifier_extension: Option<Vec<Extension>>,
     pub tissue: CodeableConcept,
     pub value: Quantity,
-    #[serde(
-        rename = "supportingInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "supportingInformation", skip_serializing_if = "Option::is_none")]
     pub supporting_information: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    #[serde(rename = "firstDose", skip_serializing_if = "Option::is_none")]
-    pub first_dose: Option<Quantity>,
-    #[serde(rename = "maxSingleDose", skip_serializing_if = "Option::is_none")]
-    pub max_single_dose: Option<Quantity>,
-    #[serde(rename = "maxDosePerDay", skip_serializing_if = "Option::is_none")]
-    pub max_dose_per_day: Option<Quantity>,
-    #[serde(
-        rename = "maxDosePerTreatmentPeriod",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub max_dose_per_treatment_period: Option<Ratio>,
-    #[serde(rename = "maxTreatmentPeriod", skip_serializing_if = "Option::is_none")]
-    pub max_treatment_period: Option<Duration>,
-    #[serde(rename = "targetSpecies", skip_serializing_if = "Option::is_none")]
-    pub target_species:
-        Option<Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies>>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MedicinalProductUndesirableEffect {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12097,37 +11869,18 @@ pub struct MedicinalProductUndesirableEffect {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<Vec<Reference>>,
-    #[serde(
-        rename = "symptomConditionEffect",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "symptomConditionEffect", skip_serializing_if = "Option::is_none")]
     pub symptom_condition_effect: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<CodeableConcept>,
-    #[serde(
-        rename = "frequencyOfOccurrence",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "frequencyOfOccurrence", skip_serializing_if = "Option::is_none")]
     pub frequency_of_occurrence: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub population: Option<Vec<Population>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MessageDefinitionAllowedResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub message: Canonical,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub situation: Option<Markdown>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageDefinitionFocus {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12145,7 +11898,7 @@ pub struct MessageDefinitionFocus {
 }
 
 /// Choice of types for the event[x] field in MessageDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageDefinitionEvent {
     /// Variant accepting the Coding type.
@@ -12156,7 +11909,7 @@ pub enum MessageDefinitionEvent {
     Uri(Uri),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12223,8 +11976,76 @@ pub struct MessageDefinition {
     pub graph: Option<Vec<Canonical>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageDefinitionAllowedResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub message: Canonical,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub situation: Option<Markdown>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageHeaderDestination {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Reference>,
+    pub endpoint: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<Reference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageHeaderSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub software: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact: Option<ContactPoint>,
+    pub endpoint: Url,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MessageHeaderResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Id,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Reference>,
+}
+
 /// Choice of types for the event[x] field in MessageHeader
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MessageHeaderEvent {
     /// Variant accepting the Coding type.
@@ -12235,7 +12056,7 @@ pub enum MessageHeaderEvent {
     Uri(Uri),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageHeader {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12277,24 +12098,10 @@ pub struct MessageHeader {
     pub definition: Option<Canonical>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MessageHeaderResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Id,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Reference>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MessageHeaderSource {
+pub struct MolecularSequenceQualityRoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12302,50 +12109,22 @@ pub struct MessageHeaderSource {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub score: Option<Vec<Integer>>,
+    #[serde(rename = "numTP", skip_serializing_if = "Option::is_none")]
+    pub num_t_p: Option<Vec<Integer>>,
+    #[serde(rename = "numFP", skip_serializing_if = "Option::is_none")]
+    pub num_f_p: Option<Vec<Integer>>,
+    #[serde(rename = "numFN", skip_serializing_if = "Option::is_none")]
+    pub num_f_n: Option<Vec<Integer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub software: Option<String>,
+    pub precision: Option<Vec<Decimal>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contact: Option<ContactPoint>,
-    pub endpoint: Url,
+    pub sensitivity: Option<Vec<Decimal>>,
+    #[serde(rename = "fMeasure", skip_serializing_if = "Option::is_none")]
+    pub f_measure: Option<Vec<Decimal>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MessageHeaderDestination {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Reference>,
-    pub endpoint: Url,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receiver: Option<Reference>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MolecularSequenceStructureVariantOuter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end: Option<Integer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MolecularSequenceRepository {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12368,9 +12147,9 @@ pub struct MolecularSequenceRepository {
     pub readset_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MolecularSequenceVariant {
+pub struct MolecularSequenceReferenceSeq {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12378,97 +12157,26 @@ pub struct MolecularSequenceVariant {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<Integer>,
+    pub chromosome: Option<CodeableConcept>,
+    #[serde(rename = "genomeBuild", skip_serializing_if = "Option::is_none")]
+    pub genome_build: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub end: Option<Integer>,
-    #[serde(rename = "observedAllele", skip_serializing_if = "Option::is_none")]
-    pub observed_allele: Option<String>,
-    #[serde(rename = "referenceAllele", skip_serializing_if = "Option::is_none")]
-    pub reference_allele: Option<String>,
+    pub orientation: Option<Code>,
+    #[serde(rename = "referenceSeqId", skip_serializing_if = "Option::is_none")]
+    pub reference_seq_id: Option<CodeableConcept>,
+    #[serde(rename = "referenceSeqPointer", skip_serializing_if = "Option::is_none")]
+    pub reference_seq_pointer: Option<Reference>,
+    #[serde(rename = "referenceSeqString", skip_serializing_if = "Option::is_none")]
+    pub reference_seq_string: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cigar: Option<String>,
-    #[serde(rename = "variantPointer", skip_serializing_if = "Option::is_none")]
-    pub variant_pointer: Option<Reference>,
+    pub strand: Option<Code>,
+    #[serde(rename = "windowStart", skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<Integer>,
+    #[serde(rename = "windowEnd", skip_serializing_if = "Option::is_none")]
+    pub window_end: Option<Integer>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MolecularSequenceStructureVariant {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "variantType", skip_serializing_if = "Option::is_none")]
-    pub variant_type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exact: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub length: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub outer: Option<MolecularSequenceStructureVariantOuter>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inner: Option<MolecularSequenceStructureVariantInner>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MolecularSequenceStructureVariantInner {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end: Option<Integer>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MolecularSequenceQuality {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(rename = "standardSequence", skip_serializing_if = "Option::is_none")]
-    pub standard_sequence: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<Quantity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<CodeableConcept>,
-    #[serde(rename = "truthTP", skip_serializing_if = "Option::is_none")]
-    pub truth_t_p: Option<Decimal>,
-    #[serde(rename = "queryTP", skip_serializing_if = "Option::is_none")]
-    pub query_t_p: Option<Decimal>,
-    #[serde(rename = "truthFN", skip_serializing_if = "Option::is_none")]
-    pub truth_f_n: Option<Decimal>,
-    #[serde(rename = "queryFP", skip_serializing_if = "Option::is_none")]
-    pub query_f_p: Option<Decimal>,
-    #[serde(rename = "gtFP", skip_serializing_if = "Option::is_none")]
-    pub gt_f_p: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub precision: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recall: Option<Decimal>,
-    #[serde(rename = "fScore", skip_serializing_if = "Option::is_none")]
-    pub f_score: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roc: Option<MolecularSequenceQualityRoc>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MolecularSequence {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12521,9 +12229,50 @@ pub struct MolecularSequence {
     pub structure_variant: Option<Vec<MolecularSequenceStructureVariant>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MolecularSequenceReferenceSeq {
+pub struct MolecularSequenceQuality {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(rename = "standardSequence", skip_serializing_if = "Option::is_none")]
+    pub standard_sequence: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<Quantity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<CodeableConcept>,
+    #[serde(rename = "truthTP", skip_serializing_if = "Option::is_none")]
+    pub truth_t_p: Option<Decimal>,
+    #[serde(rename = "queryTP", skip_serializing_if = "Option::is_none")]
+    pub query_t_p: Option<Decimal>,
+    #[serde(rename = "truthFN", skip_serializing_if = "Option::is_none")]
+    pub truth_f_n: Option<Decimal>,
+    #[serde(rename = "queryFP", skip_serializing_if = "Option::is_none")]
+    pub query_f_p: Option<Decimal>,
+    #[serde(rename = "gtFP", skip_serializing_if = "Option::is_none")]
+    pub gt_f_p: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall: Option<Decimal>,
+    #[serde(rename = "fScore", skip_serializing_if = "Option::is_none")]
+    pub f_score: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roc: Option<MolecularSequenceQualityRoc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MolecularSequenceStructureVariantOuter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12531,31 +12280,14 @@ pub struct MolecularSequenceReferenceSeq {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chromosome: Option<CodeableConcept>,
-    #[serde(rename = "genomeBuild", skip_serializing_if = "Option::is_none")]
-    pub genome_build: Option<String>,
+    pub start: Option<Integer>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub orientation: Option<Code>,
-    #[serde(rename = "referenceSeqId", skip_serializing_if = "Option::is_none")]
-    pub reference_seq_id: Option<CodeableConcept>,
-    #[serde(
-        rename = "referenceSeqPointer",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub reference_seq_pointer: Option<Reference>,
-    #[serde(rename = "referenceSeqString", skip_serializing_if = "Option::is_none")]
-    pub reference_seq_string: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strand: Option<Code>,
-    #[serde(rename = "windowStart", skip_serializing_if = "Option::is_none")]
-    pub window_start: Option<Integer>,
-    #[serde(rename = "windowEnd", skip_serializing_if = "Option::is_none")]
-    pub window_end: Option<Integer>,
+    pub end: Option<Integer>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MolecularSequenceQualityRoc {
+pub struct MolecularSequenceStructureVariantInner {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12563,22 +12295,77 @@ pub struct MolecularSequenceQualityRoc {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<Vec<Integer>>,
-    #[serde(rename = "numTP", skip_serializing_if = "Option::is_none")]
-    pub num_t_p: Option<Vec<Integer>>,
-    #[serde(rename = "numFP", skip_serializing_if = "Option::is_none")]
-    pub num_f_p: Option<Vec<Integer>>,
-    #[serde(rename = "numFN", skip_serializing_if = "Option::is_none")]
-    pub num_f_n: Option<Vec<Integer>>,
+    pub start: Option<Integer>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub precision: Option<Vec<Decimal>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sensitivity: Option<Vec<Decimal>>,
-    #[serde(rename = "fMeasure", skip_serializing_if = "Option::is_none")]
-    pub f_measure: Option<Vec<Decimal>>,
+    pub end: Option<Integer>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MolecularSequenceStructureVariant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "variantType", skip_serializing_if = "Option::is_none")]
+    pub variant_type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer: Option<MolecularSequenceStructureVariantOuter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner: Option<MolecularSequenceStructureVariantInner>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MolecularSequenceVariant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<Integer>,
+    #[serde(rename = "observedAllele", skip_serializing_if = "Option::is_none")]
+    pub observed_allele: Option<String>,
+    #[serde(rename = "referenceAllele", skip_serializing_if = "Option::is_none")]
+    pub reference_allele: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cigar: Option<String>,
+    #[serde(rename = "variantPointer", skip_serializing_if = "Option::is_none")]
+    pub variant_pointer: Option<Reference>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NamingSystemUniqueId {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NamingSystem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12621,28 +12408,24 @@ pub struct NamingSystem {
     pub unique_id: Option<Vec<NamingSystemUniqueId>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct NamingSystemUniqueId {
+pub struct NutritionOrderOralDietTexture {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preferred: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
+    pub modifier: Option<CodeableConcept>,
+    #[serde(rename = "foodType", skip_serializing_if = "Option::is_none")]
+    pub food_type: Option<CodeableConcept>,
 }
 
 /// Choice of types for the rate[x] field in NutritionOrderEnteralFormulaAdministration
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum NutritionOrderEnteralFormulaAdministrationRate {
     /// Variant accepting the Quantity type.
@@ -12653,7 +12436,7 @@ pub enum NutritionOrderEnteralFormulaAdministrationRate {
     Ratio(Ratio),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NutritionOrderEnteralFormulaAdministration {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12670,7 +12453,7 @@ pub struct NutritionOrderEnteralFormulaAdministration {
     pub rate: Option<NutritionOrderEnteralFormulaAdministrationRate>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NutritionOrderSupplement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12691,7 +12474,7 @@ pub struct NutritionOrderSupplement {
     pub instruction: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NutritionOrderOralDiet {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12708,87 +12491,13 @@ pub struct NutritionOrderOralDiet {
     pub nutrient: Option<Vec<NutritionOrderOralDietNutrient>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub texture: Option<Vec<NutritionOrderOralDietTexture>>,
-    #[serde(
-        rename = "fluidConsistencyType",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "fluidConsistencyType", skip_serializing_if = "Option::is_none")]
     pub fluid_consistency_type: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NutritionOrderOralDietNutrient {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<Quantity>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NutritionOrderOralDietTexture {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modifier: Option<CodeableConcept>,
-    #[serde(rename = "foodType", skip_serializing_if = "Option::is_none")]
-    pub food_type: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NutritionOrderEnteralFormula {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "baseFormulaType", skip_serializing_if = "Option::is_none")]
-    pub base_formula_type: Option<CodeableConcept>,
-    #[serde(
-        rename = "baseFormulaProductName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub base_formula_product_name: Option<String>,
-    #[serde(rename = "additiveType", skip_serializing_if = "Option::is_none")]
-    pub additive_type: Option<CodeableConcept>,
-    #[serde(
-        rename = "additiveProductName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub additive_product_name: Option<String>,
-    #[serde(rename = "caloricDensity", skip_serializing_if = "Option::is_none")]
-    pub caloric_density: Option<Quantity>,
-    #[serde(
-        rename = "routeofAdministration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub routeof_administration: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
-    #[serde(rename = "maxVolumeToDeliver", skip_serializing_if = "Option::is_none")]
-    pub max_volume_to_deliver: Option<Quantity>,
-    #[serde(
-        rename = "administrationInstruction",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub administration_instruction: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NutritionOrder {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12809,10 +12518,7 @@ pub struct NutritionOrder {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -12829,15 +12535,9 @@ pub struct NutritionOrder {
     pub orderer: Option<Reference>,
     #[serde(rename = "allergyIntolerance", skip_serializing_if = "Option::is_none")]
     pub allergy_intolerance: Option<Vec<Reference>>,
-    #[serde(
-        rename = "foodPreferenceModifier",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "foodPreferenceModifier", skip_serializing_if = "Option::is_none")]
     pub food_preference_modifier: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "excludeFoodModifier",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "excludeFoodModifier", skip_serializing_if = "Option::is_none")]
     pub exclude_food_modifier: Option<Vec<CodeableConcept>>,
     #[serde(rename = "oralDiet", skip_serializing_if = "Option::is_none")]
     pub oral_diet: Option<NutritionOrderOralDiet>,
@@ -12849,7 +12549,52 @@ pub struct NutritionOrder {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NutritionOrderEnteralFormula {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "baseFormulaType", skip_serializing_if = "Option::is_none")]
+    pub base_formula_type: Option<CodeableConcept>,
+    #[serde(rename = "baseFormulaProductName", skip_serializing_if = "Option::is_none")]
+    pub base_formula_product_name: Option<String>,
+    #[serde(rename = "additiveType", skip_serializing_if = "Option::is_none")]
+    pub additive_type: Option<CodeableConcept>,
+    #[serde(rename = "additiveProductName", skip_serializing_if = "Option::is_none")]
+    pub additive_product_name: Option<String>,
+    #[serde(rename = "caloricDensity", skip_serializing_if = "Option::is_none")]
+    pub caloric_density: Option<Quantity>,
+    #[serde(rename = "routeofAdministration", skip_serializing_if = "Option::is_none")]
+    pub routeof_administration: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
+    #[serde(rename = "maxVolumeToDeliver", skip_serializing_if = "Option::is_none")]
+    pub max_volume_to_deliver: Option<Quantity>,
+    #[serde(rename = "administrationInstruction", skip_serializing_if = "Option::is_none")]
+    pub administration_instruction: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NutritionOrderOralDietNutrient {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<Quantity>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationReferenceRange {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12873,7 +12618,7 @@ pub struct ObservationReferenceRange {
 }
 
 /// Choice of types for the value[x] field in ObservationComponent
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ObservationComponentValue {
     /// Variant accepting the Quantity type.
@@ -12911,7 +12656,7 @@ pub enum ObservationComponentValue {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -12932,7 +12677,7 @@ pub struct ObservationComponent {
 }
 
 /// Choice of types for the effective[x] field in Observation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ObservationEffective {
     /// Variant accepting the DateTime type.
@@ -12950,7 +12695,7 @@ pub enum ObservationEffective {
 }
 
 /// Choice of types for the value[x] field in Observation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ObservationValue {
     /// Variant accepting the Quantity type.
@@ -12988,7 +12733,7 @@ pub enum ObservationValue {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13055,7 +12800,8 @@ pub struct Observation {
     pub component: Option<Vec<ObservationComponent>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13081,45 +12827,46 @@ pub struct ObservationDefinition {
     pub identifier: Option<Vec<Identifier>>,
     #[serde(rename = "permittedDataType", skip_serializing_if = "Option::is_none")]
     pub permitted_data_type: Option<Vec<Code>>,
-    #[serde(
-        rename = "multipleResultsAllowed",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "multipleResultsAllowed", skip_serializing_if = "Option::is_none")]
     pub multiple_results_allowed: Option<Boolean>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<CodeableConcept>,
-    #[serde(
-        rename = "preferredReportName",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "preferredReportName", skip_serializing_if = "Option::is_none")]
     pub preferred_report_name: Option<String>,
-    #[serde(
-        rename = "quantitativeDetails",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "quantitativeDetails", skip_serializing_if = "Option::is_none")]
     pub quantitative_details: Option<ObservationDefinitionQuantitativeDetails>,
     #[serde(rename = "qualifiedInterval", skip_serializing_if = "Option::is_none")]
     pub qualified_interval: Option<Vec<ObservationDefinitionQualifiedInterval>>,
     #[serde(rename = "validCodedValueSet", skip_serializing_if = "Option::is_none")]
     pub valid_coded_value_set: Option<Reference>,
-    #[serde(
-        rename = "normalCodedValueSet",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "normalCodedValueSet", skip_serializing_if = "Option::is_none")]
     pub normal_coded_value_set: Option<Reference>,
-    #[serde(
-        rename = "abnormalCodedValueSet",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "abnormalCodedValueSet", skip_serializing_if = "Option::is_none")]
     pub abnormal_coded_value_set: Option<Reference>,
-    #[serde(
-        rename = "criticalCodedValueSet",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "criticalCodedValueSet", skip_serializing_if = "Option::is_none")]
     pub critical_coded_value_set: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationDefinitionQuantitativeDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "customaryUnit", skip_serializing_if = "Option::is_none")]
+    pub customary_unit: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<CodeableConcept>,
+    #[serde(rename = "conversionFactor", skip_serializing_if = "Option::is_none")]
+    pub conversion_factor: Option<Decimal>,
+    #[serde(rename = "decimalPrecision", skip_serializing_if = "Option::is_none")]
+    pub decimal_precision: Option<Integer>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationDefinitionQualifiedInterval {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13146,56 +12893,8 @@ pub struct ObservationDefinitionQualifiedInterval {
     pub condition: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ObservationDefinitionQuantitativeDetails {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "customaryUnit", skip_serializing_if = "Option::is_none")]
-    pub customary_unit: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unit: Option<CodeableConcept>,
-    #[serde(rename = "conversionFactor", skip_serializing_if = "Option::is_none")]
-    pub conversion_factor: Option<Decimal>,
-    #[serde(rename = "decimalPrecision", skip_serializing_if = "Option::is_none")]
-    pub decimal_precision: Option<Integer>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperationDefinitionParameter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Code,
-    #[serde(rename = "use")]
-    pub r#use: Code,
-    pub min: Integer,
-    pub max: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Code>,
-    #[serde(rename = "targetProfile", skip_serializing_if = "Option::is_none")]
-    pub target_profile: Option<Vec<Canonical>>,
-    #[serde(rename = "searchType", skip_serializing_if = "Option::is_none")]
-    pub search_type: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub binding: Option<OperationDefinitionParameterBinding>,
-    #[serde(rename = "referencedFrom", skip_serializing_if = "Option::is_none")]
-    pub referenced_from: Option<Vec<OperationDefinitionParameterReferencedFrom>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub part: Option<Vec<OperationDefinitionParameter>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13262,21 +12961,7 @@ pub struct OperationDefinition {
     pub overload: Option<Vec<OperationDefinitionOverload>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperationDefinitionParameterBinding {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    #[serde(rename = "valueSet")]
-    pub value_set: Canonical,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationDefinitionParameterReferencedFrom {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13290,7 +12975,21 @@ pub struct OperationDefinitionParameterReferencedFrom {
     pub source_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationDefinitionParameterBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub strength: Code,
+    #[serde(rename = "valueSet")]
+    pub value_set: Canonical,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationDefinitionOverload {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13305,7 +13004,59 @@ pub struct OperationDefinitionOverload {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationDefinitionParameter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Code,
+    #[serde(rename = "use")]
+    pub r#use: Code,
+    pub min: Integer,
+    pub max: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Code>,
+    #[serde(rename = "targetProfile", skip_serializing_if = "Option::is_none")]
+    pub target_profile: Option<Vec<Canonical>>,
+    #[serde(rename = "searchType", skip_serializing_if = "Option::is_none")]
+    pub search_type: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<OperationDefinitionParameterBinding>,
+    #[serde(rename = "referencedFrom", skip_serializing_if = "Option::is_none")]
+    pub referenced_from: Option<Vec<OperationDefinitionParameterReferencedFrom>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<Vec<OperationDefinitionParameter>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationOutcomeIssue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub severity: Code,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OperationOutcome {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13328,47 +13079,8 @@ pub struct OperationOutcome {
     pub issue: Option<Vec<OperationOutcomeIssue>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OperationOutcomeIssue {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub severity: Code,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub diagnostics: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<Vec<String>>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OrganizationContact {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub purpose: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<HumanName>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub telecom: Option<Vec<ContactPoint>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address: Option<Address>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Organization {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13409,7 +13121,27 @@ pub struct Organization {
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OrganizationContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<HumanName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telecom: Option<Vec<ContactPoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<Address>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OrganizationAffiliation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13436,10 +13168,7 @@ pub struct OrganizationAffiliation {
     pub period: Option<Period>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organization: Option<Reference>,
-    #[serde(
-        rename = "participatingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "participatingOrganization", skip_serializing_if = "Option::is_none")]
     pub participating_organization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<Vec<Reference>>,
@@ -13457,7 +13186,8 @@ pub struct OrganizationAffiliation {
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Parameters {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13473,7 +13203,7 @@ pub struct Parameters {
 }
 
 /// Choice of types for the value[x] field in ParametersParameter
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ParametersParameterValue {
     /// Variant accepting the Base64Binary type.
@@ -13628,7 +13358,7 @@ pub enum ParametersParameterValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ParametersParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13646,7 +13376,47 @@ pub struct ParametersParameter {
     pub part: Option<Vec<ParametersParameter>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PatientLink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub other: Reference,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PatientContact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<HumanName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telecom: Option<Vec<ContactPoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gender: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PatientCommunication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13661,7 +13431,7 @@ pub struct PatientCommunication {
 }
 
 /// Choice of types for the deceased[x] field in Patient
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PatientDeceased {
     /// Variant accepting the Boolean type.
@@ -13673,7 +13443,7 @@ pub enum PatientDeceased {
 }
 
 /// Choice of types for the multipleBirth[x] field in Patient
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PatientMultipleBirth {
     /// Variant accepting the Boolean type.
@@ -13684,7 +13454,7 @@ pub enum PatientMultipleBirth {
     Integer(Integer),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Patient {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13729,60 +13499,16 @@ pub struct Patient {
     pub contact: Option<Vec<PatientContact>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub communication: Option<Vec<PatientCommunication>>,
-    #[serde(
-        rename = "generalPractitioner",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "generalPractitioner", skip_serializing_if = "Option::is_none")]
     pub general_practitioner: Option<Vec<Reference>>,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<Vec<PatientLink>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PatientLink {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub other: Reference,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PatientContact {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<HumanName>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub telecom: Option<Vec<ContactPoint>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub address: Option<Address>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gender: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub organization: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentNotice {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13822,7 +13548,8 @@ pub struct PaymentNotice {
     pub payment_status: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentReconciliation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13871,7 +13598,7 @@ pub struct PaymentReconciliation {
     pub process_note: Option<Vec<PaymentReconciliationProcessNote>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentReconciliationDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13902,7 +13629,7 @@ pub struct PaymentReconciliationDetail {
     pub amount: Option<Money>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentReconciliationProcessNote {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13917,7 +13644,8 @@ pub struct PaymentReconciliationProcessNote {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PersonLink {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13931,7 +13659,7 @@ pub struct PersonLink {
     pub assurance: Option<Code>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Person {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -13964,10 +13692,7 @@ pub struct Person {
     pub address: Option<Vec<Address>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub photo: Option<Attachment>,
-    #[serde(
-        rename = "managingOrganization",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "managingOrganization", skip_serializing_if = "Option::is_none")]
     pub managing_organization: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<Boolean>,
@@ -13975,252 +13700,9 @@ pub struct Person {
     pub link: Option<Vec<PersonLink>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionActionDynamicValue {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<Expression>,
-}
-
-/// Choice of types for the subject[x] field in PlanDefinitionAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionSubject {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "subjectCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "subjectReference")]
-    Reference(Reference),
-}
-
-/// Choice of types for the timing[x] field in PlanDefinitionAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionTiming {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timingDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Age type.
-    #[serde(rename = "timingAge")]
-    Age(Age),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timingPeriod")]
-    Period(Period),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "timingDuration")]
-    Duration(Duration),
-    /// Variant accepting the Range type.
-    #[serde(rename = "timingRange")]
-    Range(Range),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "timingTiming")]
-    Timing(Timing),
-}
-
-/// Choice of types for the definition[x] field in PlanDefinitionAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionDefinition {
-    /// Variant accepting the Canonical type.
-    #[serde(rename = "definitionCanonical")]
-    Canonical(Canonical),
-    /// Variant accepting the Uri type.
-    #[serde(rename = "definitionUri")]
-    Uri(Uri),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "textEquivalent", skip_serializing_if = "Option::is_none")]
-    pub text_equivalent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<Vec<RelatedArtifact>>,
-    #[serde(rename = "goalId", skip_serializing_if = "Option::is_none")]
-    pub goal_id: Option<Vec<Id>>,
-    #[serde(flatten)]
-    pub subject: Option<PlanDefinitionActionSubject>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger: Option<Vec<TriggerDefinition>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition: Option<Vec<PlanDefinitionActionCondition>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Vec<DataRequirement>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<Vec<DataRequirement>>,
-    #[serde(rename = "relatedAction", skip_serializing_if = "Option::is_none")]
-    pub related_action: Option<Vec<PlanDefinitionActionRelatedAction>>,
-    #[serde(flatten)]
-    pub timing: Option<PlanDefinitionActionTiming>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub participant: Option<Vec<PlanDefinitionActionParticipant>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "groupingBehavior", skip_serializing_if = "Option::is_none")]
-    pub grouping_behavior: Option<Code>,
-    #[serde(rename = "selectionBehavior", skip_serializing_if = "Option::is_none")]
-    pub selection_behavior: Option<Code>,
-    #[serde(rename = "requiredBehavior", skip_serializing_if = "Option::is_none")]
-    pub required_behavior: Option<Code>,
-    #[serde(rename = "precheckBehavior", skip_serializing_if = "Option::is_none")]
-    pub precheck_behavior: Option<Code>,
-    #[serde(
-        rename = "cardinalityBehavior",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub cardinality_behavior: Option<Code>,
-    #[serde(flatten)]
-    pub definition: Option<PlanDefinitionActionDefinition>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transform: Option<Canonical>,
-    #[serde(rename = "dynamicValue", skip_serializing_if = "Option::is_none")]
-    pub dynamic_value: Option<Vec<PlanDefinitionActionDynamicValue>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<PlanDefinitionAction>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionGoal {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
-    pub description: CodeableConcept,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub addresses: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<Vec<RelatedArtifact>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Vec<PlanDefinitionGoalTarget>>,
-}
-
-/// Choice of types for the detail[x] field in PlanDefinitionGoalTarget
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionGoalTargetDetail {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "detailQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "detailRange")]
-    Range(Range),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "detailCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionGoalTarget {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub measure: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub detail: Option<PlanDefinitionGoalTargetDetail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub due: Option<Duration>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionActionCondition {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub kind: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<Expression>,
-}
-
-/// Choice of types for the offset[x] field in PlanDefinitionActionRelatedAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionRelatedActionOffset {
-    /// Variant accepting the Duration type.
-    #[serde(rename = "offsetDuration")]
-    Duration(Duration),
-    /// Variant accepting the Range type.
-    #[serde(rename = "offsetRange")]
-    Range(Range),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionActionRelatedAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "actionId")]
-    pub action_id: Id,
-    pub relationship: Code,
-    #[serde(flatten)]
-    pub offset: Option<PlanDefinitionActionRelatedActionOffset>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanDefinitionActionParticipant {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-}
 
 /// Choice of types for the subject[x] field in PlanDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PlanDefinitionSubject {
     /// Variant accepting the CodeableConcept type.
@@ -14231,7 +13713,7 @@ pub enum PlanDefinitionSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PlanDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14313,9 +13795,24 @@ pub struct PlanDefinition {
     pub action: Option<Vec<PlanDefinitionAction>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the detail[x] field in PlanDefinitionGoalTarget
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionGoalTargetDetail {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "detailQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "detailRange")]
+    Range(Range),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "detailCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PractitionerQualification {
+pub struct PlanDefinitionGoalTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14323,15 +13820,224 @@ pub struct PractitionerQualification {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Vec<Identifier>>,
-    pub code: CodeableConcept,
+    pub measure: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub detail: Option<PlanDefinitionGoalTargetDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<Period>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issuer: Option<Reference>,
+    pub due: Option<Duration>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the offset[x] field in PlanDefinitionActionRelatedAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionRelatedActionOffset {
+    /// Variant accepting the Duration type.
+    #[serde(rename = "offsetDuration")]
+    Duration(Duration),
+    /// Variant accepting the Range type.
+    #[serde(rename = "offsetRange")]
+    Range(Range),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionActionRelatedAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "actionId")]
+    pub action_id: Id,
+    pub relationship: Code,
+    #[serde(flatten)]
+    pub offset: Option<PlanDefinitionActionRelatedActionOffset>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionActionCondition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub kind: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<Expression>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionActionDynamicValue {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<Expression>,
+}
+
+/// Choice of types for the subject[x] field in PlanDefinitionAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionSubject {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "subjectCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "subjectReference")]
+    Reference(Reference),
+}
+
+/// Choice of types for the timing[x] field in PlanDefinitionAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionTiming {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timingDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Age type.
+    #[serde(rename = "timingAge")]
+    Age(Age),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timingPeriod")]
+    Period(Period),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "timingDuration")]
+    Duration(Duration),
+    /// Variant accepting the Range type.
+    #[serde(rename = "timingRange")]
+    Range(Range),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "timingTiming")]
+    Timing(Timing),
+}
+
+/// Choice of types for the definition[x] field in PlanDefinitionAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionDefinition {
+    /// Variant accepting the Canonical type.
+    #[serde(rename = "definitionCanonical")]
+    Canonical(Canonical),
+    /// Variant accepting the Uri type.
+    #[serde(rename = "definitionUri")]
+    Uri(Uri),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "textEquivalent", skip_serializing_if = "Option::is_none")]
+    pub text_equivalent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<Vec<RelatedArtifact>>,
+    #[serde(rename = "goalId", skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<Vec<Id>>,
+    #[serde(flatten)]
+    pub subject: Option<PlanDefinitionActionSubject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<Vec<TriggerDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<Vec<PlanDefinitionActionCondition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<DataRequirement>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<DataRequirement>>,
+    #[serde(rename = "relatedAction", skip_serializing_if = "Option::is_none")]
+    pub related_action: Option<Vec<PlanDefinitionActionRelatedAction>>,
+    #[serde(flatten)]
+    pub timing: Option<PlanDefinitionActionTiming>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant: Option<Vec<PlanDefinitionActionParticipant>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "groupingBehavior", skip_serializing_if = "Option::is_none")]
+    pub grouping_behavior: Option<Code>,
+    #[serde(rename = "selectionBehavior", skip_serializing_if = "Option::is_none")]
+    pub selection_behavior: Option<Code>,
+    #[serde(rename = "requiredBehavior", skip_serializing_if = "Option::is_none")]
+    pub required_behavior: Option<Code>,
+    #[serde(rename = "precheckBehavior", skip_serializing_if = "Option::is_none")]
+    pub precheck_behavior: Option<Code>,
+    #[serde(rename = "cardinalityBehavior", skip_serializing_if = "Option::is_none")]
+    pub cardinality_behavior: Option<Code>,
+    #[serde(flatten)]
+    pub definition: Option<PlanDefinitionActionDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Canonical>,
+    #[serde(rename = "dynamicValue", skip_serializing_if = "Option::is_none")]
+    pub dynamic_value: Option<Vec<PlanDefinitionActionDynamicValue>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<PlanDefinitionAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionGoal {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<CodeableConcept>,
+    pub description: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<Vec<RelatedArtifact>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Vec<PlanDefinitionGoalTarget>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDefinitionActionParticipant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<CodeableConcept>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Practitioner {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14372,7 +14078,40 @@ pub struct Practitioner {
     pub communication: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PractitionerQualification {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Vec<Identifier>>,
+    pub code: CodeableConcept,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<Period>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<Reference>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PractitionerRoleNotAvailable {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub during: Option<Period>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PractitionerRole {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14415,16 +14154,13 @@ pub struct PractitionerRole {
     pub available_time: Option<Vec<PractitionerRoleAvailableTime>>,
     #[serde(rename = "notAvailable", skip_serializing_if = "Option::is_none")]
     pub not_available: Option<Vec<PractitionerRoleNotAvailable>>,
-    #[serde(
-        rename = "availabilityExceptions",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "availabilityExceptions", skip_serializing_if = "Option::is_none")]
     pub availability_exceptions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PractitionerRoleAvailableTime {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14443,21 +14179,8 @@ pub struct PractitionerRoleAvailableTime {
     pub available_end_time: Option<Time>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PractitionerRoleNotAvailable {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub during: Option<Period>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcedurePerformer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14473,7 +14196,7 @@ pub struct ProcedurePerformer {
     pub on_behalf_of: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProcedureFocalDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14488,7 +14211,7 @@ pub struct ProcedureFocalDevice {
 }
 
 /// Choice of types for the performed[x] field in Procedure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ProcedurePerformed {
     /// Variant accepting the DateTime type.
@@ -14508,7 +14231,7 @@ pub enum ProcedurePerformed {
     Range(Range),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Procedure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14529,10 +14252,7 @@ pub struct Procedure {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -14586,23 +14306,9 @@ pub struct Procedure {
     pub used_code: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProvenanceEntity {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Code,
-    pub what: Reference,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<Vec<ProvenanceAgent>>,
-}
 
 /// Choice of types for the occurred[x] field in Provenance
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ProvenanceOccurred {
     /// Variant accepting the Period type.
@@ -14613,7 +14319,7 @@ pub enum ProvenanceOccurred {
     DateTime(DateTime),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14653,7 +14359,7 @@ pub struct Provenance {
     pub signature: Option<Vec<Signature>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14671,8 +14377,67 @@ pub struct ProvenanceAgent {
     pub on_behalf_of: Option<Reference>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenanceEntity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub role: Code,
+    pub what: Reference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Vec<ProvenanceAgent>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionnaireItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "linkId")]
+    pub link_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Vec<Coding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    #[serde(rename = "enableWhen", skip_serializing_if = "Option::is_none")]
+    pub enable_when: Option<Vec<QuestionnaireItemEnableWhen>>,
+    #[serde(rename = "enableBehavior", skip_serializing_if = "Option::is_none")]
+    pub enable_behavior: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<Boolean>,
+    #[serde(rename = "readOnly", skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<Boolean>,
+    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<Integer>,
+    #[serde(rename = "answerValueSet", skip_serializing_if = "Option::is_none")]
+    pub answer_value_set: Option<Canonical>,
+    #[serde(rename = "answerOption", skip_serializing_if = "Option::is_none")]
+    pub answer_option: Option<Vec<QuestionnaireItemAnswerOption>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial: Option<Vec<QuestionnaireItemInitial>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<Vec<QuestionnaireItem>>,
+}
+
 /// Choice of types for the answer[x] field in QuestionnaireItemEnableWhen
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum QuestionnaireItemEnableWhenAnswer {
     /// Variant accepting the Boolean type.
@@ -14707,7 +14472,7 @@ pub enum QuestionnaireItemEnableWhenAnswer {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionnaireItemEnableWhen {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14722,101 +14487,7 @@ pub struct QuestionnaireItemEnableWhen {
     pub answer: Option<QuestionnaireItemEnableWhenAnswer>,
 }
 
-/// Choice of types for the value[x] field in QuestionnaireItemInitial
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum QuestionnaireItemInitialValue {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "valueDecimal")]
-    Decimal(Decimal),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Date type.
-    #[serde(rename = "valueDate")]
-    Date(Date),
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "valueDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Time type.
-    #[serde(rename = "valueTime")]
-    Time(Time),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Uri type.
-    #[serde(rename = "valueUri")]
-    Uri(Uri),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "valueCoding")]
-    Coding(Coding),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionnaireItemInitial {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub value: Option<QuestionnaireItemInitialValue>,
-}
-
-/// Choice of types for the value[x] field in QuestionnaireItemAnswerOption
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum QuestionnaireItemAnswerOptionValue {
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Date type.
-    #[serde(rename = "valueDate")]
-    Date(Date),
-    /// Variant accepting the Time type.
-    #[serde(rename = "valueTime")]
-    Time(Time),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "valueCoding")]
-    Coding(Coding),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionnaireItemAnswerOption {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub value: Option<QuestionnaireItemAnswerOptionValue>,
-    #[serde(rename = "initialSelected", skip_serializing_if = "Option::is_none")]
-    pub initial_selected: Option<Boolean>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Questionnaire {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14880,50 +14551,102 @@ pub struct Questionnaire {
     pub item: Option<Vec<QuestionnaireItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the value[x] field in QuestionnaireItemInitial
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionnaireItemInitialValue {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "valueDecimal")]
+    Decimal(Decimal),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Date type.
+    #[serde(rename = "valueDate")]
+    Date(Date),
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "valueDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Time type.
+    #[serde(rename = "valueTime")]
+    Time(Time),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Uri type.
+    #[serde(rename = "valueUri")]
+    Uri(Uri),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "valueCoding")]
+    Coding(Coding),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct QuestionnaireItem {
+pub struct QuestionnaireItemInitial {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "linkId")]
-    pub link_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definition: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Vec<Coding>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    #[serde(rename = "enableWhen", skip_serializing_if = "Option::is_none")]
-    pub enable_when: Option<Vec<QuestionnaireItemEnableWhen>>,
-    #[serde(rename = "enableBehavior", skip_serializing_if = "Option::is_none")]
-    pub enable_behavior: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repeats: Option<Boolean>,
-    #[serde(rename = "readOnly", skip_serializing_if = "Option::is_none")]
-    pub read_only: Option<Boolean>,
-    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
-    pub max_length: Option<Integer>,
-    #[serde(rename = "answerValueSet", skip_serializing_if = "Option::is_none")]
-    pub answer_value_set: Option<Canonical>,
-    #[serde(rename = "answerOption", skip_serializing_if = "Option::is_none")]
-    pub answer_option: Option<Vec<QuestionnaireItemAnswerOption>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub initial: Option<Vec<QuestionnaireItemInitial>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item: Option<Vec<QuestionnaireItem>>,
+    #[serde(flatten)]
+    pub value: Option<QuestionnaireItemInitialValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the value[x] field in QuestionnaireItemAnswerOption
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionnaireItemAnswerOptionValue {
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Date type.
+    #[serde(rename = "valueDate")]
+    Date(Date),
+    /// Variant accepting the Time type.
+    #[serde(rename = "valueTime")]
+    Time(Time),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "valueCoding")]
+    Coding(Coding),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionnaireItemAnswerOption {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub value: Option<QuestionnaireItemAnswerOptionValue>,
+    #[serde(rename = "initialSelected", skip_serializing_if = "Option::is_none")]
+    pub initial_selected: Option<Boolean>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionnaireResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14965,29 +14688,8 @@ pub struct QuestionnaireResponse {
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QuestionnaireResponseItem {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "linkId")]
-    pub link_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definition: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub item: Option<Vec<QuestionnaireResponseItem>>,
-}
-
 /// Choice of types for the value[x] field in QuestionnaireResponseItemAnswer
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum QuestionnaireResponseItemAnswerValue {
     /// Variant accepting the Boolean type.
@@ -15028,7 +14730,7 @@ pub enum QuestionnaireResponseItemAnswerValue {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionnaireResponseItemAnswer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15043,7 +14745,29 @@ pub struct QuestionnaireResponseItemAnswer {
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuestionnaireResponseItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "linkId")]
+    pub link_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<Vec<QuestionnaireResponseItem>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RelatedPersonCommunication {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15057,7 +14781,7 @@ pub struct RelatedPersonCommunication {
     pub preferred: Option<Boolean>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RelatedPerson {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15101,7 +14825,63 @@ pub struct RelatedPerson {
     pub communication: Option<Vec<RelatedPersonCommunication>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules", skip_serializing_if = "Option::is_none")]
+    pub implicit_rules: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Narrative>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contained: Option<Vec<Resource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
+    pub instantiates_canonical: Option<Vec<Canonical>>,
+    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
+    pub instantiates_uri: Option<Vec<Uri>>,
+    #[serde(rename = "basedOn", skip_serializing_if = "Option::is_none")]
+    pub based_on: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Vec<Reference>>,
+    #[serde(rename = "groupIdentifier", skip_serializing_if = "Option::is_none")]
+    pub group_identifier: Option<Identifier>,
+    pub status: Code,
+    pub intent: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encounter: Option<Reference>,
+    #[serde(rename = "authoredOn", skip_serializing_if = "Option::is_none")]
+    pub authored_on: Option<DateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<Reference>,
+    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
+    pub reason_reference: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<Vec<Annotation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<RequestGroupAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestGroupActionCondition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15115,8 +14895,36 @@ pub struct RequestGroupActionCondition {
     pub expression: Option<Expression>,
 }
 
+/// Choice of types for the offset[x] field in RequestGroupActionRelatedAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RequestGroupActionRelatedActionOffset {
+    /// Variant accepting the Duration type.
+    #[serde(rename = "offsetDuration")]
+    Duration(Duration),
+    /// Variant accepting the Range type.
+    #[serde(rename = "offsetRange")]
+    Range(Range),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RequestGroupActionRelatedAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "actionId")]
+    pub action_id: Id,
+    pub relationship: Code,
+    #[serde(flatten)]
+    pub offset: Option<RequestGroupActionRelatedActionOffset>,
+}
+
 /// Choice of types for the timing[x] field in RequestGroupAction
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RequestGroupActionTiming {
     /// Variant accepting the DateTime type.
@@ -15139,7 +14947,7 @@ pub enum RequestGroupActionTiming {
     Timing(Timing),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestGroupAction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15180,10 +14988,7 @@ pub struct RequestGroupAction {
     pub required_behavior: Option<Code>,
     #[serde(rename = "precheckBehavior", skip_serializing_if = "Option::is_none")]
     pub precheck_behavior: Option<Code>,
-    #[serde(
-        rename = "cardinalityBehavior",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "cardinalityBehavior", skip_serializing_if = "Option::is_none")]
     pub cardinality_behavior: Option<Code>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<Reference>,
@@ -15191,94 +14996,9 @@ pub struct RequestGroupAction {
     pub action: Option<Vec<RequestGroupAction>>,
 }
 
-/// Choice of types for the offset[x] field in RequestGroupActionRelatedAction
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RequestGroupActionRelatedActionOffset {
-    /// Variant accepting the Duration type.
-    #[serde(rename = "offsetDuration")]
-    Duration(Duration),
-    /// Variant accepting the Range type.
-    #[serde(rename = "offsetRange")]
-    Range(Range),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestGroupActionRelatedAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "actionId")]
-    pub action_id: Id,
-    pub relationship: Code,
-    #[serde(flatten)]
-    pub offset: Option<RequestGroupActionRelatedActionOffset>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RequestGroup {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules", skip_serializing_if = "Option::is_none")]
-    pub implicit_rules: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<Narrative>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contained: Option<Vec<Resource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub instantiates_canonical: Option<Vec<Canonical>>,
-    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
-    pub instantiates_uri: Option<Vec<Uri>>,
-    #[serde(rename = "basedOn", skip_serializing_if = "Option::is_none")]
-    pub based_on: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replaces: Option<Vec<Reference>>,
-    #[serde(rename = "groupIdentifier", skip_serializing_if = "Option::is_none")]
-    pub group_identifier: Option<Identifier>,
-    pub status: Code,
-    pub intent: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subject: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encounter: Option<Reference>,
-    #[serde(rename = "authoredOn", skip_serializing_if = "Option::is_none")]
-    pub authored_on: Option<DateTime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub author: Option<Reference>,
-    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
-    pub reason_reference: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Vec<Annotation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<RequestGroupAction>>,
-}
 
 /// Choice of types for the subject[x] field in ResearchDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ResearchDefinitionSubject {
     /// Variant accepting the CodeableConcept type.
@@ -15289,7 +15009,7 @@ pub enum ResearchDefinitionSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15370,17 +15090,104 @@ pub struct ResearchDefinition {
     pub population: Reference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exposure: Option<Reference>,
-    #[serde(
-        rename = "exposureAlternative",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "exposureAlternative", skip_serializing_if = "Option::is_none")]
     pub exposure_alternative: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Reference>,
 }
 
+
+/// Choice of types for the definition[x] field in ResearchElementDefinitionCharacteristic
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResearchElementDefinitionCharacteristicDefinition {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "definitionCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Canonical type.
+    #[serde(rename = "definitionCanonical")]
+    Canonical(Canonical),
+    /// Variant accepting the Expression type.
+    #[serde(rename = "definitionExpression")]
+    Expression(Expression),
+    /// Variant accepting the DataRequirement type.
+    #[serde(rename = "definitionDataRequirement")]
+    DataRequirement(DataRequirement),
+}
+
+/// Choice of types for the studyEffective[x] field in ResearchElementDefinitionCharacteristic
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResearchElementDefinitionCharacteristicStudyEffective {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "studyEffectiveDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "studyEffectivePeriod")]
+    Period(Period),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "studyEffectiveDuration")]
+    Duration(Duration),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "studyEffectiveTiming")]
+    Timing(Timing),
+}
+
+/// Choice of types for the participantEffective[x] field in ResearchElementDefinitionCharacteristic
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResearchElementDefinitionCharacteristicParticipantEffective {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "participantEffectiveDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "participantEffectivePeriod")]
+    Period(Period),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "participantEffectiveDuration")]
+    Duration(Duration),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "participantEffectiveTiming")]
+    Timing(Timing),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResearchElementDefinitionCharacteristic {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub definition: Option<ResearchElementDefinitionCharacteristicDefinition>,
+    #[serde(rename = "usageContext", skip_serializing_if = "Option::is_none")]
+    pub usage_context: Option<Vec<UsageContext>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Boolean>,
+    #[serde(rename = "unitOfMeasure", skip_serializing_if = "Option::is_none")]
+    pub unit_of_measure: Option<CodeableConcept>,
+    #[serde(rename = "studyEffectiveDescription", skip_serializing_if = "Option::is_none")]
+    pub study_effective_description: Option<String>,
+    #[serde(flatten)]
+    pub study_effective: Option<ResearchElementDefinitionCharacteristicStudyEffective>,
+    #[serde(rename = "studyEffectiveTimeFromStart", skip_serializing_if = "Option::is_none")]
+    pub study_effective_time_from_start: Option<Duration>,
+    #[serde(rename = "studyEffectiveGroupMeasure", skip_serializing_if = "Option::is_none")]
+    pub study_effective_group_measure: Option<Code>,
+    #[serde(rename = "participantEffectiveDescription", skip_serializing_if = "Option::is_none")]
+    pub participant_effective_description: Option<String>,
+    #[serde(flatten)]
+    pub participant_effective: Option<ResearchElementDefinitionCharacteristicParticipantEffective>,
+    #[serde(rename = "participantEffectiveTimeFromStart", skip_serializing_if = "Option::is_none")]
+    pub participant_effective_time_from_start: Option<Duration>,
+    #[serde(rename = "participantEffectiveGroupMeasure", skip_serializing_if = "Option::is_none")]
+    pub participant_effective_group_measure: Option<Code>,
+}
+
 /// Choice of types for the subject[x] field in ResearchElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ResearchElementDefinitionSubject {
     /// Variant accepting the CodeableConcept type.
@@ -15391,7 +15198,7 @@ pub enum ResearchElementDefinitionSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchElementDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15477,129 +15284,24 @@ pub struct ResearchElementDefinition {
     pub characteristic: Option<Vec<ResearchElementDefinitionCharacteristic>>,
 }
 
-/// Choice of types for the definition[x] field in ResearchElementDefinitionCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ResearchElementDefinitionCharacteristicDefinition {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "definitionCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Canonical type.
-    #[serde(rename = "definitionCanonical")]
-    Canonical(Canonical),
-    /// Variant accepting the Expression type.
-    #[serde(rename = "definitionExpression")]
-    Expression(Expression),
-    /// Variant accepting the DataRequirement type.
-    #[serde(rename = "definitionDataRequirement")]
-    DataRequirement(DataRequirement),
-}
 
-/// Choice of types for the studyEffective[x] field in ResearchElementDefinitionCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ResearchElementDefinitionCharacteristicStudyEffective {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "studyEffectiveDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "studyEffectivePeriod")]
-    Period(Period),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "studyEffectiveDuration")]
-    Duration(Duration),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "studyEffectiveTiming")]
-    Timing(Timing),
-}
-
-/// Choice of types for the participantEffective[x] field in ResearchElementDefinitionCharacteristic
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ResearchElementDefinitionCharacteristicParticipantEffective {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "participantEffectiveDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "participantEffectivePeriod")]
-    Period(Period),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "participantEffectiveDuration")]
-    Duration(Duration),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "participantEffectiveTiming")]
-    Timing(Timing),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ResearchElementDefinitionCharacteristic {
+pub struct ResearchStudyArm {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub definition: Option<ResearchElementDefinitionCharacteristicDefinition>,
-    #[serde(rename = "usageContext", skip_serializing_if = "Option::is_none")]
-    pub usage_context: Option<Vec<UsageContext>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<Boolean>,
-    #[serde(rename = "unitOfMeasure", skip_serializing_if = "Option::is_none")]
-    pub unit_of_measure: Option<CodeableConcept>,
-    #[serde(
-        rename = "studyEffectiveDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub study_effective_description: Option<String>,
-    #[serde(flatten)]
-    pub study_effective: Option<ResearchElementDefinitionCharacteristicStudyEffective>,
-    #[serde(
-        rename = "studyEffectiveTimeFromStart",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub study_effective_time_from_start: Option<Duration>,
-    #[serde(
-        rename = "studyEffectiveGroupMeasure",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub study_effective_group_measure: Option<Code>,
-    #[serde(
-        rename = "participantEffectiveDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub participant_effective_description: Option<String>,
-    #[serde(flatten)]
-    pub participant_effective: Option<ResearchElementDefinitionCharacteristicParticipantEffective>,
-    #[serde(
-        rename = "participantEffectiveTimeFromStart",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub participant_effective_time_from_start: Option<Duration>,
-    #[serde(
-        rename = "participantEffectiveGroupMeasure",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub participant_effective_group_measure: Option<Code>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResearchStudyObjective {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub name: String,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchStudy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15653,10 +15355,7 @@ pub struct ResearchStudy {
     pub period: Option<Period>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sponsor: Option<Reference>,
-    #[serde(
-        rename = "principalInvestigator",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "principalInvestigator", skip_serializing_if = "Option::is_none")]
     pub principal_investigator: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site: Option<Vec<Reference>>,
@@ -15670,23 +15369,23 @@ pub struct ResearchStudy {
     pub objective: Option<Vec<ResearchStudyObjective>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ResearchStudyArm {
+pub struct ResearchStudyObjective {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResearchSubject {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15720,8 +15419,9 @@ pub struct ResearchSubject {
     pub consent: Option<Reference>,
 }
 
+
 /// Choice of types for the occurrence[x] field in RiskAssessment
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RiskAssessmentOccurrence {
     /// Variant accepting the DateTime type.
@@ -15732,7 +15432,7 @@ pub enum RiskAssessmentOccurrence {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskAssessment {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15786,7 +15486,7 @@ pub struct RiskAssessment {
 }
 
 /// Choice of types for the probability[x] field in RiskAssessmentPrediction
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RiskAssessmentPredictionProbability {
     /// Variant accepting the Decimal type.
@@ -15798,7 +15498,7 @@ pub enum RiskAssessmentPredictionProbability {
 }
 
 /// Choice of types for the when[x] field in RiskAssessmentPrediction
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RiskAssessmentPredictionWhen {
     /// Variant accepting the Period type.
@@ -15809,7 +15509,7 @@ pub enum RiskAssessmentPredictionWhen {
     Range(Range),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskAssessmentPrediction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15832,7 +15532,8 @@ pub struct RiskAssessmentPrediction {
     pub rationale: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15849,26 +15550,41 @@ pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
+pub struct RiskEvidenceSynthesisCertainty {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<Decimal>,
+    pub rating: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub from: Option<Decimal>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to: Option<Decimal>,
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "certaintySubcomponent", skip_serializing_if = "Option::is_none")]
+    pub certainty_subcomponent: Option<Vec<RiskEvidenceSynthesisCertaintyCertaintySubcomponent>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RiskEvidenceSynthesisSampleSize {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "numberOfStudies", skip_serializing_if = "Option::is_none")]
+    pub number_of_studies: Option<Integer>,
+    #[serde(rename = "numberOfParticipants", skip_serializing_if = "Option::is_none")]
+    pub number_of_participants: Option<Integer>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskEvidenceSynthesis {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15948,27 +15664,7 @@ pub struct RiskEvidenceSynthesis {
     pub certainty: Option<Vec<RiskEvidenceSynthesisCertainty>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RiskEvidenceSynthesisCertainty {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rating: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Vec<Annotation>>,
-    #[serde(
-        rename = "certaintySubcomponent",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub certainty_subcomponent: Option<Vec<RiskEvidenceSynthesisCertaintyCertaintySubcomponent>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RiskEvidenceSynthesisRiskEstimate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15993,27 +15689,27 @@ pub struct RiskEvidenceSynthesisRiskEstimate {
     pub precision_estimate: Option<Vec<RiskEvidenceSynthesisRiskEstimatePrecisionEstimate>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct RiskEvidenceSynthesisSampleSize {
+pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "numberOfStudies", skip_serializing_if = "Option::is_none")]
-    pub number_of_studies: Option<Integer>,
-    #[serde(
-        rename = "numberOfParticipants",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub number_of_participants: Option<Integer>,
+    pub level: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<Decimal>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16050,20 +15746,8 @@ pub struct Schedule {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SearchParameterComponent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub definition: Canonical,
-    pub expression: String,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SearchParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16131,8 +15815,22 @@ pub struct SearchParameter {
     pub component: Option<Vec<SearchParameterComponent>>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SearchParameterComponent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub definition: Canonical,
+    pub expression: String,
+}
+
+
 /// Choice of types for the quantity[x] field in ServiceRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ServiceRequestQuantity {
     /// Variant accepting the Quantity type.
@@ -16147,7 +15845,7 @@ pub enum ServiceRequestQuantity {
 }
 
 /// Choice of types for the occurrence[x] field in ServiceRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ServiceRequestOccurrence {
     /// Variant accepting the DateTime type.
@@ -16162,7 +15860,7 @@ pub enum ServiceRequestOccurrence {
 }
 
 /// Choice of types for the asNeeded[x] field in ServiceRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ServiceRequestAsNeeded {
     /// Variant accepting the Boolean type.
@@ -16173,7 +15871,7 @@ pub enum ServiceRequestAsNeeded {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16194,10 +15892,7 @@ pub struct ServiceRequest {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
     pub instantiates_canonical: Option<Vec<Canonical>>,
     #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
     pub instantiates_uri: Option<Vec<Uri>>,
@@ -16260,7 +15955,8 @@ pub struct ServiceRequest {
     pub relevant_history: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Slot {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16299,7 +15995,39 @@ pub struct Slot {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+/// Choice of types for the time[x] field in SpecimenProcessing
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecimenProcessingTime {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timeDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timePeriod")]
+    Period(Period),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecimenProcessing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additive: Option<Vec<Reference>>,
+    #[serde(flatten)]
+    pub time: Option<SpecimenProcessingTime>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Specimen {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16320,10 +16048,7 @@ pub struct Specimen {
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "accessionIdentifier",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "accessionIdentifier", skip_serializing_if = "Option::is_none")]
     pub accession_identifier: Option<Identifier>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<Code>,
@@ -16350,7 +16075,7 @@ pub struct Specimen {
 }
 
 /// Choice of types for the collected[x] field in SpecimenCollection
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SpecimenCollectionCollected {
     /// Variant accepting the DateTime type.
@@ -16362,7 +16087,7 @@ pub enum SpecimenCollectionCollected {
 }
 
 /// Choice of types for the fastingStatus[x] field in SpecimenCollection
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SpecimenCollectionFastingStatus {
     /// Variant accepting the CodeableConcept type.
@@ -16373,7 +16098,7 @@ pub enum SpecimenCollectionFastingStatus {
     Duration(Duration),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpecimenCollection {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16398,39 +16123,8 @@ pub struct SpecimenCollection {
     pub fasting_status: Option<SpecimenCollectionFastingStatus>,
 }
 
-/// Choice of types for the time[x] field in SpecimenProcessing
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SpecimenProcessingTime {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timeDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timePeriod")]
-    Period(Period),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpecimenProcessing {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub procedure: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additive: Option<Vec<Reference>>,
-    #[serde(flatten)]
-    pub time: Option<SpecimenProcessingTime>,
-}
-
 /// Choice of types for the additive[x] field in SpecimenContainer
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SpecimenContainerAdditive {
     /// Variant accepting the CodeableConcept type.
@@ -16441,7 +16135,7 @@ pub enum SpecimenContainerAdditive {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpecimenContainer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16464,46 +16158,34 @@ pub struct SpecimenContainer {
     pub additive: Option<SpecimenContainerAdditive>,
 }
 
-/// Choice of types for the minimumVolume[x] field in SpecimenDefinitionTypeTestedContainer
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SpecimenDefinitionTypeTestedContainerMinimumVolume {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "minimumVolumeQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the String type.
-    #[serde(rename = "minimumVolumeString")]
-    String(String),
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SpecimenDefinitionTypeTestedContainer {
+pub struct SpecimenDefinitionTypeTested {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub material: Option<CodeableConcept>,
+    #[serde(rename = "isDerived", skip_serializing_if = "Option::is_none")]
+    pub is_derived: Option<Boolean>,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub r#type: Option<CodeableConcept>,
+    pub preference: Code,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cap: Option<CodeableConcept>,
+    pub container: Option<SpecimenDefinitionTypeTestedContainer>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub requirement: Option<String>,
+    #[serde(rename = "retentionTime", skip_serializing_if = "Option::is_none")]
+    pub retention_time: Option<Duration>,
+    #[serde(rename = "rejectionCriterion", skip_serializing_if = "Option::is_none")]
+    pub rejection_criterion: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub capacity: Option<Quantity>,
-    #[serde(flatten)]
-    pub minimum_volume: Option<SpecimenDefinitionTypeTestedContainerMinimumVolume>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub additive: Option<Vec<SpecimenDefinitionTypeTestedContainerAdditive>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preparation: Option<String>,
+    pub handling: Option<Vec<SpecimenDefinitionTypeTestedHandling>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpecimenDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16536,56 +16218,8 @@ pub struct SpecimenDefinition {
     pub type_tested: Option<Vec<SpecimenDefinitionTypeTested>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpecimenDefinitionTypeTestedHandling {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "temperatureQualifier",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub temperature_qualifier: Option<CodeableConcept>,
-    #[serde(rename = "temperatureRange", skip_serializing_if = "Option::is_none")]
-    pub temperature_range: Option<Range>,
-    #[serde(rename = "maxDuration", skip_serializing_if = "Option::is_none")]
-    pub max_duration: Option<Duration>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instruction: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpecimenDefinitionTypeTested {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "isDerived", skip_serializing_if = "Option::is_none")]
-    pub is_derived: Option<Boolean>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    pub preference: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub container: Option<SpecimenDefinitionTypeTestedContainer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requirement: Option<String>,
-    #[serde(rename = "retentionTime", skip_serializing_if = "Option::is_none")]
-    pub retention_time: Option<Duration>,
-    #[serde(rename = "rejectionCriterion", skip_serializing_if = "Option::is_none")]
-    pub rejection_criterion: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub handling: Option<Vec<SpecimenDefinitionTypeTestedHandling>>,
-}
-
 /// Choice of types for the additive[x] field in SpecimenDefinitionTypeTestedContainerAdditive
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SpecimenDefinitionTypeTestedContainerAdditiveAdditive {
     /// Variant accepting the CodeableConcept type.
@@ -16596,7 +16230,7 @@ pub enum SpecimenDefinitionTypeTestedContainerAdditiveAdditive {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpecimenDefinitionTypeTestedContainerAdditive {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16609,21 +16243,84 @@ pub struct SpecimenDefinitionTypeTestedContainerAdditive {
     pub additive: Option<SpecimenDefinitionTypeTestedContainerAdditiveAdditive>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the minimumVolume[x] field in SpecimenDefinitionTypeTestedContainer
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecimenDefinitionTypeTestedContainerMinimumVolume {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "minimumVolumeQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the String type.
+    #[serde(rename = "minimumVolumeString")]
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct StructureDefinitionContext {
+pub struct SpecimenDefinitionTypeTestedContainer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub expression: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub material: Option<CodeableConcept>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<Quantity>,
+    #[serde(flatten)]
+    pub minimum_volume: Option<SpecimenDefinitionTypeTestedContainerMinimumVolume>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additive: Option<Vec<SpecimenDefinitionTypeTestedContainerAdditive>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecimenDefinitionTypeTestedHandling {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "temperatureQualifier", skip_serializing_if = "Option::is_none")]
+    pub temperature_qualifier: Option<CodeableConcept>,
+    #[serde(rename = "temperatureRange", skip_serializing_if = "Option::is_none")]
+    pub temperature_range: Option<Range>,
+    #[serde(rename = "maxDuration", skip_serializing_if = "Option::is_none")]
+    pub max_duration: Option<Duration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureDefinitionMapping {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identity: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16694,25 +16391,21 @@ pub struct StructureDefinition {
     pub differential: Option<StructureDefinitionDifferential>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct StructureDefinitionMapping {
+pub struct StructureDefinitionContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identity: Id,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub comment: Option<String>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub expression: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureDefinitionDifferential {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16725,7 +16418,7 @@ pub struct StructureDefinitionDifferential {
     pub element: Option<Vec<ElementDefinition>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureDefinitionSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16738,30 +16431,36 @@ pub struct StructureDefinitionSnapshot {
     pub element: Option<Vec<ElementDefinition>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct StructureMapGroup {
+pub struct StructureMapGroupRuleTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub extends: Option<Id>,
-    #[serde(rename = "typeMode")]
-    pub type_mode: Code,
+    pub context: Option<Id>,
+    #[serde(rename = "contextType", skip_serializing_if = "Option::is_none")]
+    pub context_type: Option<Code>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
+    pub element: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Vec<StructureMapGroupInput>>,
+    pub variable: Option<Id>,
+    #[serde(rename = "listMode", skip_serializing_if = "Option::is_none")]
+    pub list_mode: Option<Vec<Code>>,
+    #[serde(rename = "listRuleId", skip_serializing_if = "Option::is_none")]
+    pub list_rule_id: Option<Id>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule: Option<Vec<StructureMapGroupRule>>,
+    pub transform: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<Vec<StructureMapGroupRuleTargetParameter>>,
 }
 
 /// Choice of types for the defaultValue[x] field in StructureMapGroupRuleSource
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StructureMapGroupRuleSourceDefaultValue {
     /// Variant accepting the Base64Binary type.
@@ -16916,7 +16615,7 @@ pub enum StructureMapGroupRuleSourceDefaultValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureMapGroupRuleSource {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16948,7 +16647,102 @@ pub struct StructureMapGroupRuleSource {
     pub log_message: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureMapGroupRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Vec<StructureMapGroupRuleSource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Vec<StructureMapGroupRule>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureMapGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extends: Option<Id>,
+    #[serde(rename = "typeMode")]
+    pub type_mode: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<StructureMapGroupInput>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Vec<StructureMapGroupRule>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureMapGroupInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    pub mode: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+/// Choice of types for the value[x] field in StructureMapGroupRuleTargetParameter
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StructureMapGroupRuleTargetParameterValue {
+    /// Variant accepting the Id type.
+    #[serde(rename = "valueId")]
+    Id(Id),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "valueDecimal")]
+    Decimal(Decimal),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StructureMapGroupRuleTargetParameter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub value: Option<StructureMapGroupRuleTargetParameterValue>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureMap {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17002,34 +16796,7 @@ pub struct StructureMap {
     pub group: Option<Vec<StructureMapGroup>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructureMapGroupRuleTarget {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<Id>,
-    #[serde(rename = "contextType", skip_serializing_if = "Option::is_none")]
-    pub context_type: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub element: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub variable: Option<Id>,
-    #[serde(rename = "listMode", skip_serializing_if = "Option::is_none")]
-    pub list_mode: Option<Vec<Code>>,
-    #[serde(rename = "listRuleId", skip_serializing_if = "Option::is_none")]
-    pub list_rule_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transform: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameter: Option<Vec<StructureMapGroupRuleTargetParameter>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureMapStructure {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17046,80 +16813,7 @@ pub struct StructureMapStructure {
     pub documentation: Option<String>,
 }
 
-/// Choice of types for the value[x] field in StructureMapGroupRuleTargetParameter
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum StructureMapGroupRuleTargetParameterValue {
-    /// Variant accepting the Id type.
-    #[serde(rename = "valueId")]
-    Id(Id),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "valueDecimal")]
-    Decimal(Decimal),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructureMapGroupRuleTargetParameter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub value: Option<StructureMapGroupRuleTargetParameterValue>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructureMapGroupRule {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Vec<StructureMapGroupRuleSource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rule: Option<Vec<StructureMapGroupRule>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructureMapGroupInput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
-    pub mode: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StructureMapGroupRuleDependent {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17133,7 +16827,8 @@ pub struct StructureMapGroupRuleDependent {
     pub variable: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17164,7 +16859,7 @@ pub struct Subscription {
     pub channel: SubscriptionChannel,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionChannel {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17183,7 +16878,35 @@ pub struct SubscriptionChannel {
     pub header: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+/// Choice of types for the substance[x] field in SubstanceIngredient
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceIngredientSubstance {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "substanceCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "substanceReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceIngredient {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Ratio>,
+    #[serde(flatten)]
+    pub substance: Option<SubstanceIngredientSubstance>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Substance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17217,34 +16940,7 @@ pub struct Substance {
     pub ingredient: Option<Vec<SubstanceIngredient>>,
 }
 
-/// Choice of types for the substance[x] field in SubstanceIngredient
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceIngredientSubstance {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "substanceCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "substanceReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceIngredient {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quantity: Option<Ratio>,
-    #[serde(flatten)]
-    pub substance: Option<SubstanceIngredientSubstance>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceInstance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17261,7 +16957,25 @@ pub struct SubstanceInstance {
     pub quantity: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceNucleicAcidSubunitSugar {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Identifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "residueSite", skip_serializing_if = "Option::is_none")]
+    pub residue_site: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceNucleicAcid {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17284,21 +16998,15 @@ pub struct SubstanceNucleicAcid {
     pub sequence_type: Option<CodeableConcept>,
     #[serde(rename = "numberOfSubunits", skip_serializing_if = "Option::is_none")]
     pub number_of_subunits: Option<Integer>,
-    #[serde(
-        rename = "areaOfHybridisation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "areaOfHybridisation", skip_serializing_if = "Option::is_none")]
     pub area_of_hybridisation: Option<String>,
-    #[serde(
-        rename = "oligoNucleotideType",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "oligoNucleotideType", skip_serializing_if = "Option::is_none")]
     pub oligo_nucleotide_type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subunit: Option<Vec<SubstanceNucleicAcidSubunit>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceNucleicAcidSubunitLinkage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17317,7 +17025,7 @@ pub struct SubstanceNucleicAcidSubunitLinkage {
     pub residue_site: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceNucleicAcidSubunit {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17344,107 +17052,27 @@ pub struct SubstanceNucleicAcidSubunit {
     pub sugar: Option<Vec<SubstanceNucleicAcidSubunitSugar>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceNucleicAcidSubunitSugar {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(rename = "residueSite", skip_serializing_if = "Option::is_none")]
-    pub residue_site: Option<String>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstancePolymerMonomerSetStartingMaterial {
+pub struct SubstancePolymerRepeat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub material: Option<CodeableConcept>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(rename = "isDefining", skip_serializing_if = "Option::is_none")]
-    pub is_defining: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<SubstanceAmount>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstancePolymerRepeatRepeatUnit {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "orientationOfPolymerisation",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub orientation_of_polymerisation: Option<CodeableConcept>,
+    #[serde(rename = "numberOfUnits", skip_serializing_if = "Option::is_none")]
+    pub number_of_units: Option<Integer>,
+    #[serde(rename = "averageMolecularFormula", skip_serializing_if = "Option::is_none")]
+    pub average_molecular_formula: Option<String>,
+    #[serde(rename = "repeatUnitAmountType", skip_serializing_if = "Option::is_none")]
+    pub repeat_unit_amount_type: Option<CodeableConcept>,
     #[serde(rename = "repeatUnit", skip_serializing_if = "Option::is_none")]
-    pub repeat_unit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<SubstanceAmount>,
-    #[serde(
-        rename = "degreeOfPolymerisation",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub degree_of_polymerisation:
-        Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
-    #[serde(
-        rename = "structuralRepresentation",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub structural_representation:
-        Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
+    pub repeat_unit: Option<Vec<SubstancePolymerRepeatRepeatUnit>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub representation: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attachment: Option<Attachment>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstancePolymerMonomerSet {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "ratioType", skip_serializing_if = "Option::is_none")]
-    pub ratio_type: Option<CodeableConcept>,
-    #[serde(rename = "startingMaterial", skip_serializing_if = "Option::is_none")]
-    pub starting_material: Option<Vec<SubstancePolymerMonomerSetStartingMaterial>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstancePolymer {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17467,10 +17095,7 @@ pub struct SubstancePolymer {
     pub class: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geometry: Option<CodeableConcept>,
-    #[serde(
-        rename = "copolymerConnectivity",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "copolymerConnectivity", skip_serializing_if = "Option::is_none")]
     pub copolymer_connectivity: Option<Vec<CodeableConcept>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modification: Option<Vec<String>>,
@@ -17480,32 +17105,7 @@ pub struct SubstancePolymer {
     pub repeat: Option<Vec<SubstancePolymerRepeat>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstancePolymerRepeat {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "numberOfUnits", skip_serializing_if = "Option::is_none")]
-    pub number_of_units: Option<Integer>,
-    #[serde(
-        rename = "averageMolecularFormula",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub average_molecular_formula: Option<String>,
-    #[serde(
-        rename = "repeatUnitAmountType",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub repeat_unit_amount_type: Option<CodeableConcept>,
-    #[serde(rename = "repeatUnit", skip_serializing_if = "Option::is_none")]
-    pub repeat_unit: Option<Vec<SubstancePolymerRepeatRepeatUnit>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17520,9 +17120,9 @@ pub struct SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation {
     pub amount: Option<SubstanceAmount>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstanceProteinSubunit {
+pub struct SubstancePolymerMonomerSetStartingMaterial {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17530,36 +17130,70 @@ pub struct SubstanceProteinSubunit {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub subunit: Option<Integer>,
+    pub material: Option<CodeableConcept>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(rename = "isDefining", skip_serializing_if = "Option::is_none")]
+    pub is_defining: Option<Boolean>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequence: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub length: Option<Integer>,
-    #[serde(rename = "sequenceAttachment", skip_serializing_if = "Option::is_none")]
-    pub sequence_attachment: Option<Attachment>,
-    #[serde(
-        rename = "nTerminalModificationId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub n_terminal_modification_id: Option<Identifier>,
-    #[serde(
-        rename = "nTerminalModification",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub n_terminal_modification: Option<String>,
-    #[serde(
-        rename = "cTerminalModificationId",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub c_terminal_modification_id: Option<Identifier>,
-    #[serde(
-        rename = "cTerminalModification",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub c_terminal_modification: Option<String>,
+    pub amount: Option<SubstanceAmount>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstancePolymerMonomerSet {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "ratioType", skip_serializing_if = "Option::is_none")]
+    pub ratio_type: Option<CodeableConcept>,
+    #[serde(rename = "startingMaterial", skip_serializing_if = "Option::is_none")]
+    pub starting_material: Option<Vec<SubstancePolymerMonomerSetStartingMaterial>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstancePolymerRepeatRepeatUnit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "orientationOfPolymerisation", skip_serializing_if = "Option::is_none")]
+    pub orientation_of_polymerisation: Option<CodeableConcept>,
+    #[serde(rename = "repeatUnit", skip_serializing_if = "Option::is_none")]
+    pub repeat_unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<SubstanceAmount>,
+    #[serde(rename = "degreeOfPolymerisation", skip_serializing_if = "Option::is_none")]
+    pub degree_of_polymerisation: Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
+    #[serde(rename = "structuralRepresentation", skip_serializing_if = "Option::is_none")]
+    pub structural_representation: Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceProtein {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17588,7 +17222,35 @@ pub struct SubstanceProtein {
     pub subunit: Option<Vec<SubstanceProteinSubunit>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceProteinSubunit {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subunit: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<Integer>,
+    #[serde(rename = "sequenceAttachment", skip_serializing_if = "Option::is_none")]
+    pub sequence_attachment: Option<Attachment>,
+    #[serde(rename = "nTerminalModificationId", skip_serializing_if = "Option::is_none")]
+    pub n_terminal_modification_id: Option<Identifier>,
+    #[serde(rename = "nTerminalModification", skip_serializing_if = "Option::is_none")]
+    pub n_terminal_modification: Option<String>,
+    #[serde(rename = "cTerminalModificationId", skip_serializing_if = "Option::is_none")]
+    pub c_terminal_modification_id: Option<Identifier>,
+    #[serde(rename = "cTerminalModification", skip_serializing_if = "Option::is_none")]
+    pub c_terminal_modification: Option<String>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceReferenceInformationGene {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17605,66 +17267,7 @@ pub struct SubstanceReferenceInformationGene {
     pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceReferenceInformationGeneElement {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub element: Option<Identifier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Vec<Reference>>,
-}
-
-/// Choice of types for the amount[x] field in SubstanceReferenceInformationTarget
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceReferenceInformationTargetAmount {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "amountQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "amountRange")]
-    Range(Range),
-    /// Variant accepting the String type.
-    #[serde(rename = "amountString")]
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceReferenceInformationTarget {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<Identifier>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interaction: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub organism: Option<CodeableConcept>,
-    #[serde(rename = "organismType", skip_serializing_if = "Option::is_none")]
-    pub organism_type: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub amount: Option<SubstanceReferenceInformationTargetAmount>,
-    #[serde(rename = "amountType", skip_serializing_if = "Option::is_none")]
-    pub amount_type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceReferenceInformation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17695,7 +17298,7 @@ pub struct SubstanceReferenceInformation {
     pub target: Option<Vec<SubstanceReferenceInformationTarget>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceReferenceInformationClassification {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17714,9 +17317,41 @@ pub struct SubstanceReferenceInformationClassification {
     pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstanceSourceMaterialOrganism {
+pub struct SubstanceReferenceInformationGeneElement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element: Option<Identifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Vec<Reference>>,
+}
+
+/// Choice of types for the amount[x] field in SubstanceReferenceInformationTarget
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceReferenceInformationTargetAmount {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "amountQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "amountRange")]
+    Range(Range),
+    /// Variant accepting the String type.
+    #[serde(rename = "amountString")]
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceReferenceInformationTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17724,27 +17359,25 @@ pub struct SubstanceSourceMaterialOrganism {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub family: Option<CodeableConcept>,
+    pub target: Option<Identifier>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub genus: Option<CodeableConcept>,
+    pub interaction: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub species: Option<CodeableConcept>,
-    #[serde(rename = "intraspecificType", skip_serializing_if = "Option::is_none")]
-    pub intraspecific_type: Option<CodeableConcept>,
-    #[serde(
-        rename = "intraspecificDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub intraspecific_description: Option<String>,
+    pub organism: Option<CodeableConcept>,
+    #[serde(rename = "organismType", skip_serializing_if = "Option::is_none")]
+    pub organism_type: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub amount: Option<SubstanceReferenceInformationTargetAmount>,
+    #[serde(rename = "amountType", skip_serializing_if = "Option::is_none")]
+    pub amount_type: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub author: Option<Vec<SubstanceSourceMaterialOrganismAuthor>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hybrid: Option<SubstanceSourceMaterialOrganismHybrid>,
-    #[serde(rename = "organismGeneral", skip_serializing_if = "Option::is_none")]
-    pub organism_general: Option<SubstanceSourceMaterialOrganismOrganismGeneral>,
+    pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSourceMaterial {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17763,17 +17396,11 @@ pub struct SubstanceSourceMaterial {
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(
-        rename = "sourceMaterialClass",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "sourceMaterialClass", skip_serializing_if = "Option::is_none")]
     pub source_material_class: Option<CodeableConcept>,
     #[serde(rename = "sourceMaterialType", skip_serializing_if = "Option::is_none")]
     pub source_material_type: Option<CodeableConcept>,
-    #[serde(
-        rename = "sourceMaterialState",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "sourceMaterialState", skip_serializing_if = "Option::is_none")]
     pub source_material_state: Option<CodeableConcept>,
     #[serde(rename = "organismId", skip_serializing_if = "Option::is_none")]
     pub organism_id: Option<Identifier>,
@@ -17781,24 +17408,15 @@ pub struct SubstanceSourceMaterial {
     pub organism_name: Option<String>,
     #[serde(rename = "parentSubstanceId", skip_serializing_if = "Option::is_none")]
     pub parent_substance_id: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "parentSubstanceName",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "parentSubstanceName", skip_serializing_if = "Option::is_none")]
     pub parent_substance_name: Option<Vec<String>>,
     #[serde(rename = "countryOfOrigin", skip_serializing_if = "Option::is_none")]
     pub country_of_origin: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "geographicalLocation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "geographicalLocation", skip_serializing_if = "Option::is_none")]
     pub geographical_location: Option<Vec<String>>,
     #[serde(rename = "developmentStage", skip_serializing_if = "Option::is_none")]
     pub development_stage: Option<CodeableConcept>,
-    #[serde(
-        rename = "fractionDescription",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "fractionDescription", skip_serializing_if = "Option::is_none")]
     pub fraction_description: Option<Vec<SubstanceSourceMaterialFractionDescription>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organism: Option<SubstanceSourceMaterialOrganism>,
@@ -17806,49 +17424,7 @@ pub struct SubstanceSourceMaterial {
     pub part_description: Option<Vec<SubstanceSourceMaterialPartDescription>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSourceMaterialOrganismAuthor {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "authorType", skip_serializing_if = "Option::is_none")]
-    pub author_type: Option<CodeableConcept>,
-    #[serde(rename = "authorDescription", skip_serializing_if = "Option::is_none")]
-    pub author_description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSourceMaterialOrganismHybrid {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "maternalOrganismId", skip_serializing_if = "Option::is_none")]
-    pub maternal_organism_id: Option<String>,
-    #[serde(
-        rename = "maternalOrganismName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub maternal_organism_name: Option<String>,
-    #[serde(rename = "paternalOrganismId", skip_serializing_if = "Option::is_none")]
-    pub paternal_organism_id: Option<String>,
-    #[serde(
-        rename = "paternalOrganismName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub paternal_organism_name: Option<String>,
-    #[serde(rename = "hybridType", skip_serializing_if = "Option::is_none")]
-    pub hybrid_type: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSourceMaterialFractionDescription {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17863,7 +17439,70 @@ pub struct SubstanceSourceMaterialFractionDescription {
     pub material_type: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSourceMaterialOrganismAuthor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "authorType", skip_serializing_if = "Option::is_none")]
+    pub author_type: Option<CodeableConcept>,
+    #[serde(rename = "authorDescription", skip_serializing_if = "Option::is_none")]
+    pub author_description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSourceMaterialOrganism {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genus: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub species: Option<CodeableConcept>,
+    #[serde(rename = "intraspecificType", skip_serializing_if = "Option::is_none")]
+    pub intraspecific_type: Option<CodeableConcept>,
+    #[serde(rename = "intraspecificDescription", skip_serializing_if = "Option::is_none")]
+    pub intraspecific_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<Vec<SubstanceSourceMaterialOrganismAuthor>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<SubstanceSourceMaterialOrganismHybrid>,
+    #[serde(rename = "organismGeneral", skip_serializing_if = "Option::is_none")]
+    pub organism_general: Option<SubstanceSourceMaterialOrganismOrganismGeneral>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSourceMaterialOrganismHybrid {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "maternalOrganismId", skip_serializing_if = "Option::is_none")]
+    pub maternal_organism_id: Option<String>,
+    #[serde(rename = "maternalOrganismName", skip_serializing_if = "Option::is_none")]
+    pub maternal_organism_name: Option<String>,
+    #[serde(rename = "paternalOrganismId", skip_serializing_if = "Option::is_none")]
+    pub paternal_organism_id: Option<String>,
+    #[serde(rename = "paternalOrganismName", skip_serializing_if = "Option::is_none")]
+    pub paternal_organism_name: Option<String>,
+    #[serde(rename = "hybridType", skip_serializing_if = "Option::is_none")]
+    pub hybrid_type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17882,7 +17521,7 @@ pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
     pub order: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSourceMaterialPartDescription {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17897,136 +17536,74 @@ pub struct SubstanceSourceMaterialPartDescription {
     pub part_location: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationNameOfficial {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authority: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<DateTime>,
-}
 
-/// Choice of types for the amount[x] field in SubstanceSpecificationMoiety
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the definingSubstance[x] field in SubstanceSpecificationProperty
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationMoietyAmount {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "amountQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the String type.
-    #[serde(rename = "amountString")]
-    String(String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationMoiety {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stereochemistry: Option<CodeableConcept>,
-    #[serde(rename = "opticalActivity", skip_serializing_if = "Option::is_none")]
-    pub optical_activity: Option<CodeableConcept>,
-    #[serde(rename = "molecularFormula", skip_serializing_if = "Option::is_none")]
-    pub molecular_formula: Option<String>,
-    #[serde(flatten)]
-    pub amount: Option<SubstanceSpecificationMoietyAmount>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<CodeableConcept>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub amount: Option<Quantity>,
-}
-
-/// Choice of types for the substance[x] field in SubstanceSpecificationRelationship
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationRelationshipSubstance {
+pub enum SubstanceSpecificationPropertyDefiningSubstance {
     /// Variant accepting the Reference type.
-    #[serde(rename = "substanceReference")]
+    #[serde(rename = "definingSubstanceReference")]
     Reference(Reference),
     /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "substanceCodeableConcept")]
+    #[serde(rename = "definingSubstanceCodeableConcept")]
     CodeableConcept(CodeableConcept),
 }
 
-/// Choice of types for the amount[x] field in SubstanceSpecificationRelationship
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the amount[x] field in SubstanceSpecificationProperty
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationRelationshipAmount {
+pub enum SubstanceSpecificationPropertyAmount {
     /// Variant accepting the Quantity type.
     #[serde(rename = "amountQuantity")]
     Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "amountRange")]
-    Range(Range),
-    /// Variant accepting the Ratio type.
-    #[serde(rename = "amountRatio")]
-    Ratio(Ratio),
     /// Variant accepting the String type.
     #[serde(rename = "amountString")]
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationRelationship {
+pub struct SubstanceSpecificationProperty {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(flatten)]
-    pub substance: Option<SubstanceSpecificationRelationshipSubstance>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub relationship: Option<CodeableConcept>,
-    #[serde(rename = "isDefining", skip_serializing_if = "Option::is_none")]
-    pub is_defining: Option<Boolean>,
-    #[serde(flatten)]
-    pub amount: Option<SubstanceSpecificationRelationshipAmount>,
-    #[serde(
-        rename = "amountRatioLowLimit",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub amount_ratio_low_limit: Option<Ratio>,
-    #[serde(rename = "amountType", skip_serializing_if = "Option::is_none")]
-    pub amount_type: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Vec<Reference>>,
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<String>,
+    #[serde(flatten)]
+    pub defining_substance: Option<SubstanceSpecificationPropertyDefiningSubstance>,
+    #[serde(flatten)]
+    pub amount: Option<SubstanceSpecificationPropertyAmount>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSpecificationStructureIsotope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Identifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub substitution: Option<CodeableConcept>,
+    #[serde(rename = "halfLife", skip_serializing_if = "Option::is_none")]
+    pub half_life: Option<Quantity>,
+    #[serde(rename = "molecularWeight", skip_serializing_if = "Option::is_none")]
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSpecification {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18063,10 +17640,7 @@ pub struct SubstanceSpecification {
     pub moiety: Option<Vec<SubstanceSpecificationMoiety>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub property: Option<Vec<SubstanceSpecificationProperty>>,
-    #[serde(
-        rename = "referenceInformation",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "referenceInformation", skip_serializing_if = "Option::is_none")]
     pub reference_information: Option<Reference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<SubstanceSpecificationStructure>,
@@ -18088,7 +17662,34 @@ pub struct SubstanceSpecification {
     pub source_material: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSpecificationStructure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stereochemistry: Option<CodeableConcept>,
+    #[serde(rename = "opticalActivity", skip_serializing_if = "Option::is_none")]
+    pub optical_activity: Option<CodeableConcept>,
+    #[serde(rename = "molecularFormula", skip_serializing_if = "Option::is_none")]
+    pub molecular_formula: Option<String>,
+    #[serde(rename = "molecularFormulaByMoiety", skip_serializing_if = "Option::is_none")]
+    pub molecular_formula_by_moiety: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
+    #[serde(rename = "molecularWeight", skip_serializing_if = "Option::is_none")]
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSpecificationCode {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18109,7 +17710,7 @@ pub struct SubstanceSpecificationCode {
     pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSpecificationName {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18141,9 +17742,9 @@ pub struct SubstanceSpecificationName {
     pub source: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationStructureIsotope {
+pub struct SubstanceSpecificationNameOfficial {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18151,18 +17752,69 @@ pub struct SubstanceSpecificationStructureIsotope {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Identifier>,
+    pub authority: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub substitution: Option<CodeableConcept>,
-    #[serde(rename = "halfLife", skip_serializing_if = "Option::is_none")]
-    pub half_life: Option<Quantity>,
-    #[serde(rename = "molecularWeight", skip_serializing_if = "Option::is_none")]
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
+    pub date: Option<DateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the substance[x] field in SubstanceSpecificationRelationship
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceSpecificationRelationshipSubstance {
+    /// Variant accepting the Reference type.
+    #[serde(rename = "substanceReference")]
+    Reference(Reference),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "substanceCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+}
+
+/// Choice of types for the amount[x] field in SubstanceSpecificationRelationship
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceSpecificationRelationshipAmount {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "amountQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "amountRange")]
+    Range(Range),
+    /// Variant accepting the Ratio type.
+    #[serde(rename = "amountRatio")]
+    Ratio(Ratio),
+    /// Variant accepting the String type.
+    #[serde(rename = "amountString")]
+    String(String),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSpecificationRelationship {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(flatten)]
+    pub substance: Option<SubstanceSpecificationRelationshipSubstance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<CodeableConcept>,
+    #[serde(rename = "isDefining", skip_serializing_if = "Option::is_none")]
+    pub is_defining: Option<Boolean>,
+    #[serde(flatten)]
+    pub amount: Option<SubstanceSpecificationRelationshipAmount>,
+    #[serde(rename = "amountRatioLowLimit", skip_serializing_if = "Option::is_none")]
+    pub amount_ratio_low_limit: Option<Ratio>,
+    #[serde(rename = "amountType", skip_serializing_if = "Option::is_none")]
+    pub amount_type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceSpecificationStructureRepresentation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18179,22 +17831,10 @@ pub struct SubstanceSpecificationStructureRepresentation {
     pub attachment: Option<Attachment>,
 }
 
-/// Choice of types for the definingSubstance[x] field in SubstanceSpecificationProperty
-#[derive(Debug, Serialize, Deserialize)]
+/// Choice of types for the amount[x] field in SubstanceSpecificationMoiety
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationPropertyDefiningSubstance {
-    /// Variant accepting the Reference type.
-    #[serde(rename = "definingSubstanceReference")]
-    Reference(Reference),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "definingSubstanceCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-}
-
-/// Choice of types for the amount[x] field in SubstanceSpecificationProperty
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationPropertyAmount {
+pub enum SubstanceSpecificationMoietyAmount {
     /// Variant accepting the Quantity type.
     #[serde(rename = "amountQuantity")]
     Quantity(Quantity),
@@ -18203,9 +17843,9 @@ pub enum SubstanceSpecificationPropertyAmount {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationProperty {
+pub struct SubstanceSpecificationMoiety {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18213,49 +17853,41 @@ pub struct SubstanceSpecificationProperty {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<CodeableConcept>,
+    pub role: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
+    pub identifier: Option<Identifier>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<String>,
-    #[serde(flatten)]
-    pub defining_substance: Option<SubstanceSpecificationPropertyDefiningSubstance>,
-    #[serde(flatten)]
-    pub amount: Option<SubstanceSpecificationPropertyAmount>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubstanceSpecificationStructure {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereochemistry: Option<CodeableConcept>,
     #[serde(rename = "opticalActivity", skip_serializing_if = "Option::is_none")]
     pub optical_activity: Option<CodeableConcept>,
     #[serde(rename = "molecularFormula", skip_serializing_if = "Option::is_none")]
     pub molecular_formula: Option<String>,
-    #[serde(
-        rename = "molecularFormulaByMoiety",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub molecular_formula_by_moiety: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
-    #[serde(rename = "molecularWeight", skip_serializing_if = "Option::is_none")]
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
+    #[serde(flatten)]
+    pub amount: Option<SubstanceSpecificationMoietyAmount>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<CodeableConcept>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<Quantity>,
+}
+
+
 /// Choice of types for the occurrence[x] field in SupplyDelivery
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SupplyDeliveryOccurrence {
     /// Variant accepting the DateTime type.
@@ -18269,7 +17901,7 @@ pub enum SupplyDeliveryOccurrence {
     Timing(Timing),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyDelivery {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18313,7 +17945,7 @@ pub struct SupplyDelivery {
 }
 
 /// Choice of types for the item[x] field in SupplyDeliverySuppliedItem
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SupplyDeliverySuppliedItemItem {
     /// Variant accepting the CodeableConcept type.
@@ -18324,7 +17956,7 @@ pub enum SupplyDeliverySuppliedItemItem {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyDeliverySuppliedItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18339,8 +17971,42 @@ pub struct SupplyDeliverySuppliedItem {
     pub item: Option<SupplyDeliverySuppliedItemItem>,
 }
 
+
+/// Choice of types for the value[x] field in SupplyRequestParameter
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SupplyRequestParameterValue {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "valueCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "valueRange")]
+    Range(Range),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyRequestParameter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(flatten)]
+    pub value: Option<SupplyRequestParameterValue>,
+}
+
 /// Choice of types for the item[x] field in SupplyRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SupplyRequestItem {
     /// Variant accepting the CodeableConcept type.
@@ -18352,7 +18018,7 @@ pub enum SupplyRequestItem {
 }
 
 /// Choice of types for the occurrence[x] field in SupplyRequest
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SupplyRequestOccurrence {
     /// Variant accepting the DateTime type.
@@ -18366,7 +18032,7 @@ pub enum SupplyRequestOccurrence {
     Timing(Timing),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SupplyRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18416,40 +18082,8 @@ pub struct SupplyRequest {
     pub deliver_to: Option<Reference>,
 }
 
-/// Choice of types for the value[x] field in SupplyRequestParameter
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SupplyRequestParameterValue {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "valueCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "valueRange")]
-    Range(Range),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SupplyRequestParameter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(flatten)]
-    pub value: Option<SupplyRequestParameterValue>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskRestriction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18466,92 +18100,8 @@ pub struct TaskRestriction {
     pub recipient: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Task {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta: Option<Meta>,
-    #[serde(rename = "implicitRules", skip_serializing_if = "Option::is_none")]
-    pub implicit_rules: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<Narrative>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contained: Option<Vec<Resource>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Vec<Identifier>>,
-    #[serde(
-        rename = "instantiatesCanonical",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub instantiates_canonical: Option<Canonical>,
-    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
-    pub instantiates_uri: Option<Uri>,
-    #[serde(rename = "basedOn", skip_serializing_if = "Option::is_none")]
-    pub based_on: Option<Vec<Reference>>,
-    #[serde(rename = "groupIdentifier", skip_serializing_if = "Option::is_none")]
-    pub group_identifier: Option<Identifier>,
-    #[serde(rename = "partOf", skip_serializing_if = "Option::is_none")]
-    pub part_of: Option<Vec<Reference>>,
-    pub status: Code,
-    #[serde(rename = "statusReason", skip_serializing_if = "Option::is_none")]
-    pub status_reason: Option<CodeableConcept>,
-    #[serde(rename = "businessStatus", skip_serializing_if = "Option::is_none")]
-    pub business_status: Option<CodeableConcept>,
-    pub intent: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub focus: Option<Reference>,
-    #[serde(rename = "for", skip_serializing_if = "Option::is_none")]
-    pub r#for: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub encounter: Option<Reference>,
-    #[serde(rename = "executionPeriod", skip_serializing_if = "Option::is_none")]
-    pub execution_period: Option<Period>,
-    #[serde(rename = "authoredOn", skip_serializing_if = "Option::is_none")]
-    pub authored_on: Option<DateTime>,
-    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
-    pub last_modified: Option<DateTime>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requester: Option<Reference>,
-    #[serde(rename = "performerType", skip_serializing_if = "Option::is_none")]
-    pub performer_type: Option<Vec<CodeableConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<Reference>,
-    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<CodeableConcept>,
-    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
-    pub reason_reference: Option<Reference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub insurance: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<Vec<Annotation>>,
-    #[serde(rename = "relevantHistory", skip_serializing_if = "Option::is_none")]
-    pub relevant_history: Option<Vec<Reference>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub restriction: Option<TaskRestriction>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Vec<TaskInput>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<Vec<TaskOutput>>,
-}
-
 /// Choice of types for the value[x] field in TaskInput
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskInputValue {
     /// Variant accepting the Base64Binary type.
@@ -18706,7 +18256,7 @@ pub enum TaskInputValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskInput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18721,8 +18271,89 @@ pub struct TaskInput {
     pub value: Option<TaskInputValue>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Task {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Meta>,
+    #[serde(rename = "implicitRules", skip_serializing_if = "Option::is_none")]
+    pub implicit_rules: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<Narrative>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contained: Option<Vec<Resource>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<Vec<Identifier>>,
+    #[serde(rename = "instantiatesCanonical", skip_serializing_if = "Option::is_none")]
+    pub instantiates_canonical: Option<Canonical>,
+    #[serde(rename = "instantiatesUri", skip_serializing_if = "Option::is_none")]
+    pub instantiates_uri: Option<Uri>,
+    #[serde(rename = "basedOn", skip_serializing_if = "Option::is_none")]
+    pub based_on: Option<Vec<Reference>>,
+    #[serde(rename = "groupIdentifier", skip_serializing_if = "Option::is_none")]
+    pub group_identifier: Option<Identifier>,
+    #[serde(rename = "partOf", skip_serializing_if = "Option::is_none")]
+    pub part_of: Option<Vec<Reference>>,
+    pub status: Code,
+    #[serde(rename = "statusReason", skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<CodeableConcept>,
+    #[serde(rename = "businessStatus", skip_serializing_if = "Option::is_none")]
+    pub business_status: Option<CodeableConcept>,
+    pub intent: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Reference>,
+    #[serde(rename = "for", skip_serializing_if = "Option::is_none")]
+    pub r#for: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encounter: Option<Reference>,
+    #[serde(rename = "executionPeriod", skip_serializing_if = "Option::is_none")]
+    pub execution_period: Option<Period>,
+    #[serde(rename = "authoredOn", skip_serializing_if = "Option::is_none")]
+    pub authored_on: Option<DateTime>,
+    #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<DateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Reference>,
+    #[serde(rename = "performerType", skip_serializing_if = "Option::is_none")]
+    pub performer_type: Option<Vec<CodeableConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Reference>,
+    #[serde(rename = "reasonCode", skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<CodeableConcept>,
+    #[serde(rename = "reasonReference", skip_serializing_if = "Option::is_none")]
+    pub reason_reference: Option<Reference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insurance: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<Vec<Annotation>>,
+    #[serde(rename = "relevantHistory", skip_serializing_if = "Option::is_none")]
+    pub relevant_history: Option<Vec<Reference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restriction: Option<TaskRestriction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Vec<TaskInput>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<Vec<TaskOutput>>,
+}
+
 /// Choice of types for the value[x] field in TaskOutput
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TaskOutputValue {
     /// Variant accepting the Base64Binary type.
@@ -18877,7 +18508,7 @@ pub enum TaskOutputValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18892,9 +18523,10 @@ pub struct TaskOutput {
     pub value: Option<TaskOutputValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesCodeSystem {
+pub struct TerminologyCapabilitiesClosure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18902,14 +18534,10 @@ pub struct TerminologyCapabilitiesCodeSystem {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub uri: Option<Canonical>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<Vec<TerminologyCapabilitiesCodeSystemVersion>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subsumption: Option<Boolean>,
+    pub translation: Option<Boolean>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TerminologyCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -18975,95 +18603,7 @@ pub struct TerminologyCapabilities {
     pub closure: Option<TerminologyCapabilitiesClosure>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesImplementation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<Url>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesExpansion {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hierarchical: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub paging: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
-    #[serde(rename = "textFilter", skip_serializing_if = "Option::is_none")]
-    pub text_filter: Option<Markdown>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesExpansionParameter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesValidateCode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub translations: Boolean,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub op: Option<Vec<Code>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesTranslation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "needsMap")]
-    pub needs_map: Boolean,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TerminologyCapabilitiesCodeSystemVersion {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19086,20 +18626,21 @@ pub struct TerminologyCapabilitiesCodeSystemVersion {
     pub property: Option<Vec<Code>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TerminologyCapabilitiesClosure {
+pub struct TerminologyCapabilitiesExpansionParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Code,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub translation: Option<Boolean>,
+    pub documentation: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TerminologyCapabilitiesSoftware {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19113,9 +18654,62 @@ pub struct TerminologyCapabilitiesSoftware {
     pub version: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestReportSetupAction {
+pub struct TerminologyCapabilitiesValidateCode {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub translations: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<Vec<Code>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminologyCapabilitiesImplementation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<Url>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminologyCapabilitiesTranslation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "needsMap")]
+    pub needs_map: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminologyCapabilitiesCodeSystem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19123,12 +18717,36 @@ pub struct TestReportSetupAction {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<TestReportSetupActionOperation>,
+    pub uri: Option<Canonical>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assert: Option<TestReportSetupActionAssert>,
+    pub version: Option<Vec<TerminologyCapabilitiesCodeSystemVersion>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subsumption: Option<Boolean>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminologyCapabilitiesExpansion {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchical: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paging: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
+    #[serde(rename = "textFilter", skip_serializing_if = "Option::is_none")]
+    pub text_filter: Option<Markdown>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestReportSetupActionAssert {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19144,7 +18762,7 @@ pub struct TestReportSetupActionAssert {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestReportTeardown {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19157,23 +18775,34 @@ pub struct TestReportTeardown {
     pub action: Option<Vec<TestReportTeardownAction>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestReportSetupActionOperation {
+pub struct TestReportTeardownAction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub result: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<Markdown>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<Uri>,
+    pub operation: TestReportSetupActionOperation,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestReportTestAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<TestReportSetupActionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assert: Option<TestReportSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestReportParticipant {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19189,7 +18818,68 @@ pub struct TestReportParticipant {
     pub display: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestReportSetupActionOperation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub result: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<Markdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Uri>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestReportSetupAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<TestReportSetupActionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assert: Option<TestReportSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestReportTest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<TestReportTestAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestReportSetup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<TestReportSetupAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestReport {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19232,125 +18922,8 @@ pub struct TestReport {
     pub teardown: Option<TestReportTeardown>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestReportSetup {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<TestReportSetupAction>>,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestReportTeardownAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: TestReportSetupActionOperation,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestReportTest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<TestReportTestAction>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestReportTestAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<TestReportSetupActionOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assert: Option<TestReportSetupActionAssert>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptSetupActionAssert {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub direction: Option<Code>,
-    #[serde(rename = "compareToSourceId", skip_serializing_if = "Option::is_none")]
-    pub compare_to_source_id: Option<String>,
-    #[serde(
-        rename = "compareToSourceExpression",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub compare_to_source_expression: Option<String>,
-    #[serde(
-        rename = "compareToSourcePath",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub compare_to_source_path: Option<String>,
-    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<String>,
-    #[serde(rename = "headerField", skip_serializing_if = "Option::is_none")]
-    pub header_field: Option<String>,
-    #[serde(rename = "minimumId", skip_serializing_if = "Option::is_none")]
-    pub minimum_id: Option<String>,
-    #[serde(rename = "navigationLinks", skip_serializing_if = "Option::is_none")]
-    pub navigation_links: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operator: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(rename = "requestMethod", skip_serializing_if = "Option::is_none")]
-    pub request_method: Option<Code>,
-    #[serde(rename = "requestURL", skip_serializing_if = "Option::is_none")]
-    pub request_u_r_l: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<Code>,
-    #[serde(rename = "responseCode", skip_serializing_if = "Option::is_none")]
-    pub response_code: Option<String>,
-    #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<Id>,
-    #[serde(rename = "validateProfileId", skip_serializing_if = "Option::is_none")]
-    pub validate_profile_id: Option<Id>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(rename = "warningOnly")]
-    pub warning_only: Boolean,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestScriptMetadataCapability {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19372,7 +18945,91 @@ pub struct TestScriptMetadataCapability {
     pub capabilities: Canonical,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptTeardown {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<TestScriptTeardownAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptSetupActionOperationRequestHeader {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub field: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptMetadataLink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Uri,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptTeardownAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: TestScriptSetupActionOperation,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptTest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<Vec<TestScriptTestAction>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptTestAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<TestScriptSetupActionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestScript {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19438,22 +19095,22 @@ pub struct TestScript {
     pub teardown: Option<TestScriptTeardown>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptSetupActionOperationRequestHeader {
+pub struct TestScriptOrigin {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub field: String,
-    pub value: String,
+    pub index: Integer,
+    pub profile: Coding,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptTeardown {
+pub struct TestScriptSetup {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19461,10 +19118,65 @@ pub struct TestScriptTeardown {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<TestScriptTeardownAction>>,
+    pub action: Option<Vec<TestScriptSetupAction>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptSetupActionAssert {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Code>,
+    #[serde(rename = "compareToSourceId", skip_serializing_if = "Option::is_none")]
+    pub compare_to_source_id: Option<String>,
+    #[serde(rename = "compareToSourceExpression", skip_serializing_if = "Option::is_none")]
+    pub compare_to_source_expression: Option<String>,
+    #[serde(rename = "compareToSourcePath", skip_serializing_if = "Option::is_none")]
+    pub compare_to_source_path: Option<String>,
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(rename = "headerField", skip_serializing_if = "Option::is_none")]
+    pub header_field: Option<String>,
+    #[serde(rename = "minimumId", skip_serializing_if = "Option::is_none")]
+    pub minimum_id: Option<String>,
+    #[serde(rename = "navigationLinks", skip_serializing_if = "Option::is_none")]
+    pub navigation_links: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(rename = "requestMethod", skip_serializing_if = "Option::is_none")]
+    pub request_method: Option<Code>,
+    #[serde(rename = "requestURL", skip_serializing_if = "Option::is_none")]
+    pub request_u_r_l: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<Code>,
+    #[serde(rename = "responseCode", skip_serializing_if = "Option::is_none")]
+    pub response_code: Option<String>,
+    #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Id>,
+    #[serde(rename = "validateProfileId", skip_serializing_if = "Option::is_none")]
+    pub validate_profile_id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(rename = "warningOnly")]
+    pub warning_only: Boolean,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestScriptFixture {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19479,9 +19191,9 @@ pub struct TestScriptFixture {
     pub resource: Option<Reference>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptTest {
+pub struct TestScriptMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19489,55 +19201,12 @@ pub struct TestScriptTest {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub link: Option<Vec<TestScriptMetadataLink>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<TestScriptTestAction>>,
+    pub capability: Option<Vec<TestScriptMetadataCapability>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptMetadataLink {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Uri,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptTeardownAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: TestScriptSetupActionOperation,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptTestAction {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<TestScriptSetupActionOperation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assert: Option<TestScriptSetupActionAssert>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestScriptDestination {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19550,7 +19219,48 @@ pub struct TestScriptDestination {
     pub profile: Coding,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptVariable {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    #[serde(rename = "defaultValue", skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(rename = "headerField", skip_serializing_if = "Option::is_none")]
+    pub header_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<Id>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestScriptSetupAction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<TestScriptSetupActionOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TestScriptSetupActionOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19595,9 +19305,10 @@ pub struct TestScriptSetupActionOperation {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptSetupAction {
+pub struct ValueSetExpansion {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19605,14 +19316,21 @@ pub struct TestScriptSetupAction {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation: Option<TestScriptSetupActionOperation>,
+    pub identifier: Option<Uri>,
+    pub timestamp: DateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub assert: Option<TestScriptSetupActionAssert>,
+    pub total: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<Integer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contains: Option<Vec<ValueSetExpansionContains>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptMetadata {
+pub struct ValueSetComposeIncludeConceptDesignation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19620,53 +19338,15 @@ pub struct TestScriptMetadata {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub link: Option<Vec<TestScriptMetadataLink>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capability: Option<Vec<TestScriptMetadataCapability>>,
+    pub language: Option<Code>,
+    #[serde(rename = "use", skip_serializing_if = "Option::is_none")]
+    pub r#use: Option<Coding>,
+    pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TestScriptVariable {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    #[serde(rename = "defaultValue", skip_serializing_if = "Option::is_none")]
-    pub default_value: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expression: Option<String>,
-    #[serde(rename = "headerField", skip_serializing_if = "Option::is_none")]
-    pub header_field: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(rename = "sourceId", skip_serializing_if = "Option::is_none")]
-    pub source_id: Option<Id>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptOrigin {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub index: Integer,
-    pub profile: Coding,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestScriptSetup {
+pub struct ValueSetExpansionContains {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19674,10 +19354,45 @@ pub struct TestScriptSetup {
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<Vec<TestScriptSetupAction>>,
+    pub system: Option<Uri>,
+    #[serde(rename = "abstract", skip_serializing_if = "Option::is_none")]
+    pub r#abstract: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<Code>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contains: Option<Vec<ValueSetExpansionContains>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValueSetComposeInclude {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<Uri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
+    #[serde(rename = "valueSet", skip_serializing_if = "Option::is_none")]
+    pub value_set: Option<Vec<Canonical>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValueSet {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19733,8 +19448,27 @@ pub struct ValueSet {
     pub expansion: Option<ValueSetExpansion>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ValueSetCompose {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(rename = "lockedDate", skip_serializing_if = "Option::is_none")]
+    pub locked_date: Option<Date>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive: Option<Boolean>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<ValueSetComposeInclude>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<ValueSetComposeInclude>>,
+}
+
 /// Choice of types for the value[x] field in ValueSetExpansionParameter
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ValueSetExpansionParameterValue {
     /// Variant accepting the String type.
@@ -19760,7 +19494,7 @@ pub enum ValueSetExpansionParameterValue {
     DateTime(DateTime),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValueSetExpansionParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19774,21 +19508,7 @@ pub struct ValueSetExpansionParameter {
     pub value: Option<ValueSetExpansionParameterValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ValueSetComposeIncludeFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub property: Code,
-    pub op: Code,
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValueSetComposeIncludeConcept {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19804,176 +19524,38 @@ pub struct ValueSetComposeIncludeConcept {
     pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ValueSetComposeIncludeConceptDesignation {
+pub struct ValueSetComposeIncludeFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<Code>,
-    #[serde(rename = "use", skip_serializing_if = "Option::is_none")]
-    pub r#use: Option<Coding>,
+    pub property: Code,
+    pub op: Code,
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ValueSetExpansionContains {
+pub struct VerificationResultValidator {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<Uri>,
-    #[serde(rename = "abstract", skip_serializing_if = "Option::is_none")]
-    pub r#abstract: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inactive: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<Code>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contains: Option<Vec<ValueSetExpansionContains>>,
+    pub organization: Reference,
+    #[serde(rename = "identityCertificate", skip_serializing_if = "Option::is_none")]
+    pub identity_certificate: Option<String>,
+    #[serde(rename = "attestationSignature", skip_serializing_if = "Option::is_none")]
+    pub attestation_signature: Option<Signature>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ValueSetExpansion {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<Uri>,
-    pub timestamp: DateTime,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offset: Option<Integer>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contains: Option<Vec<ValueSetExpansionContains>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ValueSetComposeInclude {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<Uri>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
-    #[serde(rename = "valueSet", skip_serializing_if = "Option::is_none")]
-    pub value_set: Option<Vec<Canonical>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ValueSetCompose {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(rename = "lockedDate", skip_serializing_if = "Option::is_none")]
-    pub locked_date: Option<Date>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inactive: Option<Boolean>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include: Option<Vec<ValueSetComposeInclude>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<Vec<ValueSetComposeInclude>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerificationResultAttestation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub who: Option<Reference>,
-    #[serde(rename = "onBehalfOf", skip_serializing_if = "Option::is_none")]
-    pub on_behalf_of: Option<Reference>,
-    #[serde(
-        rename = "communicationMethod",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub communication_method: Option<CodeableConcept>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<Date>,
-    #[serde(
-        rename = "sourceIdentityCertificate",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub source_identity_certificate: Option<String>,
-    #[serde(
-        rename = "proxyIdentityCertificate",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub proxy_identity_certificate: Option<String>,
-    #[serde(rename = "proxySignature", skip_serializing_if = "Option::is_none")]
-    pub proxy_signature: Option<Signature>,
-    #[serde(rename = "sourceSignature", skip_serializing_if = "Option::is_none")]
-    pub source_signature: Option<Signature>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VerificationResultPrimarySource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub who: Option<Reference>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<Vec<CodeableConcept>>,
-    #[serde(
-        rename = "communicationMethod",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub communication_method: Option<Vec<CodeableConcept>>,
-    #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
-    pub validation_status: Option<CodeableConcept>,
-    #[serde(rename = "validationDate", skip_serializing_if = "Option::is_none")]
-    pub validation_date: Option<DateTime>,
-    #[serde(rename = "canPushUpdates", skip_serializing_if = "Option::is_none")]
-    pub can_push_updates: Option<CodeableConcept>,
-    #[serde(rename = "pushTypeAvailable", skip_serializing_if = "Option::is_none")]
-    pub push_type_available: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20021,29 +19603,73 @@ pub struct VerificationResult {
     pub validator: Option<Vec<VerificationResultValidator>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct VerificationResultValidator {
+pub struct VerificationResultPrimarySource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<std::string::String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
     #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
     pub modifier_extension: Option<Vec<Extension>>,
-    pub organization: Reference,
-    #[serde(
-        rename = "identityCertificate",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub identity_certificate: Option<String>,
-    #[serde(
-        rename = "attestationSignature",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub attestation_signature: Option<Signature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub who: Option<Reference>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "communicationMethod", skip_serializing_if = "Option::is_none")]
+    pub communication_method: Option<Vec<CodeableConcept>>,
+    #[serde(rename = "validationStatus", skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<CodeableConcept>,
+    #[serde(rename = "validationDate", skip_serializing_if = "Option::is_none")]
+    pub validation_date: Option<DateTime>,
+    #[serde(rename = "canPushUpdates", skip_serializing_if = "Option::is_none")]
+    pub can_push_updates: Option<CodeableConcept>,
+    #[serde(rename = "pushTypeAvailable", skip_serializing_if = "Option::is_none")]
+    pub push_type_available: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationResultAttestation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub who: Option<Reference>,
+    #[serde(rename = "onBehalfOf", skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<Reference>,
+    #[serde(rename = "communicationMethod", skip_serializing_if = "Option::is_none")]
+    pub communication_method: Option<CodeableConcept>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<Date>,
+    #[serde(rename = "sourceIdentityCertificate", skip_serializing_if = "Option::is_none")]
+    pub source_identity_certificate: Option<String>,
+    #[serde(rename = "proxyIdentityCertificate", skip_serializing_if = "Option::is_none")]
+    pub proxy_identity_certificate: Option<String>,
+    #[serde(rename = "proxySignature", skip_serializing_if = "Option::is_none")]
+    pub proxy_signature: Option<Signature>,
+    #[serde(rename = "sourceSignature", skip_serializing_if = "Option::is_none")]
+    pub source_signature: Option<Signature>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VisionPrescriptionLensSpecificationPrism {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub amount: Decimal,
+    pub base: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VisionPrescription {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20076,7 +19702,7 @@ pub struct VisionPrescription {
     pub lens_specification: Option<Vec<VisionPrescriptionLensSpecification>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VisionPrescriptionLensSpecification {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20113,20 +19739,8 @@ pub struct VisionPrescriptionLensSpecification {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VisionPrescriptionLensSpecificationPrism {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub amount: Decimal,
-    pub base: Code,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "resourceType")]
 pub enum Resource {
     Account(Account),
@@ -20277,6 +19891,24 @@ pub enum Resource {
     VisionPrescription(VisionPrescription),
 }
 
+
+// --- From<T> Implementations for Element<T, Extension> ---
+impl From<bool> for Element<bool, Extension> {
+    fn from(value: bool) -> Self {
+        Self { value: Some(value), ..Default::default() }
+    }
+}
+impl From<std::primitive::i32> for Element<std::primitive::i32, Extension> {
+    fn from(value: std::primitive::i32) -> Self {
+        Self { value: Some(value), ..Default::default() }
+    }
+}
+impl From<std::string::String> for Element<std::string::String, Extension> {
+    fn from(value: std::string::String) -> Self {
+        Self { value: Some(value), ..Default::default() }
+    }
+}
+// --- End From<T> Implementations ---
 pub type Base64Binary = Element<std::string::String, Extension>;
 
 pub type Boolean = Element<bool, Extension>;
@@ -20317,7 +19949,7 @@ pub type Uuid = Element<std::string::String, Extension>;
 
 pub type Xhtml = Element<std::string::String, Extension>;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Address {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20346,7 +19978,8 @@ pub struct Address {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Age {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20365,8 +19998,9 @@ pub struct Age {
     pub code: Option<Code>,
 }
 
+
 /// Choice of types for the author[x] field in Annotation
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AnnotationAuthor {
     /// Variant accepting the Reference type.
@@ -20377,7 +20011,7 @@ pub enum AnnotationAuthor {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Annotation {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20391,7 +20025,8 @@ pub struct Annotation {
     pub text: Markdown,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Attachment {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20416,7 +20051,8 @@ pub struct Attachment {
     pub creation: Option<DateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodeableConcept {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20429,7 +20065,8 @@ pub struct CodeableConcept {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Coding {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20448,7 +20085,8 @@ pub struct Coding {
     pub user_selected: Option<Boolean>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContactDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20461,7 +20099,8 @@ pub struct ContactDetail {
     pub telecom: Option<Vec<ContactPoint>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ContactPoint {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20480,7 +20119,8 @@ pub struct ContactPoint {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Contributor {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20494,7 +20134,8 @@ pub struct Contributor {
     pub contact: Option<Vec<ContactDetail>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Count {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20513,37 +20154,8 @@ pub struct Count {
     pub code: Option<Code>,
 }
 
-/// Choice of types for the value[x] field in DataRequirementDateFilter
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DataRequirementDateFilterValue {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "valueDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "valuePeriod")]
-    Period(Period),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "valueDuration")]
-    Duration(Duration),
-}
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DataRequirementDateFilter {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(rename = "searchParam", skip_serializing_if = "Option::is_none")]
-    pub search_param: Option<String>,
-    #[serde(flatten)]
-    pub value: Option<DataRequirementDateFilterValue>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DataRequirementCodeFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20560,8 +20172,38 @@ pub struct DataRequirementCodeFilter {
     pub code: Option<Vec<Coding>>,
 }
 
+/// Choice of types for the value[x] field in DataRequirementDateFilter
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DataRequirementDateFilterValue {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "valueDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "valuePeriod")]
+    Period(Period),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "valueDuration")]
+    Duration(Duration),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DataRequirementDateFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(rename = "searchParam", skip_serializing_if = "Option::is_none")]
+    pub search_param: Option<String>,
+    #[serde(flatten)]
+    pub value: Option<DataRequirementDateFilterValue>,
+}
+
 /// Choice of types for the subject[x] field in DataRequirement
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DataRequirementSubject {
     /// Variant accepting the CodeableConcept type.
@@ -20572,7 +20214,7 @@ pub enum DataRequirementSubject {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DataRequirement {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20597,7 +20239,7 @@ pub struct DataRequirement {
     pub sort: Option<Vec<DataRequirementSort>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DataRequirementSort {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20608,7 +20250,8 @@ pub struct DataRequirementSort {
     pub direction: Code,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Distance {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20627,8 +20270,9 @@ pub struct Distance {
     pub code: Option<Code>,
 }
 
+
 /// Choice of types for the dose[x] field in DosageDoseAndRate
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DosageDoseAndRateDose {
     /// Variant accepting the Range type.
@@ -20640,7 +20284,7 @@ pub enum DosageDoseAndRateDose {
 }
 
 /// Choice of types for the rate[x] field in DosageDoseAndRate
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DosageDoseAndRateRate {
     /// Variant accepting the Ratio type.
@@ -20654,7 +20298,7 @@ pub enum DosageDoseAndRateRate {
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DosageDoseAndRate {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20670,7 +20314,7 @@ pub struct DosageDoseAndRate {
 }
 
 /// Choice of types for the asNeeded[x] field in Dosage
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DosageAsNeeded {
     /// Variant accepting the Boolean type.
@@ -20681,7 +20325,7 @@ pub enum DosageAsNeeded {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Dosage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20694,10 +20338,7 @@ pub struct Dosage {
     pub sequence: Option<Integer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(
-        rename = "additionalInstruction",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "additionalInstruction", skip_serializing_if = "Option::is_none")]
     pub additional_instruction: Option<Vec<CodeableConcept>>,
     #[serde(rename = "patientInstruction", skip_serializing_if = "Option::is_none")]
     pub patient_instruction: Option<String>,
@@ -20715,16 +20356,14 @@ pub struct Dosage {
     pub dose_and_rate: Option<Vec<DosageDoseAndRate>>,
     #[serde(rename = "maxDosePerPeriod", skip_serializing_if = "Option::is_none")]
     pub max_dose_per_period: Option<Ratio>,
-    #[serde(
-        rename = "maxDosePerAdministration",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "maxDosePerAdministration", skip_serializing_if = "Option::is_none")]
     pub max_dose_per_administration: Option<Quantity>,
     #[serde(rename = "maxDosePerLifetime", skip_serializing_if = "Option::is_none")]
     pub max_dose_per_lifetime: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Duration {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -20743,8 +20382,51 @@ pub struct Duration {
     pub code: Option<Code>,
 }
 
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ElementDefinitionSlicingDiscriminator {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "type")]
+    pub r#type: Code,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ElementDefinitionSlicing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordered: Option<Boolean>,
+    pub rules: Code,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ElementDefinitionBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    pub strength: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(rename = "valueSet", skip_serializing_if = "Option::is_none")]
+    pub value_set: Option<Canonical>,
+}
+
 /// Choice of types for the defaultValue[x] field in ElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionDefaultValue {
     /// Variant accepting the Base64Binary type.
@@ -20900,7 +20582,7 @@ pub enum ElementDefinitionDefaultValue {
 }
 
 /// Choice of types for the fixed[x] field in ElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionFixed {
     /// Variant accepting the Base64Binary type.
@@ -21056,7 +20738,7 @@ pub enum ElementDefinitionFixed {
 }
 
 /// Choice of types for the pattern[x] field in ElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionPattern {
     /// Variant accepting the Base64Binary type.
@@ -21212,7 +20894,7 @@ pub enum ElementDefinitionPattern {
 }
 
 /// Choice of types for the minValue[x] field in ElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionMinValue {
     /// Variant accepting the Date type.
@@ -21245,7 +20927,7 @@ pub enum ElementDefinitionMinValue {
 }
 
 /// Choice of types for the maxValue[x] field in ElementDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionMaxValue {
     /// Variant accepting the Date type.
@@ -21277,7 +20959,7 @@ pub enum ElementDefinitionMaxValue {
     Quantity(Quantity),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ElementDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21291,10 +20973,7 @@ pub struct ElementDefinition {
     pub representation: Option<Vec<Code>>,
     #[serde(rename = "sliceName", skip_serializing_if = "Option::is_none")]
     pub slice_name: Option<String>,
-    #[serde(
-        rename = "sliceIsConstraining",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "sliceIsConstraining", skip_serializing_if = "Option::is_none")]
     pub slice_is_constraining: Option<Boolean>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -21358,19 +21037,7 @@ pub struct ElementDefinition {
     pub mapping: Option<Vec<ElementDefinitionMapping>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElementDefinitionBase {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub min: UnsignedInt,
-    pub max: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ElementDefinitionType {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21388,8 +21055,20 @@ pub struct ElementDefinitionType {
     pub versioning: Option<Code>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ElementDefinitionBase {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    pub path: String,
+    pub min: UnsignedInt,
+    pub max: String,
+}
+
 /// Choice of types for the value[x] field in ElementDefinitionExample
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ElementDefinitionExampleValue {
     /// Variant accepting the Base64Binary type.
@@ -21544,7 +21223,7 @@ pub enum ElementDefinitionExampleValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ElementDefinitionExample {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21556,35 +21235,7 @@ pub struct ElementDefinitionExample {
     pub value: Option<ElementDefinitionExampleValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElementDefinitionSlicing {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ordered: Option<Boolean>,
-    pub rules: Code,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElementDefinitionSlicingDiscriminator {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "type")]
-    pub r#type: Code,
-    pub path: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ElementDefinitionConstraint {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21604,21 +21255,7 @@ pub struct ElementDefinitionConstraint {
     pub source: Option<Canonical>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ElementDefinitionBinding {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(rename = "valueSet", skip_serializing_if = "Option::is_none")]
-    pub value_set: Option<Canonical>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ElementDefinitionMapping {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21633,7 +21270,8 @@ pub struct ElementDefinitionMapping {
     pub comment: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Expression {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21651,8 +21289,9 @@ pub struct Expression {
     pub reference: Option<Uri>,
 }
 
+
 /// Choice of types for the value[x] field in Extension
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ExtensionValue {
     /// Variant accepting the Base64Binary type.
@@ -21807,7 +21446,7 @@ pub enum ExtensionValue {
     Meta(Meta),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Extension {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21819,7 +21458,8 @@ pub struct Extension {
     pub value: Option<ExtensionValue>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HumanName {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21842,7 +21482,8 @@ pub struct HumanName {
     pub period: Option<Period>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Identifier {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21863,7 +21504,8 @@ pub struct Identifier {
     pub assigner: Option<Box<Reference>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MarketingStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21882,7 +21524,8 @@ pub struct MarketingStatus {
     pub restore_date: Option<DateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Meta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21903,7 +21546,8 @@ pub struct Meta {
     pub tag: Option<Vec<Coding>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Money {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21916,7 +21560,8 @@ pub struct Money {
     pub currency: Option<Code>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Narrative {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21927,7 +21572,8 @@ pub struct Narrative {
     pub div: Xhtml,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ParameterDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21950,7 +21596,8 @@ pub struct ParameterDefinition {
     pub profile: Option<Canonical>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Period {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21963,8 +21610,9 @@ pub struct Period {
     pub end: Option<DateTime>,
 }
 
+
 /// Choice of types for the age[x] field in Population
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PopulationAge {
     /// Variant accepting the Range type.
@@ -21975,7 +21623,7 @@ pub enum PopulationAge {
     CodeableConcept(CodeableConcept),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Population {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -21990,14 +21638,12 @@ pub struct Population {
     pub gender: Option<CodeableConcept>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub race: Option<CodeableConcept>,
-    #[serde(
-        rename = "physiologicalCondition",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "physiologicalCondition", skip_serializing_if = "Option::is_none")]
     pub physiological_condition: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProdCharacteristic {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22030,7 +21676,8 @@ pub struct ProdCharacteristic {
     pub scoring: Option<CodeableConcept>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProductShelfLife {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22044,14 +21691,12 @@ pub struct ProductShelfLife {
     #[serde(rename = "type")]
     pub r#type: CodeableConcept,
     pub period: Quantity,
-    #[serde(
-        rename = "specialPrecautionsForStorage",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "specialPrecautionsForStorage", skip_serializing_if = "Option::is_none")]
     pub special_precautions_for_storage: Option<Vec<CodeableConcept>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Quantity {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22070,7 +21715,8 @@ pub struct Quantity {
     pub code: Option<Code>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Range {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22083,7 +21729,8 @@ pub struct Range {
     pub high: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Ratio {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22096,7 +21743,8 @@ pub struct Ratio {
     pub denominator: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Reference {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22113,7 +21761,8 @@ pub struct Reference {
     pub display: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RelatedArtifact {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22136,7 +21785,8 @@ pub struct RelatedArtifact {
     pub resource: Option<Canonical>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SampledData {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22156,7 +21806,8 @@ pub struct SampledData {
     pub data: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Signature {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22177,8 +21828,9 @@ pub struct Signature {
     pub data: Option<Base64Binary>,
 }
 
+
 /// Choice of types for the amount[x] field in SubstanceAmount
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum SubstanceAmountAmount {
     /// Variant accepting the Quantity type.
@@ -22192,7 +21844,7 @@ pub enum SubstanceAmountAmount {
     String(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceAmount {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22211,7 +21863,7 @@ pub struct SubstanceAmount {
     pub reference_range: Option<SubstanceAmountReferenceRange>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubstanceAmountReferenceRange {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22224,25 +21876,9 @@ pub struct SubstanceAmountReferenceRange {
     pub high_limit: Option<Quantity>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Timing {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<std::string::String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extension: Option<Vec<Extension>>,
-    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
-    pub modifier_extension: Option<Vec<Extension>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event: Option<Vec<DateTime>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repeat: Option<TimingRepeat>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<CodeableConcept>,
-}
 
 /// Choice of types for the bounds[x] field in TimingRepeat
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TimingRepeatBounds {
     /// Variant accepting the Duration type.
@@ -22256,7 +21892,7 @@ pub enum TimingRepeatBounds {
     Period(Period),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TimingRepeat {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22295,8 +21931,26 @@ pub struct TimingRepeat {
     pub offset: Option<UnsignedInt>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Timing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<Vec<Extension>>,
+    #[serde(rename = "modifierExtension", skip_serializing_if = "Option::is_none")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<Vec<DateTime>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<TimingRepeat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeableConcept>,
+}
+
+
 /// Choice of types for the timing[x] field in TriggerDefinition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TriggerDefinitionTiming {
     /// Variant accepting the Timing type.
@@ -22313,7 +21967,7 @@ pub enum TriggerDefinitionTiming {
     DateTime(DateTime),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TriggerDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22332,8 +21986,9 @@ pub struct TriggerDefinition {
     pub condition: Option<Expression>,
 }
 
+
 /// Choice of types for the value[x] field in UsageContext
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UsageContextValue {
     /// Variant accepting the CodeableConcept type.
@@ -22350,7 +22005,7 @@ pub enum UsageContextValue {
     Reference(Reference),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UsageContext {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22361,3 +22016,5 @@ pub struct UsageContext {
     #[serde(flatten)]
     pub value: Option<UsageContextValue>,
 }
+
+
