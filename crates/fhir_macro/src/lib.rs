@@ -77,17 +77,28 @@ fn try_get_element_generics(ty: &Type) -> Result<(Type, Type), ()> {
                 // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
                 let extension_type = syn::parse_str::<Type>("crate::r4::Extension")
                     .expect("Failed to parse crate::r4::Extension type");
+                // --- Refined Alias Check ---
+                // Only match FHIR-specific aliases, not base Rust types.
                 let value_type_str_opt: Option<&str> = match ident_str.as_str() {
-                    "Boolean" => Some("bool"),
-                    "Integer" | "PositiveInt" | "UnsignedInt" => Some("std::primitive::i32"),
-                    "Integer64" => Some("std::primitive::i64"), // R5+
-                    "Decimal" => Some("crate::PreciseDecimal"),
-                    // List known string-based aliases explicitly
-                    "Base64Binary" | "Canonical" | "Code" | "Date" | "DateTime" | "Id"
-                    | "Instant" | "Markdown" | "Oid" | "String" | "Time" | "Uri" | "Url"
-                    | "Uuid" | "Xhtml" => Some("std::string::String"),
-                    _ => None, // Not a known alias
+                    // Keep FHIR aliases (assuming they alias Element<...>)
+                    "Boolean" | "Integer" | "PositiveInt" | "UnsignedInt" | "Integer64" | "Decimal" |
+                    "Base64Binary" | "Canonical" | "Code" | "Date" | "DateTime" | "Id" |
+                    "Instant" | "Markdown" | "Oid" | "Time" | "Uri" | "Url" | "Uuid" | "Xhtml"
+                        => {
+                            // Map the alias name back to the expected primitive *value* type inside the Element
+                            match ident_str.as_str() {
+                                "Boolean" => Some("bool"),
+                                "Integer" | "PositiveInt" | "UnsignedInt" => Some("std::primitive::i32"),
+                                "Integer64" => Some("std::primitive::i64"),
+                                "Decimal" => Some("crate::PreciseDecimal"),
+                                // All other FHIR aliases map to String
+                                _ => Some("std::string::String"),
+                            }
+                        }
+                    // Do NOT match base types like "String", "bool", "i32" here.
+                    _ => None, // Not a known FHIR alias
                 };
+
 
                 if let Some(value_type_str) = value_type_str_opt {
                     let value_type =
