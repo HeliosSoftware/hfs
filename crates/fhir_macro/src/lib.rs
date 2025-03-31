@@ -637,8 +637,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // Bring quote into scope for generated code inside visit_map
-                use quote::quote;
+                // quote is now available from the outer macro scope
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
