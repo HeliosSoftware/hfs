@@ -1599,7 +1599,14 @@ mod tests {
             name: Some("Test3".to_string()),
             birth_date: Some(r4::Date { // Construct using the alias type
                 id: Some("bd-id-3".to_string()),
-                extension: None, // Expect None based on input JSON
+                // Expect the actual r4::Extension based on the corrected json3 input
+                extension: Some(vec![r4::Extension {
+                    id: None,
+                    extension: None,
+                    url: "http://example.com/test".to_string(),
+                    // Construct r4::String explicitly
+                    value: Some(r4::ExtensionValue::String(r4::String { value: Some("some-ext-val".to_string()), ..Default::default() })),
+                }]),
                 value: Some("1970-03-30".to_string()),
             }),
             is_active: Some(r4::Boolean { // Construct using the alias type
