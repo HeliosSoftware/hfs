@@ -277,8 +277,8 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
             capitalize_first_letter(type_name),
             value_type
         ));
-        // Only generate From<String> for the base String alias to avoid conflicts
-        if type_name == "string" {
+        // Generate From<value_type> for all primitive aliases except Decimal
+        if type_name != "decimal" {
             output.push_str(&format!(
                 "impl From<{}> for {} {{\n",
                 value_type,

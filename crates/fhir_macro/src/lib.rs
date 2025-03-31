@@ -506,8 +506,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         // If not null, deserialize the Value into the helper
                         // Use updated #extension_helper_name (no __) directly (defined outside impl block)
                         // Use the extracted ext_ty for the helper
-                        // Add lifetime annotation when using the helper type
-                        let helper: #extension_helper_name<'de, #ext_ty> = ::serde_json::from_value(value)
+                        // Remove explicit 'de lifetime annotation here as E uses HRTB.
+                        let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
                             .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
                         if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                         #id_field = helper.id;

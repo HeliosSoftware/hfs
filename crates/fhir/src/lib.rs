@@ -923,13 +923,15 @@ mod tests {
                     id: None,
                     extension: None,
                     url: "http://example.com/ext1".to_string(),
-                    value: Some(r4::ExtensionValue::Boolean(true.into())),
+                    // Construct r4::Boolean explicitly, initializing all fields
+                    value: Some(r4::ExtensionValue::Boolean(r4::Boolean { id: None, extension: None, value: Some(true) })),
                 },
                 r4::Extension {
                     id: None,
                     extension: None,
                     url: "http://example.com/ext2".to_string(),
-                    value: Some(r4::ExtensionValue::String("val2".to_string().into())),
+                    // Construct r4::String explicitly, initializing all fields
+                    value: Some(r4::ExtensionValue::String(r4::String { id: None, extension: None, value: Some("val2".to_string()) })),
                 },
             ]),
             // Wrap the Decimal in PreciseDecimal
