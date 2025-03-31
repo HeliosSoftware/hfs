@@ -506,12 +506,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     if !value.is_null() {
                         // If not null, deserialize the Value into the helper
                         // Use updated #extension_helper_name (no __) directly (defined outside impl block)
-                        // Use the extracted ext_ty for the helper
-                        // No explicit lifetime needed here when using the helper, as E uses DeserializeOwned
-                        let helper: #extension_helper_name<#ext_ty> = ::serde_json::from_value(value)
+                        // Helper is now non-generic
+                        let helper: #extension_helper_name = ::serde_json::from_value(value)
                             .map_err(|e| ::serde::de::Error::custom(format!("Failed to deserialize _field helper: {}", e)))?; // Provide context on error
                         if #id_field.is_some() || #ext_field.is_some() { return Err(::serde::de::Error::duplicate_field(#underscore_name_lit)); }
                         #id_field = helper.id;
+                        // Assign the Vec<Value> to the temporary field
                         #ext_field = helper.extension;
                     }
                     // If value was null, do nothing, fields remain None
@@ -625,14 +625,15 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
     // Define the extension helper struct for Deserialize here as well
     // Use updated helper name (no __)
+    // Make it non-generic, deserialize extension as Vec<Value>
     let deserialize_extension_helper_def = quote! {
-        // Remove 'de lifetime, use DeserializeOwned for E
         #[derive(::serde::Deserialize)] // Use Deserialize from use statement
-        struct #extension_helper_name<E: ::serde::de::DeserializeOwned> { // Use DeserializeOwned
+        struct #extension_helper_name { // No generic E, no lifetime 'de needed here
              #[serde(default)]
              id: ::std::option::Option<String>,
              #[serde(default)]
-             extension: ::std::option::Option<::std::vec::Vec<E>>,
+             // Deserialize into Vec<Value> initially
+             extension: ::std::option::Option<::std::vec::Vec<::serde_json::Value>>,
         }
     };
 
