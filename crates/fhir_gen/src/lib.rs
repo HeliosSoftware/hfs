@@ -445,6 +445,10 @@ fn process_elements(
             "PartialEq",
             "Eq",
         ];
+        // Add Default derive specifically for Extension struct
+        if type_name == "Extension" {
+            derives.push("Default");
+        }
         output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
 
         // Add other serde attributes and struct definition
