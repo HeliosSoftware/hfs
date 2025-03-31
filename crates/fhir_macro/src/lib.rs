@@ -300,7 +300,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             None => (false, field_ty),
         };
         // Use the updated helper function
-        let is_element = is_fhir_primitive_element_type(inner_ty);
+        let is_element = is_element_or_decimal_element(inner_ty);
 
         // *** Move field_infos population here ***
         field_infos.push(FieldInfo {
