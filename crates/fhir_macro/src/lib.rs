@@ -232,9 +232,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          state.serialize_field(#original_name_lit, value)?;
                     }
                 });
-            }
-                    }
-                });
+            // Removed extra closing brace });
             } else {
                 // Non-optional field (must not be element-like based on above checks)
                 // Serialize the value directly using the original field name
