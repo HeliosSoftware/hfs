@@ -42,14 +42,18 @@ fn is_fhir_primitive_element_type(ty: &Type) -> bool {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
                 // Check for direct Element/DecimalElement or known R4 primitive type aliases
+                // IMPORTANT: Do NOT include base types like "String", "bool", "i32" here.
+                // Only include types that are structurally Element or DecimalElement.
                 match ident_str.as_str() {
                     "Element" | "DecimalElement" |
+                    // R4 Aliases (assuming they are Element<V, E> or DecimalElement<E>)
                     "Base64Binary" | "Boolean" | "Canonical" | "Code" | "Date" | "DateTime" |
                     "Decimal" | "Id" | "Instant" | "Integer" | "Markdown" | "Oid" |
                     "PositiveInt" | "String" | "Time" | "UnsignedInt" | "Uri" | "Url" |
-                    "Uuid" | "Xhtml" => return true,
-                    // Add other versions' aliases if needed
-                    _ => return false,
+                    "Uuid" | "Xhtml"
+                    // Add other versions' aliases if needed (e.g., R5 Integer64)
+                         => return true,
+                    _ => return false, // Return false for base types (like std::string::String, bool, i32) and unknown types
                 }
             }
         }
@@ -646,7 +650,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // quote is now available from the outer macro scope
+                // Bring quote into scope for generated code inside visit_map
+                use quote::quote;
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
