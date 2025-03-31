@@ -551,13 +551,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                          format_ident!("DecimalElement")
                      } else {
                          format_ident!("Element") // Construct Element for others
-                     }
-                 } else {
-                     format_ident!("Element") // Default fallback
-                 }
-             } else {
-                 format_ident!("Element") // Default fallback
-             };
+                     }; // Removed extra else clauses
 
              // Get V and E again for the construction, ensuring it's only called on the element type
              // Prefix ext_ty with _ if it might be unused (e.g., for DecimalElement construction)
