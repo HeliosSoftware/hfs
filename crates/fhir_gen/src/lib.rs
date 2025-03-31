@@ -411,8 +411,14 @@ fn process_elements(
             output.push_str("}\n\n");
         }
 
-        // Generate struct
-        output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+        // Generate struct derives
+        let mut derives = vec!["Debug", "Serialize", "Deserialize"];
+        if type_name == "Extension" {
+            derives.extend(["Clone", "PartialEq", "Eq"]);
+        }
+        output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
+
+        // Add other serde attributes and struct definition
         output.push_str("#[serde(deny_unknown_fields)]\n");
         output.push_str(&format!(
             "pub struct {} {{\n",
