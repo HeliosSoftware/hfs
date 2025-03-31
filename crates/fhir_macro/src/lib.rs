@@ -11,8 +11,7 @@ use syn::{
     PathArguments, // Removed Meta, NestedMeta
     Type,
     parse_macro_input,
-}; // Added Ident back
-// Removed unused HashMap import
+};
 
 // Helper function to check if a type is Option<T> and return T
 fn get_option_inner_type(ty: &Type) -> Option<&Type> {
@@ -329,24 +328,29 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         let underscore_ident_enum = format_ident!("{}Underscore", field_ident_enum_str);
 
         // Determine if the field is Option<T> and get the inner type T
-        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) { // Prefix is_option with _
+        let (_is_option, inner_ty) = match get_option_inner_type(field_ty) {
             Some(inner) => (true, inner),
             None => (false, field_ty),
         };
-        // Use the renamed helper function
-        let is_element = is_element_or_decimal_element(inner_ty);
 
-        // *** Move field_infos population here ***
+        // Try to get generics; determine is_element based on success
+        let (is_element, v_ty_opt, ext_ty_opt) = match try_get_element_generics(inner_ty) {
+            Ok((v, e)) => (true, Some(v), Some(e)),
+            Err(_) => (false, None, None),
+        };
+
+        // Populate field_infos
         field_infos.push(FieldInfo {
             ident: field_ident,
-            ty: field_ty,
+            ty: field_ty, // Original field type (Option<T> or T)
             original_name: original_name.clone(),
             underscore_name: underscore_name.clone(),
-            is_element,
-            // is_option, // Removed unused field
-            inner_ty, // Store the inner type T
+            is_element, // Use the determined flag
+            inner_ty, // Store the inner type T (or original type if not Option)
+            // Store V and E types if is_element is true
+            v_ty: v_ty_opt,
+            ext_ty: ext_ty_opt,
         });
-        // *** End moved block ***
 
         // For Field enum and match arms
         field_enum_variants.push(quote! { #field_ident_enum });
