@@ -277,8 +277,10 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
             capitalize_first_letter(type_name),
             value_type
         ));
-        // Generate From<value_type> for all primitive aliases except Decimal
-        if type_name != "decimal" {
+        // Generate From<value_type> only for the base Rust types to avoid conflicts
+        if value_type == "bool" || value_type == "std::primitive::i32" || value_type == "std::string::String" {
+             // Generate for the specific alias being processed, as it resolves to Element<T, E>
+             // The compiler handles the fact that multiple aliases point to the same impl.
             output.push_str(&format!(
                 "impl From<{}> for {} {{\n",
                 value_type,
