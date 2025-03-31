@@ -1493,7 +1493,6 @@ mod tests {
             birth_date: Some(r4::Date {
                 // Construct using the alias type
                 id: Some("bd-id".to_string()),
-                // Use the actual r4::Extension type, or None if simpler
                 extension: None, // Using None for simplicity in test data
                 value: None,
             }),
@@ -1502,7 +1501,7 @@ mod tests {
         };
         let json2 = serde_json::to_string(&s2).unwrap();
         // Expected output according to FHIR: Only _fieldName when value is absent
-        let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id"}}"#; // Corrected back to _birthDate
+        let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id"}}"#;
         assert_eq!(json2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate
