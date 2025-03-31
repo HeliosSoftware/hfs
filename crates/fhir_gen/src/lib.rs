@@ -182,7 +182,8 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
-    output.push_str("#[derive(Debug, Serialize, Deserialize)]\n");
+    // Add Clone to the derives for the Resource enum
+    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
