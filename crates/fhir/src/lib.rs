@@ -311,7 +311,7 @@ where
 // --- End Element Visitor ---
 
 // Add PartialEq, Eq derives
-#[derive(Debug, PartialEq, Eq, FhirSerde)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Element<V, E> {
     // Fields are already public
     pub id: Option<String>,
