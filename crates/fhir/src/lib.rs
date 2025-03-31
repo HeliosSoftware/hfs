@@ -1502,6 +1502,8 @@ mod tests {
         let json2 = serde_json::to_string(&s2).unwrap();
         // Expected output according to FHIR: Only _fieldName when value is absent
         let expected2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id"}}"#;
+        println!("Actual JSON: {}", json2);
+        println!("Expected JSON: {}", expected2);
         assert_eq!(json2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate
