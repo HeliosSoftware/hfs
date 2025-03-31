@@ -59,12 +59,55 @@ fn is_fhir_primitive_element_type(ty: &Type) -> bool {
 // Helper function to get the V and E types from Element<V, E> or DecimalElement<E>
 // Returns (V_Type, E_Type)
 fn get_element_generics(ty: &Type) -> (Type, Type) {
+    if let Type::Path(type_path) = ty {
+        if type_path.qself.is_none() { // Allow multi-segment paths
+            if let Some(segment) = type_path.path.segments.last() { // Check the last segment
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    // Handle Element<V, E> (potentially multi-segment path)
+                    if segment.ident == "Element" && args.args.len() == 2 {
+                        let v_arg = &args.args[0];
+                        let e_arg = &args.args[1];
+                        let v_type = match v_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for V") };
+                        let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
+                        return (v_type, e_type);
+                    // Handle DecimalElement<E> (potentially multi-segment path)
+                    } else if segment.ident == "DecimalElement" && args.args.len() == 1 {
+                        // V is crate::PreciseDecimal for DecimalElement
+                        let precise_decimal_type = syn::parse_str::<Type>("crate::PreciseDecimal").unwrap();
+                        let e_arg = &args.args[0];
+                        let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
+                        return (precise_decimal_type, e_type);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback or error - this shouldn't happen if called after is_fhir_primitive_element_type
+    // *** Correction: We need to handle the aliases here! ***
+
+    // If it's an alias (potentially multi-segment like r4::Date), infer V and E based on the *last* segment.
      if let Type::Path(type_path) = ty {
-        if type_path.qself.is_none() && type_path.path.segments.len() == 1 {
-            let segment = &type_path.path.segments[0];
-            if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                if segment.ident == "Element" && args.args.len() == 2 {
-                    let v_arg = &args.args[0];
+        if type_path.qself.is_none() { // Allow multi-segment paths
+            if let Some(segment) = type_path.path.segments.last() { // Get the last segment
+                let ident_str = segment.ident.to_string();
+                // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
+                // This might need adjustment if supporting multiple FHIR versions simultaneously in one struct.
+                let extension_type = syn::parse_str::<Type>("crate::r4::Extension").expect("Failed to parse crate::r4::Extension type");
+
+                let value_type_str = match ident_str.as_str() {
+                    "Boolean" => "bool",
+                 "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
+                 "Integer64" => "std::primitive::i64", // Assuming R6 might be used
+                 "Decimal" => "crate::PreciseDecimal", // Special case handled above, but include for completeness
+                 _ => "std::string::String", // Default for string-based types like Code, Uri, String, Date, DateTime etc.
+            };
+            let value_type = syn::parse_str::<Type>(value_type_str).expect("Failed to parse value type");
+            return (value_type, extension_type);
+        }
+    }
+
+    panic!("Could not extract generics from non-Element/DecimalElement type: {}", quote!(#ty));
+}
                     let e_arg = &args.args[1];
                     let v_type = match v_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for V") };
                     let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
