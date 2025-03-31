@@ -78,11 +78,11 @@ fn get_element_generics(ty: &Type) -> (Type, Type) {
                         let e_type = match e_arg { GenericArgument::Type(t) => t.clone(), _ => panic!("Expected Type for E") };
                         return (precise_decimal_type, e_type);
                     }
+                    // If it has generics but isn't Element/DecimalElement, fall through to panic below.
                 }
-            }
-                    // else: It has generics but isn't Element/DecimalElement - fall through to alias check/panic.
-                }
-                // Check 2: If not Element/DecimalElement with generics, try matching known aliases based on the last segment name.
+                // else: No angle-bracketed generics found. Proceed to alias check.
+
+                // Attempt 2: If it wasn't Element/DecimalElement with generics, try matching known aliases.
                 let ident_str = segment.ident.to_string();
                 // Assume R4 context for aliases like Date, Boolean -> use crate::r4::Extension
                 let extension_type = syn::parse_str::<Type>("crate::r4::Extension").expect("Failed to parse crate::r4::Extension type");
