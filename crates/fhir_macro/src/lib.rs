@@ -190,37 +190,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                         // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
                     }
                 });
-
-                // Generate serialization logic according to FHIR JSON rules
-                serialize_fields.push(quote! {
-                    if let Some(element) = &self.#field_ident {
-                        let has_value = element.value.is_some();
-                        let has_extension_data = element.id.is_some() || element.extension.is_some();
-
-                        if has_value && !has_extension_data {
-                            // Case 1: Only value -> "fieldName": value
-                            state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
-                        } else if !has_value && has_extension_data {
-                            // Case 2: Only id/extension -> "_fieldName": { ... }
-                            // Use ::serde prefix for Serialize trait bound on E
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
-                                id: &element.id,
-                                extension: &element.extension,
-                            };
-                            state.serialize_field(#underscore_name_lit, &helper)?;
-                        } else if has_value && has_extension_data {
-                            // Case 3: Both value and id/extension -> "fieldName": value, "_fieldName": { ... }
-                            state.serialize_field(#original_name_lit, element.value.as_ref().unwrap())?;
-                            // Use ::serde prefix for Serialize trait bound on E
-                            let helper = #serialize_extension_helper_name::<'_, #ext_ty> {
-                                id: &element.id,
-                                extension: &element.extension,
-                            };
-                            state.serialize_field(#underscore_name_lit, &helper)?;
-                        }
-                        // Case 4: Neither value nor id/extension -> Field is omitted entirely (handled by field_count_calculation)
-                    }
-                });
+                // Removed duplicated serialization logic block
             } else if is_option {
                 // Regular Option<T> field (not element-like) - Serialize inner value if Some
                 field_count_calculation.push(quote! {
