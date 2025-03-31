@@ -1272,8 +1272,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext1".to_string(),
-                // Construct r4::Boolean explicitly
-                value: Some(r4::ExtensionValue::Boolean(r4::Boolean { value: Some(true), ..Default::default() })),
+                // Construct r4::Boolean explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::Boolean(r4::Boolean { id: None, extension: None, value: Some(true) })),
             }])
         );
         assert_eq!(element.value, Some("test_value".to_string()));
@@ -1292,8 +1292,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext3".to_string(),
-                // Construct r4::Integer explicitly
-                value: Some(r4::ExtensionValue::Integer(r4::Integer { value: Some(123), ..Default::default() })),
+                // Construct r4::Integer explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::Integer(r4::Integer { id: None, extension: None, value: Some(123) })),
             }])
         );
         assert_eq!(element_missing_value.value, None); // Value should be None
@@ -1321,8 +1321,8 @@ mod tests {
                 id: None,
                 extension: None,
                 url: "http://example.com/ext2".to_string(),
-                // Construct r4::String explicitly
-                value: Some(r4::ExtensionValue::String(r4::String { value: Some("val2".to_string()), ..Default::default() })),
+                // Construct r4::String explicitly, initializing all fields
+                value: Some(r4::ExtensionValue::String(r4::String { id: None, extension: None, value: Some("val2".to_string()) })),
             }])
         );
         assert_eq!(element_missing_id.value, Some("test_value_ext".to_string()));
