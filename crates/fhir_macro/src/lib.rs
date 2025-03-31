@@ -33,9 +33,11 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper function to check if a type is specifically Element or DecimalElement (by name)
-fn is_element_or_decimal_element(ty: &Type) -> bool {
+// Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
+// Renamed back from is_element_or_decimal_element
+fn is_fhir_primitive_element_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
+        // Allow multi-segment paths like crate::r4::Date, but only check the last segment's identifier
         if type_path.qself.is_none() {
             if let Some(segment) = type_path.path.segments.last() {
                 let ident_str = segment.ident.to_string();
@@ -152,11 +154,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
         // Check if the field is Option<T>
         if let Some(inner_ty) = get_option_inner_type(field_ty) {
-            // Check if the inner type T is specifically Element or DecimalElement
-            if is_element_or_decimal_element(inner_ty) {
-                // This field is Option<Element<V, E>> or Option<DecimalElement<E>>
-                // Extract E type using get_element_generics
-                // We only need E for the serialization helper generic argument
+            // Check if the inner type T is a FHIR primitive element (Element, DecimalElement, or alias)
+            if is_fhir_primitive_element_type(inner_ty) {
+                // This field is a FHIR primitive element type (e.g., Option<r4::Date>, Option<Element<...>>)
+                // Apply the complex FHIR serialization logic (_fieldName vs fieldName)
                 let (_v_ty, ext_ty) = get_element_generics(inner_ty);
                 // --- End moved block ---
 
@@ -299,8 +300,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             Some(inner) => (true, inner),
             None => (false, field_ty),
         };
-        // Use the updated helper function
-        let is_element = is_element_or_decimal_element(inner_ty);
+        // Use the renamed helper function
+        let is_element = is_fhir_primitive_element_type(inner_ty);
 
         // *** Move field_infos population here ***
         field_infos.push(FieldInfo {
@@ -536,7 +537,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             // Determine the actual struct type to construct (Element or DecimalElement)
             // based on the inner_ty name
-            let element_struct_ident = if let Type::Path(type_path) = inner_ty {
+            // Prefix with _ as it's unused now
+            let _element_struct_ident = if let Type::Path(type_path) = inner_ty {
                  if type_path.path.segments.len() == 1 {
                      let segment = &type_path.path.segments[0];
                      if segment.ident == "DecimalElement" || segment.ident.to_string() == "Decimal" {
