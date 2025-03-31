@@ -213,14 +213,16 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     }
                 });
             } else {
-                // Regular Option<T> field (unchanged)
+                // Regular Option<T> field - Serialize the inner value directly if Some
                 field_count_calculation.push(quote! {
                     if self.#field_ident.is_some() { count += 1; }
                 });
                 serialize_fields.push(quote! {
+                    // Use serialize_field_if_some helper or equivalent logic
                     if let Some(value) = &self.#field_ident {
-                        state.serialize_field(#original_name_lit, value)?;
+                         state.serialize_field(#original_name_lit, value)?;
                     }
+                    // For non-optional fields, handle directly below
                 });
             }
         } else {
@@ -593,20 +595,17 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     // Need to pass the correct generics <V, E> or <E>
                     let element_value = if stringify!(#element_struct_ident) == "DecimalElement" {
                          // Construct DecimalElement<E>
-                         // Use the _ext_ty variable defined outside this quote! block
-                         #element_struct_ident::<#_ext_ty> { // Use #_ext_ty
-                             value: #val_field_ident, // Already Option<PreciseDecimal>
-                             id: #id_field_ident,
-                             extension: #final_ext_field_ident, // Use the final deserialized extensions
+                         #element_struct_ident::<#_ext_ty> { // Use _ext_ty
+                             value: #val_field_ident, // Assign the temporary value field
+                             id: #id_field_ident, // Assign the temporary id field
+                             extension: #final_ext_field_ident, // Assign the final deserialized extension field
                          }
                     } else {
                          // Construct Element<V, E>
-                         // Need V type here again!
-                         // Use the _ext_ty variable defined outside this quote! block
-                         #element_struct_ident::<#v_ty_construct, #_ext_ty> { // Use #_ext_ty
-                             value: #val_field_ident, // Already Option<V>
-                             id: #id_field_ident,
-                             extension: #final_ext_field_ident, // Use the final deserialized extensions
+                         #element_struct_ident::<#v_ty_construct, #_ext_ty> { // Use v_ty_construct and _ext_ty
+                             value: #val_field_ident, // Assign the temporary value field
+                             id: #id_field_ident, // Assign the temporary id field
+                             extension: #final_ext_field_ident, // Assign the final deserialized extension field
                          }
                     };
                     ::std::option::Option::Some(element_value)
