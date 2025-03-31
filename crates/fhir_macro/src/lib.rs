@@ -33,14 +33,6 @@ fn get_option_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// List of known FHIR primitive type aliases that wrap Element or DecimalElement
-const FHIR_PRIMITIVE_ALIASES: &[&str] = &[
-    "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime",
-    "Id", "Instant", "Integer", "Markdown", "Oid", "PositiveInt", "String",
-    "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
-    // Note: Decimal is handled separately as it maps to DecimalElement
-];
-
 // Helper function to check if a type is Element<V, E>, DecimalElement<E>, or a known primitive alias
 fn is_fhir_primitive_element_type(ty: &Type) -> bool {
     if let Type::Path(type_path) = ty {
@@ -677,11 +669,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Ensure the main Deserialize impl correctly declares and uses the 'de lifetime
     let deserialize_impl = quote! {
         impl<'de> ::serde::Deserialize<'de> for #name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                D: ::serde::Deserializer<'de>,
+                D: ::serde::Deserializer<'de>, // 'de is used here by the Deserializer bound
             {
                 // Define the fields Serde should expect
                 const FIELDS: &'static [&'static str] = &[#(#field_strings),*];
