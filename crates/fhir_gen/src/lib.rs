@@ -283,7 +283,8 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
             value_type,
             capitalize_first_letter(type_name)
         ));
-        output.push_str("    fn from(value: {}) -> Self {\n");
+        // Use the determined value_type in the function signature
+        output.push_str(&format!("    fn from(value: {}) -> Self {{\n", value_type));
         output.push_str("        Self { value: Some(value), ..Default::default() }\n"); // Use Default for id/extension
         output.push_str("    }\n");
         output.push_str("}\n");
