@@ -594,7 +594,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Determine if we should construct DecimalElement based *only* on whether the
             // original inner type identifier was exactly "Decimal".
             // Get the string representation of the inner_ty (the type inside Option<...>)
-            let inner_ty_path_str = quote!(#info.inner_ty).to_string(); // Access inner_ty via info
+            let inner_ty_var = info.inner_ty; // Assign to a local variable first
+            let inner_ty_path_str = quote!(#inner_ty_var).to_string(); // Interpolate the variable
             // Check if the type path string ends with "Decimal", accounting for potential module paths like r4::Decimal
             let should_construct_decimal_element = inner_ty_path_str.split("::").last() == Some("Decimal");
             // --- End Check Original Type Name ---
