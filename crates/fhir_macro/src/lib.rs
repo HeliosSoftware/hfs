@@ -171,20 +171,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             attrs.iter().find_map(|attr| {
                                 if attr.path().is_ident("serde") {
                                     // Use parse_args_with for syn 2.0
-                                    // Ensure we handle potential errors during parsing
-                                    if let Ok(args) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
-                                        args.iter().find_map(|meta| {
-                                            // Access the value field of MetaNameValue
-                                            if let Meta::NameValue(MetaNameValue { path, value: syn::Expr::Lit(expr_lit), .. }) = meta {
-                                                 if let Lit::Str(lit_str) = &expr_lit.lit {
-                                                    if path.is_ident("skip_serializing_if") {
-                                                        return syn::parse_str::<Path>(&lit_str.value()).ok();
+                                    match attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                                        Ok(args) => {
+                                            args.iter().find_map(|meta| {
+                                                if let Meta::NameValue(nv) = meta {
+                                                    if nv.path.is_ident("skip_serializing_if") {
+                                                        // The value is now an Expr, check if it's a Lit::Str
+                                                        if let syn::Expr::Lit(expr_lit) = &nv.value {
+                                                            if let Lit::Str(lit_str) = &expr_lit.lit {
+                                                                return syn::parse_str::<Path>(&lit_str.value()).ok();
+                                                            }
+                                                        }
                                                     }
-                                                 }
-                                            None
-                                        })
-                                    })
-                                } else { None }
+                                                }
+                                                None // Not the meta item we are looking for
+                                            })
+                                        },
+                                        Err(_) => None, // Failed to parse args, ignore this attribute
+                                    }
+                                } else { None } // Not a #[serde(...)] attribute
                             })
                         }
 
