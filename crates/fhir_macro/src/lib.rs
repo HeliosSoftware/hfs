@@ -320,12 +320,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         }
 
                                         // Define helper struct locally for serialization (used in cases 2 & 3)
+                                        // Assuming E is crate::r4::Extension for now
                                         #[derive(Serialize)]
-                                        struct IdAndExtensionHelper<'a, E: Serialize> {
+                                        struct IdAndExtensionHelper<'a> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             id: &'a Option<String>,
                                             #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<E>>,
+                                            extension: &'a Option<Vec<crate::r4::Extension>>, // Use concrete type
                                         }
 
                                         // Case 1: Value only -> Serialize primitive
