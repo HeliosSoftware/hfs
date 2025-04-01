@@ -380,7 +380,8 @@ fn generate_deserialize_impl(
     name: &Ident,
     impl_generics: &syn::ImplGenerics,
     ty_generics: &syn::TypeGenerics,
-    where_clause: &Option<syn::WhereClause>,
+    // Accept the type returned by split_for_impl
+    where_clause: &Option<&syn::WhereClause>,
 ) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
@@ -391,7 +392,8 @@ fn generate_deserialize_impl(
 
                     let field_names: Vec<_> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
                     let field_name_strs: Vec<_> = field_names.iter().map(|f| f.to_string()).collect();
-                    let field_types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
+                    // Remove unused field_types
+                    // let field_types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
 
                     // Create enum variants for field matching
                     let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
