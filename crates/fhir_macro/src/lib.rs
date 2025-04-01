@@ -305,13 +305,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // Check the outer skip condition first
                                 if !(#skip_check) {
                                     if let Some(element) = &#field_access {
+                                        let has_value = element.value.is_some();
+                                        let has_extension = element.id.is_some() || element.extension.is_some();
+
                                         // Serialize primitive value under fieldName if present
-                                        if let Some(value) = &element.value {
+                                        if has_value {
                                             // Serialize the inner value directly using its own Serialize impl
-                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                            state.serialize_field(&#effective_field_name_str, &element.value)?;
                                         }
 
                                         // Serialize id/extension under _fieldName if present
+                                        if has_extension {
                                         if element.id.is_some() || element.extension.is_some() {
                                             // Create the underscore field name based on the effective name
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
@@ -645,22 +649,36 @@ fn generate_deserialize_impl(
                                             // Only extension element present: construct a new Element<V, E> with value: None
                                             (None, Some(ee)) => {
                                                  // Construct the Element with id/extension from ee and value: None
-                                                 // Need to handle Option<Element> vs Element for the field type
+                                                 // We need the concrete type V and E for Element<V, E>
+                                                 // Let's assume #field_ty is Option<Element<V, E>> or Element<V, E>
+                                                 // We create the Element<V, E> and wrap in Some if #field_ty is Option<_>
                                                  let constructed_element = crate::Element {
                                                      id: ee.id,
                                                      extension: ee.extension,
                                                      value: None, // Explicitly None
                                                  };
-                                                 // If the field type is Option<Element>, wrap in Some.
-                                                 // If the field type is Element, use directly (this requires Default if _field was missing/null).
-                                                 // Let's assume Option<Element> for now as it's safer.
-                                                 Some(constructed_element)
+                                                 // Wrap in Some if the original field type was Option<_>
+                                                 if #is_option {
+                                                     Some(constructed_element)
+                                                 } else {
+                                                     // This case (non-optional Element with only extension) might be less common
+                                                     // or invalid depending on FHIR rules, but we construct it anyway.
+                                                     constructed_element
+                                                 }
                                             },
                                             // Neither present
-                                            (None, None) => None, // Result is None for Option<Element>
+                                            (None, None) => {
+                                                // If the field is Option<Element>, result is None.
+                                                // If the field is Element, result is Default::default().
+                                                if #is_option {
+                                                    None
+                                                } else {
+                                                    Default::default() // Assumes Element implements Default
+                                                }
+                                            }
                                         }
                                     };
-                                     #field_ident // Assign the Option<Element> or Element directly
+                                     #field_ident // Assign the constructed Element or Option<Element>
                                 });
                             }
 
