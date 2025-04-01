@@ -596,11 +596,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Get the string representation of the inner_ty (the type inside Option<...>)
             let inner_ty_var = info.inner_ty; // Assign to a local variable first
             let inner_ty_path_str = quote!(#inner_ty_var).to_string(); // Interpolate the variable
-            // Check if the type path string ends with "Decimal", accounting for potential module paths like r4::Decimal
-            // Trim whitespace from the last segment before comparing
-            let last_segment = inner_ty_path_str.split("::").last().map(|s| s.trim());
-            let should_construct_decimal_element = last_segment == Some("Decimal");
-            // --- End Check Original Type Name ---
+            // --- Logic moved inside quote block below ---
 
 
             Some(quote! {
