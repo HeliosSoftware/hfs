@@ -656,13 +656,12 @@ fn generate_deserialize_impl(
                         }
                     }
 
-                    // Generate final struct construction logic
-                    // Generate field assignments for the final struct construction
-                    let final_field_assignments: Vec<_> = fields.named.iter().map(|field| {
+                    // Generate the logic to construct the final field values *after* the loop
+                    let final_construction_logic: Vec<_> = fields.named.iter().enumerate().map(|(i, field)| {
                         let field_ident = field.ident.as_ref().unwrap();
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
-                        let is_fhir_elem = get_element_info(field_ty).0 || get_element_info(field_ty).1; // Re-check here
+                        let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean
 
                         if is_fhir_elem {
                             let effective_field_name_str = get_effective_field_name(field);
@@ -673,7 +672,7 @@ fn generate_deserialize_impl(
                             if is_vec {
                                 // Handle Vec<Option<Element>> or Vec<Element>
                                 quote! {
-                                    #field_ident: {
+                                    let #field_ident: #field_ty = { // Use let binding here
                                         // Deserialize primitive array (fieldName)
                                         let primitives: Option<Vec<Option<_>>> = #temp_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
@@ -714,12 +713,12 @@ fn generate_deserialize_impl(
                                             },
                                             (None, None) => None,
                                         }
-                                    }
+                                    }; // End of let binding block
                                 }
                             } else {
                                 // Handle single Option<Element> or Element
                                 quote! {
-                                    #field_ident: {
+                                    let #field_ident: #field_ty = { // Use let binding here
                                         let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
                                         let extension_value_json: Option<serde_json::Value> = #temp_underscore_field_name;
 
@@ -745,25 +744,29 @@ fn generate_deserialize_impl(
                                                 }
                                             }
                                         }
-                                    }
+                                    }; // End of let binding block
                                 }
                             }
                         } else {
                             // Default deserialization for non-FHIR-element fields
                             quote! {
-                                #field_ident: match #temp_field_name {
+                                let #field_ident: #field_ty = match #temp_field_name { // Use let binding here
                                     Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
                                     None => Default::default(),
-                                }
+                                }; // End of let binding block
                             }
                         }
                     }).collect();
 
+                    // Get just the field idents for the final struct construction
+                    let final_field_idents: Vec<_> = fields.named.iter().map(|field| {
+                        field.ident.as_ref().unwrap()
+                    }).collect();
 
-                    // Assemble the final struct instantiation
+                    // Assemble the final struct instantiation using the field idents
                     let struct_instantiation = quote! {
                         #name {
-                            #(#final_field_assignments),* // Use the generated assignments
+                            #(#final_field_idents),* // Use just the idents
                         }
                     };
 
@@ -810,8 +813,9 @@ fn generate_deserialize_impl(
                             }
                         } // end impl Visitor
 
-                        deserializer.deserialize_map(#visitor_name)
-                    }
+                        // Start deserialization using the visitor
+                        deserializer.deserialize_map(#visitor_name) // Pass visitor with generics if needed, but deserialize_map doesn't take it directly
+                    } // end quote!
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
                 Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
