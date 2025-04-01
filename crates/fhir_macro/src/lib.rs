@@ -590,13 +590,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             // --- New Robust Check ---
             // Parse the target type `crate::PreciseDecimal` once for comparison
-            // --- Check Original Type Name for "Decimal" ---
-            // Determine if we should construct DecimalElement based *only* on whether the
-            // original inner type identifier was exactly "Decimal".
-            // Get the string representation of the inner_ty (the type inside Option<...>)
-            let inner_ty_var = info.inner_ty; // Assign to a local variable first
-            let _inner_ty_path_str = quote!(#inner_ty_var).to_string(); // Interpolate the variable // PREFIXED
             // --- Logic moved inside quote block below ---
+            // No need to calculate should_construct_decimal_element here anymore.
 
 
             Some(quote! {
