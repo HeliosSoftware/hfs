@@ -217,6 +217,27 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
+// Helper to extract V and E from Element<V, E>
+fn get_element_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
+    if let Type::Path(TypePath { path, .. }) = ty {
+        if let Some(segment) = path.segments.last() {
+            if segment.ident == "Element" {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if args.args.len() == 2 {
+                        let v_arg = args.args.first().unwrap();
+                        let e_arg = args.args.last().unwrap();
+                        if let (GenericArgument::Type(ty_v), GenericArgument::Type(ty_e)) = (v_arg, e_arg) {
+                            return Some((ty_v, ty_e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
@@ -738,73 +759,56 @@ fn generate_deserialize_impl(
                             } else {
                                 // Handle single Option<Element> or Element
                                 final_construction_logic.push(quote! {
-                                    // Use field_ident for the variable name
                                     let #field_ident: #field_ty = {
-
-
-                                        // Define helper struct locally for id/extension part
-                                        #[derive(Deserialize, Debug, Default)]
-                                        struct IdAndExtension<E: serde::de::DeserializeOwned + Default> {
-                                            id: Option<String>,
-                                            extension: Option<Vec<E>>,
-                                        }
-
-                                        // Attempt to deserialize the primitive value directly into Option<V>
-                                        // This requires knowing V. Let's deserialize the raw JSON value first.
                                         let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
+                                        let extension_value_json: Option<serde_json::Value> = #temp_underscore_field_name;
 
-                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
-                                        // Assuming E is crate::r4::Extension for the helper struct
-                                        let extension_part_opt: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name
-                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
-                                            .transpose()?;
-
-                                        // Call helper *before* the quote block
-                                        let inner_types_opt = get_element_inner_types(&#field_ty);
-
-                                        // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
-                                        let result_element_opt = if let Some((ty_v, _ty_e)) = inner_types_opt { // Use the result from the helper
-                                            // Deserialize primitive_value_json into Option<V> using the extracted type
-                                            let value_part: Option<#ty_v> = primitive_value_json
-                                                .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
-                                                .transpose()?;
-
-                                            match (value_part, extension_part_opt) {
-                                                (Some(v), Some(ep)) => Some(crate::Element { id: ep.id, extension: ep.extension, value: Some(v) }),
-                                                (Some(v), None) => Some(crate::Element { id: None, extension: None, value: Some(v) }),
-                                                (None, Some(ep)) => Some(crate::Element { id: ep.id, extension: ep.extension, value: None }), // V needs Default here if Element is not Option
-                                                (None, None) => None,
-                                            }
-                                        } else {
-                                            // Fallback for types where V couldn't be extracted (e.g., DecimalElement)
-                                            // Or if the type wasn't Element<V,E>
-                                            // Rely on extension part only, or None/Default
-                                            match extension_part_opt {
-                                                 // Construct Element with id/extension and value: None
-                                                 // This still assumes V: Default if the field is not Option<Element<V,E>>
-                                                 Some(ep) => Some(crate::Element { id: ep.id, extension: ep.extension, value: None }),
-                                                 None => None,
-                                            }
+                                        // Combine primitive and extension JSON into a single representation suitable for Element::deserialize
+                                        let combined_json_to_deserialize = match (primitive_value_json, extension_value_json) {
+                                            // Case 3: Both value and extension present -> Construct object for Element::deserialize
+                                            (Some(prim_val), Some(mut ext_obj @ serde_json::Value::Object(_))) => {
+                                                if let serde_json::Value::Object(map) = &mut ext_obj {
+                                                    // Add the primitive value under the "value" key
+                                                    map.insert("value".to_string(), prim_val);
+                                                }
+                                                Some(ext_obj) // Pass the combined object to Element::deserialize
+                                            },
+                                            // Case 1: Only primitive value present -> Pass primitive directly to Element::deserialize
+                                            (Some(prim_val), None) => Some(prim_val),
+                                            // Case 2: Only extension object present -> Pass object directly to Element::deserialize
+                                            (None, Some(ext_obj)) => Some(ext_obj),
+                                            // Case 4: Neither present -> Pass None (or handle based on Option)
+                                            (None, None) => None,
                                         };
 
-                                        // Assign to the final field, handling Option vs non-Option field type
-                                        if #is_option {
-                                            result_element_opt
-                                        } else {
-                                            result_element_opt.unwrap_or_default() // Assumes Element<V, E> implements Default
+                                        // Deserialize the combined JSON (or None) into the target field type (#field_ty)
+                                        // This leverages the custom Deserialize impl for Element<V, E> or DecimalElement<E>
+                                        match combined_json_to_deserialize {
+                                            Some(json) => serde_json::from_value(json).map_err(serde::de::Error::custom)?,
+                                            None => {
+                                                // If the field type itself is Option<...>, the result is None.
+                                                // If the field type is not Option<...>, use Default.
+                                                if #is_option {
+                                                    None
+                                                } else {
+                                                    // This assumes the type #field_ty implements Default
+                                                    Default::default()
+                                                }
+                                            }
                                         }
                                     };
-                                     #field_ident // Assign the constructed Element or Option<Element>
+                                    #field_ident // Assign the result
                                 });
                             }
                         } else {
-                            // Default deserialization for non-FHIR-element fields
+                            // Default deserialization for non-FHIR-element fields (non-Option or Option<NonElement>)
                             final_construction_logic.push(quote! {
-                                // Deserialize directly from the temporary JSON value
-                                let #field_ident : #field_ty = #temp_field_name // Use field_ident here
-                                    .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
-                                    .transpose()? // Propagate V::Error
-                                    .unwrap_or_default(); // Use default if field was missing or null, assuming Default trait
+                                // Deserialize directly from the temporary JSON value into the target type #field_ty
+                                let #field_ident : #field_ty = match #temp_field_name {
+                                    Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                                    None => Default::default(), // Assumes #field_ty implements Default
+                                };
+                                #field_ident // Assign the result
                             });
                         }
                     }
