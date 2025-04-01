@@ -294,38 +294,32 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Special handling for FHIR elements that might add an extra `_field`
                         if is_fhir_element && !is_vec {
                             // Single Element or DecimalElement
-                            // let underscore_field_name_str = format!("_{}", field_name_str); // Not needed for count
                             field_count_calculator.push(quote! {
-                                if let Some(element) = &#field_access {
-                                    let has_value = element.value.is_some();
-                                    let has_extension = element.id.is_some() || element.extension.is_some();
-                                    if has_value {
-                                        count += 1; // Count the main field
-                                    }
-                                    if has_extension {
-                                        count += 1; // Count the underscore field
-                                    }
-                                    // If the element exists but has neither value nor extension,
-                                    // the Element's serialize impl might output {}, which counts as 1 field.
-                                    // However, our Element serialize impl outputs null or primitive if only value,
-                                    // and object if id/ext exist. If both are none, it depends on Option.
-                                    // Let's refine: if the Option is Some, but the element is empty (no value, no id, no ext),
-                                    // the Element serialize outputs {}, so we should count 1.
-                                    // But the current Element impl outputs null in that case if id/ext are none.
-                                    // Let's stick to counting based on value/extension presence.
+                                // Check outer skip condition first
+                                if !(#skip_check) {
+                                     if let Some(element) = &#field_access {
+                                         let has_value = element.value.is_some();
+                                         let has_extension = element.id.is_some() || element.extension.is_some(); // Simpler check
+                                         if has_value && has_extension {
+                                             count += 2; // fieldName + _fieldName
+                                         } else if has_value || has_extension {
+                                             count += 1; // fieldName OR _fieldName
+                                         }
+                                         // If neither, count remains 0 for this field
+                                     }
                                 }
                             });
                         } else if is_fhir_element && is_vec {
                             // Vec<Option<Element>>
                             // let underscore_field_name_str = format!("_{}", effective_field_name_str); // Use effective name if needed
                             field_count_calculator.push(quote! {
-                                if let Some(vec) = &#field_access {
-                                     // Check if the vector itself should be serialized based on skip_serializing_if or Option rules
-                                     if #base_count_logic {
-                                        // Check if the primitive array needs serialization (non-empty or skip doesn't apply)
-                                        let serialize_primitive_array = !vec.is_empty(); // Always serialize if not empty? Or respect skip? Let's assume serialize if not empty for now.
-                                        if serialize_primitive_array {
-                                             count += 1; // Count the main field array
+                                // Check outer skip condition first (for the Option<Vec> itself)
+                                if !(#skip_check) {
+                                    if let Some(vec) = &#field_access {
+                                        // Check if the primitive array needs serialization (any non-null value)
+                                        let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
+                                        if has_any_value || !vec.is_empty() { // Serialize even if empty but not skipped
+                                            count += 1; // Count the main field array
                                         }
 
                                         // Check if any element in the vec has extensions or id
@@ -335,13 +329,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         if has_any_extension {
                                             count += 1; // Count the underscore field array
                                         }
-                                     }
+                                    }
+                                     // If Option<Vec> is None, the outer skip_check handles it.
                                 }
                             });
                         } else {
-                            // Use the standard count logic for non-FHIR elements or non-optional fields
-                            field_count_calculator
-                                .push(quote! { if #base_count_logic { count += 1; } });
+                            // Standard count logic for non-FHIR elements
+                            field_count_calculator.push(quote! {
+                                if !(#skip_check) { // Use the skip_check logic derived earlier
+                                    count += 1;
+                                }
+                            });
                         }
 
                         // --- Field Serialization Logic ---
@@ -355,8 +353,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         if is_fhir_element && !is_vec {
                             // Single Element or DecimalElement
-                            // Use effective_field_name_str here
-                            // let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             field_serializers.push(quote! {
                                 // Check the outer skip condition first
                                 if !(#skip_check) {
@@ -364,52 +360,45 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_value = element.value.is_some();
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                        let has_value = element.value.is_some();
-                                        let has_extension = element.id.is_some() || element.extension.is_some();
-
-                                        let has_value = element.value.is_some();
-                                        let has_extension = element.id.is_some() || element.extension.is_some();
-
                                         // Define helper struct locally for serializing only id/extension
+                                        // Use ::fhir::r4::Extension as a concrete type for now, assuming R4 context or similar structure.
+                                        // This might need adjustment if the macro needs to be more generic across FHIR versions.
                                         #[derive(Serialize)]
-                                        struct IdAndExtensionHelper<'a, E: Serialize> {
+                                        struct IdAndExtensionHelper<'a> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             id: &'a Option<String>,
                                             #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<E>>,
+                                            extension: &'a Option<Vec<::fhir::r4::Extension>>, // Use concrete type
                                         }
-
-                                        // Explicitly handle the three serialization cases + the empty case
 
                                         // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
                                         if has_value && has_extension {
                                             // Serialize primitive value under fieldName
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                             // Serialize extension object under _fieldName using helper struct
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                            let underscore_field_name_str = format!("_{}", #effective_field_name_str);
                                             let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
-                                                extension: &element.extension, // Assuming E can be inferred or is correct
+                                                extension: &element.extension,
                                             };
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
-                                        // Case 1: Value only -> Serialize primitive
-                                        else if has_value { // && !has_extension is implied by the else
+                                        // Case 1: Value only -> Serialize primitive under fieldName
+                                        else if has_value { // && !has_extension is implied
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                         }
                                         // Case 2: Extension only -> Serialize helper object under _fieldName
-                                        else if has_extension { // && !has_value is implied by the else
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                        else if has_extension { // && !has_value is implied
+                                            let underscore_field_name_str = format!("_{}", #effective_field_name_str);
                                             let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
-                                                extension: &element.extension, // Assuming E can be inferred or is correct
+                                                extension: &element.extension,
                                             };
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
                                         // Case 4: Neither value nor extension -> Serialize nothing (field is skipped by count logic)
                                     }
-
-
+                                    // If the outer Option was None, the skip_check handles it.
                                 }
                             });
                         } else if is_fhir_element && is_vec {
