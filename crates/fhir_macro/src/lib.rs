@@ -309,9 +309,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
                                         // Serialize primitive value under fieldName if present
-                                        if let Some(value) = &element.value {
-                                            // Use the value's own Serialize implementation
-                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                        if has_value {
+                                            // Ensure we serialize the inner value V, not Option<V>
+                                            if let Some(value) = &element.value {
+                                                state.serialize_field(&#effective_field_name_str, value)?;
+                                            }
                                         }
 
                                         // Serialize id/extension under _fieldName if present
@@ -660,7 +662,7 @@ fn generate_deserialize_impl(
                                             .transpose()?; // Propagate V::Error
 
                                         // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
-                                        let result_element = match (value_part, extension_part) {
+                                        let result_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (value_part, extension_part) {
                                             (Some(v), Some(ep)) => Some(crate::Element { // Both present
                                                 id: ep.id,
                                                 extension: ep.extension,
@@ -674,16 +676,18 @@ fn generate_deserialize_impl(
                                             (None, Some(ep)) => Some(crate::Element { // Only extension present
                                                 id: ep.id,
                                                 extension: ep.extension,
-                                                value: None,
+                                                value: None, // Value is explicitly None
                                             }),
                                             (None, None) => None, // Neither present
                                         };
 
                                         // Assign to the final field, handling Option vs non-Option field type
                                         if #is_option {
-                                            result_element // Assign Option<Element<V, E>>
+                                            result_element_opt // Assign Option<Element<V, E>>
                                         } else {
-                                            result_element.unwrap_or_default() // Assign Element<V, E>, requires Default
+                                            // If the field is not optional, but we got None (e.g., empty JSON object), return Default
+                                            // If we constructed Some(element), unwrap it.
+                                            result_element_opt.unwrap_or_default() // Assign Element<V, E>, requires Default
                                         }
                                     };
                                      #field_ident // Assign the constructed Element or Option<Element>
