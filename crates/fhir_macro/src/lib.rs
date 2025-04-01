@@ -2,11 +2,13 @@ extern crate proc_macro;
 
 extern crate proc_macro;
 
+extern crate proc_macro;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, punctuated::Punctuated, token, Attribute, Data, DeriveInput, Fields,
-    GenericArgument, Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type, TypePath, // Removed PathSegment, added Lit, MetaNameValue, Punctuated, token
+    GenericArgument, Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type, TypePath, // Removed PathSegment
 };
 use heck::ToPascalCase; // For generating visitor names
 
@@ -169,12 +171,16 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             attrs.iter().find_map(|attr| {
                                 if attr.path().is_ident("serde") {
                                     // Use parse_args_with for syn 2.0
-                                    attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated).ok().and_then(|args| {
+                                    // Ensure we handle potential errors during parsing
+                                    if let Ok(args) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
                                         args.iter().find_map(|meta| {
-                                            if let Meta::NameValue(MetaNameValue { path, lit: Lit::Str(lit_str), .. }) = meta {
-                                                if path.is_ident("skip_serializing_if") {
-                                                    return syn::parse_str::<Path>(&lit_str.value()).ok();
-                                                }
+                                            // Access the value field of MetaNameValue
+                                            if let Meta::NameValue(MetaNameValue { path, value: syn::Expr::Lit(expr_lit), .. }) = meta {
+                                                 if let Lit::Str(lit_str) = &expr_lit.lit {
+                                                    if path.is_ident("skip_serializing_if") {
+                                                        return syn::parse_str::<Path>(&lit_str.value()).ok();
+                                                    }
+                                                 }
                                             None
                                         })
                                     })
@@ -614,9 +620,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident, ty_generics: &syn::TypeG
                             #ignore_variant
                         }
 
-                        struct #visitor_name #ty_generics #where_clause; // Add generics and where clause here
+                        // Define visitor struct with generics
+                        struct #visitor_name #ty_generics #where_clause;
 
-                        // Use the generics captured earlier for the impl block
+                        // Apply impl_generics and where_clause correctly to the impl block
                         impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause {
                             type Value = #name #ty_generics;
 
