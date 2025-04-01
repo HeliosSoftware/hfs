@@ -539,6 +539,42 @@ where
                 Some(val) => val.serialize(serializer),
                 None => serializer.serialize_none(),
             }
+        } else if self.value.is_some() && (self.id.is_some() || self.extension.is_some()) {
+            // If both value and id/extension are present, we need to use a special serialization format
+            // This is handled by the FhirSerde derive macro, but we need to handle it here for direct Element usage
+            
+            // First, serialize the value directly
+            let value = self.value.as_ref().unwrap();
+            
+            // Then, create a helper struct for the id/extension part
+            #[derive(Serialize)]
+            struct IdAndExtensionHelper<'a, E> {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                id: &'a Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                extension: &'a Option<Vec<E>>,
+            }
+            
+            let extension_part = IdAndExtensionHelper {
+                id: &self.id,
+                extension: &self.extension,
+            };
+            
+            // Create a tuple struct to serialize both parts
+            #[derive(Serialize)]
+            struct ElementWithExtension<'a, V, E> {
+                #[serde(rename = "")]
+                value: &'a V,
+                #[serde(rename = "_")]
+                extension: IdAndExtensionHelper<'a, E>,
+            }
+            
+            let element_with_extension = ElementWithExtension {
+                value,
+                extension: extension_part,
+            };
+            
+            element_with_extension.serialize(serializer)
         } else {
             // Otherwise, serialize as an object containing id, extension, value if present
             let mut len = 0;
