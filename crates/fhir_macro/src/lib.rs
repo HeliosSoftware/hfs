@@ -592,6 +592,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // Parse the target type `crate::PreciseDecimal` once for comparison
             // --- Logic moved inside quote block below ---
             // No need to calculate should_construct_decimal_element here anymore.
+            let inner_ty_var = info.inner_ty; // Assign to local var for use in stringify!
 
 
             Some(quote! {
@@ -621,7 +622,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     // Construct the Element/DecimalElement directly inside Some()
                     // --- Check Original Inner Type inside generated code ---
                     // Get string of the original inner type (e.g., "r4 :: Date", "r4 :: Decimal")
-                    let inner_ty_string_check = stringify!(#info.inner_ty).replace(" ", "");
+                    let inner_ty_string_check = stringify!(#inner_ty_var).replace(" ", ""); // Use local var
                     // Check if the last segment is "Decimal"
                     let last_segment_check = inner_ty_string_check.split("::").last();
                     let is_decimal_type_check = last_segment_check == Some("Decimal");
