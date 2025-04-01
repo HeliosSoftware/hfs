@@ -2,7 +2,6 @@ use fhir::DecimalElement;
 use fhir::Element;
 use fhir::PreciseDecimal;
 use fhir::r4;
-use fhir_macro::FhirSerde;
 use serde::Deserialize;
 use serde::ser::SerializeStruct;
 
@@ -632,9 +631,25 @@ impl serde::Serialize for FhirSerdeTestStruct {
         if let Some(bd) = &self.birth_date {
             if birth_date_value {
                 state.serialize_field("birthDate", bd.value.as_ref().unwrap())?;
+            } else if birth_date_extension {
+                // If there's no value but there are extensions, serialize under birthDate
+                #[derive(serde::Serialize)]
+                struct IdAndExtensionHelper<'a> {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    id: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    extension: &'a Option<Vec<r4::Extension>>,
+                }
+                
+                let extension_part = IdAndExtensionHelper {
+                    id: &bd.id,
+                    extension: &bd.extension,
+                };
+                state.serialize_field("birthDate", &extension_part)?;
             }
             
-            if birth_date_extension {
+            // Only add _birthDate if both value and extension exist
+            if birth_date_value && birth_date_extension {
                 #[derive(serde::Serialize)]
                 struct IdAndExtensionHelper<'a> {
                     #[serde(skip_serializing_if = "Option::is_none")]
@@ -655,9 +670,25 @@ impl serde::Serialize for FhirSerdeTestStruct {
         if let Some(ia) = &self.is_active {
             if is_active_value {
                 state.serialize_field("isActive", ia.value.as_ref().unwrap())?;
+            } else if is_active_extension {
+                // If there's no value but there are extensions, serialize under isActive
+                #[derive(serde::Serialize)]
+                struct IdAndExtensionHelper<'a> {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    id: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    extension: &'a Option<Vec<r4::Extension>>,
+                }
+                
+                let extension_part = IdAndExtensionHelper {
+                    id: &ia.id,
+                    extension: &ia.extension,
+                };
+                state.serialize_field("isActive", &extension_part)?;
             }
             
-            if is_active_extension {
+            // Only add _isActive if both value and extension exist
+            if is_active_value && is_active_extension {
                 #[derive(serde::Serialize)]
                 struct IdAndExtensionHelper<'a> {
                     #[serde(skip_serializing_if = "Option::is_none")]
