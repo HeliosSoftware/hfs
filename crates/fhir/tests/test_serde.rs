@@ -560,8 +560,8 @@ fn test_deserialize_element_invalid_type() {
 use fhir_macro::FhirSerde;
 
 // Define a test struct that uses manual Serialize implementation
-// instead of FhirSerde derive to avoid conflicts
-#[derive(Debug, PartialEq, Deserialize)] // Add Deserialize derive
+// instead of FhirSerde derive to avoid conflicts - NOW USING FhirSerde
+#[derive(Debug, PartialEq, Deserialize, FhirSerde)] // Add Deserialize and FhirSerde derive
 struct FhirSerdeTestStruct {
     // Regular field
     name: Option<String>,
