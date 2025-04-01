@@ -6,7 +6,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, punctuated::Punctuated, token, Attribute, Data, DeriveInput, Fields,
-    GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type, TypePath, MetaNameValue, // Keep MetaNameValue for parsing
+    GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type, TypePath, // Removed unused MetaNameValue
 };
 use heck::ToPascalCase; // For generating visitor names
 
