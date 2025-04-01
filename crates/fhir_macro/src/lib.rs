@@ -933,7 +933,7 @@ fn generate_deserialize_impl(
                                             }
                                         }
                                     };
-                                    #field_ident // Assign the result
+                                    // Remove the trailing #field_ident assignment here
                                 });
                             }
                         } else {
@@ -944,7 +944,7 @@ fn generate_deserialize_impl(
                                     Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
                                     None => Default::default(), // Assumes #field_ty implements Default
                                 };
-                                #field_ident // Assign the result
+                                // Remove the trailing #field_ident assignment here
                             });
                         }
                     }
