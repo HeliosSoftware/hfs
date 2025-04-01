@@ -278,28 +278,26 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Use field_name_ident for accessing the struct field
                         let field_access = quote! { self.#field_name_ident };
 
-                        // --- Field Count Calculation ---
-                        let base_count_logic =
-                            if let Some(condition_path) = &skip_serializing_if_path {
-                                // If skip_serializing_if is present, use its condition
-                                quote! { !#condition_path(&#field_access) }
-                            } else if is_option {
-                                // Default for Option is skip if None
-                                quote! { #field_access.is_some() }
-                            } else {
-                                // Always count non-optional fields (unless skipped by attribute handled above)
-                                quote! { true }
-                            };
+                        // --- Define skip_check logic FIRST ---
+                        let skip_check = if let Some(condition_path) = &skip_serializing_if_path {
+                            quote! { #condition_path(&#field_access) }
+                        } else if is_option {
+                            quote! { #field_access.is_none() }
+                        } else {
+                            quote! { false } // Don't skip non-optional fields by default
+                        };
 
+
+                        // --- Field Count Calculation ---
                         // Special handling for FHIR elements that might add an extra `_field`
                         if is_fhir_element && !is_vec {
                             // Single Element or DecimalElement
                             field_count_calculator.push(quote! {
                                 // Check outer skip condition first
-                                if !(#skip_check) {
+                                if !(#skip_check) { // Now skip_check is defined
                                      if let Some(element) = &#field_access {
                                          let has_value = element.value.is_some();
-                                         let has_extension = element.id.is_some() || element.extension.is_some(); // Simpler check
+                                         let has_extension = element.id.is_some() || element.extension.is_some();
                                          if has_value && has_extension {
                                              count += 2; // fieldName + _fieldName
                                          } else if has_value || has_extension {
@@ -311,10 +309,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             });
                         } else if is_fhir_element && is_vec {
                             // Vec<Option<Element>>
-                            // let underscore_field_name_str = format!("_{}", effective_field_name_str); // Use effective name if needed
                             field_count_calculator.push(quote! {
                                 // Check outer skip condition first (for the Option<Vec> itself)
-                                if !(#skip_check) {
+                                if !(#skip_check) { // Now skip_check is defined
                                     if let Some(vec) = &#field_access {
                                         // Check if the primitive array needs serialization (any non-null value)
                                         let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
@@ -336,20 +333,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         } else {
                             // Standard count logic for non-FHIR elements
                             field_count_calculator.push(quote! {
-                                if !(#skip_check) { // Use the skip_check logic derived earlier
+                                if !(#skip_check) { // Now skip_check is defined
                                     count += 1;
                                 }
                             });
                         }
 
                         // --- Field Serialization Logic ---
-                        let skip_check = if let Some(condition_path) = &skip_serializing_if_path {
-                            quote! { #condition_path(&#field_access) }
-                        } else if is_option {
-                            quote! { #field_access.is_none() }
-                        } else {
-                            quote! { false } // Don't skip non-optional fields by default
-                        };
+                        // skip_check is already defined above
 
                         if is_fhir_element && !is_vec {
                             // Single Element or DecimalElement
