@@ -620,13 +620,10 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use stored #v_ty_construct and #ext_ty
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
-                    // --- Check Original Inner Type inside generated code ---
-                    // Get string of the original inner type (e.g., "r4 :: Date", "r4 :: Decimal")
-                    let inner_ty_string_check = stringify!(#inner_ty_var).replace(" ", ""); // Use local var
-                    // Check if the last segment is "Decimal"
-                    // Check if the last segment is "Decimal"
-                    let last_segment_check = inner_ty_string_check.split("::").last();
-                    let is_decimal_type_check = last_segment_check == Some("Decimal");
+                    // --- Check Resolved V Type inside generated code ---
+                    // Compare the stringified resolved V type (#v_ty_construct) against the target.
+                    let v_ty_string_check = stringify!(#v_ty_construct).replace(" ", "");
+                    let is_decimal_type_check = v_ty_string_check == "crate::PreciseDecimal";
                     // --- End check ---
                     ::std::option::Option::Some(
                         if is_decimal_type_check { // Use the check performed inside the generated code
