@@ -590,12 +590,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
 
             // --- New Robust Check ---
             // Parse the target type `crate::PreciseDecimal` once for comparison
-            // --- String Comparison Check ---
-            // Convert both types to strings and compare them, removing whitespace.
-            let v_ty_string = quote!(#v_ty_construct).to_string().replace(" ", "");
-            let target_string = "crate::PreciseDecimal".replace(" ", ""); // Target string
-            let should_construct_decimal_element = v_ty_string == target_string;
-            // --- End String Comparison Check ---
+            // --- Check Original Type Name for "Decimal" ---
+            // Determine if we should construct DecimalElement based *only* on whether the
+            // original inner type identifier was exactly "Decimal".
+            // Get the string representation of the inner_ty (the type inside Option<...>)
+            let inner_ty_path_str = quote!(#inner_ty).to_string();
+            // Check if the type path string ends with "Decimal", accounting for potential module paths like r4::Decimal
+            let should_construct_decimal_element = inner_ty_path_str.split("::").last() == Some("Decimal");
+            // --- End Check Original Type Name ---
 
 
             Some(quote! {
