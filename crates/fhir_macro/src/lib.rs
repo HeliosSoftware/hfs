@@ -494,15 +494,13 @@ fn generate_deserialize_impl(
                                     let #field_name: #field_ty = {
                                         // Deserialize primitive array (fieldName)
                                         let primitives: Option<Vec<Option<_>>> = #temp_field_name
-                                            .map(|v| serde_json::from_value(v))
-                                            .transpose()
-                                            .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive array for {}: {}", stringify!(#field_name), e)))?;
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                            .transpose()?; // Propagate V::Error
 
                                         // Deserialize extension array (_fieldName) - Use concrete Extension type
                                         let extensions: Option<Vec<Option<crate::Element<(), crate::r4::Extension>>>> = #temp_underscore_field_name
-                                            .map(|v| serde_json::from_value(v))
-                                            .transpose()
-                                            .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize extension array for {}: {}", stringify!(#field_name), e)))?;
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                            .transpose()?; // Propagate V::Error
 
                                         // Combine logic
                                         match (primitives, extensions) {
@@ -553,15 +551,13 @@ fn generate_deserialize_impl(
                                         // Let's try deserializing the whole Element from each part if present.
 
                                         let value_element: Option<#field_ty> = #temp_field_name
-                                            .map(|v| serde_json::from_value(v))
-                                            .transpose()
-                                            .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize value for {}: {}", stringify!(#field_name), e)))?;
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                            .transpose()?; // Propagate V::Error
 
                                         // Deserialize extension part (_fieldName) - Use concrete Extension type
                                         let extension_element: Option<crate::Element<(), crate::r4::Extension>> = #temp_underscore_field_name
-                                            .map(|v| serde_json::from_value(v))
-                                            .transpose()
-                                            .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize extension for {}: {}", stringify!(#field_name), e)))?;
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                            .transpose()?; // Propagate V::Error
 
                                         // Combine logic
                                         match (value_element, extension_element) {
@@ -583,8 +579,8 @@ fn generate_deserialize_impl(
                                                  // Or, more simply, deserialize the extension part *into* the target type directly,
                                                  // relying on the Element's Deserialize impl to handle the object format.
                                                  let combined_element: #field_ty = #temp_underscore_field_name
-                                                      .map(|v| serde_json::from_value(v))
-                                                      .transpose()? // Propagate error
+                                                      .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                                      .transpose()? // Propagate V::Error
                                                       .flatten(); // Flatten Option<Option<T>> -> Option<T>
                                                  combined_element
 
@@ -607,8 +603,8 @@ fn generate_deserialize_impl(
                             final_construction_logic.push(quote! {
                                 // Deserialize directly from the temporary JSON value
                                 let #field_name : #field_ty = #temp_field_name
-                                    .map(|v| serde_json::from_value(v))
-                                    .transpose()? // Propagate potential serde_json::Error
+                                    .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
+                                    .transpose()? // Propagate V::Error
                                     .unwrap_or_default(); // Use default if field was missing or null, assuming Default trait
                             });
                         }
