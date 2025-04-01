@@ -626,7 +626,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     // Construct the Element/DecimalElement directly inside Some()
                     // --- Check V type inside generated code ---
                     // Convert the interpolated type #v_ty_construct to a string and normalize it
-                    let v_ty_string_check = quote!(#v_ty_construct).to_string().replace(" ", ""); // Use quote!().to_string()
+                    let v_ty_string_check = stringify!(#v_ty_construct).replace(" ", ""); // Revert to stringify!
                     // Compare against the normalized target string
                     let is_decimal_type_check = v_ty_string_check == "crate::PreciseDecimal";
                     // --- End check ---
@@ -681,7 +681,8 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // No need to bring quote into scope for generated code inside visit_map
+                // Bring quote into scope for generated code inside visit_map
+                use quote::quote;
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
