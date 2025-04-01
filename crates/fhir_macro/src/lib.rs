@@ -319,21 +319,23 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                         }
 
+                                        // Define helper struct locally for serialization (used in cases 2 & 3)
+                                        #[derive(Serialize)]
+                                        struct IdAndExtensionHelper<'a, E: Serialize> {
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            id: &'a Option<String>,
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            extension: &'a Option<Vec<E>>,
+                                        }
+
                                         // Case 1: Value only -> Serialize primitive
                                         if has_value && !has_extension {
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                         }
-                                        // Case 2: Extension only -> Serialize object under _fieldName
+                                        // Case 2: Extension only -> Serialize helper object under _fieldName
                                         else if !has_value && has_extension {
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            #[derive(Serialize)]
-                                            struct IdAndExtension<'a, E: Serialize> {
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                id: &'a Option<String>,
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<E>>,
-                                            }
-                                            let extension_part = IdAndExtension {
+                                            let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
                                                 extension: &element.extension,
                                             };
@@ -345,14 +347,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                             // Serialize extension object under _fieldName using helper struct
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            #[derive(Serialize)]
-                                            struct IdAndExtension<'a, E: Serialize> {
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                id: &'a Option<String>,
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<E>>,
-                                            }
-                                            let extension_part = IdAndExtension {
+                                            let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
                                                 extension: &element.extension,
                                             };
