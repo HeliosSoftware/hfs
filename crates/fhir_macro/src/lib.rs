@@ -377,14 +377,21 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             // Assuming the inner value type V implements Serialize
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
                                         }
-                                        // Case 2: Extension only -> Serialize helper object under _fieldName
+                                        // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
                                         else if has_extension { // && !has_value is implied
-                                            let underscore_field_name_str = format!("_{}", #effective_field_name_str);
+                                            #[derive(serde::Serialize)]
+                                            struct IdAndExtensionHelper<'a> {
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<::fhir::r4::Extension>>,
+                                            }
+                                            
                                             let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
                                                 extension: &element.extension,
                                             };
-                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
+                                            state.serialize_field(&#effective_field_name_str, &extension_part)?;
                                         }
                                         // Case 4: Neither value nor extension -> Serialize nothing (field is skipped by count logic)
                                     }
