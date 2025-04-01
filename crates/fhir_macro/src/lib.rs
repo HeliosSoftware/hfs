@@ -222,7 +222,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
                         let is_fhir_element = is_element || is_decimal_element;
 
-                        let field_access = quote! { self.#field_name };
+                        // Use field_name_ident for accessing the struct field
+                        let field_access = quote! { self.#field_name_ident };
 
                         // --- Field Count Calculation ---
                         let base_count_logic = if let Some(condition_path) = &skip_serializing_if_path {
@@ -261,7 +262,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             });
                         } else if is_fhir_element && is_vec { // Vec<Option<Element>>
-                            // let underscore_field_name_str = format!("_{}", field_name_str); // Marked as unused, remove or use
+                            // let underscore_field_name_str = format!("_{}", effective_field_name_str); // Use effective name if needed
                             field_count_calculator.push(quote! {
                                 if let Some(vec) = &#field_access {
                                      // Check if the vector itself should be serialized based on skip_serializing_if or Option rules
@@ -298,7 +299,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         };
 
                         if is_fhir_element && !is_vec { // Single Element or DecimalElement
-                            let underscore_field_name_str = format!("_{}", field_name_str);
+                            // Use effective_field_name_str here
+                            // let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             field_serializers.push(quote! {
                                 // Check the outer skip condition first
                                 if !(#skip_check) {
@@ -334,7 +336,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             });
                         } else if is_fhir_element && is_vec { // Vec<Option<Element>> or Vec<Element>
-                            let underscore_field_name_str = format!("_{}", field_name_str);
+                            // Use effective_field_name_str here if needed for underscore name generation inside
+                            // let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             field_serializers.push(quote!{
                                 // Check the outer skip condition first
                                 if !(#skip_check) {
@@ -433,24 +436,24 @@ fn generate_deserialize_impl(
                     let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
                     // Helper to get aliases
                     fn get_field_aliases(attrs: &[Attribute]) -> Vec<String> {
-                        attrs.iter().filter_map(|attr| {
+                        attrs.iter().flat_map(|attr| -> Vec<String> { // Ensure closure returns Vec<String>
                             if attr.path().is_ident("serde") {
                                 if let Ok(args) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
-                                    args.iter().filter_map(|meta| {
+                                    args.iter().filter_map(|meta| { // Use filter_map to return Option<String>
                                         if let Meta::NameValue(nv) = meta {
                                             if nv.path.is_ident("alias") {
                                                 if let syn::Expr::Lit(expr_lit) = &nv.value {
                                                     if let Lit::Str(lit_str) = &expr_lit.lit {
-                                                        return Some(lit_str.value());
+                                                        return Some(lit_str.value()); // Return Option<String>
                                                     }
                                                 }
                                             }
                                         }
                                         None
-                                    }).collect::<Vec<_>>() // Collect aliases from this attr
-                                } else { vec![] }
-                            } else { vec![] }
-                        }).flatten().collect() // Flatten results from all attrs
+                                    }).collect::<Vec<String>>() // Collect Options into Vec<String>
+                                } else { vec![] } // Return empty Vec if parsing fails
+                            } else { vec![] } // Return empty Vec if not serde attribute
+                        }).collect() // Collect results from all attributes
                     }
 
 
@@ -565,7 +568,8 @@ fn generate_deserialize_impl(
 
                             if is_vec { // Handle Vec<Option<Element>> or Vec<Element>
                                 final_construction_logic.push(quote! {
-                                    let #field_name: #field_ty = {
+                                    // Use field_ident for the variable name
+                                    let #field_ident: #field_ty = {
                                         // Deserialize primitive array (fieldName)
                                         let primitives: Option<Vec<Option<_>>> = #temp_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
@@ -580,7 +584,8 @@ fn generate_deserialize_impl(
                                         match (primitives, extensions) {
                                             (Some(p_vec), Some(e_vec)) => {
                                                 if p_vec.len() != e_vec.len() {
-                                                    return Err(serde::de::Error::custom(format!("Array length mismatch for field '{}' ({} vs {})", stringify!(#field_name), p_vec.len(), e_vec.len())));
+                                                    // Use field_ident in stringify!
+                                                    return Err(serde::de::Error::custom(format!("Array length mismatch for field '{}' ({} vs {})", stringify!(#field_ident), p_vec.len(), e_vec.len())));
                                                 }
                                                 let mut combined = Vec::with_capacity(p_vec.len());
                                                 for (p_opt, e_opt) in p_vec.into_iter().zip(e_vec.into_iter()) {
@@ -616,7 +621,8 @@ fn generate_deserialize_impl(
 
                             } else { // Handle single Option<Element> or Element
                                 final_construction_logic.push(quote! {
-                                    let #field_name: #field_ty = {
+                                    // Use field_ident for the variable name
+                                    let #field_ident: #field_ty = {
                                         // Deserialize value part (fieldName)
                                         // The target type for value_part depends on the Element's V type.
                                         // We need to deserialize into Option<V> where Element<V, E>
