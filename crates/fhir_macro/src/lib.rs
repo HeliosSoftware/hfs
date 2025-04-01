@@ -595,7 +595,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             // original inner type identifier was exactly "Decimal".
             // Get the string representation of the inner_ty (the type inside Option<...>)
             let inner_ty_var = info.inner_ty; // Assign to a local variable first
-            let inner_ty_path_str = quote!(#inner_ty_var).to_string(); // Interpolate the variable
+            let _inner_ty_path_str = quote!(#inner_ty_var).to_string(); // Interpolate the variable // PREFIXED
             // --- Logic moved inside quote block below ---
 
 
