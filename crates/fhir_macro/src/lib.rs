@@ -1,14 +1,12 @@
 extern crate proc_macro;
 
-extern crate proc_macro;
-
-extern crate proc_macro;
+// Removed redundant extern crate declarations
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
     parse_macro_input, punctuated::Punctuated, token, Attribute, Data, DeriveInput, Fields,
-    GenericArgument, Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type, TypePath, // Removed PathSegment
+    GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type, TypePath, MetaNameValue, // Keep MetaNameValue for parsing
 };
 use heck::ToPascalCase; // For generating visitor names
 
@@ -20,8 +18,8 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let serialize_impl = generate_serialize_impl(&input.data, &name);
-    // Pass ty_generics to deserialize generator
-    let deserialize_impl = generate_deserialize_impl(&input.data, &name, &ty_generics);
+    // Pass all generic parts to deserialize generator
+    let deserialize_impl = generate_deserialize_impl(&input.data, &name, &impl_generics, &ty_generics, &where_clause);
 
     let expanded = quote! {
         // --- Serialize Implementation ---
@@ -376,7 +374,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 }
 
 
-fn generate_deserialize_impl(data: &Data, name: &Ident, ty_generics: &syn::TypeGenerics) -> proc_macro2::TokenStream { // Added ty_generics
+// Add impl_generics and where_clause as parameters
+fn generate_deserialize_impl(
+    data: &Data,
+    name: &Ident,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: &Option<syn::WhereClause>,
+) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
             match data.fields {
@@ -625,10 +630,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident, ty_generics: &syn::TypeG
                             #ignore_variant
                         }
 
-                        // Define visitor struct with generics
+                        // Define visitor struct with type generics and where clause
                         struct #visitor_name #ty_generics #where_clause;
 
-                        // Apply impl_generics and where_clause correctly to the impl block
+                        // Apply impl generics and where clause correctly to the impl block
                         impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause {
                             type Value = #name #ty_generics;
 
