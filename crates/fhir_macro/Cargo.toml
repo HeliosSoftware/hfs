@@ -1,14 +1,15 @@
 [package]
 name = "fhir_macro"
 version = "0.1.0"
-edition = "2024"
+edition = "2021" # Using 2021 as it's common for macros, adjust if needed
 
 [lib]
 proc-macro = true
- 
+
 [dependencies]
-syn = { version = "1.0", features = ["full"] } # Enable "full" feature for parsing field types
+syn = { version = "2.0", features = ["full", "derive", "parsing"] } # Updated syn version and features
 quote = "1.0"
 proc-macro2 = "1.0"
-serde = { workspace = true, features = ["derive"] } # Add serde
-serde_json = { workspace = true } # Add serde_json
+serde = { version = "1.0", features = ["derive"] } # Use specific version, ensure workspace = true if needed elsewhere
+serde_json = "1.0" # Use specific version, ensure workspace = true if needed elsewhere
+heck = "0.5" # For case conversion
