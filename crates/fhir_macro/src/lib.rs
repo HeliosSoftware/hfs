@@ -320,14 +320,23 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         }
 
                                         if has_extension {
-                                            // Serialize extension object under _fieldName
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            let extension_part = crate::Element::<(), crate::r4::Extension> { // Assuming r4::Extension
-                                                id: element.id.clone(),
-                                                extension: element.extension.clone(),
-                                                value: None, // Crucial: value MUST be None here
+                                            // Define helper struct locally for serialization
+                                            #[derive(Serialize)] // Use derive Serialize
+                                            struct IdAndExtension<'a, E: Serialize> { // Add Serialize bound
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<E>>,
+                                            }
+                                            // Create an instance of the helper struct referencing the element's id/extension
+                                            let extension_part = IdAndExtension {
+                                                id: &element.id,
+                                                // Assuming element.extension is Option<Vec<crate::r4::Extension>>
+                                                // Adjust the type E in IdAndExtension if needed based on the actual field type
+                                                extension: &element.extension,
                                             };
-                                            // Rely on Element::Serialize (as modified above) to output only id/extension because value is None
+                                            // Serialize the helper struct, which only contains id/extension
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
                                         // If neither has_value nor has_extension, nothing is serialized for this element.
