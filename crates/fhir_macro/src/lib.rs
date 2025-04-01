@@ -624,9 +624,14 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use stored #v_ty_construct and #ext_ty
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
+                    // --- Check V type inside generated code ---
+                    // Convert the interpolated type #v_ty_construct to a string and normalize it
+                    let v_ty_string_check = stringify!(#v_ty_construct).replace(" ", "");
+                    // Compare against the normalized target string
+                    let is_decimal_type_check = v_ty_string_check == "crate::PreciseDecimal";
+                    // --- End check ---
                     ::std::option::Option::Some(
-                        // Use the new boolean flag directly based on V type
-                        if #should_construct_decimal_element {
+                        if is_decimal_type_check { // Use the check performed inside the generated code
                             // Use stored #ext_ty
                             crate::DecimalElement::<#ext_ty> { value: #val_field_ident, id: #id_field_ident, extension: #final_ext_field_ident }
                         } else {
