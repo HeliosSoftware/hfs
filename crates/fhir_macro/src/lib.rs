@@ -307,13 +307,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     if let Some(element) = &#field_access {
                                         // Serialize primitive value under fieldName if present
                                         if let Some(value) = &element.value {
-                                            // Use the Element's own Serialize impl for the value part? No, serialize the inner value directly.
-                                            // state.serialize_field(#effective_field_name_str, value)?;
-                                            // Let Element's custom serialize handle the primitive case correctly
-                                            let primitive_element = crate::Element { id: None, extension: None, value: element.value.clone() };
-                                            // Use effective name for serialization
-                                            state.serialize_field(&#effective_field_name_str, &primitive_element)?;
-
+                                            // Serialize the inner value directly using its own Serialize impl
+                                            state.serialize_field(&#effective_field_name_str, value)?;
                                         }
 
                                         // Serialize id/extension under _fieldName if present
@@ -427,13 +422,11 @@ fn generate_deserialize_impl(
                     let struct_name_str = name.to_string();
                     let visitor_name = format_ident!("{}Visitor", name.to_string().to_pascal_case());
 
-                    let field_names: Vec<_> = fields.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
-                    let field_name_strs: Vec<_> = field_names.iter().map(|f| f.to_string()).collect();
-                    // Remove unused field_types
-                    // let field_types: Vec<_> = fields.named.iter().map(|f| &f.ty).collect();
+                    // Remove unused field_name_strs
+                    // let field_name_strs: Vec<_> = field_names.iter().map(|f| f.to_string()).collect();
 
                     // Create enum variants for field matching
-                    let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
+                    let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case()); // Keep this for the enum name
                     // Helper to get aliases
                     fn get_field_aliases(attrs: &[Attribute]) -> Vec<String> {
                         attrs.iter().flat_map(|attr| -> Vec<String> { // Ensure closure returns Vec<String>
@@ -456,8 +449,8 @@ fn generate_deserialize_impl(
                         }).collect() // Collect results from all attributes
                     }
 
-
-                    let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
+                    // Remove unused field_enum_name variable definition here
+                    // let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
                     let mut field_enum_variants_map = std::collections::HashMap::new(); // Store PascalCase variant name per field ident
                     let mut underscore_field_enum_variants = Vec::new();
                     let mut field_match_arms = Vec::new();
@@ -649,20 +642,22 @@ fn generate_deserialize_impl(
                                             },
                                             // Only value element present
                                             (Some(ve), None) => Some(ve),
-                                            // Only extension element present: construct a new Element<V, E>
+                                            // Only extension element present: construct a new Element<V, E> with value: None
                                             (None, Some(ee)) => {
-                                                 // Deserialize the extension object *as* the target type.
-                                                 // This relies on Element's Deserialize handling the object format correctly.
-                                                 // If #field_ty is Option<Element>, deserialize into Option<Element>.
-                                                 // If #field_ty is Element, deserialize into Element.
-                                                 let element_from_ext: #field_ty = #temp_underscore_field_name
-                                                      .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
-                                                      .transpose()? // Propagate V::Error
-                                                      .unwrap_or_default(); // Use default if _field was null or missing
-                                                 Some(element_from_ext) // Wrap in Some if the outer type is Option, otherwise this needs adjustment
+                                                 // Construct the Element with id/extension from ee and value: None
+                                                 // Need to handle Option<Element> vs Element for the field type
+                                                 let constructed_element = crate::Element {
+                                                     id: ee.id,
+                                                     extension: ee.extension,
+                                                     value: None, // Explicitly None
+                                                 };
+                                                 // If the field type is Option<Element>, wrap in Some.
+                                                 // If the field type is Element, use directly (this requires Default if _field was missing/null).
+                                                 // Let's assume Option<Element> for now as it's safer.
+                                                 Some(constructed_element)
                                             },
                                             // Neither present
-                                            (None, None) => None,
+                                            (None, None) => None, // Result is None for Option<Element>
                                         }
                                     };
                                      #field_ident // Assign the Option<Element> or Element directly
