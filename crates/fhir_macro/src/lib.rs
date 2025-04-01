@@ -316,7 +316,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Serialize id/extension under _fieldName if present
                                         if has_extension {
-                                        if element.id.is_some() || element.extension.is_some() {
                                             // Create the underscore field name based on the effective name
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
                                             // Create a temporary Element containing only id and extension
@@ -433,24 +432,30 @@ fn generate_deserialize_impl(
                     let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case()); // Keep this for the enum name
                     // Helper to get aliases
                     fn get_field_aliases(attrs: &[Attribute]) -> Vec<String> {
-                        attrs.iter().flat_map(|attr| -> Vec<String> { // Ensure closure returns Vec<String>
+                        attrs.iter().flat_map(|attr| -> Vec<String> { // Outer closure returns Vec<String>
                             if attr.path().is_ident("serde") {
-                                if let Ok(args) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
-                                    args.iter().filter_map(|meta| { // Use filter_map to return Option<String>
-                                        if let Meta::NameValue(nv) = meta {
-                                            if nv.path.is_ident("alias") {
-                                                if let syn::Expr::Lit(expr_lit) = &nv.value {
-                                                    if let Lit::Str(lit_str) = &expr_lit.lit {
-                                                        return Some(lit_str.value()); // Return Option<String>
+                                match attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                                    Ok(args) => {
+                                        // Inner closure for filter_map returns Option<String>
+                                        args.iter().filter_map(|meta| {
+                                            if let Meta::NameValue(nv) = meta {
+                                                if nv.path.is_ident("alias") {
+                                                    if let syn::Expr::Lit(expr_lit) = &nv.value {
+                                                        if let Lit::Str(lit_str) = &expr_lit.lit {
+                                                            return Some(lit_str.value()); // Correct: filter_map expects Option
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                        None
-                                    }).collect::<Vec<String>>() // Collect Options into Vec<String>
-                                } else { vec![] } // Return empty Vec if parsing fails
-                            } else { vec![] } // Return empty Vec if not serde attribute
-                        }).collect() // Collect results from all attributes
+                                            None // Correct: filter_map expects Option
+                                        }).collect::<Vec<String>>() // Collects Option<String> into Vec<String>
+                                    },
+                                    Err(_) => vec![], // Correct: flat_map expects IntoIterator<Item = String>
+                                }
+                            } else {
+                                vec![] // Correct: flat_map expects IntoIterator<Item = String>
+                            }
+                        }).collect() // Collects Strings from all attributes
                     }
 
                     // Remove unused field_enum_name variable definition here
