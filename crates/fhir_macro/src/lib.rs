@@ -309,9 +309,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
                                         // Serialize primitive value under fieldName if present
-                                        if has_value {
-                                            // Serialize the inner value directly using its own Serialize impl
-                                            state.serialize_field(&#effective_field_name_str, &element.value)?;
+                                        if let Some(value) = &element.value { // Check and unwrap Option<V>
+                                            // Serialize the inner value V directly
+                                            state.serialize_field(&#effective_field_name_str, value)?;
                                         }
 
                                         // Serialize id/extension under _fieldName if present
@@ -626,62 +626,60 @@ fn generate_deserialize_impl(
                                 final_construction_logic.push(quote! {
                                     // Use field_ident for the variable name
                                     let #field_ident: #field_ty = {
-                                        // Deserialize value part (fieldName)
-                                        // The target type for value_part depends on the Element's V type.
-                                        // We need to deserialize into Option<V> where Element<V, E>
-                                        // This requires knowing V. Let's assume we can deserialize into the Element directly
-                                        // and extract the value later if needed, or handle primitives specially.
-                                        // Let's try deserializing the whole Element from each part if present.
+                                        // Define helper struct locally
+                                        #[derive(Deserialize)]
+                                        struct IdAndExtension<E: serde::de::DeserializeOwned> {
+                                            id: Option<String>,
+                                            extension: Option<Vec<E>>,
+                                        }
 
-                                        let value_element: Option<#field_ty> = #temp_field_name
-                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
-                                            .transpose()?; // Propagate V::Error
+                                        // Deserialize the primitive value part (fieldName) into Option<V>
+                                        // This still requires knowing V. Let's deserialize into serde_json::Value first.
+                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
 
-                                        // Deserialize extension part (_fieldName) - Use concrete Extension type
-                                        let extension_element: Option<crate::Element<(), crate::r4::Extension>> = #temp_underscore_field_name
+                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
+                                        let extension_part: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name // Assuming r4::Extension
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
                                             .transpose()?; // Propagate V::Error
 
                                         // Combine logic
-                                        match (value_element, extension_element) {
-                                            // Both present: merge id/extension from _field into element from main field
-                                            (Some(mut ve), Some(ee)) => {
-                                                ve.id = ee.id;
-                                                ve.extension = ee.extension;
-                                                Some(ve)
+                                        let combined_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (primitive_value_json, extension_part) { // Assuming r4::Extension for E
+                                            (Some(prim_json), Some(ep)) => {
+                                                // Deserialize prim_json into V - This is the tricky part without knowing V easily.
+                                                // Let's assume V can be derived from #field_ty or use a placeholder/generic approach if possible.
+                                                // For now, let's try deserializing into the target Element type directly from the primitive.
+                                                // This relies on Element::deserialize handling primitives.
+                                                let value_part: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json).map_err(serde::de::Error::custom)?;
+                                                Some(crate::Element {
+                                                    id: ep.id,
+                                                    extension: ep.extension,
+                                                    value: value_part.value, // Take value from primitive deserialization
+                                                })
                                             },
-                                            // Only value element present
-                                            (Some(ve), None) => Some(ve),
-                                            // Only extension element present: construct a new Element<V, E> with value: None
-                                            (None, Some(ee)) => {
-                                                 // Construct the Element with id/extension from ee and value: None
-                                                 // We need the concrete type V and E for Element<V, E>
-                                                 // Let's assume #field_ty is Option<Element<V, E>> or Element<V, E>
-                                                 // We create the Element<V, E> and wrap in Some if #field_ty is Option<_>
-                                                 let constructed_element = crate::Element {
-                                                     id: ee.id,
-                                                     extension: ee.extension,
+                                            (Some(prim_json), None) => {
+                                                // Deserialize prim_json into Element<V, E> directly
+                                                let value_part: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json).map_err(serde::de::Error::custom)?;
+                                                Some(value_part) // Contains only value
+                                            },
+                                            (None, Some(ep)) => {
+                                                 // Construct Element with id/extension and value: None
+                                                 // Need to specify V somehow. If #field_ty is Option<Element<V, E>>, we need V.
+                                                 // Let's explicitly construct with a default V if possible, or leave it generic.
+                                                 // This might require V: Default.
+                                                 Some(crate::Element {
+                                                     id: ep.id,
+                                                     extension: ep.extension,
                                                      value: None, // Explicitly None
-                                                 };
-                                                 // Wrap in Some if the original field type was Option<_>
-                                                 if #is_option {
-                                                     Some(constructed_element)
-                                                 } else {
-                                                     // This case (non-optional Element with only extension) might be less common
-                                                     // or invalid depending on FHIR rules, but we construct it anyway.
-                                                     constructed_element
-                                                 }
+                                                 })
                                             },
-                                            // Neither present
-                                            (None, None) => {
-                                                // If the field is Option<Element>, result is None.
-                                                // If the field is Element, result is Default::default().
-                                                if #is_option {
-                                                    None
-                                                } else {
-                                                    Default::default() // Assumes Element implements Default
-                                                }
-                                            }
+                                            (None, None) => None, // Neither field present
+                                        };
+
+                                        // Assign to the final field, handling Option vs non-Option field type
+                                        if #is_option {
+                                            combined_element_opt
+                                        } else {
+                                            combined_element_opt.unwrap_or_default() // Assumes Element implements Default
                                         }
                                     };
                                      #field_ident // Assign the constructed Element or Option<Element>
