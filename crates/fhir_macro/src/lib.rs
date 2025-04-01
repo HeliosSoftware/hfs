@@ -191,24 +191,21 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
         current_ty = inner;
     }
 
-    // Check if the (potentially unwrapped) type is Element or DecimalElement
+    // Check if the (potentially unwrapped) type path ends with Element or DecimalElement
     if let Type::Path(TypePath { path, .. }) = current_ty {
         if let Some(segment) = path.segments.last() {
             let type_name = &segment.ident;
+            // Check if the last segment's identifier is Element or DecimalElement
+            // This handles type aliases like r4::Date which is Element<...>
             let is_element = type_name == "Element";
             let is_decimal_element = type_name == "DecimalElement";
             if is_element || is_decimal_element {
-                // Return the type *before* potential Box unwrapping if it was an Element
-                // This assumes Element<Box<T>> is not a pattern we need to handle specially for _field logic
-                // If the original type was Option<Vec<Option<Element<...>>>>, current_ty is Element<...>
-                // If the original type was Option<Element<...>>, current_ty is Element<...>
-                // If the original type was Element<...>, current_ty is Element<...>
                 return (
                     is_element,
                     is_decimal_element,
                     is_option,
                     is_vec,
-                    Some(current_ty),
+                    Some(current_ty), // Return the type path itself
                 );
             }
         }
