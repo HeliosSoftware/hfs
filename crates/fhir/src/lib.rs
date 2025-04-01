@@ -559,11 +559,10 @@ where
             if let Some(extension) = &self.extension {
                 state.serialize_field("extension", extension)?;
             }
-            // Remove the value field serialization from the object form.
-            // The macro will handle serializing the value under the main field name.
-            // if let Some(value) = &self.value {
-            //     state.serialize_field("value", value)?;
-            // }
+            // Restore value serialization for direct Element serialization
+            if let Some(value) = &self.value {
+                state.serialize_field("value", value)?;
+            }
             state.end()
         }
     }
