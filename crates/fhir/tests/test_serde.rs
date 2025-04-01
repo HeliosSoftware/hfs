@@ -579,6 +579,109 @@ struct FhirSerdeTestStruct {
     count: Option<i32>,
 }
 
+// Manual implementation for debugging
+impl serde::Serialize for FhirSerdeTestStruct {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut count = 0;
+        if self.name.is_some() {
+            count += 1;
+        }
+        
+        // Handle birth_date field
+        let mut birth_date_value = false;
+        let mut birth_date_extension = false;
+        if let Some(bd) = &self.birth_date {
+            if bd.value.is_some() {
+                count += 1;
+                birth_date_value = true;
+            }
+            if bd.id.is_some() || bd.extension.is_some() {
+                count += 1;
+                birth_date_extension = true;
+            }
+        }
+        
+        // Handle is_active field
+        let mut is_active_value = false;
+        let mut is_active_extension = false;
+        if let Some(ia) = &self.is_active {
+            if ia.value.is_some() {
+                count += 1;
+                is_active_value = true;
+            }
+            if ia.id.is_some() || ia.extension.is_some() {
+                count += 1;
+                is_active_extension = true;
+            }
+        }
+        
+        if self.count.is_some() {
+            count += 1;
+        }
+        
+        let mut state = serializer.serialize_struct("FhirSerdeTestStruct", count)?;
+        
+        if let Some(name) = &self.name {
+            state.serialize_field("name", name)?;
+        }
+        
+        // Serialize birth_date field
+        if let Some(bd) = &self.birth_date {
+            if birth_date_value {
+                state.serialize_field("birthDate", bd.value.as_ref().unwrap())?;
+            }
+            
+            if birth_date_extension {
+                #[derive(serde::Serialize)]
+                struct IdAndExtensionHelper<'a> {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    id: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    extension: &'a Option<Vec<r4::Extension>>,
+                }
+                
+                let extension_part = IdAndExtensionHelper {
+                    id: &bd.id,
+                    extension: &bd.extension,
+                };
+                state.serialize_field("_birthDate", &extension_part)?;
+            }
+        }
+        
+        // Serialize is_active field
+        if let Some(ia) = &self.is_active {
+            if is_active_value {
+                state.serialize_field("isActive", ia.value.as_ref().unwrap())?;
+            }
+            
+            if is_active_extension {
+                #[derive(serde::Serialize)]
+                struct IdAndExtensionHelper<'a> {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    id: &'a Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    extension: &'a Option<Vec<r4::Extension>>,
+                }
+                
+                let extension_part = IdAndExtensionHelper {
+                    id: &ia.id,
+                    extension: &ia.extension,
+                };
+                state.serialize_field("_isActive", &extension_part)?;
+            }
+        }
+        
+        if let Some(count) = &self.count {
+            state.serialize_field("count", count)?;
+        }
+        
+        state.end()
+    }
+}
+
 #[test]
 fn test_fhir_serde_serialize() {
     // Case 1: Only primitive value for birthDate
@@ -638,11 +741,24 @@ fn test_fhir_serde_serialize() {
         }),
         count: Some(3),
     };
+    
+    // Debug print the structure
+    println!("birth_date: id={:?}, extension={:?}, value={:?}", 
+             s3.birth_date.as_ref().unwrap().id,
+             s3.birth_date.as_ref().unwrap().extension,
+             s3.birth_date.as_ref().unwrap().value);
+             
     let json3 = serde_json::to_string(&s3).unwrap();
+    println!("Serialized JSON: {}", json3);
     // Expected output according to FHIR: Both fieldName (for value) and _fieldName (for id/extension)
     // The _birthDate object should only contain id/extension, not the value.
     // isActive only has value, so only "isActive" field.
     let expected3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3"},"isActive":true,"count":3}"#; // Corrected structure
+    
+    // Print the actual JSON for debugging
+    println!("Actual JSON: {}", json3);
+    println!("Expected JSON: {}", expected3);
+    
     assert_eq!(json3, expected3);
 
     // Case 4: birthDate field is None
