@@ -750,12 +750,11 @@ fn generate_deserialize_impl(
                         } else {
                             // Default deserialization for non-FHIR-element fields
                             // Generate the let binding directly without an extra quote! macro
-                            quote! {
-                                let #field_ident: #field_ty = match #temp_field_name {
-                                    Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
-                                    None => Default::default(), // Assumes #field_ty implements Default
-                                };
-                            }
+                            // No quote! macro here
+                            let #field_ident: #field_ty = match #temp_field_name {
+                                Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                                None => Default::default(), // Assumes #field_ty implements Default
+                            };
                         }
                     }).collect();
 
