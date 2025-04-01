@@ -8,7 +8,32 @@ use syn::{
     parse_macro_input, punctuated::Punctuated, token, Attribute, Data, DeriveInput, Fields,
     GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type, TypePath, // Removed unused MetaNameValue
 };
-use heck::ToPascalCase; // For generating visitor names
+use heck::{ToPascalCase, ToLowerCamelCase}; // Added ToLowerCamelCase
+
+// Helper function to get the effective field name for serialization/deserialization
+// Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
+fn get_effective_field_name(field: &syn::Field) -> String {
+    for attr in &field.attrs {
+        if attr.path().is_ident("serde") {
+            if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                for meta in list {
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("rename") {
+                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                if let Lit::Str(lit_str) = expr_lit.lit {
+                                    return lit_str.value();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Default to camelCase if no rename attribute found
+    field.ident.as_ref().unwrap().to_string().to_lower_camel_case()
+}
+
 
 #[proc_macro_derive(FhirSerde)]
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
@@ -160,9 +185,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     let mut field_count_calculator = Vec::new();
 
                     for field in fields.named.iter() {
-                        let field_name = field.ident.as_ref().unwrap();
-                        let field_name_str = field_name.to_string();
+                        let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
                         let field_ty = &field.ty;
+                        // Get effective name for JSON serialization
+                        let effective_field_name_str = get_effective_field_name(field);
 
                         // Function to find and extract the path from skip_serializing_if
                         fn get_skip_serializing_if_path(attrs: &[Attribute]) -> Option<Path> {
@@ -280,15 +306,18 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         // Serialize primitive value under fieldName if present
                                         if let Some(value) = &element.value {
                                             // Use the Element's own Serialize impl for the value part? No, serialize the inner value directly.
-                                            // state.serialize_field(#field_name_str, value)?;
+                                            // state.serialize_field(#effective_field_name_str, value)?;
                                             // Let Element's custom serialize handle the primitive case correctly
                                             let primitive_element = crate::Element { id: None, extension: None, value: element.value.clone() };
-                                            state.serialize_field(#field_name_str, &primitive_element)?;
+                                            // Use effective name for serialization
+                                            state.serialize_field(&#effective_field_name_str, &primitive_element)?;
 
                                         }
 
                                         // Serialize id/extension under _fieldName if present
                                         if element.id.is_some() || element.extension.is_some() {
+                                            // Create the underscore field name based on the effective name
+                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
                                             // Create a temporary Element containing only id and extension
                                             // Use a concrete type for E if possible, or keep generic if needed. Assuming Extension for now.
                                             let extension_part = crate::Element::<(), crate::r4::Extension> { // Use dummy type for V, concrete Extension
@@ -297,7 +326,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 value: None, // Ensure value is None here
                                             };
                                             // Serialize this temporary object, which should output {"id":..., "extension":...}
-                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
                                     }
                                      // If Option is Some but element has neither value nor id/extension, nothing is serialized here.
@@ -316,10 +345,12 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             let primitive_values: Vec<_> = vec.iter().map(|opt_elem| {
                                                 opt_elem.as_ref().and_then(|elem| elem.value.as_ref()) // Clones the inner value if present
                                             }).collect();
-                                            state.serialize_field(#field_name_str, &primitive_values)?;
+                                            // Use effective name for serialization
+                                            state.serialize_field(&#effective_field_name_str, &primitive_values)?;
                                         } else {
                                              // Serialize empty array if input vec is empty but Some and not skipped
-                                             state.serialize_field(#field_name_str, &Vec::<Option<()>>::new())?; // Use appropriate dummy type if needed
+                                             // Use effective name for serialization
+                                             state.serialize_field(&#effective_field_name_str, &Vec::<Option<()>>::new())?; // Use appropriate dummy type if needed
                                         }
 
                                         // Prepare extension values array (_fieldName): Vec<Option<Element<(), Extension>>>
@@ -339,7 +370,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Only serialize _fieldName array if there's at least one non-null extension part
                                         if extension_values.iter().any(|opt_ext| opt_ext.is_some()) {
-                                            state.serialize_field(#underscore_field_name_str, &extension_values)?;
+                                            // Create the underscore field name based on the effective name
+                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                            state.serialize_field(&underscore_field_name_str, &extension_values)?;
                                         }
                                     }
                                      // If Option<Vec> is None, the outer skip_check handles it.
@@ -349,7 +382,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Default serialization for non-FHIR-element fields
                             field_serializers.push(quote! {
                                 if !(#skip_check) {
-                                    state.serialize_field(#field_name_str, &#field_access)?;
+                                    // Use effective name for serialization
+                                    state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }
                             });
                         }
@@ -397,30 +431,67 @@ fn generate_deserialize_impl(
 
                     // Create enum variants for field matching
                     let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
-                    let field_enum_variants: Vec<_> = field_name_strs.iter().map(|s| format_ident!("{}", s.to_pascal_case())).collect();
-                    // Generate underscore variants only for fields that *could* have extensions
+                    // Helper to get aliases
+                    fn get_field_aliases(attrs: &[Attribute]) -> Vec<String> {
+                        attrs.iter().filter_map(|attr| {
+                            if attr.path().is_ident("serde") {
+                                if let Ok(args) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                                    args.iter().filter_map(|meta| {
+                                        if let Meta::NameValue(nv) = meta {
+                                            if nv.path.is_ident("alias") {
+                                                if let syn::Expr::Lit(expr_lit) = &nv.value {
+                                                    if let Lit::Str(lit_str) = &expr_lit.lit {
+                                                        return Some(lit_str.value());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None
+                                    }).collect::<Vec<_>>() // Collect aliases from this attr
+                                } else { vec![] }
+                            } else { vec![] }
+                        }).flatten().collect() // Flatten results from all attrs
+                    }
+
+
+                    let field_enum_name = format_ident!("{}Field", name.to_string().to_pascal_case());
+                    let mut field_enum_variants_map = std::collections::HashMap::new(); // Store PascalCase variant name per field ident
                     let mut underscore_field_enum_variants = Vec::new();
                     let mut field_match_arms = Vec::new();
                     let mut is_fhir_element_field = Vec::new(); // Track which fields are FHIR elements
 
-                    for (i, field) in fields.named.iter().enumerate() {
-                         let field_name_str = &field_name_strs[i];
-                         let variant = &field_enum_variants[i];
+                    for field in fields.named.iter() {
+                         let field_ident = field.ident.as_ref().unwrap();
+                         let effective_field_name_str = get_effective_field_name(field); // Use helper
+                         let variant = format_ident!("{}", field_ident.to_string().to_pascal_case()); // Variant based on Rust ident
+                         field_enum_variants_map.insert(field_ident.clone(), variant.clone());
+
                          let field_ty = &field.ty;
                          let (is_element, is_decimal_element, _is_option, _is_vec, _inner_ty_opt) = get_element_info(field_ty);
                          let is_fhir_elem = is_element || is_decimal_element;
                          is_fhir_element_field.push(is_fhir_elem); // Store result
 
-                         field_match_arms.push(quote! { #field_name_str => Ok(#field_enum_name::#variant) });
+                         // Match effective name
+                         field_match_arms.push(quote! { #effective_field_name_str => Ok(#field_enum_name::#variant) });
+
+                         // Match aliases
+                         let aliases = get_field_aliases(&field.attrs);
+                         for alias in aliases {
+                             field_match_arms.push(quote! { #alias => Ok(#field_enum_name::#variant) });
+                         }
 
                          if is_fhir_elem {
-                             let underscore_field_name_str = format!("_{}", field_name_str);
-                             let underscore_variant = format_ident!("_{}", field_name_str.to_pascal_case());
+                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                             let underscore_variant = format_ident!("_{}", field_ident.to_string().to_pascal_case()); // Underscore variant also based on Rust ident
                              underscore_field_enum_variants.push(underscore_variant.clone()); // Add to list of variants
+                             // Match underscore name
                              field_match_arms.push(quote! { #underscore_field_name_str => Ok(#field_enum_name::#underscore_variant) });
+                             // Match underscore aliases? (Less common, skip for now)
                          }
                     }
                     let ignore_variant = format_ident!("Ignore");
+                    // Extract just the variant names for the enum definition
+                    let field_enum_variants: Vec<_> = field_enum_variants_map.values().cloned().collect();
 
 
                     // Generate field storage (using Option for all fields)
@@ -433,10 +504,11 @@ fn generate_deserialize_impl(
                     let mut map_access_logic = Vec::new();
                     let mut temp_field_storage = Vec::new(); // For storing Option<serde_json::Value>
 
-                    for (i, field_name) in field_names.iter().enumerate() {
-                        let field_name_str = &field_name_strs[i];
-                        let variant = &field_enum_variants[i];
-                        let temp_field_name = format_ident!("temp_{}", field_name);
+                    for (i, field) in fields.named.iter().enumerate() { // Iterate over fields again
+                        let field_ident = field.ident.as_ref().unwrap();
+                        let effective_field_name_str = get_effective_field_name(field); // Use helper
+                        let variant = field_enum_variants_map.get(field_ident).unwrap(); // Get variant from map
+                        let temp_field_name = format_ident!("temp_{}", field_ident);
 
                         // Initialize temporary storage for the main field
                         temp_field_storage.push(quote! { let mut #temp_field_name: Option<serde_json::Value> = None; });
@@ -445,7 +517,8 @@ fn generate_deserialize_impl(
                         map_access_logic.push(quote! {
                             #field_enum_name::#variant => {
                                 if #temp_field_name.is_some() {
-                                    return Err(serde::de::Error::duplicate_field(#field_name_str));
+                                    // Use effective name in error
+                                    return Err(serde::de::Error::duplicate_field(#effective_field_name_str));
                                 }
                                 #temp_field_name = Some(map.next_value()?);
                             }
@@ -453,8 +526,8 @@ fn generate_deserialize_impl(
 
                         // If it's a FHIR element, also handle the underscore field
                         if is_fhir_element_field[i] {
-                            let underscore_field_name_str = format!("_{}", field_name_str);
-                            let underscore_variant = format_ident!("_{}", field_name_str.to_pascal_case());
+                            let underscore_field_name_str = format!("_{}", effective_field_name_str); // Use effective name
+                            let underscore_variant = format_ident!("_{}", field_ident.to_string().to_pascal_case()); // Variant based on Rust ident
                             let temp_underscore_field_name = format_ident!("temp_{}", underscore_field_name_str);
 
                             // Initialize temporary storage for the underscore field
@@ -477,17 +550,18 @@ fn generate_deserialize_impl(
                     let mut final_field_assignments = Vec::new(); // To build the final struct { field1, field2, ... }
 
                     for (i, field) in fields.named.iter().enumerate() {
-                        let field_name = field.ident.as_ref().unwrap();
+                        let field_ident = field.ident.as_ref().unwrap(); // Use ident for assignment
                         let field_ty = &field.ty;
-                        let temp_field_name = format_ident!("temp_{}", field_name);
+                        let temp_field_name = format_ident!("temp_{}", field_ident);
                         let is_fhir_elem = is_fhir_element_field[i];
 
-                        final_field_assignments.push(quote! { #field_name }); // Add field name for final struct construction
+                        final_field_assignments.push(quote! { #field_ident }); // Add field ident for final struct construction
 
                         if is_fhir_elem {
-                            let underscore_field_name_str = format!("_{}", field_name.to_string());
+                            let effective_field_name_str = get_effective_field_name(field); // Use helper
+                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             let temp_underscore_field_name = format_ident!("temp_{}", underscore_field_name_str);
-                            let (_is_element, _is_decimal_element, is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
+                            let (_is_element, _is_decimal_element, _is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
 
                             if is_vec { // Handle Vec<Option<Element>> or Vec<Element>
                                 final_construction_logic.push(quote! {
@@ -569,32 +643,23 @@ fn generate_deserialize_impl(
                                             },
                                             // Only value element present
                                             (Some(ve), None) => Some(ve),
-                                            // Only extension element present: create a new element with id/ext but no value
+                                            // Only extension element present: construct a new Element<V, E>
                                             (None, Some(ee)) => {
-                                                 // We need to construct the correct Element<V, E> type here.
-                                                 // This requires knowing V and E. Let's assume #field_ty is Option<Element<V, E>>
-                                                 // and construct Element<V, E> { id, extension, value: None }
-                                                 // This might require extracting V and E from field_ty.
-                                                 // For now, let's assume the target type #field_ty handles default construction.
-                                                 // Or, more simply, deserialize the extension part *into* the target type directly,
-                                                 // relying on the Element's Deserialize impl to handle the object format.
-                                                 let combined_element: #field_ty = #temp_underscore_field_name
+                                                 // Deserialize the extension object *as* the target type.
+                                                 // This relies on Element's Deserialize handling the object format correctly.
+                                                 // If #field_ty is Option<Element>, deserialize into Option<Element>.
+                                                 // If #field_ty is Element, deserialize into Element.
+                                                 let element_from_ext: #field_ty = #temp_underscore_field_name
                                                       .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
                                                       .transpose()? // Propagate V::Error
-                                                      .flatten(); // Flatten Option<Option<T>> -> Option<T>
-                                                 combined_element
-
+                                                      .unwrap_or_default(); // Use default if _field was null or missing
+                                                 Some(element_from_ext) // Wrap in Some if the outer type is Option, otherwise this needs adjustment
                                             },
                                             // Neither present
                                             (None, None) => None,
                                         }
                                     };
-                                    // If the field itself is not Option<...>, handle unwrap or default
-                                    if !#is_option {
-                                         #field_name.unwrap_or_default() // Assuming Default trait
-                                    } else {
-                                         #field_name
-                                    }
+                                     #field_ident // Assign the Option<Element> or Element directly
                                 });
                             }
 
@@ -602,7 +667,7 @@ fn generate_deserialize_impl(
                             // Default deserialization for non-FHIR-element fields
                             final_construction_logic.push(quote! {
                                 // Deserialize directly from the temporary JSON value
-                                let #field_name : #field_ty = #temp_field_name
+                                let #field_ident : #field_ty = #temp_field_name // Use field_ident here
                                     .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
                                     .transpose()? // Propagate V::Error
                                     .unwrap_or_default(); // Use default if field was missing or null, assuming Default trait
