@@ -217,26 +217,6 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
-// Helper to extract V and E from Element<V, E>
-fn get_element_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
-    if let Type::Path(TypePath { path, .. }) = ty {
-        if let Some(segment) = path.segments.last() {
-            if segment.ident == "Element" {
-                if let PathArguments::AngleBracketed(args) = &segment.arguments {
-                    if args.args.len() == 2 {
-                        let v_arg = args.args.first().unwrap();
-                        let e_arg = args.args.last().unwrap();
-                        if let (GenericArgument::Type(ty_v), GenericArgument::Type(ty_e)) = (v_arg, e_arg) {
-                            return Some((ty_v, ty_e));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
@@ -677,20 +657,166 @@ fn generate_deserialize_impl(
                     }
 
                     // Generate final struct construction logic
-                    let mut final_construction_logic = Vec::new();
-                    let mut final_field_assignments = Vec::new(); // To build the final struct { field1, field2, ... }
-
-                    for (i, field) in fields.named.iter().enumerate() {
-                        let field_ident = field.ident.as_ref().unwrap(); // Use ident for assignment
+                    // Generate field assignments for the final struct construction
+                    let final_field_assignments: Vec<_> = fields.named.iter().map(|field| {
+                        let field_ident = field.ident.as_ref().unwrap();
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
-                        let is_fhir_elem = is_fhir_element_field[i];
-
-                        final_field_assignments.push(quote! { #field_ident }); // Add field ident for final struct construction
+                        let is_fhir_elem = get_element_info(field_ty).0 || get_element_info(field_ty).1; // Re-check here
 
                         if is_fhir_elem {
-                            let effective_field_name_str = get_effective_field_name(field); // Use helper
-                            let underscore_field_name_str =
+                            let effective_field_name_str = get_effective_field_name(field);
+                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                            let temp_underscore_field_name = format_ident!("temp_{}", underscore_field_name_str);
+                            let (_is_element, _is_decimal_element, is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
+
+                            if is_vec {
+                                // Handle Vec<Option<Element>> or Vec<Element>
+                                quote! {
+                                    #field_ident: {
+                                        // Deserialize primitive array (fieldName)
+                                        let primitives: Option<Vec<Option<_>>> = #temp_field_name
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+                                            .transpose()?;
+
+                                        // Deserialize extension array (_fieldName) - Use concrete Extension type
+                                        let extensions: Option<Vec<Option<crate::Element<(), crate::r4::Extension>>>> = #temp_underscore_field_name
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+                                            .transpose()?;
+
+                                        // Combine logic
+                                        match (primitives, extensions) {
+                                            (Some(p_vec), Some(e_vec)) => {
+                                                if p_vec.len() != e_vec.len() {
+                                                    return Err(serde::de::Error::custom(format!("Array length mismatch for field '{}' ({} vs {})", stringify!(#field_ident), p_vec.len(), e_vec.len())));
+                                                }
+                                                let mut combined = Vec::with_capacity(p_vec.len());
+                                                for (p_opt, e_opt) in p_vec.into_iter().zip(e_vec.into_iter()) {
+                                                    let element_opt = match (p_opt, e_opt) {
+                                                        (Some(p), Some(e)) => Some(crate::Element { id: e.id, extension: e.extension, value: Some(p) }),
+                                                        (Some(p), None) => Some(crate::Element { id: None, extension: None, value: Some(p) }),
+                                                        (None, Some(e)) => Some(crate::Element { id: e.id, extension: e.extension, value: None }),
+                                                        (None, None) => None,
+                                                    };
+                                                    combined.push(element_opt);
+                                                }
+                                                Some(combined)
+                                            },
+                                            (Some(p_vec), None) => { // Only primitives
+                                                Some(p_vec.into_iter().map(|p_opt| {
+                                                    p_opt.map(|p| crate::Element { id: None, extension: None, value: Some(p) })
+                                                }).collect())
+                                            },
+                                            (None, Some(e_vec)) => { // Only extensions
+                                                Some(e_vec.into_iter().map(|e_opt| {
+                                                    e_opt.map(|e| crate::Element { id: e.id, extension: e.extension, value: None })
+                                                }).collect())
+                                            },
+                                            (None, None) => None,
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Handle single Option<Element> or Element
+                                quote! {
+                                    #field_ident: {
+                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
+                                        let extension_value_json: Option<serde_json::Value> = #temp_underscore_field_name;
+
+                                        let combined_json_to_deserialize = match (primitive_value_json, extension_value_json) {
+                                            (Some(prim_val), Some(mut ext_obj @ serde_json::Value::Object(_))) => {
+                                                if let serde_json::Value::Object(map) = &mut ext_obj {
+                                                    map.insert("value".to_string(), prim_val);
+                                                }
+                                                Some(ext_obj)
+                                            },
+                                            (Some(prim_val), None) => Some(prim_val),
+                                            (None, Some(ext_obj)) => Some(ext_obj),
+                                            (None, None) => None,
+                                        };
+
+                                        match combined_json_to_deserialize {
+                                            Some(json) => serde_json::from_value(json).map_err(serde::de::Error::custom)?,
+                                            None => {
+                                                if #is_option {
+                                                    None
+                                                } else {
+                                                    Default::default()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Default deserialization for non-FHIR-element fields
+                            quote! {
+                                #field_ident: match #temp_field_name {
+                                    Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+                                    None => Default::default(),
+                                }
+                            }
+                        }
+                    }).collect();
+
+
+                    // Assemble the final struct instantiation
+                    let struct_instantiation = quote! {
+                        #name {
+                            #(#final_field_assignments),* // Use the generated assignments
+                        }
+                    };
+
+                    // --- Visitor and Deserialize Implementation ---
+                    quote! {
+                        #[derive(serde::Deserialize)]
+                        #[serde(field_identifier, rename_all = "camelCase")]
+                        enum #field_enum_name {
+                            #(#field_enum_variants,)*
+                            #(#underscore_field_enum_variants,)*
+                            #[serde(other)]
+                            #ignore_variant
+                        }
+
+                        struct #visitor_name #ty_generics #where_clause;
+
+                        impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause {
+                            type Value = #name #ty_generics;
+
+                            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                                formatter.write_str(concat!("struct ", #struct_name_str))
+                            }
+
+                            fn visit_map<V>(self, mut map: V) -> Result<Self::Value, V::Error>
+                            where
+                                V: serde::de::MapAccess<'de>,
+                            {
+                                #(#temp_field_storage)*
+
+                                while let Some(key) = map.next_key()? {
+                                    match key {
+                                        #(#map_access_logic)*
+                                        #field_enum_name::#ignore_variant => {
+                                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                                        }
+                                    }
+                                }
+
+                                // Construct the final struct directly using the assignments
+                                Ok(#struct_instantiation)
+                            }
+                        }
+
+                        deserializer.deserialize_map(#visitor_name)
+                    }
+                }
+                Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
+                Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
+            }
+        }
+        Data::Enum(_) | Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
+    }
+}
                                 format!("_{}", effective_field_name_str);
                             let temp_underscore_field_name =
                                 format_ident!("temp_{}", underscore_field_name_str);
