@@ -308,28 +308,38 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_value = element.value.is_some();
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                        // Serialize primitive value under fieldName if present
-                                        if has_value {
-                                            // Serialize the inner value V directly
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Safe unwrap due to has_value check
-                                        }
+                                        let has_value = element.value.is_some();
+                                        let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                        // Serialize id/extension under _fieldName if present
-                                        if has_extension {
+                                        // Case 1: Value only -> Serialize primitive
+                                        if has_value && !has_extension {
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                        }
+                                        // Case 2: Extension only -> Serialize object under _fieldName
+                                        else if !has_value && has_extension {
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            // Create a struct containing only id and extension for serialization
-                                            // Use a concrete type for E if possible, or keep generic if needed. Assuming Extension for now.
-                                            let extension_part = crate::Element::<(), crate::r4::Extension> { // Use dummy type for V, concrete Extension
+                                            let extension_part = crate::Element::<(), crate::r4::Extension> { // Assuming r4::Extension
                                                 id: element.id.clone(),
                                                 extension: element.extension.clone(),
-                                                value: None, // Ensure value is None here
+                                                value: None,
                                             };
-                                            // Serialize this temporary object, which should output {"id":..., "extension":...}
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
+                                        // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
+                                        else if has_value && has_extension {
+                                            // Serialize primitive value under fieldName
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                            // Serialize extension object under _fieldName
+                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                            let extension_part = crate::Element::<(), crate::r4::Extension> { // Assuming r4::Extension
+                                                id: element.id.clone(),
+                                                extension: element.extension.clone(),
+                                                value: None,
+                                            };
+                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
+                                        }
+                                        // Case 4: Neither value nor extension (but Option is Some) -> Serialize nothing here (handled by count logic)
                                     }
-                                     // If Option is Some but element has neither value nor id/extension, nothing is serialized here.
-                                     // The count logic should ensure the field count is correct (0 in this case).
                                 }
                             });
                         } else if is_fhir_element && is_vec { // Vec<Option<Element>> or Vec<Element>
@@ -633,25 +643,8 @@ fn generate_deserialize_impl(
                                         }
 
                                         // Deserialize the primitive value part (fieldName) into Option<V>
-                                        // We need the inner type V. Let's extract it.
-                                        let value_part: Option<_> = #temp_field_name
-                                            .map(|v| {
-                                                // Attempt to deserialize the JSON value into the inner type V of the Element
-                                                // This requires extracting V from #field_ty (Option<Element<V,E>> or Element<V,E>)
-                                                // This is complex. Let's stick to deserializing into Element and extracting value.
-                                                // Deserialize into Element<V, E> assuming it handles primitive input
-                                                let temp_element: #field_ty = serde_json::from_value(v)
-                                                    .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
-                                                // Extract the value if the field is Option<Element>, otherwise take the value from Element directly
-                                                if #is_option {
-                                                    temp_element.and_then(|el| el.value)
-                                                } else {
-                                                    temp_element.value // Assumes #field_ty is Element<V,E> here
-                                                }
-                                            })
-                                            .transpose()? // Propagate potential error from inner closure
-                                            .flatten(); // Flatten Option<Option<V>> to Option<V>
-
+                                        // This requires knowing V. We deserialize into serde_json::Value first.
+                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
 
                                         // Deserialize extension part (_fieldName) into Option<IdAndExtension>
                                         let extension_part: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name // Assuming r4::Extension
@@ -659,26 +652,39 @@ fn generate_deserialize_impl(
                                             .transpose()?; // Propagate V::Error
 
                                         // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
-                                        // The type parameter V needs to be inferred or specified correctly.
-                                        // Let's assume the target field type #field_ty provides enough info,
-                                        // especially if it's Option<Element<ConcreteV, ConcreteE>> or Element<ConcreteV, ConcreteE>.
-                                        let result_element_opt = match (value_part, extension_part) {
-                                            (Some(v), Some(ep)) => Some(crate::Element { // Both present
-                                                id: ep.id,
-                                                extension: ep.extension,
-                                                value: Some(v), // Use the deserialized primitive value
-                                            }),
-                                            (Some(v), None) => Some(crate::Element { // Only value present
-                                                id: None,
-                                                extension: None,
-                                                value: Some(v), // Use the deserialized primitive value
-                                            }),
-                                            (None, Some(ep)) => Some(crate::Element { // Only extension present
-                                                id: ep.id,
-                                                extension: ep.extension,
-                                                value: None, // Value is explicitly None
-                                            }),
-                                            (None, None) => None, // Neither present
+                                        let result_element_opt = match (primitive_value_json, extension_part) {
+                                            // Both primitive value and extension object are present
+                                            (Some(prim_json), Some(ep)) => {
+                                                // Deserialize prim_json into V. This is the hard part.
+                                                // We rely on Element<V,E>::deserialize handling primitive input.
+                                                // Let's deserialize into a temporary Element and extract the value.
+                                                let temp_element: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json)
+                                                    .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
+
+                                                Some(crate::Element {
+                                                    id: ep.id,
+                                                    extension: ep.extension,
+                                                    value: temp_element.value, // Use the extracted value
+                                                })
+                                            },
+                                            // Only primitive value is present
+                                            (Some(prim_json), None) => {
+                                                // Deserialize the primitive JSON directly into the Element type.
+                                                let element: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json)
+                                                     .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
+                                                Some(element)
+                                            },
+                                            // Only extension object is present
+                                            (None, Some(ep)) => {
+                                                 // Construct Element with id/extension and value: None
+                                                 Some(crate::Element {
+                                                     id: ep.id,
+                                                     extension: ep.extension,
+                                                     value: None, // Explicitly None
+                                                 })
+                                            },
+                                            // Neither field is present
+                                            (None, None) => None,
                                         };
 
                                         // Assign to the final field, handling Option vs non-Option field type
