@@ -670,58 +670,45 @@ fn generate_deserialize_impl(
                                             extension: Option<Vec<E>>,
                                         }
 
-                                        // Attempt to deserialize the primitive value directly into Option<V>
-                                        // This requires knowing V. Let's assume V implements Deserialize.
-                                        // We need to extract V from #field_ty (Option<Element<V, E>> or Element<V, E>)
-                                        // This is complex. Let's stick to deserializing the JSON value first.
-                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
-
-                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
-                                        let extension_part: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name // Assuming r4::Extension
+                                        // Deserialize fieldName (if present) into Element, relying on Element::deserialize for primitive case
+                                        let value_element_opt: Option<crate::Element<_, crate::r4::Extension>> = #temp_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
                                             .transpose()?;
 
-                                        // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
-                                        let result_element_opt = match (primitive_value_json, extension_part) {
-                                            // Both primitive value and extension object are present
-                                            (Some(prim_json), Some(ep)) => {
-                                                // Deserialize prim_json into V. This relies on Element<V,E>::deserialize handling primitive input.
-                                                let temp_element: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json)
-                                                    .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
+                                        // Deserialize _fieldName (if present) into IdAndExtension helper
+                                        let extension_part_opt: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+                                            .transpose()?;
 
-                                                Some(crate::Element {
-                                                    id: ep.id,
-                                                    extension: ep.extension,
-                                                    value: temp_element.value, // Use the extracted value
-                                                })
+                                        // Combine logic
+                                        let result_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (value_element_opt, extension_part_opt) {
+                                            (Some(mut ve), Some(ep)) => { // Both present: Merge id/ext into ve
+                                                ve.id = ep.id;
+                                                ve.extension = ep.extension;
+                                                Some(ve)
                                             },
-                                            // Only primitive value is present
-                                            (Some(prim_json), None) => {
-                                                // Deserialize the primitive JSON directly into the Element type.
-                                                let element: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json)
-                                                     .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
-                                                Some(element)
-                                            },
-                                            // Only extension object is present
-                                            (None, Some(ep)) => {
+                                            (Some(ve), None) => { // Only primitive value present
+                                                // Ensure id/extension are None
+                                                 ve.id = None;
+                                                 ve.extension = None;
+                                                 Some(ve)
+                                            }
+                                            (None, Some(ep)) => { // Only extension present
                                                  // Construct Element with id/extension and value: None
                                                  Some(crate::Element {
                                                      id: ep.id,
                                                      extension: ep.extension,
-                                                     value: None, // Explicitly None
+                                                     value: None,
                                                  })
                                             },
-                                            // Neither field is present
-                                            (None, None) => None,
+                                            (None, None) => None, // Neither present
                                         };
 
                                         // Assign to the final field, handling Option vs non-Option field type
                                         if #is_option {
-                                            result_element_opt // Assign Option<Element<V, E>>
+                                            result_element_opt
                                         } else {
-                                            // If the field is not optional, but we got None (e.g., empty JSON object), return Default
-                                            // If we constructed Some(element), unwrap it.
-                                            result_element_opt.unwrap_or_default() // Assign Element<V, E>, requires Default
+                                            result_element_opt.unwrap_or_default()
                                         }
                                     };
                                      #field_ident // Assign the constructed Element or Option<Element>
