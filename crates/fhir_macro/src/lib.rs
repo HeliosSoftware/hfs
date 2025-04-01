@@ -351,7 +351,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         // Define helper struct locally for serializing only id/extension
                                         // Use ::fhir::r4::Extension as a concrete type for now, assuming R4 context or similar structure.
                                         // This might need adjustment if the macro needs to be more generic across FHIR versions.
-                                        #[derive(Serialize)]
+                                        #[derive(serde::Serialize)]
                                         struct IdAndExtensionHelper<'a> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             id: &'a Option<String>,
