@@ -1,11 +1,12 @@
 extern crate proc_macro;
 
+extern crate proc_macro;
+
 use proc_macro::TokenStream;
-// Removed unused Span
-use quote::{format_ident, quote}; // Removed unused ToTokens
+use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, Ident, Path, PathArguments, Type, TypePath, Attribute, Meta, PathSegment // Added Attribute, Meta, PathSegment
-    // Removed unused Field, TypePtr, TypeReference, parse_quote, spanned::Spanned
+    parse_macro_input, punctuated::Punctuated, token, Attribute, Data, DeriveInput, Fields,
+    GenericArgument, Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type, TypePath, // Removed PathSegment, added Lit, MetaNameValue, Punctuated, token
 };
 use heck::ToPascalCase; // For generating visitor names
 
@@ -167,22 +168,19 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         fn get_skip_serializing_if_path(attrs: &[Attribute]) -> Option<Path> {
                             attrs.iter().find_map(|attr| {
                                 if attr.path().is_ident("serde") {
-                                    if let Ok(Meta::List(list)) = attr.parse_meta() {
-                                        list.nested.iter().find_map(|nested| {
-                                            if let syn::NestedMeta::Meta(Meta::NameValue(nv)) = nested {
-                                                if nv.path.is_ident("skip_serializing_if") {
-                                                    if let syn::Lit::Str(lit_str) = &nv.lit {
-                                                        return syn::parse_str::<Path>(&lit_str.value()).ok();
-                                                    }
+                                    // Use parse_args_with for syn 2.0
+                                    attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated).ok().and_then(|args| {
+                                        args.iter().find_map(|meta| {
+                                            if let Meta::NameValue(MetaNameValue { path, lit: Lit::Str(lit_str), .. }) = meta {
+                                                if path.is_ident("skip_serializing_if") {
+                                                    return syn::parse_str::<Path>(&lit_str.value()).ok();
                                                 }
-                                            }
                                             None
                                         })
-                                    } else { None }
+                                    })
                                 } else { None }
                             })
                         }
-
 
                         let skip_serializing_if_path = get_skip_serializing_if_path(&field.attrs);
 
@@ -228,7 +226,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             });
                         } else if is_fhir_element && is_vec { // Vec<Option<Element>>
-                            let underscore_field_name_str = format!("_{}", field_name_str);
+                            // let underscore_field_name_str = format!("_{}", field_name_str); // Marked as unused, remove or use
                             field_count_calculator.push(quote! {
                                 if let Some(vec) = &#field_access {
                                      // Check if the vector itself should be serialized based on skip_serializing_if or Option rules
@@ -616,10 +614,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident, ty_generics: &syn::TypeG
                             #ignore_variant
                         }
 
-                        struct #visitor_name #ty_generics; // Add generics here
+                        struct #visitor_name #ty_generics #where_clause; // Add generics and where clause here
 
-                        impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause { // Add generics and where clause
-                            type Value = #name #ty_generics; // Use ty_generics here
+                        // Use the generics captured earlier for the impl block
+                        impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause {
+                            type Value = #name #ty_generics;
 
                             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                                 formatter.write_str(concat!("struct ", #struct_name_str))
