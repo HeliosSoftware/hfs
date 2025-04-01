@@ -681,25 +681,31 @@ fn generate_deserialize_impl(
                                             .transpose()?;
 
                                         // Combine logic
-                                        let result_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (value_element_opt, extension_part_opt) {
+                                        // We need the concrete V type here to construct Element<V, E>
+                                        // This is still the main challenge. Let's assume #field_ty gives us Option<Element<V, E>> or Element<V, E>
+                                        // and try to construct the correct type.
+                                        let result_element_opt = match (value_element_opt, extension_part_opt) {
                                             (Some(mut ve), Some(ep)) => { // Both present: Merge id/ext into ve
                                                 ve.id = ep.id;
                                                 ve.extension = ep.extension;
                                                 Some(ve)
                                             },
-                                            (Some(ve), None) => { // Only primitive value present
+                                            (Some(mut ve), None) => { // Only primitive value present
                                                 // Ensure id/extension are None
                                                  ve.id = None;
                                                  ve.extension = None;
                                                  Some(ve)
                                             }
                                             (None, Some(ep)) => { // Only extension present
-                                                 // Construct Element with id/extension and value: None
-                                                 Some(crate::Element {
-                                                     id: ep.id,
-                                                     extension: ep.extension,
-                                                     value: None,
-                                                 })
+                                                 // Construct Element<V, E> with id/extension and value: None
+                                                 // We need to create an instance of the specific Element type defined by #field_ty
+                                                 // This requires knowing V and E from the field type.
+                                                 // Let's try constructing a default Element and populating it.
+                                                 let mut constructed = crate::Element::default(); // Assumes V: Default
+                                                 constructed.id = ep.id;
+                                                 constructed.extension = ep.extension;
+                                                 constructed.value = None; // Explicitly set value to None
+                                                 Some(constructed)
                                             },
                                             (None, None) => None, // Neither present
                                         };
