@@ -619,11 +619,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                  // Use stored #v_ty_construct and #ext_ty
                 #field_ident = if #val_field_ident.is_some() || #id_field_ident.is_some() || #final_ext_field_ident.is_some() {
                     // Construct the Element/DecimalElement directly inside Some()
-                    // --- Check V type inside generated code ---
-                    // Convert the interpolated type #v_ty_construct to a string and normalize it
-                    let v_ty_string_check = stringify!(#v_ty_construct).replace(" ", ""); // Revert to stringify!
-                    // Compare against the normalized target string
-                    let is_decimal_type_check = v_ty_string_check == "crate::PreciseDecimal";
+                    // --- Check Original Inner Type inside generated code ---
+                    // Get string of the original inner type (e.g., "r4 :: Date", "r4 :: Decimal")
+                    let inner_ty_string_check = stringify!(#info.inner_ty).replace(" ", "");
+                    // Check if the last segment is "Decimal"
+                    let last_segment_check = inner_ty_string_check.split("::").last();
+                    let is_decimal_type_check = last_segment_check == Some("Decimal");
                     // --- End check ---
                     ::std::option::Option::Some(
                         if is_decimal_type_check { // Use the check performed inside the generated code
@@ -676,8 +677,7 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
             where
                 V: ::serde::de::MapAccess<'de>, // Use ::serde path
             {
-                // Bring quote into scope for generated code inside visit_map
-                use quote::quote;
+                // REMOVED: use quote::quote; - Unresolved in generated code scope
                 // Use fully qualified paths instead of use statements inside function
                 // use ::serde::de; // Needed for de::Error
                 // Need Deserialize in scope for helper derives
