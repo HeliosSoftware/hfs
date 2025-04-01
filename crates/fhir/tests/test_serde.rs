@@ -1,5 +1,6 @@
 use fhir::r4;
 use fhir_macro::FhirSerde;
+use serde::ser::SerializeStruct; // Import the trait
 
 #[derive(Debug, PartialEq, FhirSerde)] // Use FhirSerde derive
 struct FhirSerdeTestStruct2 {
