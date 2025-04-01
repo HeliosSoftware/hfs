@@ -364,6 +364,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             // Serialize primitive value under fieldName explicitly using its Serialize impl
                                             // Assuming the inner value type V implements Serialize
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
+                                            
                                             // Serialize extension object under _fieldName using helper struct
                                             let underscore_field_name_str = format!("_{}", #effective_field_name_str);
                                             let extension_part = IdAndExtensionHelper {
