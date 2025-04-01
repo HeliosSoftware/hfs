@@ -310,10 +310,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Serialize primitive value under fieldName if present
                                         if let Some(value) = &element.value {
-                                            // Serialize the inner value V directly using its own Serialize impl
-                                            // Ensure we are serializing the value itself, not the Option<V>
-                                            value.serialize(serde::ser::SerializeStruct::serialize_field(state, &#effective_field_name_str))?;
-                                            // state.serialize_field(&#effective_field_name_str, value)?; // This was likely wrong
+                                            // Use the value's own Serialize implementation
+                                            state.serialize_field(&#effective_field_name_str, value)?;
                                         }
 
                                         // Serialize id/extension under _fieldName if present
