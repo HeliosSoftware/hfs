@@ -626,6 +626,12 @@ pub fn fhir_derive_macro(input: TokenStream) -> TokenStream {
                     // Check if the last segment is "Decimal"
                     let last_segment_check = inner_ty_string_check.split("::").last();
                     let is_decimal_type_check = last_segment_check == Some("Decimal");
+                    // --- Debug Print ---
+                    println!("Field: {}, Inner Type String: '{}', Last Segment: {:?}, Is Decimal Check: {}",
+                             stringify!(#field_ident),
+                             inner_ty_string_check,
+                             last_segment_check,
+                             is_decimal_type_check);
                     // --- End check ---
                     ::std::option::Option::Some(
                         if is_decimal_type_check { // Use the check performed inside the generated code
