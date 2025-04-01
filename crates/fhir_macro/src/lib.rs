@@ -1,10 +1,11 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
-use quote::{format_ident, quote, ToTokens};
+// Removed unused Span
+use quote::{format_ident, quote}; // Removed unused ToTokens
 use syn::{
-    parse_macro_input, parse_quote, spanned::Spanned, Data, DeriveInput, Field, Fields, GenericArgument, Ident, Path, PathArguments, Type, TypePath, TypePtr, TypeReference
+    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, Ident, Path, PathArguments, Type, TypePath, Attribute, Meta, PathSegment // Added Attribute, Meta, PathSegment
+    // Removed unused Field, TypePtr, TypeReference, parse_quote, spanned::Spanned
 };
 use heck::ToPascalCase; // For generating visitor names
 
@@ -16,7 +17,8 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let serialize_impl = generate_serialize_impl(&input.data, &name);
-    let deserialize_impl = generate_deserialize_impl(&input.data, &name);
+    // Pass ty_generics to deserialize generator
+    let deserialize_impl = generate_deserialize_impl(&input.data, &name, &ty_generics);
 
     let expanded = quote! {
         // --- Serialize Implementation ---
@@ -161,18 +163,28 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_name_str = field_name.to_string();
                         let field_ty = &field.ty;
 
-                        // Check for serde skip_serializing_if attributes
-                        let skip_serializing_if_attr = field.attrs.iter().find(|attr| {
-                            attr.path().is_ident("serde") &&
-                            attr.parse_nested_meta(|meta| {
-                                if meta.path.is_ident("skip_serializing_if") {
-                                    // We just need to know the attribute exists
-                                    Ok(())
-                                } else {
-                                    Err(meta.error("Expected skip_serializing_if"))
-                                }
-                            }).is_ok()
-                        });
+                        // Function to find and extract the path from skip_serializing_if
+                        fn get_skip_serializing_if_path(attrs: &[Attribute]) -> Option<Path> {
+                            attrs.iter().find_map(|attr| {
+                                if attr.path().is_ident("serde") {
+                                    if let Ok(Meta::List(list)) = attr.parse_meta() {
+                                        list.nested.iter().find_map(|nested| {
+                                            if let syn::NestedMeta::Meta(Meta::NameValue(nv)) = nested {
+                                                if nv.path.is_ident("skip_serializing_if") {
+                                                    if let syn::Lit::Str(lit_str) = &nv.lit {
+                                                        return syn::parse_str::<Path>(&lit_str.value()).ok();
+                                                    }
+                                                }
+                                            }
+                                            None
+                                        })
+                                    } else { None }
+                                } else { None }
+                            })
+                        }
+
+
+                        let skip_serializing_if_path = get_skip_serializing_if_path(&field.attrs);
 
                         let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
                         let is_fhir_element = is_element || is_decimal_element;
@@ -180,10 +192,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_access = quote! { self.#field_name };
 
                         // --- Field Count Calculation ---
-                        let base_count_logic = if let Some(attr) = skip_serializing_if_attr {
+                        let base_count_logic = if let Some(condition_path) = &skip_serializing_if_path {
                              // If skip_serializing_if is present, use its condition
-                             let condition_str = attr.tokens.to_string(); // Gets the "(...)" part
-                             let condition_path: syn::Path = syn::parse_str(&condition_str[1..condition_str.len()-1]).unwrap_or_else(|_| panic!("Invalid path in skip_serializing_if for {}", field_name_str));
                              quote! { !#condition_path(&#field_access) }
                         } else if is_option {
                              // Default for Option is skip if None
@@ -246,9 +256,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
 
                         // --- Field Serialization Logic ---
-                        let skip_check = if let Some(attr) = skip_serializing_if_attr {
-                            let condition_str = attr.tokens.to_string();
-                            let condition_path: syn::Path = syn::parse_str(&condition_str[1..condition_str.len()-1]).unwrap_or_else(|_| panic!("Invalid path in skip_serializing_if for {}", field_name_str));
+                        let skip_check = if let Some(condition_path) = &skip_serializing_if_path {
                             quote! { #condition_path(&#field_access) }
                         } else if is_option {
                             quote! { #field_access.is_none() }
@@ -359,7 +367,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 }
 
 
-fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
+fn generate_deserialize_impl(data: &Data, name: &Ident, ty_generics: &syn::TypeGenerics) -> proc_macro2::TokenStream { // Added ty_generics
     match *data {
         Data::Struct(ref data) => {
             match data.fields {
@@ -608,10 +616,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             #ignore_variant
                         }
 
-                        struct #visitor_name;
+                        struct #visitor_name #ty_generics; // Add generics here
 
-                        impl<'de> serde::de::Visitor<'de> for #visitor_name {
-                            type Value = #name #ty_generics; // Include type generics
+                        impl<'de> #impl_generics serde::de::Visitor<'de> for #visitor_name #ty_generics #where_clause { // Add generics and where clause
+                            type Value = #name #ty_generics; // Use ty_generics here
 
                             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                                 formatter.write_str(concat!("struct ", #struct_name_str))
@@ -642,7 +650,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         } // end impl Visitor
 
                         // Start deserialization using the visitor
-                        deserializer.deserialize_map(#visitor_name)
+                        deserializer.deserialize_map(#visitor_name) // Pass visitor with generics if needed, but deserialize_map doesn't take it directly
                     } // end quote!
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
