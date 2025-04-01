@@ -369,8 +369,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_value = element.value.is_some();
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
-
-   // Define helper struct locally for serializing only id/extension
+                                        // Define helper struct locally for serializing only id/extension
                                         #[derive(Serialize)]
                                         struct IdAndExtensionHelper<'a, E: Serialize> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,21 +740,7 @@ fn generate_deserialize_impl(
                                 final_construction_logic.push(quote! {
                                     // Use field_ident for the variable name
                                     let #field_ident: #field_ty = {
-                                        // Define helper struct locally for id/extension part
-                                        #[derive(Deserialize, Debug, Default)] // Add Default
-                                        struct IdAndExtension<E: serde::de::DeserializeOwned + Default> { // Add Default bound
-                                            id: Option<String>,
-                                            extension: Option<Vec<E>>,
-                                        }
 
-                                        // Deserialize the primitive value part (fieldName) into Option<V>
-                                        // This requires knowing V. We deserialize into serde_json::Value first.
-                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
-
-                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
-                                        let extension_part: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name // Assuming r4::Extension
-                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
-                                            .transpose()?; // Propagate V::Error
 
                                         // Define helper struct locally for id/extension part
                                         #[derive(Deserialize, Debug, Default)]
@@ -764,40 +749,82 @@ fn generate_deserialize_impl(
                                             extension: Option<Vec<E>>,
                                         }
 
-                                        // Deserialize fieldName (if present) into Element, relying on Element::deserialize for primitive case
-                                        let value_element_opt: Option<crate::Element<_, crate::r4::Extension>> = #temp_field_name
-                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
-                                            .transpose()?;
+                                        // Attempt to deserialize the primitive value directly into Option<V>
+                                        // This requires knowing V. Let's deserialize the raw JSON value first.
+                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
 
-                                        // Deserialize _fieldName (if present) into IdAndExtension helper
+                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
+                                        // Assuming E is crate::r4::Extension for the helper struct
                                         let extension_part_opt: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
                                             .transpose()?;
 
-                                        // Combine logic
-                                        // Assuming E is crate::r4::Extension for the constructed Element
-                                        let result_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (value_element_opt, extension_part_opt) {
-                                            (Some(mut ve), Some(ep)) => { // Both present: Merge id/ext into ve
-                                                ve.id = ep.id;
-                                                ve.extension = ep.extension;
-                                                Some(ve)
-                                            },
-                                            (Some(mut ve), None) => { // Only primitive value present
-                                                // Ensure id/extension are None
-                                                 ve.id = None;
-                                                 ve.extension = None;
-                                                 Some(ve)
+                                        // Helper function to extract inner types V and E from Element<V, E> or Option<Element<V, E>>
+                                        // This is a placeholder - a real implementation needs more robust type parsing.
+                                        fn get_element_inner_types(ty: &Type) -> Option<(&Type, &Type)> {
+                                            let mut current = ty;
+                                            if let Some(inner) = get_option_inner_type(current) { // Handle Option<...>
+                                                current = inner;
                                             }
-                                            (None, Some(ep)) => { // Only extension present
-                                                 // Construct Element with id/extension and value: None
-                                                 // We need the concrete V type here. Assuming it implements Default.
-                                                 Some(crate::Element {
-                                                     id: ep.id,
-                                                     extension: ep.extension,
-                                                     value: None, // Explicitly None
-                                                 })
-                                            },
-                                            (None, None) => None, // Neither present
+                                            if let Type::Path(TypePath { path, .. }) = current {
+                                                if let Some(segment) = path.segments.last() {
+                                                    if segment.ident == "Element" || segment.ident == "DecimalElement" {
+                                                        if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                                                            if args.args.len() >= 1 {
+                                                                let ty_v = match &args.args[0] {
+                                                                    GenericArgument::Type(t) => Some(t),
+                                                                    _ => None,
+                                                                };
+                                                                // Assuming E is the second argument for Element, or fixed for DecimalElement
+                                                                let ty_e = if segment.ident == "Element" && args.args.len() >= 2 {
+                                                                     match &args.args[1] {
+                                                                        GenericArgument::Type(t) => Some(t),
+                                                                        _ => None, // Or assume default like Extension?
+                                                                     }
+                                                                } else if segment.ident == "DecimalElement" && args.args.len() >= 1 {
+                                                                     match &args.args[0] { // E is the first arg for DecimalElement
+                                                                        GenericArgument::Type(t) => Some(t),
+                                                                        _ => None,
+                                                                     }
+                                                                } else { None }; // Default E if not specified?
+
+                                                                // For now, let's assume E is always crate::r4::Extension if not found easily
+                                                                // and focus on getting V
+                                                                if let Some(v) = ty_v {
+                                                                    // We need a concrete type for E to return, let's parse a default one
+                                                                    let default_e_type: Type = syn::parse_str("crate::r4::Extension").unwrap();
+                                                                    return Some((v, ty_e.unwrap_or(&default_e_type))); // Return V and E (or default E)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            None
+                                        }
+
+
+                                        // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
+                                        let result_element_opt = if let Some((ty_v, _ty_e)) = get_element_inner_types(&#field_ty) { // Assuming Element<V, E>
+                                            // Deserialize primitive_value_json into Option<V>
+                                            let value_part: Option<#ty_v> = primitive_value_json
+                                                .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+                                                .transpose()?;
+
+                                            match (value_part, extension_part_opt) {
+                                                (Some(v), Some(ep)) => Some(crate::Element { id: ep.id, extension: ep.extension, value: Some(v) }),
+                                                (Some(v), None) => Some(crate::Element { id: None, extension: None, value: Some(v) }),
+                                                (None, Some(ep)) => Some(crate::Element { id: ep.id, extension: ep.extension, value: None }),
+                                                (None, None) => None,
+                                            }
+                                        } else {
+                                            // Fallback for types where V couldn't be extracted (e.g., DecimalElement)
+                                            // Rely on extension part only, or None/Default
+                                            match extension_part_opt {
+                                                 Some(ep) => Some(crate::Element { id: ep.id, extension: ep.extension, value: None }), // Assumes V: Default if not Option
+                                                 None => None,
+                                            }
+                                            // panic!("Could not extract inner value type V for field {}", stringify!(#field_ident));
                                         };
 
 
@@ -805,7 +832,7 @@ fn generate_deserialize_impl(
                                         if #is_option {
                                             result_element_opt
                                         } else {
-                                            result_element_opt.unwrap_or_default()
+                                            result_element_opt.unwrap_or_default() // Assumes Element<V, E> implements Default
                                         }
                                     };
                                      #field_ident // Assign the constructed Element or Option<Element>
