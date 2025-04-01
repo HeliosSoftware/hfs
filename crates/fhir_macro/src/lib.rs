@@ -566,7 +566,8 @@ fn generate_deserialize_impl(
                             let effective_field_name_str = get_effective_field_name(field); // Use helper
                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             let temp_underscore_field_name = format_ident!("temp_{}", underscore_field_name_str);
-                            let (_is_element, _is_decimal_element, _is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
+                            // Remove underscore from is_option as it's needed later
+                            let (_is_element, _is_decimal_element, is_option, is_vec, _inner_ty_opt) = get_element_info(field_ty);
 
                             if is_vec { // Handle Vec<Option<Element>> or Vec<Element>
                                 final_construction_logic.push(quote! {
