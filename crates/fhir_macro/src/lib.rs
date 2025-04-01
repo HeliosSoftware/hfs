@@ -749,13 +749,15 @@ fn generate_deserialize_impl(
                             }
                         } else {
                             // Default deserialization for non-FHIR-element fields
-                            // Put the quote! macro back
-                            quote! {
+                            // Remove the quote! macro again ONLY for this else block
+                            // The let statement itself becomes the TokenStream
+                            let construction = quote! {
                                 let #field_ident: #field_ty = match #temp_field_name {
                                     Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
                                     None => Default::default(), // Assumes #field_ty implements Default
                                 };
-                            }
+                            };
+                            construction // Directly return the TokenStream for the let binding
                         }
                     }).collect();
 
