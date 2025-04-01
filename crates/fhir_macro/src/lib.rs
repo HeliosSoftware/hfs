@@ -319,42 +319,38 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                         }
 
-                                        // Define helper struct locally for serialization (used in cases 2 & 3)
-                                        // Assuming E is crate::r4::Extension for now
+                                        let has_value = element.value.is_some();
+                                        let has_extension = element.id.is_some() || element.extension.is_some();
+
+                                        // Define helper struct locally for serializing only id/extension
                                         #[derive(Serialize)]
-                                        struct IdAndExtensionHelper<'a> {
+                                        struct IdAndExtensionHelper<'a, E: Serialize> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             id: &'a Option<String>,
                                             #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<crate::r4::Extension>>, // Use concrete type
+                                            extension: &'a Option<Vec<E>>,
                                         }
 
-                                        // Case 1: Value only -> Serialize primitive
-                                        if has_value && !has_extension {
+                                        // Serialize primitive value under fieldName if present
+                                        if has_value {
+                                            // Use .as_ref().unwrap() which is safe due to has_value check
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                         }
-                                        // Case 2: Extension only -> Serialize helper object under _fieldName
-                                        else if !has_value && has_extension {
+
+                                        // Serialize id/extension under _fieldName if present
+                                        if has_extension {
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                            // Create an instance of the helper struct referencing the element's id/extension
                                             let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
+                                                // Assuming element.extension is Option<Vec<crate::r4::Extension>>
+                                                // The generic E in IdAndExtensionHelper will adapt
                                                 extension: &element.extension,
                                             };
+                                            // Serialize the helper struct, which only contains id/extension
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
-                                        // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
-                                        else if has_value && has_extension {
-                                            // Serialize primitive value under fieldName
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
-                                            // Serialize extension object under _fieldName using helper struct
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &element.id,
-                                                extension: &element.extension,
-                                            };
-                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
-                                        }
-                                        // Case 4: Neither value nor extension (but Option is Some) -> Serialize nothing here
+                                        // If neither has_value nor has_extension, nothing is serialized for this element.
                                     }
                                 }
                             });
