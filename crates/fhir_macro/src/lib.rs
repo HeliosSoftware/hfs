@@ -671,8 +671,9 @@ fn generate_deserialize_impl(
 
                             if is_vec {
                                 // Handle Vec<Option<Element>> or Vec<Element>
+                                // Remove outer braces, return only the let statement
                                 quote! {
-                                    let #field_ident: #field_ty = { // Use let binding here
+                                    let #field_ident: #field_ty = {
                                         // Deserialize primitive array (fieldName)
                                         let primitives: Option<Vec<Option<_>>> = #temp_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
@@ -717,8 +718,9 @@ fn generate_deserialize_impl(
                                 }
                             } else {
                                 // Handle single Option<Element> or Element
+                                // Remove outer braces, return only the let statement
                                 quote! {
-                                    let #field_ident: #field_ty = { // Use let binding here
+                                    let #field_ident: #field_ty = {
                                         let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
                                         let extension_value_json: Option<serde_json::Value> = #temp_underscore_field_name;
 
@@ -749,15 +751,14 @@ fn generate_deserialize_impl(
                             }
                         } else {
                             // Default deserialization for non-FHIR-element fields
-                            // Remove the quote! macro again ONLY for this else block
-                            // The let statement itself becomes the TokenStream
-                            let construction = quote! {
+                            // Default deserialization for non-FHIR-element fields
+                            // Ensure this also returns just the let statement TokenStream
+                            quote! {
                                 let #field_ident: #field_ty = match #temp_field_name {
                                     Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
                                     None => Default::default(), // Assumes #field_ty implements Default
                                 };
-                            };
-                            construction // Directly return the TokenStream for the let binding
+                            }
                         }
                     }).collect();
 
