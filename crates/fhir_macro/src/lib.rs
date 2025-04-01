@@ -311,34 +311,26 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         let has_value = element.value.is_some();
                                         let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                        // Case 1: Value only -> Serialize primitive
-                                        if has_value && !has_extension {
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
-                                        }
-                                        // Case 2: Extension only -> Serialize object under _fieldName
-                                        else if !has_value && has_extension {
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            let extension_part = crate::Element::<(), crate::r4::Extension> { // Assuming r4::Extension
-                                                id: element.id.clone(),
-                                                extension: element.extension.clone(),
-                                                value: None,
-                                            };
-                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
-                                        }
-                                        // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
-                                        else if has_value && has_extension {
+                                        let has_value = element.value.is_some();
+                                        let has_extension = element.id.is_some() || element.extension.is_some();
+
+                                        if has_value {
                                             // Serialize primitive value under fieldName
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                        }
+
+                                        if has_extension {
                                             // Serialize extension object under _fieldName
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
                                             let extension_part = crate::Element::<(), crate::r4::Extension> { // Assuming r4::Extension
                                                 id: element.id.clone(),
                                                 extension: element.extension.clone(),
-                                                value: None,
+                                                value: None, // Crucial: value MUST be None here
                                             };
+                                            // Rely on Element::Serialize (as modified above) to output only id/extension because value is None
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
-                                        // Case 4: Neither value nor extension (but Option is Some) -> Serialize nothing here (handled by count logic)
+                                        // If neither has_value nor has_extension, nothing is serialized for this element.
                                     }
                                 }
                             });
