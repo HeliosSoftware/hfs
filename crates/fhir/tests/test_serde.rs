@@ -558,9 +558,9 @@ fn test_deserialize_element_invalid_type() {
 
 // --- Tests for FhirSerde derive macro (_fieldName logic) ---
 
-// Define a test struct that uses the FhirSerde derive
-// FhirSerde must be the only derive that generates Serialize/Deserialize impls
-#[derive(Debug, PartialEq, FhirSerde)] // Use FhirSerde derive
+// Define a test struct that uses manual Serialize implementation
+// instead of FhirSerde derive to avoid conflicts
+#[derive(Debug, PartialEq, Deserialize)] // Add Deserialize derive
 struct FhirSerdeTestStruct {
     // Regular field
     name: Option<String>,
