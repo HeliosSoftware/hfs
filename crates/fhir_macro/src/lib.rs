@@ -663,13 +663,29 @@ fn generate_deserialize_impl(
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom)) // Map error here
                                             .transpose()?; // Propagate V::Error
 
+                                        // Define helper struct locally for id/extension part
+                                        #[derive(Deserialize, Debug, Default)]
+                                        struct IdAndExtension<E: serde::de::DeserializeOwned + Default> {
+                                            id: Option<String>,
+                                            extension: Option<Vec<E>>,
+                                        }
+
+                                        // Attempt to deserialize the primitive value directly into Option<V>
+                                        // This requires knowing V. Let's assume V implements Deserialize.
+                                        // We need to extract V from #field_ty (Option<Element<V, E>> or Element<V, E>)
+                                        // This is complex. Let's stick to deserializing the JSON value first.
+                                        let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
+
+                                        // Deserialize extension part (_fieldName) into Option<IdAndExtension>
+                                        let extension_part: Option<IdAndExtension<crate::r4::Extension>> = #temp_underscore_field_name // Assuming r4::Extension
+                                            .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
+                                            .transpose()?;
+
                                         // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
                                         let result_element_opt = match (primitive_value_json, extension_part) {
                                             // Both primitive value and extension object are present
                                             (Some(prim_json), Some(ep)) => {
-                                                // Deserialize prim_json into V. This is the hard part.
-                                                // We rely on Element<V,E>::deserialize handling primitive input.
-                                                // Let's deserialize into a temporary Element and extract the value.
+                                                // Deserialize prim_json into V. This relies on Element<V,E>::deserialize handling primitive input.
                                                 let temp_element: crate::Element<_, crate::r4::Extension> = serde_json::from_value(prim_json)
                                                     .map_err(|e| serde::de::Error::custom(format!("Failed to deserialize primitive value for {}: {}", stringify!(#field_ident), e)))?;
 
