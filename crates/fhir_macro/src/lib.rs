@@ -802,10 +802,13 @@ fn generate_deserialize_impl(
                                     }
                                 }
 
-                                // Construct the final struct directly using the assignments
+                                // Process temp storage to build final fields using let bindings
+                                #(#final_construction_logic)*
+
+                                // Construct the final struct using the field idents
                                 Ok(#struct_instantiation)
                             }
-                        }
+                        } // end impl Visitor
 
                         deserializer.deserialize_map(#visitor_name)
                     }
