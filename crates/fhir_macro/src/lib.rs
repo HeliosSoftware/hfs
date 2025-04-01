@@ -371,39 +371,41 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Define helper struct locally for serializing only id/extension
                                         #[derive(Serialize)]
-                                        struct IdAndExtensionHelper<'a, E: Serialize> { // Make generic over E again
+                                        struct IdAndExtensionHelper<'a, E: Serialize> {
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             id: &'a Option<String>,
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             extension: &'a Option<Vec<E>>,
                                         }
 
-                                        // Case 1: Value only -> Serialize primitive
-                                        if has_value && !has_extension {
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
-                                        }
-                                        // Case 2: Extension only -> Serialize helper object under _fieldName
-                                        else if !has_value && has_extension {
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &element.id,
-                                                extension: &element.extension,
-                                            };
-                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
-                                        }
+                                        // Explicitly handle the three serialization cases + the empty case
+
                                         // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
-                                        else if has_value && has_extension {
+                                        if has_value && has_extension {
                                             // Serialize primitive value under fieldName
                                             state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
                                             // Serialize extension object under _fieldName using helper struct
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
                                             let extension_part = IdAndExtensionHelper {
                                                 id: &element.id,
-                                                extension: &element.extension,
+                                                extension: &element.extension, // Assuming E can be inferred or is correct
                                             };
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
-                                        // Case 4: Neither value nor extension (but Option is Some) -> Serialize nothing here
+                                        // Case 1: Value only -> Serialize primitive
+                                        else if has_value { // && !has_extension is implied by the else
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                        }
+                                        // Case 2: Extension only -> Serialize helper object under _fieldName
+                                        else if has_extension { // && !has_value is implied by the else
+                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                            let extension_part = IdAndExtensionHelper {
+                                                id: &element.id,
+                                                extension: &element.extension, // Assuming E can be inferred or is correct
+                                            };
+                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
+                                        }
+                                        // Case 4: Neither value nor extension -> Serialize nothing (field is skipped by count logic)
                                     }
 
 
