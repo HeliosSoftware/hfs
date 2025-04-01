@@ -671,7 +671,7 @@ impl serde::Serialize for FhirSerdeTestStruct {
             if is_active_value {
                 state.serialize_field("isActive", ia.value.as_ref().unwrap())?;
             } else if is_active_extension {
-                // If there's no value but there are extensions, serialize under isActive
+                // If there's no value but there are extensions, serialize under _isActive
                 #[derive(serde::Serialize)]
                 struct IdAndExtensionHelper<'a> {
                     #[serde(skip_serializing_if = "Option::is_none")]
@@ -684,7 +684,7 @@ impl serde::Serialize for FhirSerdeTestStruct {
                     id: &ia.id,
                     extension: &ia.extension,
                 };
-                state.serialize_field("isActive", &extension_part)?;
+                state.serialize_field("_isActive", &extension_part)?;
             }
             
             // Only add _isActive if both value and extension exist
