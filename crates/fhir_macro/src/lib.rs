@@ -364,8 +364,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
                                         if has_value && has_extension {
-                                            // Serialize primitive value under fieldName
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                            // Serialize primitive value under fieldName explicitly using its Serialize impl
+                                            // Assuming the inner value type V implements Serialize
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
                                             // Serialize extension object under _fieldName using helper struct
                                             let underscore_field_name_str = format!("_{}", #effective_field_name_str);
                                             let extension_part = IdAndExtensionHelper {
@@ -374,9 +375,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             };
                                             state.serialize_field(&underscore_field_name_str, &extension_part)?;
                                         }
-                                        // Case 1: Value only -> Serialize primitive under fieldName
+                                        // Case 1: Value only -> Serialize primitive under fieldName explicitly using its Serialize impl
                                         else if has_value { // && !has_extension is implied
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?;
+                                            // Assuming the inner value type V implements Serialize
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
                                         }
                                         // Case 2: Extension only -> Serialize helper object under _fieldName
                                         else if has_extension { // && !has_value is implied
