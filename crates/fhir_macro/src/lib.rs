@@ -310,17 +310,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Serialize primitive value under fieldName if present
                                         if has_value {
-                                            // Ensure we serialize the inner value V, not Option<V>
-                                            if let Some(value) = &element.value {
-                                                state.serialize_field(&#effective_field_name_str, value)?;
-                                            }
+                                            // Serialize the inner value V directly
+                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Safe unwrap due to has_value check
                                         }
 
                                         // Serialize id/extension under _fieldName if present
                                         if has_extension {
-                                            // Create the underscore field name based on the effective name
                                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            // Create a temporary Element containing only id and extension
+                                            // Create a struct containing only id and extension for serialization
                                             // Use a concrete type for E if possible, or keep generic if needed. Assuming Extension for now.
                                             let extension_part = crate::Element::<(), crate::r4::Extension> { // Use dummy type for V, concrete Extension
                                                 id: element.id.clone(),
@@ -662,16 +659,19 @@ fn generate_deserialize_impl(
                                             .transpose()?; // Propagate V::Error
 
                                         // Combine logic: Construct the final Element<V, E> or Option<Element<V, E>>
-                                        let result_element_opt: Option<crate::Element<_, crate::r4::Extension>> = match (value_part, extension_part) {
+                                        // The type parameter V needs to be inferred or specified correctly.
+                                        // Let's assume the target field type #field_ty provides enough info,
+                                        // especially if it's Option<Element<ConcreteV, ConcreteE>> or Element<ConcreteV, ConcreteE>.
+                                        let result_element_opt = match (value_part, extension_part) {
                                             (Some(v), Some(ep)) => Some(crate::Element { // Both present
                                                 id: ep.id,
                                                 extension: ep.extension,
-                                                value: Some(v),
+                                                value: Some(v), // Use the deserialized primitive value
                                             }),
                                             (Some(v), None) => Some(crate::Element { // Only value present
                                                 id: None,
                                                 extension: None,
-                                                value: Some(v),
+                                                value: Some(v), // Use the deserialized primitive value
                                             }),
                                             (None, Some(ep)) => Some(crate::Element { // Only extension present
                                                 id: ep.id,
