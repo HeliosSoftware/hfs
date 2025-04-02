@@ -358,8 +358,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 quote! {
                                     // Check outer skip condition first (for the Option<Vec> itself)
                                     if #skip_check {
-                                        // Access is safe because is_fhir_element is true
-                                        // Use a block to ensure 'vec' doesn't leak scope causing type issues
+                                        // This code block is only generated if is_fhir_element is true
                                         if let Some(vec) = &#field_access {
                                             // Check if the primitive array needs serialization (any non-null value)
                                             let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
