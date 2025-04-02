@@ -150,10 +150,10 @@ fn test_deserialize_decimal_from_integer() {
     assert_eq!(element.value.map(|pd| pd.original_string().to_string()), Some("10".to_string()));
 
 
-    // Test with a bare integer - this needs to be parsed as a JSON value first
-    let json_value = serde_json::json!(10);
+    // Test with a bare integer string
+    let json_string = r#"10"#;
     let element: DecimalElement<Extension> =
-        serde_json::from_value(json_value).expect("Deserialization from value failed");
+        serde_json::from_str(json_string).expect("Deserialization from bare integer string failed");
 
     // Check the numerical value
     assert_eq!(element.value.as_ref().map(|pd| pd.value()), Some(dec!(10)));
@@ -163,114 +163,140 @@ fn test_deserialize_decimal_from_integer() {
 
 #[test]
 fn test_roundtrip_decimal_serialization() {
-    // Test with a bare integer
-    let json_value = serde_json::json!(10);
+    // Test with a bare integer string
+    let json_input = "10";
+    let expected_value = serde_json::json!(10); // Expected output is a JSON number
 
-    // Deserialize to our type
+    // Deserialize from string
     let element: DecimalElement<Extension> =
-        serde_json::from_value(json_value.clone()).expect("Deserialization failed");
+        serde_json::from_str(json_input).expect("Deserialization from integer string failed");
 
-    // Serialize back to JSON
-    let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+    // Serialize back to JSON Value
+    let reserialized_value = serde_json::to_value(&element).expect("Serialization to value failed");
 
-    // Verify we get the same JSON back (a bare number, not an object)
+    // Verify we get the expected JSON number value back
     assert_eq!(
-        json_value, reserialized,
-        "Original: {:?}\nReserialized: {:?}",
-        json_value, reserialized
+        expected_value, reserialized_value,
+        "Original String: {}\nExpected Value: {:?}\nReserialized Value: {:?}",
+        json_input, expected_value, reserialized_value
     );
 
-    // Test with a decimal value
-    let json_value = serde_json::json!(123.456);
+    // Test with a decimal value string
+    let json_input = "123.456";
+    let expected_value = serde_json::json!(123.456); // Expected output is a JSON number
 
-    // Deserialize to our type
+    // Deserialize from string
     let element: DecimalElement<Extension> =
-        serde_json::from_value(json_value.clone()).expect("Deserialization failed");
+        serde_json::from_str(json_input).expect("Deserialization from decimal string failed");
 
-    // Serialize back to JSON
-    let reserialized = serde_json::to_value(&element).expect("Serialization failed");
+    // Serialize back to JSON Value
+    let reserialized_value = serde_json::to_value(&element).expect("Serialization to value failed");
 
-    // Verify we get the same JSON back (comparing serde_json::Value numbers)
-    assert_eq!(json_value, reserialized);
+    // Verify we get the expected JSON number value back
+    assert_eq!(
+        expected_value, reserialized_value,
+        "Original String: {}\nExpected Value: {:?}\nReserialized Value: {:?}",
+        json_input, expected_value, reserialized_value
+    );
 }
 
 #[test]
 fn test_decimal_with_trailing_zeros() {
-    // Test with a decimal value that has trailing zeros (3.0)
-    let json_value = serde_json::json!(3.0); // Input is a JSON number 3.0
-    // EXPECTED OUTPUT IS NOW A JSON NUMBER 3.0 (represented as string "3.0")
-    let expected_string = "3.0";
+    // Test case 1: Input is the JSON number 3.0
+    let json_input_num_3_0 = "3.0";
+    let expected_string_3_0 = "3.0";
 
-    // Deserialize to our type
-    let element: DecimalElement<Extension> =
-        serde_json::from_value(json_value.clone()).expect("Deserialization from number failed");
-
-    // Serialize back to string
-    let reserialized_string =
-        serde_json::to_string(&element).expect("Serialization to string failed");
-
-    // Verify the string representation is the JSON number 3.0 (as string "3.0")
-    assert_eq!(
-        reserialized_string, expected_string,
-        "Original JSON Value: {:?}\nExpected String: {}\nReserialized String: {}",
-        json_value, expected_string, reserialized_string
-    );
-
-    // Also test with a string representation in the JSON input: "3.0"
-    let json_str_input = r#""3.0""#; // Input is a JSON string "3.0"
-    // Note: Deserializing a JSON string "3.0" into DecimalElement should still work
-    // because the visitor handles visit_str/visit_borrowed_str.
-    // The serialized output should still be the bare number 3.0.
-    let element_from_string: DecimalElement<Extension> =
-        serde_json::from_str(json_str_input).expect("Deserialization from string failed");
+    // Deserialize from string
+    let element_num_3_0: DecimalElement<Extension> =
+        serde_json::from_str(json_input_num_3_0).expect("Deserialization from '3.0' failed");
 
     // Serialize back to string
-    let reserialized_string_from_str =
-        serde_json::to_string(&element_from_string).expect("Serialization to string failed");
+    let reserialized_string_num_3_0 =
+        serde_json::to_string(&element_num_3_0).expect("Serialization to string failed");
 
-    // Verify the string representation is the JSON number 3.0 (as string "3.0")
+    // Verify the string representation is "3.0"
     assert_eq!(
-        reserialized_string_from_str, expected_string,
-        "Original JSON String: {}\nExpected String: {}\nReserialized String: {}",
-        json_str_input, expected_string, reserialized_string_from_str
+        reserialized_string_num_3_0, expected_string_3_0,
+        "Input JSON: {}\nExpected String: {}\nReserialized String: {}",
+        json_input_num_3_0, expected_string_3_0, reserialized_string_num_3_0
     );
 
-    // Test case from the failure log: parsing the string "3.0" directly
-    let json_str = r#"3.0"#; // Input is bare number 3.0 in a string
-    let parsed_value: serde_json::Value = serde_json::from_str(json_str).unwrap(); // Parsed as Number(3.0)
+    // Test case 2: Input is the JSON string "3.0"
+    let json_input_str_3_0 = r#""3.0""#; // Note the outer quotes for JSON string
+    // The output should still be the JSON number 3.0
+    let expected_string_3_0 = "3.0";
 
-    let element_from_bare_string: DecimalElement<Extension> =
-        serde_json::from_value(parsed_value.clone())
-            .expect("Deserialization from bare string failed");
-
-    let reserialized_string_from_bare =
-        serde_json::to_string(&element_from_bare_string).expect("Serialization failed");
-
-    // Verify the string representation is the JSON number 3.0 (as string "3.0")
-    assert_eq!(
-        reserialized_string_from_bare, expected_string,
-        "Original bare string: {}\nParsed Value: {:?}\nExpected String: {}\nReserialized String: {}",
-        json_str, parsed_value, expected_string, reserialized_string_from_bare
-    );
-
-    // Test with a decimal value that has trailing zeros (3.00)
-    let json_value = serde_json::json!(3.00); // Input is a JSON number 3.00
-    // EXPECTED OUTPUT IS NOW A JSON NUMBER 3.00 (represented as string "3.00")
-    let expected_string = "3.00";
-
-    // Deserialize to our type
-    let element: DecimalElement<Extension> =
-        serde_json::from_value(json_value.clone()).expect("Deserialization from number failed");
+    // Deserialize from string
+    let element_str_3_0: DecimalElement<Extension> =
+        serde_json::from_str(json_input_str_3_0).expect("Deserialization from '\"3.0\"' failed");
 
     // Serialize back to string
-    let reserialized_string =
-        serde_json::to_string(&element).expect("Serialization to string failed");
+    let reserialized_string_str_3_0 =
+        serde_json::to_string(&element_str_3_0).expect("Serialization to string failed");
 
-    // Verify the string representation is the JSON number 3.00 (as string "3.00")
+    // Verify the string representation is "3.0"
     assert_eq!(
-        reserialized_string, expected_string,
-        "Original JSON Value: {:?}\nExpected String: {}\nReserialized String: {}",
-        json_value, expected_string, reserialized_string
+        reserialized_string_str_3_0, expected_string_3_0,
+        "Input JSON: {}\nExpected String: {}\nReserialized String: {}",
+        json_input_str_3_0, expected_string_3_0, reserialized_string_str_3_0
+    );
+
+    // Test case 3: Input is the JSON number 3.00
+    let json_input_num_3_00 = "3.00";
+    let expected_string_3_00 = "3.00";
+
+    // Deserialize from string
+    let element_num_3_00: DecimalElement<Extension> =
+        serde_json::from_str(json_input_num_3_00).expect("Deserialization from '3.00' failed");
+
+    // Serialize back to string
+    let reserialized_string_num_3_00 =
+        serde_json::to_string(&element_num_3_00).expect("Serialization to string failed");
+
+    // Verify the string representation is "3.00"
+    assert_eq!(
+        reserialized_string_num_3_00, expected_string_3_00,
+        "Input JSON: {}\nExpected String: {}\nReserialized String: {}",
+        json_input_num_3_00, expected_string_3_00, reserialized_string_num_3_00
+    );
+
+     // Test case 4: Input is the JSON string "3.00"
+    let json_input_str_3_00 = r#""3.00""#; // Note the outer quotes for JSON string
+    // The output should still be the JSON number 3.00
+    let expected_string_3_00 = "3.00";
+
+    // Deserialize from string
+    let element_str_3_00: DecimalElement<Extension> =
+        serde_json::from_str(json_input_str_3_00).expect("Deserialization from '\"3.00\"' failed");
+
+    // Serialize back to string
+    let reserialized_string_str_3_00 =
+        serde_json::to_string(&element_str_3_00).expect("Serialization to string failed");
+
+    // Verify the string representation is "3.00"
+    assert_eq!(
+        reserialized_string_str_3_00, expected_string_3_00,
+        "Input JSON: {}\nExpected String: {}\nReserialized String: {}",
+        json_input_str_3_00, expected_string_3_00, reserialized_string_str_3_00
+    );
+
+    // Test case 5: Input is the JSON number 3 (integer)
+    let json_input_num_3 = "3";
+    let expected_string_3 = "3";
+
+    // Deserialize from string
+    let element_num_3: DecimalElement<Extension> =
+        serde_json::from_str(json_input_num_3).expect("Deserialization from '3' failed");
+
+    // Serialize back to string
+    let reserialized_string_num_3 =
+        serde_json::to_string(&element_num_3).expect("Serialization to string failed");
+
+    // Verify the string representation is "3"
+    assert_eq!(
+        reserialized_string_num_3, expected_string_3,
+        "Input JSON: {}\nExpected String: {}\nReserialized String: {}",
+        json_input_num_3, expected_string_3, reserialized_string_num_3
     );
 }
 
