@@ -8,6 +8,19 @@ use syn::{
     Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
 
+// Define helper struct at the crate level (make it private)
+// This struct helps serialize the id/extension part for FHIR elements.
+#[derive(serde::Serialize)]
+struct IdAndExtensionHelper<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    // Use the concrete Extension type expected by the current logic.
+    // This assumes the context where the macro is used has access to ::fhir::r4::Extension.
+    extension: &'a Option<Vec<::fhir::r4::Extension>>,
+}
+
+
 // Helper function to get the effective field name for serialization/deserialization
 // Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
 fn get_effective_field_name(field: &syn::Field) -> String {
@@ -262,19 +275,8 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
 
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
-    // Define helper struct OUTSIDE the generated serialize function scope
-    // but within the scope where generate_serialize_impl can create its definition.
-    // Use the concrete Extension type directly instead of generics.
-    let id_and_extension_helper_def = quote! {
-        #[derive(serde::Serialize)]
-        struct IdAndExtensionHelper<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            id: &'a Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            // Use the concrete Extension type expected by the current logic
-            extension: &'a Option<Vec<::fhir::r4::Extension>>,
-        }
-    };
+    // The IdAndExtensionHelper struct is now defined outside this function.
+    // We will refer to it using `crate::IdAndExtensionHelper`.
 
     match *data {
         Data::Struct(ref data) => {
@@ -426,8 +428,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Serialize extension object under _fieldName using the EXTERNAL helper struct
                                                 // Assuming the extension type E is ::fhir::r4::Extension.
                                                 let underscore_field_name_str = format!("_{}", #effective_field_name_str);
-                                                // Use the non-generic helper struct
-                                                let extension_part = IdAndExtensionHelper {
+                                                // Use the crate-level helper struct
+                                                let extension_part = crate::IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -440,9 +442,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                             // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
                                             else if has_extension { // && !has_value is implied
-                                                // Use the non-generic helper struct
+                                                // Use the crate-level helper struct
                                                 // Assuming the extension type E is ::fhir::r4::Extension.
-                                                let extension_part = IdAndExtensionHelper {
+                                                let extension_part = crate::IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -517,8 +519,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                     // Combine field count calculation and serialization
                     quote! {
-                        // Define the helper struct using the definition created outside
-                        #id_and_extension_helper_def
+                        // The helper struct definition is no longer injected here.
 
                         let mut count = 0;
                         #(#field_count_calculator)* // Calculate the actual number of fields to serialize
