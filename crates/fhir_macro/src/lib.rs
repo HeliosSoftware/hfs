@@ -412,10 +412,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
 
                                                 // Serialize extension object under _fieldName using the EXTERNAL helper struct
-                                                // Assuming the extension type E is ::fhir::r4::Extension for now.
-                                                // This might need adjustment if the macro needs to support different extension types.
+                                                // Assuming the extension type E is ::fhir::r4::Extension.
                                                 let underscore_field_name_str = format!("_{}", #effective_field_name_str);
-                                                let extension_part = IdAndExtensionHelper::<::fhir::r4::Extension> {
+                                                // Use the non-generic helper struct
+                                                let extension_part = IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -428,9 +428,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                             // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
                                             else if has_extension { // && !has_value is implied
-                                                // Use the EXTERNAL helper struct
-                                                // Assuming the extension type E is ::fhir::r4::Extension for now.
-                                                let extension_part = IdAndExtensionHelper::<::fhir::r4::Extension> {
+                                                // Use the non-generic helper struct
+                                                // Assuming the extension type E is ::fhir::r4::Extension.
+                                                let extension_part = IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -506,13 +506,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     // Combine field count calculation and serialization
                     quote! {
                         // Define helper struct INSIDE the generated serialize function scope
-                        // Make it generic over the Extension type E
+                        // Use the concrete Extension type directly instead of generics
                         #[derive(serde::Serialize)]
-                        struct IdAndExtensionHelper<'a, E: serde::Serialize> {
+                        struct IdAndExtensionHelper<'a> {
                             #[serde(skip_serializing_if = "Option::is_none")]
                             id: &'a Option<String>,
                             #[serde(skip_serializing_if = "Option::is_none")]
-                            extension: &'a Option<Vec<E>>, // Use generic E
+                            // Use the concrete Extension type expected by the current logic
+                            extension: &'a Option<Vec<::fhir::r4::Extension>>,
                         }
 
                         let mut count = 0;
