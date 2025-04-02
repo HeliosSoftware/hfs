@@ -164,14 +164,14 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
             Ok(serde_json::Value::String(s)) => {
                 // Original was JSON string, e.g., "\"3.00\"". Parse the inner content 's'.
                  s.parse::<Decimal>()
-                    .map(|value| PreciseDecimal { value, original_string: s })
+                    .map(|value| PreciseDecimal { value, original_string: s.clone() }) // Clone s here
                     .map_err(|e| de::Error::custom(format!("Failed to parse decimal from JSON string content '{}': {}", s, e)))
             }
             Ok(serde_json::Value::Number(_)) => {
                  // Original was JSON number, e.g., 3.00. Parse the raw segment.
                  let s = original_json_segment.to_string();
                  s.parse::<Decimal>()
-                    .map(|value| PreciseDecimal { value, original_string: s })
+                    .map(|value| PreciseDecimal { value, original_string: s.clone() }) // Clone s here
                     .map_err(|e| de::Error::custom(format!("Failed to parse decimal from JSON number segment '{}': {}", s, e)))
             }
             Ok(other) => Err(de::Error::invalid_type(
