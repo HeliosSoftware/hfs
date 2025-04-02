@@ -263,15 +263,7 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
-            // Define helper struct INSIDE the main function but BEFORE the loop
-            // Make it generic over the Extension type E
-            #[derive(serde::Serialize)]
-            struct IdAndExtensionHelper<'a, E: serde::Serialize> {
-                #[serde(skip_serializing_if = "Option::is_none")]
-                id: &'a Option<String>,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                extension: &'a Option<Vec<E>>, // Use generic E
-            }
+            // Helper struct definition moved inside the quote! block below
             match data.fields {
                 Fields::Named(ref fields) => {
                     // let field_count = fields.named.len(); // Field count is dynamic now
