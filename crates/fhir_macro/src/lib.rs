@@ -4,23 +4,9 @@ use heck::{ToLowerCamelCase, ToPascalCase};
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input,
-    punctuated::Punctuated,
-    token,
-    Attribute,
-    Data,
-    DeriveInput,
-    Fields,
-    GenericArgument,
-    Ident,
-    Lit,
-    Meta,
-    Path,
-    PathArguments,
-    Type,
-    TypePath,
+    Attribute, Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments,
+    Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
-use serde::de::Unexpected; // Add this import
 
 // Helper function to get the effective field name for serialization/deserialization
 // Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
@@ -76,7 +62,6 @@ fn should_skip_element_handling(field: &syn::Field) -> bool {
     }
     false // Default to false if attribute not found or not true
 }
-
 
 #[proc_macro_derive(FhirSerde, attributes(fhirserde))] // Add attributes(fhirserde) here
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
@@ -191,15 +176,29 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     // List of known FHIR primitive type aliases that wrap Element or DecimalElement
     // Note: This list might need adjustment based on the specific FHIR version/implementation details.
     const KNOWN_ELEMENT_ALIASES: &[&str] = &[
-        "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime", // Removed "String"
-        "Id", "Instant", "Integer", "Markdown", "Oid", "PositiveInt",
-        "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
+        "Base64Binary",
+        "Boolean",
+        "Canonical",
+        "Code",
+        "Date",
+        "DateTime", // Removed "String"
+        "Id",
+        "Instant",
+        "Integer",
+        "Markdown",
+        "Oid",
+        "PositiveInt",
+        "Time",
+        "UnsignedInt",
+        "Uri",
+        "Url",
+        "Uuid",
+        "Xhtml",
         // Struct types that might be used directly or within Elements (e.g., Address, HumanName)
         // are NOT typically handled by this _fieldName logic, so they are excluded here.
         // Resource types (Patient, Observation) are also excluded.
     ];
     const KNOWN_DECIMAL_ELEMENT_ALIAS: &str = "Decimal";
-
 
     let mut is_option = false;
     let mut is_vec = false;
@@ -245,7 +244,7 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
             let is_decimal_element = is_direct_decimal_element || is_known_decimal_alias;
 
             if is_element || is_decimal_element {
-                 // It's considered an element type if it's Element, DecimalElement, or a known alias
+                // It's considered an element type if it's Element, DecimalElement, or a known alias
                 return (
                     is_element && !is_decimal_element, // Ensure is_element is false if it's a decimal type
                     is_decimal_element,
@@ -259,7 +258,6 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
-
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
@@ -353,7 +351,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                          }
                                     }
                                 }
-                            } else { // is_vec
+                            } else {
+                                // is_vec
                                 // Vec<Option<Element>>
                                 quote! {
                                     // Check outer skip condition first (for the Option<Vec> itself)
@@ -378,7 +377,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             }
-                        } else { // Not a FHIR element (or skipped)
+                        } else {
+                            // Not a FHIR element (or skipped)
                             // Standard count logic
                             quote! {
                                 if #skip_check {
@@ -388,116 +388,117 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         };
                         field_count_calculator.push(count_calculator_code);
 
-
                         // --- Generate serializer code conditionally ---
                         let serializer_code = if is_fhir_element {
                             if !is_vec {
                                 // Single Element or DecimalElement (and not skipped)
                                 quote! {
-                                    // Check the outer skip condition first
-                                if #skip_check {
-                                    if let Some(element) = &#field_access {
-                                        let has_value = element.value.is_some();
-                                        let has_extension = element.id.is_some() || element.extension.is_some();
+                                        // Check the outer skip condition first
+                                    if #skip_check {
+                                        if let Some(element) = &#field_access {
+                                            let has_value = element.value.is_some();
+                                            let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                        // Define helper struct locally for serializing only id/extension
-                                        // Use ::fhir::r4::Extension as a concrete type for now, assuming R4 context or similar structure.
-                                        // This might need adjustment if the macro needs to be more generic across FHIR versions.
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<::fhir::r4::Extension>>, // Use concrete type
-                                        }
-
-                                        // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
-                                        if has_value && has_extension {
-                                            // Serialize primitive value under fieldName explicitly using its Serialize impl
-                                            // Assuming the inner value type V implements Serialize
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
-                                            
-                                            // Serialize extension object under _fieldName using helper struct
-                                            let underscore_field_name_str = format!("_{}", #effective_field_name_str);
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &element.id,
-                                                extension: &element.extension,
-                                            };
-                                            state.serialize_field(&underscore_field_name_str, &extension_part)?;
-                                        }
-                                        // Case 1: Value only -> Serialize primitive under fieldName explicitly using its Serialize impl
-                                        else if has_value { // && !has_extension is implied
-                                            // Assuming the inner value type V implements Serialize
-                                            state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
-                                        }
-                                        // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
-                                        else if has_extension { // && !has_value is implied
+                                            // Define helper struct locally for serializing only id/extension
+                                            // Use ::fhir::r4::Extension as a concrete type for now, assuming R4 context or similar structure.
+                                            // This might need adjustment if the macro needs to be more generic across FHIR versions.
                                             #[derive(serde::Serialize)]
                                             struct IdAndExtensionHelper<'a> {
                                                 #[serde(skip_serializing_if = "Option::is_none")]
                                                 id: &'a Option<String>,
                                                 #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<::fhir::r4::Extension>>,
+                                                extension: &'a Option<Vec<::fhir::r4::Extension>>, // Use concrete type
                                             }
-                                            
-                                            let extension_part = IdAndExtensionHelper {
-                                                id: &element.id,
-                                                extension: &element.extension,
-                                            };
-                                            state.serialize_field(&#effective_field_name_str, &extension_part)?;
-                                        }
-                                        // Case 4: Neither value nor extension -> Serialize nothing (field is skipped by count logic)
-                                    }
-                                    // If the outer Option was None, the skip_check handles it.
-                                }
-                            }
-                            } else { // is_vec
-                                // Vec<Option<Element>> or Vec<Element>
-                                quote!{
-                                    // Check the outer skip condition first
-                                if #skip_check {
-                                    if let Some(vec) = &#field_access {
-                                        // Serialize primitive array (fieldName) if not empty
-                                        if !vec.is_empty() {
-                                            // Prepare primitive values array: Vec<Option<ValueType>>
-                                            let primitive_values: Vec<_> = vec.iter().map(|opt_elem| {
-                                                opt_elem.as_ref().and_then(|elem| elem.value.as_ref()) // Clones the inner value if present
-                                            }).collect();
-                                            // Use effective name for serialization
-                                            state.serialize_field(&#effective_field_name_str, &primitive_values)?;
-                                        } else {
-                                             // Serialize empty array if input vec is empty but Some and not skipped
-                                             // Use effective name for serialization
-                                             state.serialize_field(&#effective_field_name_str, &Vec::<Option<()>>::new())?; // Use appropriate dummy type if needed
-                                        }
 
-                                        // Prepare extension values array (_fieldName): Vec<Option<Element<(), Extension>>>
-                                        let extension_values: Vec<Option<crate::Element<(), crate::r4::Extension>>> = vec.iter().map(|opt_elem| { // Assuming r4::Extension
-                                            opt_elem.as_ref().and_then(|elem| {
-                                                if elem.id.is_some() || elem.extension.is_some() {
-                                                    Some(crate::Element::<(), crate::r4::Extension> { // Use dummy type for V
-                                                        id: elem.id.clone(),
-                                                        extension: elem.extension.clone(),
-                                                        value: None,
-                                                    })
-                                                } else {
-                                                    None // Represents null in the _fieldName array
+                                            // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
+                                            if has_value && has_extension {
+                                                // Serialize primitive value under fieldName explicitly using its Serialize impl
+                                                // Assuming the inner value type V implements Serialize
+                                                state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
+
+                                                // Serialize extension object under _fieldName using helper struct
+                                                let underscore_field_name_str = format!("_{}", #effective_field_name_str);
+                                                let extension_part = IdAndExtensionHelper {
+                                                    id: &element.id,
+                                                    extension: &element.extension,
+                                                };
+                                                state.serialize_field(&underscore_field_name_str, &extension_part)?;
+                                            }
+                                            // Case 1: Value only -> Serialize primitive under fieldName explicitly using its Serialize impl
+                                            else if has_value { // && !has_extension is implied
+                                                // Assuming the inner value type V implements Serialize
+                                                state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
+                                            }
+                                            // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
+                                            else if has_extension { // && !has_value is implied
+                                                #[derive(serde::Serialize)]
+                                                struct IdAndExtensionHelper<'a> {
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    id: &'a Option<String>,
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    extension: &'a Option<Vec<::fhir::r4::Extension>>,
                                                 }
-                                            })
-                                        }).collect();
 
-                                        // Only serialize _fieldName array if there's at least one non-null extension part
-                                        if extension_values.iter().any(|opt_ext| opt_ext.is_some()) {
-                                            // Create the underscore field name based on the effective name
-                                            let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                                            state.serialize_field(&underscore_field_name_str, &extension_values)?;
+                                                let extension_part = IdAndExtensionHelper {
+                                                    id: &element.id,
+                                                    extension: &element.extension,
+                                                };
+                                                state.serialize_field(&#effective_field_name_str, &extension_part)?;
+                                            }
+                                            // Case 4: Neither value nor extension -> Serialize nothing (field is skipped by count logic)
                                         }
+                                        // If the outer Option was None, the skip_check handles it.
                                     }
-                                     // If Option<Vec> is None, the outer skip_check handles it.
+                                }
+                            } else {
+                                // is_vec
+                                // Vec<Option<Element>> or Vec<Element>
+                                quote! {
+                                        // Check the outer skip condition first
+                                    if #skip_check {
+                                        if let Some(vec) = &#field_access {
+                                            // Serialize primitive array (fieldName) if not empty
+                                            if !vec.is_empty() {
+                                                // Prepare primitive values array: Vec<Option<ValueType>>
+                                                let primitive_values: Vec<_> = vec.iter().map(|opt_elem| {
+                                                    opt_elem.as_ref().and_then(|elem| elem.value.as_ref()) // Clones the inner value if present
+                                                }).collect();
+                                                // Use effective name for serialization
+                                                state.serialize_field(&#effective_field_name_str, &primitive_values)?;
+                                            } else {
+                                                 // Serialize empty array if input vec is empty but Some and not skipped
+                                                 // Use effective name for serialization
+                                                 state.serialize_field(&#effective_field_name_str, &Vec::<Option<()>>::new())?; // Use appropriate dummy type if needed
+                                            }
+
+                                            // Prepare extension values array (_fieldName): Vec<Option<Element<(), Extension>>>
+                                            let extension_values: Vec<Option<crate::Element<(), crate::r4::Extension>>> = vec.iter().map(|opt_elem| { // Assuming r4::Extension
+                                                opt_elem.as_ref().and_then(|elem| {
+                                                    if elem.id.is_some() || elem.extension.is_some() {
+                                                        Some(crate::Element::<(), crate::r4::Extension> { // Use dummy type for V
+                                                            id: elem.id.clone(),
+                                                            extension: elem.extension.clone(),
+                                                            value: None,
+                                                        })
+                                                    } else {
+                                                        None // Represents null in the _fieldName array
+                                                    }
+                                                })
+                                            }).collect();
+
+                                            // Only serialize _fieldName array if there's at least one non-null extension part
+                                            if extension_values.iter().any(|opt_ext| opt_ext.is_some()) {
+                                                // Create the underscore field name based on the effective name
+                                                let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                                state.serialize_field(&underscore_field_name_str, &extension_values)?;
+                                            }
+                                        }
+                                         // If Option<Vec> is None, the outer skip_check handles it.
+                                    }
                                 }
                             }
-                            }
-                        } else { // Not a FHIR element (or skipped)
+                        } else {
+                            // Not a FHIR element (or skipped)
                             // Default serialization for non-FHIR-element fields or skipped fields
                             quote! {
                                 if #skip_check {
@@ -527,12 +528,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syn::{parse_str, Type};
-    use quote::ToTokens; // Import ToTokens trait
+    use quote::ToTokens;
+    use syn::{Type, parse_str}; // Import ToTokens trait
 
     // Helper to compare Option<&Type> by converting to string
     fn type_option_to_string(ty_opt: Option<&Type>) -> Option<String> {
@@ -547,7 +547,10 @@ mod tests {
         assert!(!is_decimal);
         assert!(is_option);
         assert!(!is_vec);
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < String , Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < String , Extension >".to_string())
+        );
     }
 
     #[test]
@@ -558,7 +561,10 @@ mod tests {
         assert!(is_decimal);
         assert!(is_option);
         assert!(!is_vec);
-        assert_eq!(type_option_to_string(inner_ty), Some("DecimalElement < Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("DecimalElement < Extension >".to_string())
+        );
     }
 
     #[test]
@@ -579,10 +585,13 @@ mod tests {
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
-        assert!(is_vec);    // Vec is present
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < bool , Extension >".to_string()));
+        assert!(is_vec); // Vec is present
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < bool , Extension >".to_string())
+        );
     }
-    
+
     #[test]
     fn test_get_element_info_option_vec_option_decimal_element() {
         let ty: Type = parse_str("Option<Vec<Option<DecimalElement<Extension>>>>").unwrap();
@@ -590,8 +599,11 @@ mod tests {
         assert!(!is_element);
         assert!(is_decimal);
         assert!(is_option); // Outer Option
-        assert!(is_vec);    // Vec is present
-        assert_eq!(type_option_to_string(inner_ty), Some("DecimalElement < Extension >".to_string()));
+        assert!(is_vec); // Vec is present
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("DecimalElement < Extension >".to_string())
+        );
     }
 
     #[test]
@@ -601,7 +613,7 @@ mod tests {
         assert!(!is_element); // String should NOT be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
-        assert!(is_vec);    // Vec is present
+        assert!(is_vec); // Vec is present
         assert!(inner_ty.is_none()); // Inner type is not Element or DecimalElement
     }
 
@@ -613,7 +625,10 @@ mod tests {
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < String , Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < String , Extension >".to_string())
+        );
     }
 
     #[test]
@@ -624,7 +639,10 @@ mod tests {
         assert!(is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(type_option_to_string(inner_ty), Some("DecimalElement < Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("DecimalElement < Extension >".to_string())
+        );
     }
 
     #[test]
@@ -646,8 +664,11 @@ mod tests {
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option); // No outer Option
-        assert!(is_vec);     // Vec is present
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < bool , Extension >".to_string()));
+        assert!(is_vec); // Vec is present
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < bool , Extension >".to_string())
+        );
     }
 
     #[test]
@@ -657,8 +678,11 @@ mod tests {
         assert!(!is_element);
         assert!(is_decimal);
         assert!(!is_option); // No outer Option
-        assert!(is_vec);     // Vec is present
-        assert_eq!(type_option_to_string(inner_ty), Some("DecimalElement < Extension >".to_string()));
+        assert!(is_vec); // Vec is present
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("DecimalElement < Extension >".to_string())
+        );
     }
 
     #[test]
@@ -682,7 +706,10 @@ mod tests {
         assert!(is_option);
         assert!(!is_vec);
         // The inner type returned should be the Element itself after unwrapping Box
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < String , Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < String , Extension >".to_string())
+        );
     }
 
     #[test]
@@ -693,9 +720,12 @@ mod tests {
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
-        assert!(is_vec);    // Vec is present
+        assert!(is_vec); // Vec is present
         // The inner type returned should be the Element itself after unwrapping Box
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < bool , Extension >".to_string()));
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < bool , Extension >".to_string())
+        );
     }
 
     #[test]
@@ -714,10 +744,10 @@ mod tests {
         // This is a simplification as we don't have real type info.
         let ty_simulated_alias: Type = parse_str("Element<String, Extension>").unwrap();
 
-
         // Test with a path that *doesn't* end in Element/DecimalElement
         let ty_non_element_path: Type = parse_str("some::module::RegularStruct").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty_non_element_path);
+        let (is_element, is_decimal, is_option, is_vec, inner_ty) =
+            get_element_info(&ty_non_element_path);
         assert!(!is_element);
         assert!(!is_decimal);
         assert!(!is_option);
@@ -726,13 +756,16 @@ mod tests {
 
         // Test with a path that *does* end in Element (simulating alias)
         // We use the actual Element type parsed earlier for this simulation
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty_simulated_alias);
+        let (is_element, is_decimal, is_option, is_vec, inner_ty) =
+            get_element_info(&ty_simulated_alias);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(type_option_to_string(inner_ty), Some("Element < String , Extension >".to_string()));
-
+        assert_eq!(
+            type_option_to_string(inner_ty),
+            Some("Element < String , Extension >".to_string())
+        );
     }
 }
 
@@ -759,7 +792,7 @@ fn generate_deserialize_impl(
                     // Create enum variants for field matching
                     let field_enum_name =
                         format_ident!("{}Field", name.to_string().to_pascal_case()); // Keep this for the enum name
-                                                                                     // Helper to get aliases
+                    // Helper to get aliases
                     fn get_field_aliases(attrs: &[Attribute]) -> Vec<String> {
                         attrs
                             .iter()
@@ -840,7 +873,7 @@ fn generate_deserialize_impl(
                             let underscore_variant =
                                 format_ident!("_{}", field_ident.to_string().to_pascal_case()); // Underscore variant also based on Rust ident
                             underscore_field_enum_variants.push(underscore_variant.clone()); // Add to list of variants
-                                                                                             // Match underscore name
+                            // Match underscore name
                             field_match_arms.push(quote! { #underscore_field_name_str => Ok(#field_enum_name::#underscore_variant) });
                             // Match underscore aliases? (Less common, skip for now)
                         }
@@ -884,7 +917,8 @@ fn generate_deserialize_impl(
                         });
 
                         // If it's treated as a FHIR element (not skipped), also handle the underscore field
-                        if is_fhir_element_field[i] { // This flag already respects skip_handling
+                        if is_fhir_element_field[i] {
+                            // This flag already respects skip_handling
                             let underscore_field_name_str =
                                 format!("_{}", effective_field_name_str); // Use effective name
                             let underscore_variant =
@@ -1054,9 +1088,11 @@ fn generate_deserialize_impl(
                     }).collect();
 
                     // Get just the field idents for the final struct construction
-                    let final_field_idents: Vec<_> = fields.named.iter().map(|field| {
-                        field.ident.as_ref().unwrap()
-                    }).collect();
+                    let final_field_idents: Vec<_> = fields
+                        .named
+                        .iter()
+                        .map(|field| field.ident.as_ref().unwrap())
+                        .collect();
 
                     // Assemble the final struct instantiation using the field idents
                     let struct_instantiation = quote! {
