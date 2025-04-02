@@ -18,8 +18,9 @@ use syn::{
     Path,
     PathArguments,
     Type,
-    TypePath, 
+    TypePath,
 };
+use serde::de::Unexpected; // Add this import
 
 // Helper function to get the effective field name for serialization/deserialization
 // Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
@@ -77,7 +78,7 @@ fn should_skip_element_handling(field: &syn::Field) -> bool {
 }
 
 
-#[proc_macro_derive(FhirSerde)]
+#[proc_macro_derive(FhirSerde, attributes(fhirserde))] // Add attributes(fhirserde) here
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;
@@ -190,9 +191,9 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     // List of known FHIR primitive type aliases that wrap Element or DecimalElement
     // Note: This list might need adjustment based on the specific FHIR version/implementation details.
     const KNOWN_ELEMENT_ALIASES: &[&str] = &[
-        "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime",
+        "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime", // Removed "String"
         "Id", "Instant", "Integer", "Markdown", "Oid", "PositiveInt",
-        "String", "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
+        "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
         // Struct types that might be used directly or within Elements (e.g., Address, HumanName)
         // are NOT typically handled by this _fieldName logic, so they are excluded here.
         // Resource types (Patient, Observation) are also excluded.
@@ -332,15 +333,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             quote! { false } // Don't skip non-optional fields by default
                         };
 
-                        if is_fhir_element {
-
-                            // --- Field Count Calculation ---
-                            // Special handling for FHIR elements that might add an extra `_field`
+                        // --- Generate count calculator code conditionally ---
+                        let count_calculator_code = if is_fhir_element {
                             if !is_vec {
                                 // Single Element or DecimalElement
-                                field_count_calculator.push(quote! {
+                                quote! {
                                     // Check outer skip condition first
                                     if #skip_check {
+                                         // Access is safe because is_fhir_element is true
                                          if let Some(element) = &#field_access {
                                              let has_value = element.value.is_some();
                                              let has_extension = element.id.is_some() || element.extension.is_some();
@@ -352,12 +352,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                              // If neither, count remains 0 for this field
                                          }
                                     }
-                                });
-                            } else if is_vec {
+                                }
+                            } else { // is_vec
                                 // Vec<Option<Element>>
-                                field_count_calculator.push(quote! {
+                                quote! {
                                     // Check outer skip condition first (for the Option<Vec> itself)
-                                    if #skip_check { // Now skip_check is defined
+                                    if #skip_check {
+                                        // Access is safe because is_fhir_element is true
                                         if let Some(vec) = &#field_access {
                                             // Check if the primitive array needs serialization (any non-null value)
                                             let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
@@ -375,26 +376,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         }
                                          // If Option<Vec> is None, the outer skip_check handles it.
                                     }
-                                });
-                            } else { panic!("Shouldn't get here") }
-
-                        } else {
-                            // Standard count logic for non-FHIR elements
-                            field_count_calculator.push(quote! {
-                                if #skip_check { // Now skip_check is defined
+                                }
+                            }
+                        } else { // Not a FHIR element (or skipped)
+                            // Standard count logic
+                            quote! {
+                                if #skip_check {
                                     count += 1;
                                 }
-                            });
-                        }
+                            }
+                        };
+                        field_count_calculator.push(count_calculator_code);
 
-                        // --- Field Serialization Logic ---
-                        // skip_check is already defined above
 
-                        // Use the updated is_fhir_element flag which respects skip_handling
-                        if is_fhir_element && !is_vec {
-                            // Single Element or DecimalElement (and not skipped)
-                            field_serializers.push(quote! {
-                                // Check the outer skip condition first
+                        // --- Generate serializer code conditionally ---
+                        let serializer_code = if is_fhir_element {
+                            if !is_vec {
+                                // Single Element or DecimalElement (and not skipped)
+                                quote! {
+                                    // Check the outer skip condition first
                                 if #skip_check {
                                     if let Some(element) = &#field_access {
                                         let has_value = element.value.is_some();
@@ -450,13 +450,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                     // If the outer Option was None, the skip_check handles it.
                                 }
-                            });
-                        } else if is_fhir_element && is_vec {
-                            // Vec<Option<Element>> or Vec<Element>
-                            // Use effective_field_name_str here if needed for underscore name generation inside
-                            // let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                            field_serializers.push(quote!{
-                                // Check the outer skip condition first
+                            }
+                            } else { // is_vec
+                                // Vec<Option<Element>> or Vec<Element>
+                                quote!{
+                                    // Check the outer skip condition first
                                 if #skip_check {
                                     if let Some(vec) = &#field_access {
                                         // Serialize primitive array (fieldName) if not empty
@@ -497,16 +495,18 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                      // If Option<Vec> is None, the outer skip_check handles it.
                                 }
-                            });
-                        } else { // This block now handles non-FHIR elements AND skipped FHIR elements
+                            }
+                            }
+                        } else { // Not a FHIR element (or skipped)
                             // Default serialization for non-FHIR-element fields or skipped fields
-                            field_serializers.push(quote! {
+                            quote! {
                                 if #skip_check {
                                     // Use effective name for serialization
                                     state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }
-                            });
-                        }
+                            }
+                        };
+                        field_serializers.push(serializer_code);
                     }
 
                     // Combine field count calculation and serialization
@@ -565,7 +565,7 @@ mod tests {
     fn test_get_element_info_option_string() {
         let ty: Type = parse_str("Option<String>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element);
+        assert!(!is_element); // String should NOT be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // It is an Option
         assert!(!is_vec);
@@ -598,7 +598,7 @@ mod tests {
     fn test_get_element_info_option_vec_string() {
         let ty: Type = parse_str("Option<Vec<String>>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element);
+        assert!(!is_element); // String should NOT be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec);    // Vec is present
@@ -631,7 +631,7 @@ mod tests {
     fn test_get_element_info_string() {
         let ty: Type = parse_str("String").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element);
+        assert!(!is_element); // String should NOT be identified as Element
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
@@ -665,7 +665,7 @@ mod tests {
     fn test_get_element_info_vec_string() {
         let ty: Type = parse_str("Vec<String>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element);
+        assert!(!is_element); // String should NOT be identified as Element
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(is_vec);
@@ -702,14 +702,14 @@ mod tests {
     fn test_get_element_info_type_alias() {
         // Simulate a type alias like `type Date = Element<String, Extension>;`
         // We parse the underlying type directly here. The function should resolve it.
-        let ty: Type = parse_str("fhir::r4::Date").unwrap(); // Assuming Date is Element<...>
+        let _ty: Type = parse_str("fhir::r4::Date").unwrap(); // Prefix unused variable
         // We can't directly test the alias resolution here without more context,
         // but we can test if it correctly identifies an Element path.
         // This test assumes `fhir::r4::Date` *looks like* an Element path segment.
         // A more robust test would involve actual type resolution which is complex in macros.
 
         // Let's test a path that *ends* with Element, simulating an alias.
-        let ty_path: Type = parse_str("some::module::MyElementAlias").unwrap();
+        let _ty_path: Type = parse_str("some::module::MyElementAlias").unwrap(); // Prefix unused variable
         // Manually construct a scenario where the last segment is "Element"
         // This is a simplification as we don't have real type info.
         let ty_simulated_alias: Type = parse_str("Element<String, Extension>").unwrap();
@@ -976,18 +976,58 @@ fn generate_deserialize_impl(
                                         let primitive_value_json: Option<serde_json::Value> = #temp_field_name;
                                         let extension_value_json: Option<serde_json::Value> = #temp_underscore_field_name;
 
+                                        // Combine primitive and extension JSON, handling errors for invalid _fieldName types
                                         let combined_json_to_deserialize = match (primitive_value_json, extension_value_json) {
-                                            (Some(prim_val), Some(mut ext_obj @ serde_json::Value::Object(_))) => {
-                                                if let serde_json::Value::Object(map) = &mut ext_obj {
-                                                    map.insert("value".to_string(), prim_val);
+                                            // Case 1: Both fieldName and _fieldName exist
+                                            (Some(prim_val), Some(ext_val)) => {
+                                                match ext_val {
+                                                    serde_json::Value::Object(mut map) => {
+                                                        // Insert primitive value into the extension object map
+                                                        map.insert("value".to_string(), prim_val);
+                                                        // Return the modified object for deserialization
+                                                        Some(serde_json::Value::Object(map))
+                                                    }
+                                                    serde_json::Value::Null => {
+                                                        // _fieldName is null, treat as if only primitive exists
+                                                        Some(prim_val)
+                                                    }
+                                                    invalid_ext_val => {
+                                                        // _fieldName is not an object or null, this is an error
+                                                        return Err(serde::de::Error::invalid_type(
+                                                            invalid_ext_val.unexpected(), // Use helper method
+                                                            &"a JSON object or null for the extension field",
+                                                        ));
+                                                    }
                                                 }
-                                                Some(ext_obj)
                                             },
+                                            // Case 2: Only fieldName exists
                                             (Some(prim_val), None) => Some(prim_val),
-                                            (None, Some(ext_obj)) => Some(ext_obj),
+                                            // Case 3: Only _fieldName exists
+                                            (None, Some(ext_val)) => {
+                                                 match ext_val {
+                                                    serde_json::Value::Object(_) => {
+                                                        // It's an object, deserialize directly
+                                                        Some(ext_val)
+                                                    }
+                                                    serde_json::Value::Null => {
+                                                         // _fieldName is null, treat as if nothing exists
+                                                         None
+                                                    }
+                                                     invalid_ext_val => {
+                                                        // _fieldName is not an object or null, this is an error
+                                                        return Err(serde::de::Error::invalid_type(
+                                                            invalid_ext_val.unexpected(),
+                                                            &"a JSON object or null for the extension field",
+                                                        ));
+                                                    }
+                                                }
+                                            },
+                                            // Case 4: Neither exists
                                             (None, None) => None,
                                         };
 
+
+                                        // Deserialize the final combined JSON (or handle None/Default)
                                         match combined_json_to_deserialize {
                                             Some(json) => serde_json::from_value(json).map_err(serde::de::Error::custom)?,
                                             None => {
