@@ -259,20 +259,19 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
-// Define helper struct OUTSIDE the main function for serializing only id/extension
-// Make it generic over the Extension type E
-#[derive(serde::Serialize)]
-struct IdAndExtensionHelper<'a, E: serde::Serialize> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: &'a Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    extension: &'a Option<Vec<E>>, // Use generic E
-}
-
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
+            // Define helper struct INSIDE the main function but BEFORE the loop
+            // Make it generic over the Extension type E
+            #[derive(serde::Serialize)]
+            struct IdAndExtensionHelper<'a, E: serde::Serialize> {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                id: &'a Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                extension: &'a Option<Vec<E>>, // Use generic E
+            }
             match data.fields {
                 Fields::Named(ref fields) => {
                     // let field_count = fields.named.len(); // Field count is dynamic now
@@ -1024,7 +1023,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Unexpected::Str
+                                                           serde_json::Value::String(s) => Unexpected::OwnedString(s), // Use OwnedString
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1055,7 +1054,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Unexpected::Str
+                                                           serde_json::Value::String(s) => Unexpected::OwnedString(s), // Use OwnedString
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
