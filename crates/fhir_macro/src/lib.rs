@@ -507,15 +507,35 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     quote! {
                         // Define helper struct INSIDE the generated serialize function scope
                         // Use the concrete Extension type directly instead of generics
-                        #[derive(serde::Serialize)]
+                        // Do NOT derive Serialize, implement it manually below
                         struct IdAndExtensionHelper<'a> {
-                            #[serde(skip_serializing_if = "Option::is_none")]
                             id: &'a Option<String>,
-                            #[serde(skip_serializing_if = "Option::is_none")]
                             // Use the concrete Extension type expected by the current logic
                             // This path is valid within the crate where the macro is applied (e.g., `fhir`)
                             extension: &'a Option<Vec<::fhir::r4::Extension>>,
                         }
+
+                        // Manual Serialize implementation for the helper struct
+                        impl<'a> serde::Serialize for IdAndExtensionHelper<'a> {
+                            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                            where
+                                S: serde::Serializer,
+                            {
+                                use serde::ser::SerializeMap; // Import trait for serializer methods
+                                let mut count = 0;
+                                if self.id.is_some() { count += 1; }
+                                if self.extension.is_some() { count += 1; }
+                                let mut map_state = serializer.serialize_map(Some(count))?;
+                                if let Some(id_val) = self.id {
+                                    map_state.serialize_entry("id", id_val)?;
+                                }
+                                if let Some(ext_val) = self.extension {
+                                    map_state.serialize_entry("extension", ext_val)?;
+                                }
+                                map_state.end()
+                            }
+                        }
+
 
                         let mut count = 0;
                         #(#field_count_calculator)* // Calculate the actual number of fields to serialize
