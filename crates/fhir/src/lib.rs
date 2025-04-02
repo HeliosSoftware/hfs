@@ -737,9 +737,9 @@ where
                 // Serialize the PreciseDecimal directly, invoking its custom Serialize impl
                 return value.serialize(serializer);
             } else {
-                // If value is also None, serialize as an empty object
-                // based on test_serialize_decimal_with_no_fields
-                return serializer.serialize_struct("DecimalElement", 0)?.end();
+                // If value is also None, serialize as null
+                // based on updated test_serialize_decimal_with_no_fields
+                return serializer.serialize_none();
             }
         }
 
