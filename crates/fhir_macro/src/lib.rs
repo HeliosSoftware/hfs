@@ -394,7 +394,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
 
                         // --- Generate serializer code conditionally ---
-                        let serializer_code = if is_fhir_element && !skip_handling {
+                        let serializer_code = if is_fhir_element {
                              // --- FHIR Element Serialization Logic ---
                             if !is_vec {
                                 // Single Element or DecimalElement (and not skipped)
@@ -921,7 +921,7 @@ fn generate_deserialize_impl(
                         });
 
                         // If it's treated as a FHIR element (not skipped), also handle the underscore field
-                        if is_fhir_element_field[i] && !skip_handling {
+                        if is_fhir_element_field[i] {
                             // This flag already respects skip_handling
                             let underscore_field_name_str =
                                 format!("_{}", effective_field_name_str); // Use effective name
@@ -951,10 +951,9 @@ fn generate_deserialize_impl(
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
                         let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean (respects skip_handling)
-                        let skip_handling = should_skip_element_handling(field);
 
                         // Use FHIR element logic only if is_fhir_elem is true
-                        if is_fhir_elem && !skip_handling {
+                        if is_fhir_elem {
                             let effective_field_name_str = get_effective_field_name(field);
                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             let temp_underscore_field_name = format_ident!("temp_{}", underscore_field_name_str);
