@@ -52,6 +52,31 @@ fn get_effective_field_name(field: &syn::Field) -> String {
         .to_lower_camel_case()
 }
 
+// Helper function to check for #[fhir(skip_element_handling = true)]
+fn should_skip_element_handling(field: &syn::Field) -> bool {
+    for attr in &field.attrs {
+        if attr.path().is_ident("fhir") {
+            if let Ok(list) =
+                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+            {
+                for meta in list {
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("skip_element_handling") {
+                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                if let Lit::Bool(lit_bool) = expr_lit.lit {
+                                    return lit_bool.value();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false // Default to false if attribute not found or not true
+}
+
+
 #[proc_macro_derive(FhirSerde)]
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -287,11 +312,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         }
 
                         let skip_serializing_if_path = get_skip_serializing_if_path(&field.attrs);
+                        let skip_handling = should_skip_element_handling(field);
 
                         let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) =
                             get_element_info(field_ty);
 
-                        let is_fhir_element = is_element || is_decimal_element;
+                        // Only treat as FHIR element if it looks like one AND handling is NOT skipped
+                        let is_fhir_element = (is_element || is_decimal_element) && !skip_handling;
 
                         // Use field_name_ident for accessing the struct field
                         let field_access = quote! { self.#field_name_ident };
@@ -363,8 +390,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // --- Field Serialization Logic ---
                         // skip_check is already defined above
 
+                        // Use the updated is_fhir_element flag which respects skip_handling
                         if is_fhir_element && !is_vec {
-                            // Single Element or DecimalElement
+                            // Single Element or DecimalElement (and not skipped)
                             field_serializers.push(quote! {
                                 // Check the outer skip condition first
                                 if #skip_check {
@@ -470,8 +498,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                      // If Option<Vec> is None, the outer skip_check handles it.
                                 }
                             });
-                        } else {
-                            // Default serialization for non-FHIR-element fields
+                        } else { // This block now handles non-FHIR elements AND skipped FHIR elements
+                            // Default serialization for non-FHIR-element fields or skipped fields
                             field_serializers.push(quote! {
                                 if #skip_check {
                                     // Use effective name for serialization
@@ -786,10 +814,12 @@ fn generate_deserialize_impl(
                         field_enum_variants_map.insert(field_ident.clone(), variant.clone());
 
                         let field_ty = &field.ty;
+                        let skip_handling = should_skip_element_handling(field);
                         let (is_element, is_decimal_element, _is_option, _is_vec, _inner_ty_opt) =
                             get_element_info(field_ty);
-                        let is_fhir_elem = is_element || is_decimal_element;
-                        is_fhir_element_field.push(is_fhir_elem); // Store result
+                        // Only treat as FHIR element if it looks like one AND handling is NOT skipped
+                        let is_fhir_elem = (is_element || is_decimal_element) && !skip_handling;
+                        is_fhir_element_field.push(is_fhir_elem); // Store result (respecting skip_handling)
 
                         // Match effective name
                         field_match_arms.push(
@@ -803,6 +833,7 @@ fn generate_deserialize_impl(
                                 .push(quote! { #alias => Ok(#field_enum_name::#variant) });
                         }
 
+                        // Only add underscore variant if it's treated as a FHIR element (i.e., not skipped)
                         if is_fhir_elem {
                             let underscore_field_name_str =
                                 format!("_{}", effective_field_name_str);
@@ -852,8 +883,8 @@ fn generate_deserialize_impl(
                             }
                         });
 
-                        // If it's a FHIR element, also handle the underscore field
-                        if is_fhir_element_field[i] {
+                        // If it's treated as a FHIR element (not skipped), also handle the underscore field
+                        if is_fhir_element_field[i] { // This flag already respects skip_handling
                             let underscore_field_name_str =
                                 format!("_{}", effective_field_name_str); // Use effective name
                             let underscore_variant =
@@ -881,8 +912,9 @@ fn generate_deserialize_impl(
                         let field_ident = field.ident.as_ref().unwrap();
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
-                        let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean
+                        let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean (respects skip_handling)
 
+                        // Use FHIR element logic only if is_fhir_elem is true
                         if is_fhir_elem {
                             let effective_field_name_str = get_effective_field_name(field);
                             let underscore_field_name_str = format!("_{}", effective_field_name_str);
@@ -969,9 +1001,8 @@ fn generate_deserialize_impl(
                                     }; // End of let binding block
                                 }
                             }
-                        } else {
-                            // Default deserialization for non-FHIR-element fields
-                            // Default deserialization for non-FHIR-element fields
+                        } else { // This block handles non-FHIR elements AND skipped FHIR elements
+                            // Default deserialization for non-FHIR-element fields or skipped fields
                             // Ensure this also returns just the let statement TokenStream
                             quote! {
                                 let #field_ident: #field_ty = match #temp_field_name {
