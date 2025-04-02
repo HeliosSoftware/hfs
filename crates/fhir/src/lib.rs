@@ -71,6 +71,9 @@ impl Serialize for PreciseDecimal {
                 self.original_string, e
             ))),
         }
+    } // Added missing closing brace here
+}
+
 impl<'de> Deserialize<'de> for PreciseDecimal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
