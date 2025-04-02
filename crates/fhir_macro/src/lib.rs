@@ -306,57 +306,56 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         };
 
                         if is_fhir_element {
-                            field_count_calculator.push(quote! { let mut #field_name_ident = false; });
 
-                        // --- Field Count Calculation ---
-                        // Special handling for FHIR elements that might add an extra `_field`
-                        if !is_vec {
-                            // Single Element or DecimalElement
-                            field_count_calculator.push(quote! {
-                                // Check outer skip condition first
-                                if #skip_check {
-                                     if let Some(element) = &#field_access {
-                                         let has_value = element.value.is_some();
-                                         let has_extension = element.id.is_some() || element.extension.is_some();
-                                         if has_value && has_extension {
-                                             count += 2; // fieldName + _fieldName
-                                         } else if has_value || has_extension {
-                                             count += 1; // fieldName OR _fieldName
+                            // --- Field Count Calculation ---
+                            // Special handling for FHIR elements that might add an extra `_field`
+                            if !is_vec {
+                                // Single Element or DecimalElement
+                                field_count_calculator.push(quote! {
+                                    // Check outer skip condition first
+                                    if #skip_check {
+                                         if let Some(element) = &#field_access {
+                                             let has_value = element.value.is_some();
+                                             let has_extension = element.id.is_some() || element.extension.is_some();
+                                             if has_value && has_extension {
+                                                 count += 2; // fieldName + _fieldName
+                                             } else if has_value || has_extension {
+                                                 count += 1; // fieldName OR _fieldName
+                                             }
+                                             // If neither, count remains 0 for this field
                                          }
-                                         // If neither, count remains 0 for this field
-                                     }
-                                }
-                            });
-                        } else if is_vec {
-                            // Vec<Option<Element>>
-                            field_count_calculator.push(quote! {
-                                // Check outer skip condition first (for the Option<Vec> itself)
-                                if #skip_check { // Now skip_check is defined
-                                    if let Some(vec) = &#field_access {
-                                        // Check if the primitive array needs serialization (any non-null value)
-                                        let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
-                                        if has_any_value || !vec.is_empty() { // Serialize even if empty but not skipped
-                                            count += 1; // Count the main field array
-                                        }
-
-                                        // Check if any element in the vec has extensions or id
-                                        let has_any_extension = vec.iter().any(|opt_elem| {
-                                            opt_elem.as_ref().map_or(false, |elem| elem.id.is_some() || elem.extension.is_some())
-                                        });
-                                        if has_any_extension {
-                                            count += 1; // Count the underscore field array
-                                        }
                                     }
-                                     // If Option<Vec> is None, the outer skip_check handles it.
-                                }
-                            });
+                                });
+                            } else if is_vec {
+                                // Vec<Option<Element>>
+                                field_count_calculator.push(quote! {
+                                    // Check outer skip condition first (for the Option<Vec> itself)
+                                    if #skip_check { // Now skip_check is defined
+                                        if let Some(vec) = &#field_access {
+                                            // Check if the primitive array needs serialization (any non-null value)
+                                            let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
+                                            if has_any_value || !vec.is_empty() { // Serialize even if empty but not skipped
+                                                count += 1; // Count the main field array
+                                            }
+
+                                            // Check if any element in the vec has extensions or id
+                                            let has_any_extension = vec.iter().any(|opt_elem| {
+                                                opt_elem.as_ref().map_or(false, |elem| elem.id.is_some() || elem.extension.is_some())
+                                            });
+                                            if has_any_extension {
+                                                count += 1; // Count the underscore field array
+                                            }
+                                        }
+                                         // If Option<Vec> is None, the outer skip_check handles it.
+                                    }
+                                });
                             } else { panic!("Shouldn't get here") }
 
                         } else {
                             // Standard count logic for non-FHIR elements
                             field_count_calculator.push(quote! {
                                 if #skip_check { // Now skip_check is defined
-                                    count += 222221;
+                                    count += 1;
                                 }
                             });
                         }
