@@ -335,12 +335,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         // --- Generate count calculator code conditionally ---
                         let count_calculator_code = if is_fhir_element {
+                            // --- FHIR Element Count Logic ---
                             if !is_vec {
                                 // Single Element or DecimalElement
                                 quote! {
                                     // Check outer skip condition first
                                     if #skip_check {
                                          // Access is safe because is_fhir_element is true
+                                         // Use a block to ensure 'element' doesn't leak scope causing type issues
                                          if let Some(element) = &#field_access {
                                              let has_value = element.value.is_some();
                                              let has_extension = element.id.is_some() || element.extension.is_some();
@@ -360,6 +362,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     // Check outer skip condition first (for the Option<Vec> itself)
                                     if #skip_check {
                                         // Access is safe because is_fhir_element is true
+                                        // Use a block to ensure 'vec' doesn't leak scope causing type issues
                                         if let Some(vec) = &#field_access {
                                             // Check if the primitive array needs serialization (any non-null value)
                                             let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
@@ -392,11 +395,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         // --- Generate serializer code conditionally ---
                         let serializer_code = if is_fhir_element {
+                             // --- FHIR Element Serialization Logic ---
                             if !is_vec {
                                 // Single Element or DecimalElement (and not skipped)
                                 quote! {
                                         // Check the outer skip condition first
                                     if #skip_check {
+                                        // Use a block to ensure 'element' doesn't leak scope causing type issues
                                         if let Some(element) = &#field_access {
                                             let has_value = element.value.is_some();
                                             let has_extension = element.id.is_some() || element.extension.is_some();
@@ -443,6 +448,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 quote! {
                                         // Check the outer skip condition first
                                     if #skip_check {
+                                        // Use a block to ensure 'vec' doesn't leak scope causing type issues
                                         if let Some(vec) = &#field_access {
                                             // Serialize primitive array (fieldName) if not empty
                                             if !vec.is_empty() {
@@ -1025,7 +1031,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::String(s), // Revert to String(s)
+                                                           serde_json::Value::String(s) => Unexpected::OwnedString(s), // Use OwnedString
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1056,7 +1062,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::String(s), // Revert to String(s)
+                                                           serde_json::Value::String(s) => Unexpected::OwnedString(s), // Use OwnedString
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
