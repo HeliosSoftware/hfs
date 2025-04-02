@@ -812,12 +812,28 @@ where
                     .deserialize_map(DecimalElementObjectVisitor(PhantomData))
                     .map_err(de::Error::custom)
             }
-            // If it's a number or string, deserialize directly into PreciseDecimal
+            // If it's a number or string, handle directly to construct PreciseDecimal
             value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
-                // Deserialize the primitive Value using PreciseDecimal's Deserialize impl
-                let precise_decimal =
-                    PreciseDecimal::deserialize(value).map_err(de::Error::custom)?;
+                // Extract the original string representation from the JSON Value
+                let original_string = match value {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    // If it's a JSON string, use its content directly
+                    serde_json::Value::String(s) => s,
+                    _ => unreachable!(), // Pattern matches only Number or String
+                };
 
+                // Parse the extracted string into a rust_decimal::Decimal
+                let decimal_value = original_string.parse::<Decimal>().map_err(|e| {
+                    de::Error::custom(format!(
+                        "Failed to parse decimal from '{}': {}",
+                        original_string, e
+                    ))
+                })?;
+
+                // Create PreciseDecimal using the constructor, preserving the original string
+                let precise_decimal = PreciseDecimal::new(decimal_value, original_string);
+
+                // Construct DecimalElement with the value field populated
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
