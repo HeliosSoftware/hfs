@@ -333,14 +333,15 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             quote! { false } // Don't skip non-optional fields by default
                         };
 
-                        // --- Generate count calculator code conditionally ---
-                        let count_calculator_code = if is_fhir_element {
-                            // --- FHIR Element Count Logic ---
-                            if !is_vec {
-                                // Single Element or DecimalElement
-                                quote! {
-                                    // Check outer skip condition first
-                                    if #skip_check {
+                        // --- Generate count calculator code ---
+                        // Generate the if #skip_check block first
+                        let count_calculator_code = quote! {
+                            if #skip_check {
+                                // Check is_fhir_element INSIDE the generated code
+                                if #is_fhir_element {
+                                    // --- FHIR Element Count Logic ---
+                                    if !#is_vec { // Use boolean literals directly
+                                        // Single Element or DecimalElement
                                          // Access is safe because is_fhir_element is true
                                          // Use a block to ensure 'element' doesn't leak scope causing type issues
                                          if let Some(element) = &#field_access {
@@ -379,29 +380,29 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                         }
                                          // If Option<Vec> is None, the outer skip_check handles it.
+                                            }
+                                             // If Option<Vec> is None, the outer skip_check handles it.
+                                        }
                                     }
-                                }
-                            }
-                        } else {
-                            // --- Non-FHIR Element Count Logic ---
-                            // Standard count logic for non-FHIR elements or skipped fields
-                            quote! {
-                                if #skip_check {
+                                } else {
+                                    // --- Non-FHIR Element Count Logic ---
+                                    // Standard count logic for non-FHIR elements or skipped fields
                                     count += 1;
                                 }
-                            }
+                            } // End of if #skip_check block
                         };
                         field_count_calculator.push(count_calculator_code);
 
 
-                        // --- Generate serializer code conditionally ---
-                        let serializer_code = if is_fhir_element {
-                             // --- FHIR Element Serialization Logic ---
-                            let fhir_serialize_logic = if !is_vec {
-                                // Single Element or DecimalElement (and not skipped)
-                                quote! {
-                                    // Check the outer skip condition first
-                                    if #skip_check {
+                        // --- Generate serializer code ---
+                        // Generate the if #skip_check block first
+                        let serializer_code = quote! {
+                            if #skip_check {
+                                // Check is_fhir_element INSIDE the generated code
+                                if #is_fhir_element {
+                                    // --- FHIR Element Serialization Logic ---
+                                    if !#is_vec { // Use boolean literals directly
+                                        // Single Element or DecimalElement (and not skipped)
                                         // Access is safe because is_fhir_element is true
                                         // Bind element ONLY inside this block
                                         if let Some(element) = &#field_access {
@@ -490,21 +491,18 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                         }
                                          // If Option<Vec> is None, the outer skip_check handles it.
+                                            }
+                                             // If Option<Vec> is None, the outer skip_check handles it.
+                                        }
                                     }
-                                }
-                            };
-                            // Return the generated FHIR-specific serialization logic
-                            fhir_serialize_logic
-                        } else {
-                            // --- Non-FHIR Element Serialization Logic ---
-                            // Default serialization for non-FHIR-element fields or skipped fields
-                            quote! {
-                                if #skip_check {
+                                } else {
+                                    // --- Non-FHIR Element Serialization Logic ---
+                                    // Default serialization for non-FHIR-element fields or skipped fields
                                     // Use effective name for serialization
                                     // Access field directly, no 'element' binding needed here
                                     state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }
-                            }
+                            } // End of if #skip_check block
                         };
                         field_serializers.push(serializer_code);
                     }
