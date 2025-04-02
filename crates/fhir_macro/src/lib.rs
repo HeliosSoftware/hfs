@@ -333,17 +333,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             quote! { false } // Don't skip non-optional fields by default
                         };
 
-                        // --- Generate count calculator code ---
-                        // Generate the if #skip_check block first
-                        let count_calculator_code = quote! {
-                            if #skip_check {
-                                // Check is_fhir_element INSIDE the generated code
-                                if #is_fhir_element {
-                                    // --- FHIR Element Count Logic ---
-                                    if !#is_vec { // Use boolean literals directly
-                                        // Single Element or DecimalElement
-                                         // Access is safe because is_fhir_element is true
-                                         // Use a block to ensure 'element' doesn't leak scope causing type issues
+                        // --- Generate count calculator code conditionally ---
+                        let count_calculator_code = if is_fhir_element {
+                            // --- FHIR Element Count Logic ---
+                            if !is_vec {
+                                // Single Element or DecimalElement
+                                quote! {
+                                    if #skip_check {
                                          if let Some(element) = &#field_access {
                                              let has_value = element.value.is_some();
                                              let has_extension = element.id.is_some() || element.extension.is_some();
@@ -384,27 +380,26 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                              // If Option<Vec> is None, the outer skip_check handles it.
                                         }
                                     }
-                                } else {
-                                    // --- Non-FHIR Element Count Logic ---
-                                    // Standard count logic for non-FHIR elements or skipped fields
+                                }
+                            }
+                        } else {
+                            // --- Non-FHIR Element Count Logic ---
+                            quote! {
+                                if #skip_check {
                                     count += 1;
                                 }
-                            } // End of if #skip_check block
+                            }
                         };
                         field_count_calculator.push(count_calculator_code);
 
 
-                        // --- Generate serializer code ---
-                        // Generate the if #skip_check block first
-                        let serializer_code = quote! {
-                            if #skip_check {
-                                // Check is_fhir_element INSIDE the generated code
-                                if #is_fhir_element {
-                                    // --- FHIR Element Serialization Logic ---
-                                    if !#is_vec { // Use boolean literals directly
-                                        // Single Element or DecimalElement (and not skipped)
-                                        // Access is safe because is_fhir_element is true
-                                        // Bind element ONLY inside this block
+                        // --- Generate serializer code conditionally ---
+                        let serializer_code = if is_fhir_element {
+                             // --- FHIR Element Serialization Logic ---
+                            if !is_vec {
+                                // Single Element or DecimalElement (and not skipped)
+                                quote! {
+                                    if #skip_check {
                                         if let Some(element) = &#field_access {
                                             let has_value = element.value.is_some();
                                             let has_extension = element.id.is_some() || element.extension.is_some();
@@ -495,14 +490,15 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                              // If Option<Vec> is None, the outer skip_check handles it.
                                         }
                                     }
-                                } else {
-                                    // --- Non-FHIR Element Serialization Logic ---
-                                    // Default serialization for non-FHIR-element fields or skipped fields
-                                    // Use effective name for serialization
-                                    // Access field directly, no 'element' binding needed here
+                                }
+                            }
+                        } else {
+                            // --- Non-FHIR Element Serialization Logic ---
+                            quote! {
+                                if #skip_check {
                                     state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }
-                            } // End of if #skip_check block
+                            }
                         };
                         field_serializers.push(serializer_code);
                     }
@@ -1035,8 +1031,8 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           // Use Unexpected::Other with a static string to avoid lifetime issues
-                                                           serde_json::Value::String(_) => Unexpected::Other("string"),
+                                                           // Use Unexpected::String which takes ownership
+                                                           serde_json::Value::String(s) => Unexpected::String(s),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1067,8 +1063,8 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           // Use Unexpected::Other with a static string to avoid lifetime issues
-                                                           serde_json::Value::String(_) => Unexpected::Other("string"),
+                                                           // Use Unexpected::String which takes ownership
+                                                           serde_json::Value::String(s) => Unexpected::String(s),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
