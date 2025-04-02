@@ -2,10 +2,11 @@ use rust_decimal::Decimal;
 use serde::{
     Deserialize,
     Serialize,
-    de::{self, Deserializer, MapAccess, Visitor}, // Removed Unexpected
-    ser::{SerializeStruct, Serializer},           // Added SerializeStruct
+    de::{self, Deserializer, MapAccess, Visitor},
+    ser::{SerializeStruct, Serializer},
 };
-use std::marker::PhantomData; // Re-added PhantomData
+use serde_json::value::RawValue; // Import RawValue
+use std::marker::PhantomData;
 // Removed unused RawValue import
 // Removed unused Deref/DerefMut imports
 //use time::{Date, Month};
@@ -59,24 +60,16 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Attempt to parse the original string back into a serde_json::Number
-        // This preserves the exact formatting (trailing zeros).
-        match self.original_string.parse::<serde_json::Number>() {
-            Ok(num) => num.serialize(serializer),
-            Err(_) => {
-                // Fallback or error handling: if the original string wasn't a valid number,
-                // which shouldn't happen if deserialization succeeded, maybe serialize the value?
-                // Or return an error. Returning an error is safer.
-                // For now, let's try serializing the value directly as a fallback,
-                // though this might lose precision info in edge cases.
-                // A better approach might be to return a serialization error.
-                 Err(serde::ser::Error::custom(format!(
-                    "PreciseDecimal original_string '{}' could not be parsed back to a JSON number",
-                    self.original_string
-                )))
-                // Alternative fallback (loses original string precision):
-                // self.value.serialize(serializer)
-            }
+        // Use RawValue to serialize the original string directly as a JSON number.
+        // This ensures the exact string format (including trailing zeros) is preserved.
+        // Note: This assumes the original_string is always a valid JSON number representation.
+        // Deserialization logic should ensure this.
+        match RawValue::from_string(self.original_string.clone()) {
+            Ok(raw_value) => raw_value.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!(
+                "Failed to create RawValue from PreciseDecimal original_string '{}': {}",
+                self.original_string, e
+            ))),
         }
     }
 }

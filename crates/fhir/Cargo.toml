@@ -12,9 +12,9 @@ R6 = []
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true, features = ["raw_value"] } # Enable raw_value feature
+serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.4", features = ["derive"] }
-fhir_macro = { path = "../fhir_macro" } 
+fhir_macro = { path = "../fhir_macro" }
 time = "0.3.41"
 rust_decimal = { version = "1.37.1", features = ["serde-with-arbitrary-precision", "macros"] }
 
