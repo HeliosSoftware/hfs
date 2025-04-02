@@ -622,7 +622,7 @@ use fhir_macro::FhirSerde;
 struct FhirSerdeTestStruct {
     // Regular field
     #[fhirserde(skip_element_handling = true)]
-    name: Option<String>,
+    name: Option<std::string::String>,
 
     // Field with potential extension (_birthDate) using type alias
     // FhirSerde should handle the 'birthDate'/'_birthDate' logic based on the field name.
@@ -649,11 +649,7 @@ fn test_fhir_serde_serialize() {
     // Case 1: Only primitive value for birthDate
     // Use Date which is Element<String, Extension>
     let s1 = FhirSerdeTestStruct {
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test1".to_string()),
-        }),
+        name: Some("Test1".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: None,
@@ -670,11 +666,7 @@ fn test_fhir_serde_serialize() {
     // Case 2: Only extension for birthDate
     // Use Date which is Element<String, Extension>
     let s2 = FhirSerdeTestStruct {
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test2".to_string()),
-        }),
+        name: Some("Test2".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: Some("bd-id".to_string()),
@@ -694,11 +686,7 @@ fn test_fhir_serde_serialize() {
     // Case 3: Both primitive value and extension for birthDate
     // Use Date and Boolean
     let s3 = FhirSerdeTestStruct {
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test3".to_string()),
-        }),
+        name: Some("Test3".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: Some("bd-id-3".to_string()),
@@ -740,11 +728,7 @@ fn test_fhir_serde_serialize() {
     // Case 4: birthDate field is None
     // Use Boolean
     let s4 = FhirSerdeTestStruct {
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test4".to_string()),
-        }),
+        name: Some("Test4".to_string()),
         birth_date: None,
         is_active: Some(Boolean {
             // Construct using the alias type
@@ -789,11 +773,7 @@ fn test_fhir_serde_deserialize() {
     let json1 = r#"{"name":"Test1","birthDate":"1970-03-30","count":1}"#;
     // Use Date
     let expected1 = FhirSerdeTestStruct {
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test1".to_string()),
-        }),
+        name: Some("Test1".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: None,
@@ -811,11 +791,7 @@ fn test_fhir_serde_deserialize() {
     // Use Date
     let expected2 = FhirSerdeTestStruct {
         // Prefixed unused variable
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test2".to_string()),
-        }),
+        name: Some("Test2".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: Some("bd-id".to_string()),
@@ -843,11 +819,7 @@ fn test_fhir_serde_deserialize() {
     // Use Date and Boolean
     let _expected3 = FhirSerdeTestStruct {
         // Prefixed unused variable
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test3".to_string()),
-        }),
+        name: Some("Test3".to_string()),
         birth_date: Some(Date {
             // Construct using the alias type
             id: Some("bd-id-3".to_string()),
@@ -882,11 +854,7 @@ fn test_fhir_serde_deserialize() {
     // Use Boolean
     let _expected4 = FhirSerdeTestStruct {
         // Prefixed unused variable
-        name: Some(String {
-            id: None,
-            extension: None,
-            value: Some("Test4".to_string()),
-        }),
+        name: Some("Test4".to_string()),
         birth_date: None,
         is_active: Some(Boolean {
             // Construct using the alias type
