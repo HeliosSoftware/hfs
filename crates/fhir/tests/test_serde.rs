@@ -132,8 +132,8 @@ fn test_serialize_decimal_with_no_fields() {
 
     let json_string = serde_json::to_string(&element).expect("Serialization failed");
     assert_eq!(
-        json_string, "{}",
-        "Serialization of empty element should be empty object"
+        json_string, "null",
+        "Serialization of empty element should be null"
     );
 }
 
