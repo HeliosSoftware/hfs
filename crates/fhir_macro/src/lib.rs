@@ -188,7 +188,7 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
         "Markdown",
         "Oid",
         "PositiveInt",
-        // "String", // Remove String from the list - it's a primitive type, not an Element
+        "String", // Add String back to the list - it is an Element type in FHIR
         "Time",
         "UnsignedInt",
         "Uri",
