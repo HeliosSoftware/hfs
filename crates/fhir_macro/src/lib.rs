@@ -949,6 +949,7 @@ fn generate_deserialize_impl(
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
                         let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean (respects skip_handling)
+                        let skip_handling = should_skip_element_handling(field);
 
                         // Use FHIR element logic only if is_fhir_elem is true
                         if is_fhir_elem {
@@ -1029,11 +1030,11 @@ fn generate_deserialize_impl(
                                                     }
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
-                                                       let unexpected_type = match invalid_ext_val {
+                                                       let unexpected_type = match &invalid_ext_val {
                                                            // Use Unexpected::Str which borrows
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s),
+                                                           serde_json::Value::String(s) => Unexpected::Str(s),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
-                                                           serde_json::Value::Bool(b) => Unexpected::Bool(b),
+                                                           serde_json::Value::Bool(b) => Unexpected::Bool(*b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
                                                            // Should not happen based on outer match, but handle defensively
                                                            serde_json::Value::Object(_) => Unexpected::Map,
@@ -1061,11 +1062,11 @@ fn generate_deserialize_impl(
                                                     }
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
-                                                       let unexpected_type = match invalid_ext_val {
+                                                       let unexpected_type = match &invalid_ext_val {
                                                            // Use Unexpected::Str which borrows
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s),
+                                                           serde_json::Value::String(s) => Unexpected::Str(s),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
-                                                           serde_json::Value::Bool(b) => Unexpected::Bool(b),
+                                                           serde_json::Value::Bool(b) => Unexpected::Bool(*b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
                                                            // Should not happen based on outer match, but handle defensively
                                                            serde_json::Value::Object(_) => Unexpected::Map,
