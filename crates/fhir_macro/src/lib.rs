@@ -399,19 +399,16 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             let has_value = element.value.is_some();
                                             let has_extension = element.id.is_some() || element.extension.is_some();
 
-                                            // Define helper struct locally for serializing only id/extension
-                                            // Use ::fhir::r4::Extension as a concrete type for now, assuming R4 context or similar structure.
-                                            // This might need adjustment if the macro needs to be more generic across FHIR versions.
-                                            #[derive(serde::Serialize)]
-                                            struct IdAndExtensionHelper<'a> {
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                id: &'a Option<String>,
-                                                #[serde(skip_serializing_if = "Option::is_none")]
-                                                extension: &'a Option<Vec<::fhir::r4::Extension>>, // Use concrete type
-                                            }
-
                                             // Case 3: Both value and extension -> Serialize both fieldName and _fieldName
                                             if has_value && has_extension {
+                                                // Define helper struct locally INSIDE this block
+                                                #[derive(serde::Serialize)]
+                                                struct IdAndExtensionHelper<'a> {
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    id: &'a Option<String>,
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    extension: &'a Option<Vec<::fhir::r4::Extension>>, // Use concrete type
+                                                }
                                                 // Serialize primitive value under fieldName explicitly using its Serialize impl
                                                 // Assuming the inner value type V implements Serialize
                                                 state.serialize_field(&#effective_field_name_str, element.value.as_ref().unwrap())?; // Pass the inner value directly
@@ -431,6 +428,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                             // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
                                             else if has_extension { // && !has_value is implied
+                                                 // Define helper struct locally INSIDE this block
                                                 #[derive(serde::Serialize)]
                                                 struct IdAndExtensionHelper<'a> {
                                                     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,7 +436,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     #[serde(skip_serializing_if = "Option::is_none")]
                                                     extension: &'a Option<Vec<::fhir::r4::Extension>>,
                                                 }
-
                                                 let extension_part = IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
@@ -1026,12 +1023,21 @@ fn generate_deserialize_impl(
                                                         Some(prim_val)
                                                     }
                                                     invalid_ext_val => {
-                                                        // _fieldName is not an object or null, this is an error
-                                                        return Err(serde::de::Error::invalid_type(
-                                                            invalid_ext_val.unexpected(), // Use helper method
-                                                            &"a JSON object or null for the extension field",
-                                                        ));
-                                                    }
+                                                       // _fieldName is not an object or null, this is an error
+                                                       let unexpected_type = match invalid_ext_val {
+                                                           serde_json::Value::String(s) => Unexpected::String(s),
+                                                           serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
+                                                           serde_json::Value::Bool(b) => Unexpected::Bool(b),
+                                                           serde_json::Value::Array(_) => Unexpected::Seq,
+                                                           // Should not happen based on outer match, but handle defensively
+                                                           serde_json::Value::Object(_) => Unexpected::Map,
+                                                           serde_json::Value::Null => Unexpected::Unit, // Should not happen here
+                                                       };
+                                                       return Err(serde::de::Error::invalid_type(
+                                                           unexpected_type,
+                                                           &"a JSON object or null for the extension field",
+                                                       ));
+                                                   }
                                                 }
                                             },
                                             // Case 2: Only fieldName exists
@@ -1047,13 +1053,22 @@ fn generate_deserialize_impl(
                                                          // _fieldName is null, treat as if nothing exists
                                                          None
                                                     }
-                                                     invalid_ext_val => {
-                                                        // _fieldName is not an object or null, this is an error
-                                                        return Err(serde::de::Error::invalid_type(
-                                                            invalid_ext_val.unexpected(),
-                                                            &"a JSON object or null for the extension field",
-                                                        ));
-                                                    }
+                                                    invalid_ext_val => {
+                                                       // _fieldName is not an object or null, this is an error
+                                                       let unexpected_type = match invalid_ext_val {
+                                                           serde_json::Value::String(s) => Unexpected::String(s),
+                                                           serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
+                                                           serde_json::Value::Bool(b) => Unexpected::Bool(b),
+                                                           serde_json::Value::Array(_) => Unexpected::Seq,
+                                                           // Should not happen based on outer match, but handle defensively
+                                                           serde_json::Value::Object(_) => Unexpected::Map,
+                                                           serde_json::Value::Null => Unexpected::Unit, // Should not happen here
+                                                       };
+                                                       return Err(serde::de::Error::invalid_type(
+                                                           unexpected_type,
+                                                           &"a JSON object or null for the extension field",
+                                                       ));
+                                                   }
                                                 }
                                             },
                                             // Case 4: Neither exists
