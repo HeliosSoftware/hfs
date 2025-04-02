@@ -159,9 +159,22 @@ fn get_box_inner_type(ty: &Type) -> Option<&Type> {
     None
 }
 
-// Helper to check if a Type is Element<V, E> or DecimalElement<E>
+// Helper to check if a Type is Element<V, E> or DecimalElement<E>, potentially via a known alias.
 // Returns (IsElement, IsDecimalElement, IsOption, IsVec, InnerType)
 fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) {
+    // List of known FHIR primitive type aliases that wrap Element or DecimalElement
+    // Note: This list might need adjustment based on the specific FHIR version/implementation details.
+    const KNOWN_ELEMENT_ALIASES: &[&str] = &[
+        "Base64Binary", "Boolean", "Canonical", "Code", "Date", "DateTime",
+        "Id", "Instant", "Integer", "Markdown", "Oid", "PositiveInt",
+        "String", "Time", "UnsignedInt", "Uri", "Url", "Uuid", "Xhtml",
+        // Struct types that might be used directly or within Elements (e.g., Address, HumanName)
+        // are NOT typically handled by this _fieldName logic, so they are excluded here.
+        // Resource types (Patient, Observation) are also excluded.
+    ];
+    const KNOWN_DECIMAL_ELEMENT_ALIAS: &str = "Decimal";
+
+
     let mut is_option = false;
     let mut is_vec = false;
     let mut current_ty = field_ty;
@@ -193,14 +206,22 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     // Check if the (potentially unwrapped) type path ends with Element or DecimalElement
     if let Type::Path(TypePath { path, .. }) = current_ty {
         if let Some(segment) = path.segments.last() {
-            let type_name = &segment.ident;
-            // Check if the last segment's identifier is Element or DecimalElement
-            // This handles type aliases like r4::Date which is Element<...>
-            let is_element = type_name == "Element";
-            let is_decimal_element = type_name == "DecimalElement";
+            let type_name_ident = &segment.ident;
+            let type_name_str = type_name_ident.to_string();
+
+            // Check if the last segment's identifier is Element, DecimalElement, or a known alias
+            let is_direct_element = type_name_str == "Element";
+            let is_direct_decimal_element = type_name_str == "DecimalElement";
+            let is_known_element_alias = KNOWN_ELEMENT_ALIASES.contains(&type_name_str.as_str());
+            let is_known_decimal_alias = type_name_str == KNOWN_DECIMAL_ELEMENT_ALIAS;
+
+            let is_element = is_direct_element || is_known_element_alias;
+            let is_decimal_element = is_direct_decimal_element || is_known_decimal_alias;
+
             if is_element || is_decimal_element {
+                 // It's considered an element type if it's Element, DecimalElement, or a known alias
                 return (
-                    is_element,
+                    is_element && !is_decimal_element, // Ensure is_element is false if it's a decimal type
                     is_decimal_element,
                     is_option,
                     is_vec,
