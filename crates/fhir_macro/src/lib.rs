@@ -400,9 +400,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if !is_vec {
                                 // Single Element or DecimalElement (and not skipped)
                                 quote! {
-                                        // Check the outer skip condition first
+                                    // Check the outer skip condition first
                                     if #skip_check {
-                                        // Use a block to ensure 'element' doesn't leak scope causing type issues
+                                        // Access is safe because is_fhir_element is true
                                         if let Some(element) = &#field_access {
                                             let has_value = element.value.is_some();
                                             let has_extension = element.id.is_some() || element.extension.is_some();
@@ -447,9 +447,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // is_vec
                                 // Vec<Option<Element>> or Vec<Element>
                                 quote! {
-                                        // Check the outer skip condition first
+                                    // Check the outer skip condition first
                                     if #skip_check {
-                                        // Use a block to ensure 'vec' doesn't leak scope causing type issues
+                                        // Access is safe because is_fhir_element is true
                                         if let Some(vec) = &#field_access {
                                             // Serialize primitive array (fieldName) if not empty
                                             if !vec.is_empty() {
@@ -1032,7 +1032,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
+                                                           serde_json::Value::String(s) => Unexpected::String(s), // Use String(s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1063,7 +1063,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
+                                                           serde_json::Value::String(s) => Unexpected::String(s), // Use String(s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
