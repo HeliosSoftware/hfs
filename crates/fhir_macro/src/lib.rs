@@ -340,7 +340,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // Single Element or DecimalElement
                                 quote! {
                                     if #skip_check {
-                                         if let Some(element) = &#field_access {
+                                         let field_value = & self.#field_name_ident; // Bind here
+                                         if let Some(element) = field_value {
                                              let has_value = element.value.is_some();
                                              let has_extension = element.id.is_some() || element.extension.is_some();
                                              if has_value && has_extension {
@@ -359,7 +360,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     // Check outer skip condition first (for the Option<Vec> itself)
                                     if #skip_check {
                                         // This code block is only generated if is_fhir_element is true
-                                        if let Some(vec) = &#field_access {
+                                        let field_value = & self.#field_name_ident; // Bind here
+                                        if let Some(vec) = field_value {
                                             // Check if the primitive array needs serialization (any non-null value)
                                             let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
                                             if has_any_value || !vec.is_empty() { // Serialize even if empty but not skipped
@@ -385,6 +387,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // --- Non-FHIR Element Count Logic ---
                             quote! {
                                 if #skip_check {
+                                    // let _field_value = & self.#field_name_ident; // Binding not strictly needed here, but consistent
                                     count += 1;
                                 }
                             }
@@ -495,7 +498,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // --- Non-FHIR Element Serialization Logic ---
                             quote! {
                                 if #skip_check {
-                                    state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                    let field_value = & self.#field_name_ident; // Bind here
+                                    state.serialize_field(&#effective_field_name_str, field_value)?;
                                 }
                             }
                         };
