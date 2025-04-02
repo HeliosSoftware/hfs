@@ -172,7 +172,7 @@ fn test_examples_in_dir(dir: &PathBuf) {
                             if let Some(resource_type) = json_value.get("resourceType") {
                                 if let Some(resource_type_str) = resource_type.as_str() {
                                     println!("Resource type: {}", resource_type_str);
-                                    
+
                                     // Skip Questionnaire resources
                                     if resource_type_str == "Questionnaire" {
                                         println!("Skipping Questionnaire resource");
@@ -189,7 +189,9 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                             // Verify we can serialize the Resource back to JSON
                                             match serde_json::to_value(&resource) {
                                                 Ok(resource_json) => {
-                                                    println!("Successfully serialized Resource back to JSON");
+                                                    println!(
+                                                        "Successfully serialized Resource back to JSON"
+                                                    );
 
                                                     // Compare the original JSON with the re-serialized JSON
                                                     if resource_json != json_value {
@@ -199,7 +201,10 @@ fn test_examples_in_dir(dir: &PathBuf) {
                                                             &resource_json,
                                                         );
                                                         if !diff_paths.is_empty() {
-                                                            println!("Found {} differences between original and reserialized JSON:", diff_paths.len());
+                                                            println!(
+                                                                "Found {} differences between original and reserialized JSON:",
+                                                                diff_paths.len()
+                                                            );
                                                             for (path, orig_val, new_val) in
                                                                 diff_paths
                                                             {
@@ -223,10 +228,9 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
                                                         // Still fail the test with assert_eq
                                                         assert_eq!(
-                                                             resource_json,
-                                                             json_value,
-                                                             "JSON values should match.\nSee above for specific differences."
-                                                         );
+                                                            resource_json, json_value,
+                                                            "JSON values should match.\nSee above for specific differences."
+                                                        );
                                                     }
 
                                                     println!("Resource JSON matches original JSON");
@@ -259,7 +263,9 @@ fn test_examples_in_dir(dir: &PathBuf) {
 
                                                 // If it's a Questionnaire, look for items without linkId
                                                 if resource_type_str == "Questionnaire" {
-                                                    println!("Checking for Questionnaire items without linkId:");
+                                                    println!(
+                                                        "Checking for Questionnaire items without linkId:"
+                                                    );
                                                     find_missing_linkid(&json_value);
                                                 }
                                             }

@@ -1,7 +1,5 @@
 extern crate proc_macro;
 
-// Removed redundant extern crate declarations
-
 use heck::{ToLowerCamelCase, ToPascalCase};
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -20,8 +18,8 @@ use syn::{
     Path,
     PathArguments,
     Type,
-    TypePath, // Removed unused MetaNameValue
-}; // Added ToLowerCamelCase
+    TypePath, 
+};
 
 // Helper function to get the effective field name for serialization/deserialization
 // Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
@@ -62,6 +60,7 @@ pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let serialize_impl = generate_serialize_impl(&input.data, &name);
+
     // Pass all generic parts to deserialize generator
     let deserialize_impl = generate_deserialize_impl(
         &input.data,
@@ -279,19 +278,21 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let skip_check = if let Some(condition_path) = &skip_serializing_if_path {
                             quote! { #condition_path(&#field_access) }
                         } else if is_option {
-                            quote! { #field_access.is_none() }
+                            quote! { #field_access.is_some() }
                         } else {
                             quote! { false } // Don't skip non-optional fields by default
                         };
 
+                        if is_fhir_element {
+                            field_count_calculator.push(quote! { let mut #field_name_ident = false; });
 
                         // --- Field Count Calculation ---
                         // Special handling for FHIR elements that might add an extra `_field`
-                        if is_fhir_element && !is_vec {
+                        if !is_vec {
                             // Single Element or DecimalElement
                             field_count_calculator.push(quote! {
                                 // Check outer skip condition first
-                                if !(#skip_check) { // Now skip_check is defined
+                                if #skip_check {
                                      if let Some(element) = &#field_access {
                                          let has_value = element.value.is_some();
                                          let has_extension = element.id.is_some() || element.extension.is_some();
@@ -304,11 +305,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                      }
                                 }
                             });
-                        } else if is_fhir_element && is_vec {
+                        } else if is_vec {
                             // Vec<Option<Element>>
                             field_count_calculator.push(quote! {
                                 // Check outer skip condition first (for the Option<Vec> itself)
-                                if !(#skip_check) { // Now skip_check is defined
+                                if #skip_check { // Now skip_check is defined
                                     if let Some(vec) = &#field_access {
                                         // Check if the primitive array needs serialization (any non-null value)
                                         let has_any_value = vec.iter().any(|opt_elem| opt_elem.as_ref().map_or(false, |elem| elem.value.is_some()));
@@ -327,11 +328,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                      // If Option<Vec> is None, the outer skip_check handles it.
                                 }
                             });
+                            } else { panic!("Shouldn't get here") }
+
                         } else {
                             // Standard count logic for non-FHIR elements
                             field_count_calculator.push(quote! {
-                                if !(#skip_check) { // Now skip_check is defined
-                                    count += 1;
+                                if #skip_check { // Now skip_check is defined
+                                    count += 222221;
                                 }
                             });
                         }
@@ -343,7 +346,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Single Element or DecimalElement
                             field_serializers.push(quote! {
                                 // Check the outer skip condition first
-                                if !(#skip_check) {
+                                if #skip_check {
                                     if let Some(element) = &#field_access {
                                         let has_value = element.value.is_some();
                                         let has_extension = element.id.is_some() || element.extension.is_some();
@@ -405,7 +408,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // let underscore_field_name_str = format!("_{}", effective_field_name_str);
                             field_serializers.push(quote!{
                                 // Check the outer skip condition first
-                                if !(#skip_check) {
+                                if #skip_check {
                                     if let Some(vec) = &#field_access {
                                         // Serialize primitive array (fieldName) if not empty
                                         if !vec.is_empty() {
@@ -449,7 +452,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         } else {
                             // Default serialization for non-FHIR-element fields
                             field_serializers.push(quote! {
-                                if !(#skip_check) {
+                                if #skip_check {
                                     // Use effective name for serialization
                                     state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }

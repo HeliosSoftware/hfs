@@ -147,8 +147,10 @@ fn test_deserialize_decimal_from_integer() {
     // Check the numerical value
     assert_eq!(element.value.as_ref().map(|pd| pd.value()), Some(dec!(10)));
     // Check the stored original string
-    assert_eq!(element.value.map(|pd| pd.original_string().to_string()), Some("10".to_string()));
-
+    assert_eq!(
+        element.value.map(|pd| pd.original_string().to_string()),
+        Some("10".to_string())
+    );
 
     // Test with a bare integer string
     let json_string = r#"10"#;
@@ -158,7 +160,10 @@ fn test_deserialize_decimal_from_integer() {
     // Check the numerical value
     assert_eq!(element.value.as_ref().map(|pd| pd.value()), Some(dec!(10)));
     // Check the stored original string
-    assert_eq!(element.value.map(|pd| pd.original_string().to_string()), Some("10".to_string()));
+    assert_eq!(
+        element.value.map(|pd| pd.original_string().to_string()),
+        Some("10".to_string())
+    );
 }
 
 #[test]
@@ -260,7 +265,7 @@ fn test_decimal_with_trailing_zeros() {
         json_input_num_3_00, expected_string_3_00, reserialized_string_num_3_00
     );
 
-     // Test case 4: Input is the JSON string "3.00"
+    // Test case 4: Input is the JSON string "3.00"
     let json_input_str_3_00 = r#""3.00""#; // Note the outer quotes for JSON string
     // The output should still be the JSON number 3.00
     let expected_string_3_00 = "3.00";
@@ -628,6 +633,13 @@ struct FhirSerdeTestStruct {
 
     // A non-element field for good measure
     count: Option<i32>,
+    // A field with potental extension (_decimal) using type alias.
+    // FhirSerde should handle the 'decimal'/'_decimal' logic based on the field name.
+    //  decimal: Option<Decimal>,
+
+    // A field with potential extension (_money) that also has a Decimal value in it
+    // FhirSerde should handle the 'money'/'_money' logic based on the field name.
+    //  money: Option<Money>,
 }
 
 #[test]
