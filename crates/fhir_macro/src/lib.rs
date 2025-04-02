@@ -52,10 +52,10 @@ fn get_effective_field_name(field: &syn::Field) -> String {
         .to_lower_camel_case()
 }
 
-// Helper function to check for #[fhir(skip_element_handling = true)]
+// Helper function to check for #[fhirserde(skip_element_handling = true)]
 fn should_skip_element_handling(field: &syn::Field) -> bool {
     for attr in &field.attrs {
-        if attr.path().is_ident("fhir") {
+        if attr.path().is_ident("fhirserde") {
             if let Ok(list) =
                 attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
             {

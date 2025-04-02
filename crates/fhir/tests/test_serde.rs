@@ -621,7 +621,7 @@ use fhir_macro::FhirSerde;
 #[derive(Debug, PartialEq, FhirSerde)]
 struct FhirSerdeTestStruct {
     // Regular field
-    #[fhir(skip_element_handling = "true")]
+    #[fhirserde(skip_element_handling = "true")]
     name: Option<std::string::String>,
 
     // Field with potential extension (_birthDate) using type alias
@@ -633,7 +633,7 @@ struct FhirSerdeTestStruct {
     is_active: Option<Boolean>,
 
     // A non-element field for good measure
-    #[fhir(skip_element_handling = "true")]
+    #[fhirserde(skip_element_handling = "true")]
     count: Option<i32>,
     // A field with potental extension (_decimal) using type alias.
     // FhirSerde should handle the 'decimal'/'_decimal' logic based on the field name.
