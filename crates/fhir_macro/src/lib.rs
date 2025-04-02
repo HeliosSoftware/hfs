@@ -402,7 +402,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // Single Element or DecimalElement (and not skipped)
                                 quote! {
                                     if #skip_check {
-                                        if let Some(element) = &#field_access {
+                                        let field_value = & self.#field_name_ident; // Bind here
+                                        if let Some(element) = field_value {
                                             let has_value = element.value.is_some();
                                             let has_extension = element.id.is_some() || element.extension.is_some();
 
@@ -450,7 +451,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     if #skip_check {
                                         // Access is safe because is_fhir_element is true
                                         // Bind vec ONLY inside this block
-                                        if let Some(vec) = &#field_access {
+                                        let field_value = & self.#field_name_ident; // Bind here
+                                        if let Some(vec) = field_value {
                                             // Serialize primitive array (fieldName) if not empty
                                             if !vec.is_empty() {
                                                 // Prepare primitive values array: Vec<Option<ValueType>>
