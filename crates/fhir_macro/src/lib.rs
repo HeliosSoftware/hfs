@@ -376,10 +376,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 count += 1; // Count the underscore field array
                                             }
                                         }
-                                         // If Option<Vec> is None, the outer skip_check handles it.
-                                            }
-                                             // If Option<Vec> is None, the outer skip_check handles it.
-                                        }
+                                        // If Option<Vec> is None, the outer skip_check handles it.
                                     }
                                 }
                             }
@@ -485,14 +482,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             // Only serialize _fieldName array if there's at least one non-null extension part
                                             if extension_values.iter().any(|opt_ext| opt_ext.is_some()) {
                                                 // Create the underscore field name based on the effective name
-                                                let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                                                let underscore_field_name_str = format!("_{}", #effective_field_name_str);
                                                 state.serialize_field(&underscore_field_name_str, &extension_values)?;
                                             }
                                         }
-                                         // If Option<Vec> is None, the outer skip_check handles it.
-                                            }
-                                             // If Option<Vec> is None, the outer skip_check handles it.
-                                        }
+                                        // If Option<Vec> is None, the outer skip_check handles it.
                                     }
                                 }
                             }
