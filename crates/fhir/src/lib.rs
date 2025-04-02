@@ -12,21 +12,40 @@ use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
 
 // --- Newtype wrapper for precise Decimal serialization ---
 
-// Add Eq derive
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PreciseDecimal(pub Decimal); // Make inner Decimal public for convenience
+// Store both the parsed value and the original string representation
+#[derive(Debug, Clone)]
+pub struct PreciseDecimal {
+    value: Decimal,
+    original_string: String,
+}
 
-// Allow accessing the inner Decimal easily
-impl Deref for PreciseDecimal {
-    type Target = Decimal;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+// Implement comparison based on the numerical value only
+impl PartialEq for PreciseDecimal {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+impl Eq for PreciseDecimal {}
+
+impl PartialOrd for PreciseDecimal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.value.partial_cmp(&other.value)
     }
 }
 
-impl DerefMut for PreciseDecimal {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl Ord for PreciseDecimal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.value.cmp(&other.value)
+    }
+}
+
+// Provide methods to access the inner value if needed, instead of Deref/DerefMut
+impl PreciseDecimal {
+    pub fn value(&self) -> Decimal {
+        self.value
+    }
+    pub fn original_string(&self) -> &str {
+        &self.original_string
     }
 }
 
@@ -35,10 +54,25 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Serialize using rust_decimal's arbitrary precision serializer.
-        // This outputs a JSON number. serde_json's to_string representation
-        // seems to preserve trailing zeros correctly with this serializer.
-        rust_decimal::serde::arbitrary_precision::serialize(&self.0, serializer)
+        // Attempt to parse the original string back into a serde_json::Number
+        // This preserves the exact formatting (trailing zeros).
+        match self.original_string.parse::<serde_json::Number>() {
+            Ok(num) => num.serialize(serializer),
+            Err(_) => {
+                // Fallback or error handling: if the original string wasn't a valid number,
+                // which shouldn't happen if deserialization succeeded, maybe serialize the value?
+                // Or return an error. Returning an error is safer.
+                // For now, let's try serializing the value directly as a fallback,
+                // though this might lose precision info in edge cases.
+                // A better approach might be to return a serialization error.
+                 Err(serde::ser::Error::custom(format!(
+                    "PreciseDecimal original_string '{}' could not be parsed back to a JSON number",
+                    self.original_string
+                )))
+                // Alternative fallback (loses original string precision):
+                // self.value.serialize(serializer)
+            }
+        }
     }
 }
 
@@ -52,20 +86,20 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
 
         match json_value {
             serde_json::Value::String(s) => {
-                // If it's a string, parse it directly
+                // If it's a string, parse it and store the original string
                 s.parse::<Decimal>()
-                    .map(PreciseDecimal)
+                    .map(|value| PreciseDecimal { value, original_string: s })
                     .map_err(de::Error::custom)
             }
             serde_json::Value::Number(n) => {
-                // If it's a number, convert it to a string first, then parse.
-                // This preserves the scale (e.g., 3.0 stays "3.0").
-                n.to_string()
+                // If it's a number, convert it to string, parse, and store the original string
+                let original_string = n.to_string();
+                original_string
                     .parse::<Decimal>()
-                    .map(PreciseDecimal)
+                    .map(|value| PreciseDecimal { value, original_string })
                     .map_err(de::Error::custom)
             }
-            other => {
+             other => {
                 // Handle other unexpected types
                 Err(de::Error::invalid_type(
                     match other {

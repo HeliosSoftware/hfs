@@ -15,8 +15,8 @@ fn test_serialize_decimal_with_value_present() {
     let element = DecimalElement::<Extension> {
         id: None,
         extension: None,
-        // Wrap the Decimal in PreciseDecimal
-        value: Some(PreciseDecimal(decimal_val)),
+        // Create PreciseDecimal with original string
+        value: Some(PreciseDecimal{ value: decimal_val, original_string: "1050.00".to_string() }),
     };
 
     // Serialize the actual element
@@ -91,8 +91,8 @@ fn test_serialize_decimal_with_all_fields() {
                 })),
             },
         ]),
-        // Wrap the Decimal in PreciseDecimal
-        value: Some(PreciseDecimal(decimal_val)),
+        // Create PreciseDecimal with original string
+        value: Some(PreciseDecimal{ value: decimal_val, original_string: "-987.654321".to_string() }),
     };
 
     let json_string = serde_json::to_string(&element).expect("Serialization failed");
@@ -144,16 +144,21 @@ fn test_deserialize_decimal_from_integer() {
     let element: DecimalElement<Extension> =
         serde_json::from_str(json_string).expect("Deserialization failed");
 
-    // Compare against PreciseDecimal
-    assert_eq!(element.value, Some(PreciseDecimal(dec!(10))));
+    // Check the numerical value
+    assert_eq!(element.value.as_ref().map(|pd| pd.value()), Some(dec!(10)));
+    // Check the stored original string
+    assert_eq!(element.value.map(|pd| pd.original_string().to_string()), Some("10".to_string()));
+
 
     // Test with a bare integer - this needs to be parsed as a JSON value first
     let json_value = serde_json::json!(10);
     let element: DecimalElement<Extension> =
         serde_json::from_value(json_value).expect("Deserialization from value failed");
 
-    // Compare against PreciseDecimal
-    assert_eq!(element.value, Some(PreciseDecimal(dec!(10))));
+    // Check the numerical value
+    assert_eq!(element.value.as_ref().map(|pd| pd.value()), Some(dec!(10)));
+    // Check the stored original string
+    assert_eq!(element.value.map(|pd| pd.original_string().to_string()), Some("10".to_string()));
 }
 
 #[test]
