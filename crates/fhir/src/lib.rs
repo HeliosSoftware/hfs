@@ -7,7 +7,7 @@ use serde::{
 };
 use std::marker::PhantomData; // Re-added PhantomData
 // Removed unused RawValue import
-use std::ops::{Deref, DerefMut}; // Needed for Newtype pattern convenience
+// Removed unused Deref/DerefMut imports
 //use time::{Date, Month};
 
 // --- Newtype wrapper for precise Decimal serialization ---
@@ -41,6 +41,11 @@ impl Ord for PreciseDecimal {
 
 // Provide methods to access the inner value if needed, instead of Deref/DerefMut
 impl PreciseDecimal {
+    /// Creates a new PreciseDecimal, storing the value and its original string representation.
+    pub fn new(value: Decimal, original_string: String) -> Self {
+        Self { value, original_string }
+    }
+
     pub fn value(&self) -> Decimal {
         self.value
     }

@@ -15,8 +15,8 @@ fn test_serialize_decimal_with_value_present() {
     let element = DecimalElement::<Extension> {
         id: None,
         extension: None,
-        // Create PreciseDecimal with original string
-        value: Some(PreciseDecimal{ value: decimal_val, original_string: "1050.00".to_string() }),
+        // Use the new constructor
+        value: Some(PreciseDecimal::new(decimal_val, "1050.00".to_string())),
     };
 
     // Serialize the actual element
@@ -91,8 +91,8 @@ fn test_serialize_decimal_with_all_fields() {
                 })),
             },
         ]),
-        // Create PreciseDecimal with original string
-        value: Some(PreciseDecimal{ value: decimal_val, original_string: "-987.654321".to_string() }),
+        // Use the new constructor
+        value: Some(PreciseDecimal::new(decimal_val, "-987.654321".to_string())),
     };
 
     let json_string = serde_json::to_string(&element).expect("Serialization failed");
