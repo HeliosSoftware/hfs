@@ -71,59 +71,141 @@ impl Serialize for PreciseDecimal {
                 self.original_string, e
             ))),
         }
-    } // Added missing closing brace here
+    }
 }
+
+
+// Visitor for PreciseDecimal deserialization
+struct PreciseDecimalVisitor;
+
+impl<'de> Visitor<'de> for PreciseDecimalVisitor {
+    type Value = PreciseDecimal;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON number or string representing a decimal")
+    }
+
+    // Handle direct string input (e.g., "3.00" from a JSON string "\"3.00\"")
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        v.parse::<Decimal>()
+            .map(|value| PreciseDecimal {
+                value,
+                original_string: v.to_string(), // Store the exact string parsed
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", v, e)))
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+        where E: de::Error, {
+        self.visit_str(v)
+    }
+
+     // Handle number input (e.g., 3.00 from JSON number 3.00) - might normalize
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        // Converting f64 to string might normalize (e.g., 3.00 -> "3.0")
+        // We store the potentially normalized string here as a fallback.
+        // The visit_newtype_struct path is preferred for preserving original format.
+        let s = v.to_string();
+        s.parse::<Decimal>()
+            .map(|value| PreciseDecimal {
+                value,
+                original_string: s.clone(),
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from f64 '{}': {}", v, e)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let s = v.to_string();
+        s.parse::<Decimal>()
+            .map(|value| PreciseDecimal {
+                value,
+                original_string: s.clone(),
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from i64 '{}': {}", v, e)))
+    }
+
+     fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let s = v.to_string();
+        s.parse::<Decimal>()
+            .map(|value| PreciseDecimal {
+                value,
+                original_string: s.clone(),
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from u64 '{}': {}", v, e)))
+    }
+
+    // Preferred path for direct JSON deserialization to preserve original string via RawValue
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Try to deserialize as RawValue first
+        let raw_value = match <&RawValue>::deserialize(deserializer) {
+             Ok(rv) => rv,
+             Err(e) => {
+                 // If RawValue fails, it might be because we are deserializing from Value.
+                 // Return the error to let deserialize_any try other methods.
+                 return Err(e);
+             }
+         };
+        let original_json_segment = raw_value.get();
+
+        // Now parse the raw segment (which could be a number like 3.00 or a string like "\"3.00\"")
+        // Attempt to parse the raw segment as a Value to determine if it's a JSON string or number
+        match serde_json::from_str::<serde_json::Value>(original_json_segment) {
+            Ok(serde_json::Value::String(s)) => {
+                // Original was JSON string, e.g., "\"3.00\"". Parse the inner content 's'.
+                 s.parse::<Decimal>()
+                    .map(|value| PreciseDecimal { value, original_string: s.clone() }) // Store inner string
+                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from JSON string content '{}': {}", s, e)))
+            }
+            Ok(serde_json::Value::Number(_)) => {
+                 // Original was JSON number, e.g., 3.00. Parse the raw segment.
+                 let s = original_json_segment.to_string();
+                 s.parse::<Decimal>()
+                    .map(|value| PreciseDecimal { value, original_string: s.clone() }) // Store raw segment string
+                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from JSON number segment '{}': {}", s, e)))
+            }
+            Ok(other) => Err(de::Error::invalid_type(
+                match other {
+                    serde_json::Value::Null => de::Unexpected::Unit,
+                    serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
+                    serde_json::Value::Array(_) => de::Unexpected::Seq,
+                    serde_json::Value::Object(_) => de::Unexpected::Map,
+                    _ => de::Unexpected::Other("unexpected JSON type"),
+                 },
+                &"a number or a string",
+            )),
+            Err(e) => Err(de::Error::custom(format!(
+                "Failed to parse raw JSON segment '{}': {}",
+                original_json_segment, e
+            ))),
+        }
+    }
+}
+
 
 impl<'de> Deserialize<'de> for PreciseDecimal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Use RawValue during deserialization to capture the exact input string.
-        // This requires the deserializer to support RawValue (like serde_json::Deserializer does).
-        let raw_value = <&RawValue>::deserialize(deserializer)?;
-        let original_json_segment = raw_value.get(); // This is the raw JSON text, e.g., "3.00" or "\"3.00\""
-
-        // Attempt to parse the raw segment as a Value to easily check type and extract
-        // the string representation needed for Decimal parsing.
-        let value_for_parsing: serde_json::Value = serde_json::from_str(original_json_segment)
-            .map_err(|e| de::Error::custom(format!("Failed to parse raw value '{}': {}", original_json_segment, e)))?;
-
-        let string_to_parse = match value_for_parsing {
-             // If the original JSON was a string (e.g., "\"3.00\""), use its inner value.
-            serde_json::Value::String(s) => s,
-             // If the original JSON was a number (e.g., 3.00), use the raw segment captured.
-            serde_json::Value::Number(_) => original_json_segment.to_string(),
-            // Other JSON types are invalid for PreciseDecimal.
-            _ => {
-                 return Err(de::Error::invalid_type(
-                    match value_for_parsing {
-                        serde_json::Value::Null => de::Unexpected::Unit,
-                        serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
-                        serde_json::Value::Array(_) => de::Unexpected::Seq,
-                        serde_json::Value::Object(_) => de::Unexpected::Map,
-                        _ => de::Unexpected::Other("unexpected JSON type in RawValue"),
-                    },
-                    &"a number or a string representation of a number",
-                ));
-            }
-        };
-
-        // Parse the final string representation into Decimal
-        string_to_parse
-            .parse::<Decimal>()
-            .map(|value| PreciseDecimal {
-                value,
-                // Store the string that was successfully parsed as Decimal.
-                // This preserves the original format (e.g., "3.00").
-                original_string: string_to_parse,
-            })
-            .map_err(|e| {
-                de::Error::custom(format!(
-                    "Failed to parse decimal from original string segment '{}': {}",
-                    original_json_segment, e
-                ))
-            })
+        // Use deserialize_any with the visitor. This allows flexibility in handling
+        // different underlying deserializers (e.g., direct from JSON text vs. from Value).
+        // It prioritizes visit_newtype_struct for RawValue handling when possible.
+        deserializer.deserialize_any(PreciseDecimalVisitor)
     }
 }
 
