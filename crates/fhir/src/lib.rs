@@ -812,18 +812,28 @@ where
                     .deserialize_map(DecimalElementObjectVisitor(PhantomData))
                     .map_err(de::Error::custom)
             }
-            // If it's a number or string, deserialize it using PreciseDecimal's logic
+            // If it's a number or string, handle directly to construct PreciseDecimal
             value @ serde_json::Value::Number(_) | value @ serde_json::Value::String(_) => {
-                // Use PreciseDecimal::deserialize to handle the primitive value.
-                // This leverages the PreciseDecimalVisitor which can handle different
-                // input types (raw string via visit_newtype_struct, or standard types
-                // like f64/string via other visit methods when deserializing from Value).
-                let precise_decimal = PreciseDecimal::deserialize(value).map_err(|e| {
-                    // Add context to the error if needed
-                    de::Error::custom(format!("Failed to deserialize primitive value into PreciseDecimal: {}", e))
+                // Extract the original string representation from the JSON Value
+                let original_string = match value {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    // If it's a JSON string, use its content directly
+                    serde_json::Value::String(s) => s,
+                    _ => unreachable!(), // Pattern matches only Number or String
+                };
+
+                // Parse the extracted string into a rust_decimal::Decimal
+                let decimal_value = original_string.parse::<Decimal>().map_err(|e| {
+                    de::Error::custom(format!(
+                        "Failed to parse decimal from '{}': {}",
+                        original_string, e
+                    ))
                 })?;
 
-                // Construct DecimalElement with the deserialized PreciseDecimal
+                // Create PreciseDecimal using the constructor, preserving the original string
+                let precise_decimal = PreciseDecimal::new(decimal_value, original_string);
+
+                // Construct DecimalElement with the value field populated
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
