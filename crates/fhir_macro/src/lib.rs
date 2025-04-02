@@ -902,6 +902,7 @@ fn generate_deserialize_impl(
                         let effective_field_name_str = get_effective_field_name(field); // Use helper
                         let variant = field_enum_variants_map.get(field_ident).unwrap(); // Get variant from map
                         let temp_field_name = format_ident!("temp_{}", field_ident);
+                        let skip_handling = should_skip_element_handling(field);
 
                         // Initialize temporary storage for the main field
                         temp_field_storage.push(
@@ -920,7 +921,7 @@ fn generate_deserialize_impl(
                         });
 
                         // If it's treated as a FHIR element (not skipped), also handle the underscore field
-                        if is_fhir_element_field[i] {
+                        if is_fhir_element_field[i] && !skip_handling {
                             // This flag already respects skip_handling
                             let underscore_field_name_str =
                                 format!("_{}", effective_field_name_str); // Use effective name
