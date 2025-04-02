@@ -269,6 +269,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) =
                             get_element_info(field_ty);
+
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
