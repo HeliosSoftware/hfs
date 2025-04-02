@@ -949,7 +949,6 @@ fn generate_deserialize_impl(
                         let field_ty = &field.ty;
                         let temp_field_name = format_ident!("temp_{}", field_ident);
                         let is_fhir_elem = is_fhir_element_field[i]; // Use the stored boolean (respects skip_handling)
-                        let skip_handling = should_skip_element_handling(field);
 
                         // Use FHIR element logic only if is_fhir_elem is true
                         if is_fhir_elem {
