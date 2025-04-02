@@ -262,12 +262,24 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
 
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
+    // Define helper struct OUTSIDE the generated serialize function scope
+    // but within the scope where generate_serialize_impl can create its definition.
+    // Use the concrete Extension type directly instead of generics.
+    let id_and_extension_helper_def = quote! {
+        #[derive(serde::Serialize)]
+        struct IdAndExtensionHelper<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            id: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            // Use the concrete Extension type expected by the current logic
+            extension: &'a Option<Vec<::fhir::r4::Extension>>,
+        }
+    };
+
     match *data {
         Data::Struct(ref data) => {
-            // Helper struct definition moved inside the quote! block below
             match data.fields {
                 Fields::Named(ref fields) => {
-                    // let field_count = fields.named.len(); // Field count is dynamic now
                     let mut field_serializers = Vec::new();
                     let mut field_count_calculator = Vec::new();
 
@@ -505,16 +517,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                     // Combine field count calculation and serialization
                     quote! {
-                        // Define helper struct INSIDE the generated serialize function scope
-                        // Use the concrete Extension type directly instead of generics
-                        #[derive(serde::Serialize)]
-                        struct IdAndExtensionHelper<'a> {
-                            #[serde(skip_serializing_if = "Option::is_none")]
-                            id: &'a Option<String>,
-                            #[serde(skip_serializing_if = "Option::is_none")]
-                            // Use the concrete Extension type expected by the current logic
-                            extension: &'a Option<Vec<::fhir::r4::Extension>>,
-                        }
+                        // Define the helper struct using the definition created outside
+                        #id_and_extension_helper_def
 
                         let mut count = 0;
                         #(#field_count_calculator)* // Calculate the actual number of fields to serialize
