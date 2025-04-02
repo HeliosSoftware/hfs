@@ -336,7 +336,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // --- Generate count calculator code conditionally ---
                         let count_calculator_code = if is_fhir_element {
                             // --- FHIR Element Count Logic ---
-                            let fhir_count_logic = if !is_vec {
+                            if !is_vec {
                                 // Single Element or DecimalElement
                                 quote! {
                                     // Check outer skip condition first
@@ -381,9 +381,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                          // If Option<Vec> is None, the outer skip_check handles it.
                                     }
                                 }
-                            };
-                            // Return the generated FHIR-specific count logic
-                            fhir_count_logic
+                            }
                         } else {
                             // --- Non-FHIR Element Count Logic ---
                             // Standard count logic for non-FHIR elements or skipped fields
@@ -399,7 +397,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // --- Generate serializer code conditionally ---
                         let serializer_code = if is_fhir_element {
                              // --- FHIR Element Serialization Logic ---
-                             let fhir_serialize_logic = if !is_vec {
+                            if !is_vec {
                                 // Single Element or DecimalElement (and not skipped)
                                 quote! {
                                         // Check the outer skip condition first
@@ -492,9 +490,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                          // If Option<Vec> is None, the outer skip_check handles it.
                                     }
                                 }
-                            };
-                            // Return the generated FHIR-specific serialization logic
-                            fhir_serialize_logic
+                            }
                         } else {
                             // --- Non-FHIR Element Serialization Logic ---
                             // Default serialization for non-FHIR-element fields or skipped fields
@@ -1036,7 +1032,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::String(s), // Use String
+                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1067,7 +1063,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::String(s), // Use String
+                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
