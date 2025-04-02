@@ -1118,7 +1118,10 @@ fn generate_deserialize_impl(
 
                     // --- Visitor and Deserialize Implementation ---
                     quote! {
-                        #[derive(serde::Deserialize)]
+                        // Add necessary imports for generated code inside the deserialize function body
+                        use serde::de::{self, Unexpected, Visitor, MapAccess};
+
+                        #[derive(serde::Deserialize)] // Use serde::Deserialize
                         #[serde(field_identifier, rename_all = "camelCase")]
                         enum #field_enum_name {
                             #(#field_enum_variants,)*
