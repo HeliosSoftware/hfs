@@ -79,39 +79,50 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize into an intermediate serde_json::Value first
-        let json_value = serde_json::Value::deserialize(deserializer)?;
+        // Use RawValue during deserialization to capture the exact input string
+        let raw_value = <&RawValue>::deserialize(deserializer)?;
+        let original_json_segment = raw_value.get(); // This is the raw JSON text, e.g., "3.00" or "\"3.00\""
 
-        match json_value {
-            serde_json::Value::String(s) => {
-                // If it's a string, parse it and store the original string
-                s.parse::<Decimal>()
-                    .map(|value| PreciseDecimal { value, original_string: s })
-                    .map_err(de::Error::custom)
-            }
-            serde_json::Value::Number(n) => {
-                // If it's a number, convert it to string, parse, and store the original string
-                let original_string = n.to_string();
-                original_string
-                    .parse::<Decimal>()
-                    .map(|value| PreciseDecimal { value, original_string })
-                    .map_err(de::Error::custom)
-            }
-             other => {
-                // Handle other unexpected types
-                Err(de::Error::invalid_type(
-                    match other {
+        // Attempt to deserialize the raw segment as a Value to easily check type and extract
+        // the string representation needed for Decimal parsing.
+        let value_for_parsing: serde_json::Value = serde_json::from_str(original_json_segment)
+            .map_err(|e| de::Error::custom(format!("Failed to parse raw value '{}': {}", original_json_segment, e)))?;
+
+        let string_to_parse = match value_for_parsing {
+             // If the original JSON was a string (e.g., "3.00"), use its inner value.
+            serde_json::Value::String(s) => s,
+             // If the original JSON was a number (e.g., 3.00), use the raw segment captured.
+            serde_json::Value::Number(_) => original_json_segment.to_string(),
+            // Other JSON types are invalid for PreciseDecimal.
+            _ => {
+                 return Err(de::Error::invalid_type(
+                    match value_for_parsing {
                         serde_json::Value::Null => de::Unexpected::Unit,
                         serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
                         serde_json::Value::Array(_) => de::Unexpected::Seq,
                         serde_json::Value::Object(_) => de::Unexpected::Map,
-                        // Should not happen based on Value enum definition
-                        _ => de::Unexpected::Other("unexpected JSON type"),
+                        _ => de::Unexpected::Other("unexpected JSON type in RawValue"),
                     },
-                    &"a number or a string",
-                ))
+                    &"a number or a string representation of a number",
+                ));
             }
-        }
+        };
+
+        // Parse the final string representation into Decimal
+        string_to_parse
+            .parse::<Decimal>()
+            .map(|value| PreciseDecimal {
+                value,
+                // Store the string that was successfully parsed as Decimal.
+                // This preserves the original format (e.g., "3.00").
+                original_string: string_to_parse,
+            })
+            .map_err(|e| {
+                de::Error::custom(format!(
+                    "Failed to parse decimal from original string segment '{}': {}",
+                    original_json_segment, e
+                ))
+            })
     }
 }
 
