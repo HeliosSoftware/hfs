@@ -1025,7 +1025,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
+                                                           serde_json::Value::String(s) => Unexpected::String(s), // Revert to String(s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1056,7 +1056,7 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           serde_json::Value::String(s) => Unexpected::Str(&s), // Use Str(&s)
+                                                           serde_json::Value::String(s) => Unexpected::String(s), // Revert to String(s)
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
