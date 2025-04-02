@@ -1019,7 +1019,7 @@ fn generate_deserialize_impl(
                                                 match ext_val {
                                                     serde_json::Value::Object(mut map) => {
                                                         // Insert primitive value into the extension object map
-                                                        map.insert("value".to_string(), prim_val);
+                                                        map.insert("value".to_string(), prim_val.clone());
                                                         // Return the modified object for deserialization
                                                         Some(serde_json::Value::Object(map))
                                                     }
