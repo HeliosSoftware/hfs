@@ -1037,8 +1037,8 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           // Use Unexpected::Other for string types to avoid lifetime issues with Str
-                                                           serde_json::Value::String(s) => Unexpected::Other(&format!("string \"{}\"", s)),
+                                                           // Use Unexpected::Other with a static string to avoid lifetime issues
+                                                           serde_json::Value::String(_) => Unexpected::Other("string"),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
@@ -1069,8 +1069,8 @@ fn generate_deserialize_impl(
                                                     invalid_ext_val => {
                                                        // _fieldName is not an object or null, this is an error
                                                        let unexpected_type = match invalid_ext_val {
-                                                           // Use Unexpected::Other for string types to avoid lifetime issues with Str
-                                                           serde_json::Value::String(s) => Unexpected::Other(&format!("string \"{}\"", s)),
+                                                           // Use Unexpected::Other with a static string to avoid lifetime issues
+                                                           serde_json::Value::String(_) => Unexpected::Other("string"),
                                                            serde_json::Value::Number(n) => Unexpected::Float(n.as_f64().unwrap_or(0.0)), // Or Unexpected::Signed/Unsigned
                                                            serde_json::Value::Bool(b) => Unexpected::Bool(b),
                                                            serde_json::Value::Array(_) => Unexpected::Seq,
