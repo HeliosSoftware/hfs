@@ -181,13 +181,14 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
         "Canonical",
         "Code",
         "Date",
-        "DateTime", // Removed "String"
+        "DateTime",
         "Id",
         "Instant",
         "Integer",
         "Markdown",
         "Oid",
         "PositiveInt",
+        "String", // Add String back to the list
         "Time",
         "UnsignedInt",
         "Uri",
