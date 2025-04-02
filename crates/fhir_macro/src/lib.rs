@@ -8,19 +8,6 @@ use syn::{
     Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
 
-// Define helper struct at the crate level (make it private)
-// This struct helps serialize the id/extension part for FHIR elements.
-#[derive(serde::Serialize)]
-struct IdAndExtensionHelper<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: &'a Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    // Use the concrete Extension type expected by the current logic.
-    // This assumes the context where the macro is used has access to ::fhir::r4::Extension.
-    extension: &'a Option<Vec<::fhir::r4::Extension>>,
-}
-
-
 // Helper function to get the effective field name for serialization/deserialization
 // Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
 fn get_effective_field_name(field: &syn::Field) -> String {
@@ -275,8 +262,7 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
 
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
-    // The IdAndExtensionHelper struct is now defined outside this function.
-    // We will refer to it using `crate::IdAndExtensionHelper`.
+    // The IdAndExtensionHelper struct definition will be placed inside the generated code below.
 
     match *data {
         Data::Struct(ref data) => {
@@ -428,8 +414,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Serialize extension object under _fieldName using the EXTERNAL helper struct
                                                 // Assuming the extension type E is ::fhir::r4::Extension.
                                                 let underscore_field_name_str = format!("_{}", #effective_field_name_str);
-                                                // Use the crate-level helper struct
-                                                let extension_part = crate::IdAndExtensionHelper {
+                                                // Use the locally defined helper struct (defined below in the quote!)
+                                                let extension_part = IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -442,9 +428,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                             // Case 2: Extension only -> Serialize helper object under fieldName (not _fieldName)
                                             else if has_extension { // && !has_value is implied
-                                                // Use the crate-level helper struct
+                                                // Use the locally defined helper struct (defined below in the quote!)
                                                 // Assuming the extension type E is ::fhir::r4::Extension.
-                                                let extension_part = crate::IdAndExtensionHelper {
+                                                let extension_part = IdAndExtensionHelper {
                                                     id: &element.id,
                                                     extension: &element.extension,
                                                 };
@@ -519,7 +505,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                     // Combine field count calculation and serialization
                     quote! {
-                        // The helper struct definition is no longer injected here.
+                        // Define helper struct INSIDE the generated serialize function scope
+                        // Use the concrete Extension type directly instead of generics
+                        #[derive(serde::Serialize)]
+                        struct IdAndExtensionHelper<'a> {
+                            #[serde(skip_serializing_if = "Option::is_none")]
+                            id: &'a Option<String>,
+                            #[serde(skip_serializing_if = "Option::is_none")]
+                            // Use the concrete Extension type expected by the current logic
+                            // This path is valid within the crate where the macro is applied (e.g., `fhir`)
+                            extension: &'a Option<Vec<::fhir::r4::Extension>>,
+                        }
 
                         let mut count = 0;
                         #(#field_count_calculator)* // Calculate the actual number of fields to serialize
@@ -976,8 +972,8 @@ fn generate_deserialize_impl(
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
                                             .transpose()?;
 
-                                        // Deserialize extension array (_fieldName) - Use concrete Extension type
-                                        let extensions: Option<Vec<Option<crate::Element<(), crate::r4::Extension>>>> = #temp_underscore_field_name
+                                        // Deserialize extension array (_fieldName) - Use concrete Extension type via ::fhir path
+                                        let extensions: Option<Vec<Option<::fhir::Element<(), ::fhir::r4::Extension>>>> = #temp_underscore_field_name
                                             .map(|v| serde_json::from_value(v).map_err(serde::de::Error::custom))
                                             .transpose()?;
 
@@ -990,9 +986,10 @@ fn generate_deserialize_impl(
                                                 let mut combined = Vec::with_capacity(p_vec.len());
                                                 for (p_opt, e_opt) in p_vec.into_iter().zip(e_vec.into_iter()) {
                                                     let element_opt = match (p_opt, e_opt) {
-                                                        (Some(p), Some(e)) => Some(crate::Element { id: e.id, extension: e.extension, value: Some(p) }),
-                                                        (Some(p), None) => Some(crate::Element { id: None, extension: None, value: Some(p) }),
-                                                        (None, Some(e)) => Some(crate::Element { id: e.id, extension: e.extension, value: None }),
+                                                        // Use ::fhir path for Element
+                                                        (Some(p), Some(e)) => Some(::fhir::Element { id: e.id, extension: e.extension, value: Some(p) }),
+                                                        (Some(p), None) => Some(::fhir::Element { id: None, extension: None, value: Some(p) }),
+                                                        (None, Some(e)) => Some(::fhir::Element { id: e.id, extension: e.extension, value: None }),
                                                         (None, None) => None,
                                                     };
                                                     combined.push(element_opt);
@@ -1001,12 +998,14 @@ fn generate_deserialize_impl(
                                             },
                                             (Some(p_vec), None) => { // Only primitives
                                                 Some(p_vec.into_iter().map(|p_opt| {
-                                                    p_opt.map(|p| crate::Element { id: None, extension: None, value: Some(p) })
+                                                    // Use ::fhir path for Element
+                                                    p_opt.map(|p| ::fhir::Element { id: None, extension: None, value: Some(p) })
                                                 }).collect())
                                             },
                                             (None, Some(e_vec)) => { // Only extensions
                                                 Some(e_vec.into_iter().map(|e_opt| {
-                                                    e_opt.map(|e| crate::Element { id: e.id, extension: e.extension, value: None })
+                                                    // Use ::fhir path for Element
+                                                    e_opt.map(|e| ::fhir::Element { id: e.id, extension: e.extension, value: None })
                                                 }).collect())
                                             },
                                             (None, None) => None,
