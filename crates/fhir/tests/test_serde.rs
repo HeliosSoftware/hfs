@@ -652,103 +652,81 @@ struct FhirSerdeTestStruct {
     // A field that uses Vec - need to handle nulls in extensions correctly - https://hl7.org/fhir/json.html#primitive
     pub given: Option<Vec<String>>,
 }
-/*
+
 #[test]
 fn test_fhir_serde_serialize() {
-    // Case 1: Only primitive value for birthDate
-    // Use Date which is Element<String, Extension>
+    // Helper to create default extension
+    let default_extension = || Extension {
+        id: None,
+        extension: None,
+        url: "http://example.com/ext".to_string(),
+        value: Some(ExtensionValue::String(String {
+            id: None,
+            extension: None,
+            value: Some("ext-val".to_string()),
+        })),
+    };
+    // Case 1: Only primitive value for birthDate1
     let s1 = FhirSerdeTestStruct {
-        name: Some("Test1".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test1".to_string(), // Required field
+        birth_date1: Date {
             id: None,
             extension: None,
             value: Some("1970-03-30".to_string()),
-        }),
-        is_active: None,
+        },
         count: Some(1),
+        ..Default::default() // Initialize other fields with default
     };
     let json1 = serde_json::to_string(&s1).unwrap();
-    let expected1 = r#"{"name":"Test1","birthDate":"1970-03-30","count":1}"#;
+    // Expected: name1, birthDate1 (primitive), count
+    let expected1 = r#"{"name1":"Test1","name2":"","birthDate1":"1970-03-30","isActive1":null,"decimal1":null,"money1":null,"count":1}"#;
     assert_eq!(json1, expected1);
 
-    // Case 2: Only extension for birthDate
-    // Use Date which is Element<String, Extension>
+    // Case 2: Only extension for birthDate1
     let s2 = FhirSerdeTestStruct {
-        name: Some("Test2".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test2".to_string(), // Required field
+        birth_date1: Date {
             id: Some("bd-id".to_string()),
-            extension: None, // Using None for simplicity in test data
+            extension: None,
             value: None,
-        }),
-        is_active: None,
-        count: None,
+        },
+        ..Default::default()
     };
     let json2 = serde_json::to_string(&s2).unwrap();
-    // Expected output according to FHIR: Only _fieldName when value is absent
-    let expected2 = r#"{"name":"Test2","birthDate":{"id":"bd-id"}}"#;
-    println!("Actual JSON: {}", json2);
-    println!("Expected JSON: {}", expected2);
+    // Expected: name1, _birthDate1 (object with id)
+    let expected2 = r#"{"name1":"Test2","name2":"","_birthDate1":{"id":"bd-id"},"isActive1":null,"decimal1":null,"money1":null}"#;
     assert_eq!(json2, expected2);
 
-    // Case 3: Both primitive value and extension for birthDate
-    // Use Date and Boolean
+    // Case 3: Both primitive value and extension for birthDate1 and isActive1
     let s3 = FhirSerdeTestStruct {
-        name: Some("Test3".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test3".to_string(), // Required field
+        birth_date1: Date {
             id: Some("bd-id-3".to_string()),
-            // Use the actual Extension type, or None if simpler
-            extension: None, // Using None for simplicity
+            extension: None,
             value: Some("1970-03-30".to_string()),
-        }),
-        is_active: Some(Boolean {
-            // Construct using the alias type
-            // Also test is_active field
+        },
+        is_active1: Boolean {
             id: None,
             extension: None,
             value: Some(true),
-        }),
+        },
         count: Some(3),
+        ..Default::default()
     };
-
-    // Debug print the structure
-    println!(
-        "birth_date: id={:?}, extension={:?}, value={:?}",
-        s3.birth_date.as_ref().unwrap().id,
-        s3.birth_date.as_ref().unwrap().extension,
-        s3.birth_date.as_ref().unwrap().value
-    );
-
     let json3 = serde_json::to_string(&s3).unwrap();
-    println!("Serialized JSON: {}", json3);
-    // Expected output according to FHIR: Both fieldName (for value) and _fieldName (for id/extension)
-    // The _birthDate object should only contain id/extension, not the value.
-    // isActive only has value, so only "isActive" field.
-    let expected3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3"},"isActive":true,"count":3}"#; // Corrected structure
-
-    // Print the actual JSON for debugging
-    println!("Actual JSON: {}", json3);
-    println!("Expected JSON: {}", expected3);
-
+    // Expected: name1, birthDate1 (primitive), _birthDate1 (id), isActive1 (primitive), count
+    let expected3 = r#"{"name1":"Test3","name2":"","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3"},"isActive1":true,"decimal1":null,"money1":null,"count":3}"#;
     assert_eq!(json3, expected3);
 
-    // Case 4: birthDate field is None
-    // Use Boolean
+    // Case 4: birthDate1 is default (null), isActive1 has only extension
     let s4 = FhirSerdeTestStruct {
-        name: Some("Test4".to_string()),
-        birth_date: None,
-        is_active: Some(Boolean {
-            // Construct using the alias type
-            // is_active has only extension
+        name1: "Test4".to_string(), // Required field
+        is_active1: Boolean {
             id: None,
-            // Expect the actual Extension based on corrected json4 input
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
                 url: "http://example.com/flag".to_string(),
-                // Construct Boolean explicitly, initializing all fields
                 value: Some(ExtensionValue::Boolean(Boolean {
                     id: None,
                     extension: None,
@@ -756,55 +734,164 @@ fn test_fhir_serde_serialize() {
                 })),
             }]),
             value: None,
-        }),
-        count: None,
+        },
+        ..Default::default()
     };
     let json4 = serde_json::to_string(&s4).unwrap();
-    // Expected output according to FHIR: Only fieldName when value is absent but extension exists
-    let expected4 = r#"{"name":"Test4","isActive":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]}}"#;
+    // Expected: name1, _isActive1 (object with extension)
+    let expected4 = r#"{"name1":"Test4","name2":"","birthDate1":null,"_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]},"decimal1":null,"money1":null}"#;
     assert_eq!(json4, expected4);
 
-    // Case 5: All optional fields are None
+    // Case 5: All optional fields are None/Default
     let s5 = FhirSerdeTestStruct {
-        name: None,
-        birth_date: None,
-        is_active: None,
-        count: None,
+        name1: "Test5".to_string(), // Required field
+        ..Default::default()
     };
     let json5 = serde_json::to_string(&s5).unwrap();
-    let expected5 = r#"{}"#;
+    // Expected: Only required fields (name1, name2) and non-optional elements (birthDate1, isActive1, decimal1, money1) serialized as null
+    let expected5 = r#"{"name1":"Test5","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null}"#;
     assert_eq!(json5, expected5);
+
+    // Case 6: Test Decimal serialization (primitive and extension)
+    let s6 = FhirSerdeTestStruct {
+        name1: "Test6".to_string(),
+        decimal1: Decimal {
+            id: Some("dec-id".to_string()),
+            extension: None,
+            value: Some(PreciseDecimal::new(dec!(123.45), "123.45".to_string())),
+        },
+        decimal2: Some(Decimal { // Optional field with only value
+            id: None,
+            extension: None,
+            value: Some(PreciseDecimal::new(dec!(98.7), "98.7".to_string())),
+        }),
+        ..Default::default()
+    };
+    let json6 = serde_json::to_string(&s6).unwrap();
+    // Expected: decimal1 (primitive), _decimal1 (id), decimal2 (primitive)
+    let expected6 = r#"{"name1":"Test6","name2":"","birthDate1":null,"isActive1":null,"decimal1":123.45,"_decimal1":{"id":"dec-id"},"decimal2":98.7,"money1":null}"#;
+    assert_eq!(json6, expected6);
+
+    // Case 7: Test Money serialization (always object)
+    let s7 = FhirSerdeTestStruct {
+        name1: "Test7".to_string(),
+        money1: Money { // Required Money field
+            id: Some("money-id".to_string()),
+            extension: None,
+            value: Some(dec!(100.50)),
+            currency: Some(Code { // Assuming Code is Element<String, Extension>
+                id: None, extension: None, value: Some("USD".to_string())
+            }),
+        },
+        money2: Some(Money { // Optional Money field
+             id: None,
+             extension: Some(vec![default_extension()]),
+             value: Some(dec!(200)),
+             currency: None,
+        }),
+        ..Default::default()
+    };
+    let json7 = serde_json::to_string(&s7).unwrap();
+    // Expected: money1 (object), money2 (object)
+    // Note: Money always serializes as an object, so no _money1/_money2 split
+    let expected7 = r#"{"name1":"Test7","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
+    assert_eq!(json7, expected7);
+
+    // Case 8: Test Vec<String> serialization (primitive and extension)
+    let s8 = FhirSerdeTestStruct {
+        name1: "Test8".to_string(),
+        given: Some(vec![
+            String { id: None, extension: None, value: Some("Peter".to_string()) }, // Primitive only
+            String { id: Some("given-id-2".to_string()), extension: None, value: Some("James".to_string()) }, // Value + ID
+            String { id: None, extension: Some(vec![default_extension()]), value: None }, // Extension only
+            String { id: Some("given-id-4".to_string()), extension: Some(vec![default_extension()]), value: Some("Smith".to_string()) }, // Value + ID + Extension
+        ]),
+        ..Default::default()
+    };
+    let json8 = serde_json::to_string(&s8).unwrap();
+    // Expected: given (array of primitives/nulls), _given (array of objects/nulls for extensions/ids)
+    let expected8 = r#"{"name1":"Test8","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    assert_eq!(json8, expected8);
+
+     // Case 9: Test Vec<String> with only primitives
+    let s9 = FhirSerdeTestStruct {
+        name1: "Test9".to_string(),
+        given: Some(vec![
+            String { id: None, extension: None, value: Some("Alice".to_string()) },
+            String { id: None, extension: None, value: Some("Bob".to_string()) },
+        ]),
+        ..Default::default()
+    };
+    let json9 = serde_json::to_string(&s9).unwrap();
+    // Expected: Only `given` array, no `_given`
+    let expected9 = r#"{"name1":"Test9","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":["Alice","Bob"]}"#;
+    assert_eq!(json9, expected9);
+
+    // Case 10: Test Vec<String> with only extensions/ids
+    let s10 = FhirSerdeTestStruct {
+        name1: "Test10".to_string(),
+        given: Some(vec![
+            String { id: Some("g1".to_string()), extension: None, value: None },
+            String { id: None, extension: Some(vec![default_extension()]), value: None },
+        ]),
+        ..Default::default()
+    };
+    let json10 = serde_json::to_string(&s10).unwrap();
+    // Expected: `given` array with nulls, `_given` array with objects
+    let expected10 = r#"{"name1":"Test10","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":[null,null],"_given":[{"id":"g1"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    assert_eq!(json10, expected10);
+
+    // Case 11: Test Vec<String> with null value in primitive array and corresponding extension
+    let s11 = FhirSerdeTestStruct {
+        name1: "Test11".to_string(),
+        given: Some(vec![
+            String { id: None, extension: None, value: Some("First".to_string()) },
+            String { id: Some("g-null".to_string()), extension: None, value: None }, // Value is None
+            String { id: None, extension: None, value: Some("Last".to_string()) },
+        ]),
+        ..Default::default()
+    };
+    let json11 = serde_json::to_string(&s11).unwrap();
+    // Expected: `given` array with null for the second item, `_given` array with object for the second item's ID
+    let expected11 = r#"{"name1":"Test11","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":["First",null,"Last"],"_given":[null,{"id":"g-null"},null]}"#;
+    assert_eq!(json11, expected11);
 }
 
 #[test]
 fn test_fhir_serde_deserialize() {
-    // Case 1: Only primitive value for birthDate
-    let json1 = r#"{"name":"Test1","birthDate":"1970-03-30","count":1}"#;
-    // Use Date
+    // Helper to create default extension for comparison
+    let default_extension = || Extension {
+        id: None,
+        extension: None,
+        url: "http://example.com/ext".to_string(),
+        value: Some(ExtensionValue::String(String {
+            id: None,
+            extension: None,
+            value: Some("ext-val".to_string()),
+        })),
+    };
+
+    // Case 1: Only primitive value for birthDate1
+    let json1 = r#"{"name1":"Test1","name2":"","birthDate1":"1970-03-30","isActive1":null,"decimal1":null,"money1":null,"count":1}"#;
     let expected1 = FhirSerdeTestStruct {
-        name: Some("Test1".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test1".to_string(),
+        birth_date1: Date {
             id: None,
             extension: None,
             value: Some("1970-03-30".to_string()),
-        }),
-        is_active: None,
+        },
         count: Some(1),
+        ..Default::default()
     };
     let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
     assert_eq!(s1, expected1);
 
-    // Case 2: Only extension for birthDate
-    let json2 = r#"{"name":"Test2","_birthDate":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]}}"#;
-    // Use Date
+    // Case 2: Only extension for birthDate1
+    let json2 = r#"{"name1":"Test2","name2":"","_birthDate1":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]},"isActive1":null,"decimal1":null,"money1":null}"#;
     let expected2 = FhirSerdeTestStruct {
-        // Prefixed unused variable
-        name: Some("Test2".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test2".to_string(),
+        birth_date1: Date {
             id: Some("bd-id".to_string()),
-            // Expect the valid extension based on corrected json2
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
@@ -816,28 +903,22 @@ fn test_fhir_serde_deserialize() {
                 })),
             }]),
             value: None,
-        }),
-        is_active: None,
-        count: None,
+        },
+        ..Default::default()
     };
-    let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap(); // Prefixed unused variable
+    let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
     assert_eq!(s2, expected2);
 
-    // Case 3: Both primitive value and extension for birthDate and isActive
-    let json3 = r#"{"name":"Test3","birthDate":"1970-03-30","_birthDate":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive":true,"_isActive":{"id":"active-id"},"count":3}"#;
-    // Use Date and Boolean
-    let _expected3 = FhirSerdeTestStruct {
-        // Prefixed unused variable
-        name: Some("Test3".to_string()),
-        birth_date: Some(Date {
-            // Construct using the alias type
+    // Case 3: Both primitive value and extension for birthDate1 and isActive1
+    let json3 = r#"{"name1":"Test3","name2":"","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive1":true,"_isActive1":{"id":"active-id"},"decimal1":null,"money1":null,"count":3}"#;
+    let expected3 = FhirSerdeTestStruct {
+        name1: "Test3".to_string(),
+        birth_date1: Date {
             id: Some("bd-id-3".to_string()),
-            // Expect the actual Extension based on the corrected json3 input
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
                 url: "http://example.com/test".to_string(),
-                // Construct String explicitly, initializing all fields
                 value: Some(ExtensionValue::String(String {
                     id: None,
                     extension: None,
@@ -845,28 +926,23 @@ fn test_fhir_serde_deserialize() {
                 })),
             }]),
             value: Some("1970-03-30".to_string()),
-        }),
-        is_active: Some(Boolean {
-            // Construct using the alias type
-            id: Some("active-id".to_string()), // Merged from _isActive
-            extension: None,                   // Merged from _isActive
-            value: Some(true),                 // From isActive
-        }),
+        },
+        is_active1: Boolean {
+            id: Some("active-id".to_string()), // Merged from _isActive1
+            extension: None,                   // Merged from _isActive1
+            value: Some(true),                 // From isActive1
+        },
         count: Some(3),
+        ..Default::default()
     };
-    let _s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap(); // Prefixed unused variable
-    assert_eq!(_s3, _expected3); // Should now pass with macro fix
+    let s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap();
+    assert_eq!(s3, expected3);
 
-    // Case 4: birthDate field is missing, isActive has only extension
-    // Update JSON to use valid Extension structure
-    let json4 = r#"{"name":"Test4","isActive":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]}}"#;
-    // Use Boolean
-    let _expected4 = FhirSerdeTestStruct {
-        // Prefixed unused variable
-        name: Some("Test4".to_string()),
-        birth_date: None,
-        is_active: Some(Boolean {
-            // Construct using the alias type
+    // Case 4: birthDate1 is null, isActive1 has only extension
+    let json4 = r#"{"name1":"Test4","name2":"","birthDate1":null,"_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]},"decimal1":null,"money1":null}"#;
+    let expected4 = FhirSerdeTestStruct {
+        name1: "Test4".to_string(),
+        is_active1: Boolean {
             id: None,
             extension: Some(vec![Extension {
                 id: None,
@@ -878,78 +954,154 @@ fn test_fhir_serde_deserialize() {
                     value: Some(true),
                 })),
             }]),
-            value: None,
-        }),
-        count: None,
+            value: None, // isActive1 primitive is missing/null
+        },
+        ..Default::default()
     };
-    let _s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap(); // Prefixed unused variable
-    assert_eq!(_s4, _expected4); // Should now pass with macro fix
+    let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
+    assert_eq!(s4, expected4);
 
-    // Case 5: Empty object
-    let json5 = r#"{}"#;
+    // Case 5: Empty object (plus required fields)
+    let json5 = r#"{"name1":"Test5","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null}"#;
     let expected5 = FhirSerdeTestStruct {
-        name: None,
-        birth_date: None,
-        is_active: None,
-        count: None,
+        name1: "Test5".to_string(),
+        ..Default::default()
     };
     let s5: FhirSerdeTestStruct = serde_json::from_str(json5).unwrap();
-    assert_eq!(s5, expected5); // Uncomment assertion
+    assert_eq!(s5, expected5);
 
     // Case 6: Primitive value is null, but extension exists
-    let json6 = r#"{"birthDate":null,"_birthDate":{"id":"bd-null"}}"#;
-    // Use Date
+    let json6 = r#"{"name1":"Test6","name2":"","birthDate1":null,"_birthDate1":{"id":"bd-null"},"isActive1":null,"decimal1":null,"money1":null}"#;
     let expected6 = FhirSerdeTestStruct {
-        // Renamed from _expected6
-        name: None,
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test6".to_string(),
+        birth_date1: Date {
             id: Some("bd-null".to_string()),
             extension: None,
             value: None, // Value is None because input was null
-        }),
-        is_active: None,
-        count: None,
+        },
+        ..Default::default()
     };
-    let s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap(); // Renamed from _s6
-    assert_eq!(s6, expected6); // Use renamed variables
+    let s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap();
+    assert_eq!(s6, expected6);
 
     // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
-    let json7 = r#"{"birthDate":"1999-09-09","_birthDate":null}"#;
-    // Use Date
+    let json7 = r#"{"name1":"Test7","name2":"","birthDate1":"1999-09-09","_birthDate1":null,"isActive1":null,"decimal1":null,"money1":null}"#;
     let expected7 = FhirSerdeTestStruct {
-        // Renamed from _expected7
-        name: None,
-        birth_date: Some(Date {
-            // Construct using the alias type
+        name1: "Test7".to_string(),
+        birth_date1: Date {
             id: None,
             extension: None,
             value: Some("1999-09-09".to_string()),
-        }),
-        is_active: None,
-        count: None,
+        },
+        ..Default::default()
     };
-    let s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap(); // Renamed from _s7
-    assert_eq!(s7, expected7); // Use renamed variables
+    let s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap();
+    assert_eq!(s7, expected7);
 
     // Case 8: Duplicate primitive field (should error)
-    let json8 = r#"{"birthDate":"1970-03-30", "birthDate":"1971-04-01"}"#;
+    let json8 = r#"{"birthDate1":"1970-03-30", "birthDate1":"1971-04-01"}"#;
     let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
     assert!(res8.is_err());
     assert!(
         res8.unwrap_err()
             .to_string()
-            .contains("duplicate field `birthDate`")
+            .contains("duplicate field `birthDate1`")
     );
 
     // Case 9: Duplicate extension field (should error)
-    let json9 = r#"{"_birthDate":{"id":"a"}, "_birthDate":{"id":"b"}}"#;
-    let res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9); // Renamed from _res9
-    assert!(res9.is_err()); // Should now error due to duplicate field handled by macro visitor
+    let json9 = r#"{"_birthDate1":{"id":"a"}, "_birthDate1":{"id":"b"}}"#;
+    let res9: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json9);
+    assert!(res9.is_err());
     assert!(
         res9.unwrap_err()
             .to_string()
-            .contains("duplicate field `_birthDate`")
+            .contains("duplicate field `_birthDate1`")
     );
+
+    // Case 10: Deserialize Decimal (primitive and extension)
+    let json10 = r#"{"name1":"Test10","name2":"","birthDate1":null,"isActive1":null,"decimal1":123.45,"_decimal1":{"id":"dec-id"},"decimal2":98.7,"money1":null}"#;
+    let expected10 = FhirSerdeTestStruct {
+        name1: "Test10".to_string(),
+        decimal1: Decimal {
+            id: Some("dec-id".to_string()),
+            extension: None,
+            // Deserialization preserves original string rep
+            value: Some(PreciseDecimal::new(dec!(123.45), "123.45".to_string())),
+        },
+        decimal2: Some(Decimal {
+            id: None,
+            extension: None,
+            value: Some(PreciseDecimal::new(dec!(98.7), "98.7".to_string())),
+        }),
+        ..Default::default()
+    };
+    let s10: FhirSerdeTestStruct = serde_json::from_str(json10).unwrap();
+    assert_eq!(s10, expected10);
+
+    // Case 11: Deserialize Money (always object)
+    let json11 = r#"{"name1":"Test11","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
+    let expected11 = FhirSerdeTestStruct {
+        name1: "Test11".to_string(),
+        money1: Money {
+            id: Some("money-id".to_string()),
+            extension: None,
+            value: Some(dec!(100.50)),
+            currency: Some(Code { value: Some("USD".to_string()), ..Default::default() }),
+        },
+        money2: Some(Money {
+             id: None,
+             extension: Some(vec![default_extension()]),
+             value: Some(dec!(200)),
+             currency: None,
+        }),
+        ..Default::default()
+    };
+    let s11: FhirSerdeTestStruct = serde_json::from_str(json11).unwrap();
+    assert_eq!(s11, expected11);
+
+    // Case 12: Deserialize Vec<String> (primitive and extension)
+    let json12 = r#"{"name1":"Test12","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    let expected12 = FhirSerdeTestStruct {
+        name1: "Test12".to_string(),
+        given: Some(vec![
+            String { id: None, extension: None, value: Some("Peter".to_string()) },
+            String { id: Some("given-id-2".to_string()), extension: None, value: Some("James".to_string()) },
+            String { id: None, extension: Some(vec![default_extension()]), value: None },
+            String { id: Some("given-id-4".to_string()), extension: Some(vec![default_extension()]), value: Some("Smith".to_string()) },
+        ]),
+        ..Default::default()
+    };
+    let s12: FhirSerdeTestStruct = serde_json::from_str(json12).unwrap();
+    assert_eq!(s12, expected12);
+
+    // Case 13: Deserialize Vec<String> with mismatched lengths (should error)
+    let json13_err = r#"{"given":["Peter"],"_given":[null, {"id":"extra-id"}]}"#;
+    let res13: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json13_err);
+    assert!(res13.is_err());
+    assert!(res13.unwrap_err().to_string().contains("array lengths differ for field 'given'"));
+
+    // Case 14: Deserialize Vec<String> with null primitive but non-null extension element
+    let json14 = r#"{"name1":"Test14","given":[null],"_given":[{"id":"g-null"}]}"#;
+    let expected14 = FhirSerdeTestStruct {
+        name1: "Test14".to_string(),
+        given: Some(vec![
+            String { id: Some("g-null".to_string()), extension: None, value: None },
+        ]),
+        ..Default::default()
+    };
+    let s14: FhirSerdeTestStruct = serde_json::from_str(json14).unwrap();
+    assert_eq!(s14, expected14);
+
+    // Case 15: Deserialize Vec<String> with primitive value but null extension element (should be ok)
+    let json15 = r#"{"name1":"Test15","given":["Value"],"_given":[null]}"#;
+     let expected15 = FhirSerdeTestStruct {
+        name1: "Test15".to_string(),
+        given: Some(vec![
+            String { id: None, extension: None, value: Some("Value".to_string()) },
+        ]),
+        ..Default::default()
+    };
+    let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
+    assert_eq!(s15, expected15);
+
 }
-*/
