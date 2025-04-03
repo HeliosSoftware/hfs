@@ -3,7 +3,6 @@ use fhir::Element;
 use fhir::PreciseDecimal;
 use fhir::r4::*;
 use serde::Deserialize;
-use serde::ser::SerializeStruct;
 
 use rust_decimal_macros::dec;
 use serde_json;
@@ -778,7 +777,12 @@ fn test_fhir_serde_serialize() {
         money1: Money { // Required Money field
             id: Some("money-id".to_string()),
             extension: None,
-            value: Some(dec!(100.50)),
+            // Wrap dec! in PreciseDecimal and DecimalElement
+            value: Some(Decimal {
+                id: None,
+                extension: None,
+                value: Some(PreciseDecimal::new(dec!(100.50), "100.50".to_string())),
+            }),
             currency: Some(Code { // Assuming Code is Element<String, Extension>
                 id: None, extension: None, value: Some("USD".to_string())
             }),
@@ -786,7 +790,12 @@ fn test_fhir_serde_serialize() {
         money2: Some(Money { // Optional Money field
              id: None,
              extension: Some(vec![default_extension()]),
-             value: Some(dec!(200)),
+             // Wrap dec! in PreciseDecimal and DecimalElement
+             value: Some(Decimal {
+                 id: None,
+                 extension: None,
+                 value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
+             }),
              currency: None,
         }),
         ..Default::default()
@@ -1045,13 +1054,26 @@ fn test_fhir_serde_deserialize() {
         money1: Money {
             id: Some("money-id".to_string()),
             extension: None,
-            value: Some(dec!(100.50)),
+            // Wrap dec! in PreciseDecimal and DecimalElement for comparison
+            value: Some(Decimal {
+                id: None,
+                extension: None,
+                // Note: Deserialization should preserve original string if possible,
+                // but for direct comparison, we construct it. Assume "100.50" was the input.
+                value: Some(PreciseDecimal::new(dec!(100.50), "100.50".to_string())),
+            }),
             currency: Some(Code { value: Some("USD".to_string()), ..Default::default() }),
         },
         money2: Some(Money {
              id: None,
              extension: Some(vec![default_extension()]),
-             value: Some(dec!(200)),
+             // Wrap dec! in PreciseDecimal and DecimalElement for comparison
+             value: Some(Decimal {
+                 id: None,
+                 extension: None,
+                 // Assume "200" was the input.
+                 value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
+             }),
              currency: None,
         }),
         ..Default::default()
