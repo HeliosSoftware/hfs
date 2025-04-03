@@ -804,12 +804,77 @@ fn generate_deserialize_impl(
     // Accept the type returned by split_for_impl
     _where_clause: &Option<&syn::WhereClause>,
 ) -> proc_macro2::TokenStream {
+    let struct_name = _name; // Use the provided Ident
+    let visitor_name = format_ident!("{}Visitor", _name); // Create a unique visitor name based on the struct name
+    let impl_generics = _impl_generics; // Use provided generics
+    let ty_generics = _ty_generics;
+    let where_clause = _where_clause;
+
     quote! {
-        // Nothing for now
-        Ok(None)
+        // Add necessary imports for generated code inside the deserialize function body
+        use serde::de::{self, Visitor, MapAccess};
+        use std::marker::PhantomData; // Needed for visitor generics
+
+        // Define the Visitor struct, including generics from the original struct
+        struct #visitor_name #ty_generics #where_clause {
+            // PhantomData is used to associate the visitor with the generic parameters of the struct
+            _marker: PhantomData<#struct_name #ty_generics>,
+        }
+
+        // Implement the Visitor trait for our struct visitor
+        impl<'de> #impl_generics Visitor<'de> for #visitor_name #ty_generics #where_clause {
+            // The type that the Visitor will produce.
+            type Value = #struct_name #ty_generics;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str(concat!("struct ", stringify!(#struct_name)))
+            }
+
+            // Implement visit_map for handling JSON objects.
+            // This is a bare-bones implementation that consumes the map and returns Default.
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                // Consume the map entries without processing them.
+                // This prevents "unused map" errors during deserialization.
+                while let Some((_key, _value)) = map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()? {
+                    // Key and value are ignored in this minimal implementation.
+                }
+
+                // Return a default instance of the struct.
+                // This requires the struct to implement or derive Default.
+                Ok(Default::default())
+            }
+
+            // Implement visit_unit to handle deserializing from `null`.
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                 // Return a default instance if the input JSON is `null`.
+                 Ok(Default::default())
+            }
+
+            // Potentially add other visit_* methods here if needed.
+            // For a minimal implementation, returning errors for unexpected types is usually sufficient.
+            // Example: Handle unexpected primitive string input.
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Err(de::Error::invalid_type(de::Unexpected::Str(v), &self))
+            }
+             // Add similar error handlers for visit_i64, visit_bool, visit_seq etc. if necessary
+             // to provide more specific error messages for unexpected input types.
+        }
+
+        // Start deserialization using the visitor.
+        // deserialize_any allows handling different top-level JSON types (object, null).
+        deserializer.deserialize_any(#visitor_name { _marker: PhantomData })
     }
     /*
-        match *data {
+        match *_data {
             Data::Struct(ref data) => {
                 match data.fields {
                     Fields::Named(ref fields) => {
