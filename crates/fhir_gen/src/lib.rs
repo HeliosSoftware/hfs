@@ -24,7 +24,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Create the version-specific output file with initial content
     std::fs::write(
         &version_path,
-        "use serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
+        "use fhir_macro::FhirSerde;\nuse serde::{Serialize, Deserialize};\nuse crate::{Element, DecimalElement};\n\n",
     )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -176,26 +176,43 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
             writeln!(file, "{}", resource_enum)?;
 
             // Add From<T> implementations for base types ONCE after all types are defined
-            writeln!(file, "// --- From<T> Implementations for Element<T, Extension> ---")?;
+            writeln!(
+                file,
+                "// --- From<T> Implementations for Element<T, Extension> ---"
+            )?;
             writeln!(file, "impl From<bool> for Element<bool, Extension> {{")?;
             writeln!(file, "    fn from(value: bool) -> Self {{")?;
-            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(
+                file,
+                "        Self {{ value: Some(value), ..Default::default() }}"
+            )?;
             writeln!(file, "    }}")?;
             writeln!(file, "}}")?;
 
-            writeln!(file, "impl From<std::primitive::i32> for Element<std::primitive::i32, Extension> {{")?;
+            writeln!(
+                file,
+                "impl From<std::primitive::i32> for Element<std::primitive::i32, Extension> {{"
+            )?;
             writeln!(file, "    fn from(value: std::primitive::i32) -> Self {{")?;
-            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(
+                file,
+                "        Self {{ value: Some(value), ..Default::default() }}"
+            )?;
             writeln!(file, "    }}")?;
             writeln!(file, "}}")?;
 
-            writeln!(file, "impl From<std::string::String> for Element<std::string::String, Extension> {{")?;
+            writeln!(
+                file,
+                "impl From<std::string::String> for Element<std::string::String, Extension> {{"
+            )?;
             writeln!(file, "    fn from(value: std::string::String) -> Self {{")?;
-            writeln!(file, "        Self {{ value: Some(value), ..Default::default() }}")?;
+            writeln!(
+                file,
+                "        Self {{ value: Some(value), ..Default::default() }}"
+            )?;
             writeln!(file, "    }}")?;
             writeln!(file, "}}")?;
             writeln!(file, "// --- End From<T> Implementations ---")?;
-
         }
     }
 
@@ -447,22 +464,10 @@ fn process_elements(
         }
 
         // Generate struct derives - Add Clone, PartialEq, Eq to all structs
-        let mut derives = vec![ // Added 'mut' here
-            "Debug",
-            "Serialize",
-            "Deserialize",
-            "Clone",
-            "PartialEq",
-            "Eq",
-        ];
-        // Add Default derive specifically for Extension struct
-        if type_name == "Extension" {
-            derives.push("Default");
-        }
+        let derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde", "Default"];
         output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
 
         // Add other serde attributes and struct definition
-        output.push_str("#[serde(deny_unknown_fields)]\n");
         output.push_str(&format!(
             "pub struct {} {{\n",
             capitalize_first_letter(&type_name)
@@ -497,14 +502,16 @@ fn generate_element_definition(
         // Handle field renaming, ensuring we don't add duplicate rename attributes
         if field_name != rust_field_name {
             // For choice fields, use the name without [x]
-            if field_name.ends_with("[x]") {
-                serde_attrs.push(format!(
-                    "rename = \"{}\"",
-                    field_name.trim_end_matches("[x]")
-                ));
-            } else {
-                serde_attrs.push(format!("rename = \"{}\"", field_name));
-            }
+            /*
+                        if field_name.ends_with("[x]") {
+                            serde_attrs.push(format!(
+                                "rename = \"{}\"",
+                                field_name.trim_end_matches("[x]")
+                            ));
+                        } else {
+                            serde_attrs.push(format!("rename = \"{}\"", field_name));
+                        }
+            */
         }
 
         let ty = match element.r#type.as_ref().and_then(|t| t.first()) {
@@ -594,11 +601,6 @@ fn generate_element_definition(
                     }
                 }
             }
-        }
-
-        // Output consolidated serde attributes if any exist
-        if !serde_attrs.is_empty() {
-            output.push_str(&format!("    #[serde({})]\n", serde_attrs.join(", ")));
         }
 
         // For choice fields, strip the [x] from the field name
