@@ -899,6 +899,87 @@ mod tests {
             Some("Element < String , Extension >".to_string())
         );
     }
+
+    #[test]
+    fn test_should_skip_element_handling() {
+        // Struct with the attribute on the first field
+        let input_true: DeriveInput = parse_str(
+            r#"
+            struct TestStructTrue {
+                #[fhirserde(skip_element_handling = true)]
+                field1: String,
+                field2: i32,
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Data::Struct(data) = input_true.data {
+            if let Fields::Named(fields) = data.fields {
+                let first_field = fields.named.first().unwrap();
+                assert!(
+                    should_skip_element_handling(first_field),
+                    "should_skip_element_handling should return true for the first field with the attribute"
+                );
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct data");
+        }
+
+        // Struct without the attribute on the first field
+        let input_false: DeriveInput = parse_str(
+            r#"
+            struct TestStructFalse {
+                field1: String,
+                #[fhirserde(skip_element_handling = true)]
+                field2: i32,
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Data::Struct(data) = input_false.data {
+            if let Fields::Named(fields) = data.fields {
+                let first_field = fields.named.first().unwrap();
+                assert!(
+                    !should_skip_element_handling(first_field),
+                    "should_skip_element_handling should return false for the first field without the attribute"
+                );
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct data");
+        }
+
+        // Struct with the attribute but set to false
+        let input_attr_false: DeriveInput = parse_str(
+            r#"
+            struct TestStructAttrFalse {
+                #[fhirserde(skip_element_handling = false)]
+                field1: String,
+                field2: i32,
+            }
+        "#,
+        )
+        .unwrap();
+
+        if let Data::Struct(data) = input_attr_false.data {
+            if let Fields::Named(fields) = data.fields {
+                let first_field = fields.named.first().unwrap();
+                assert!(
+                    !should_skip_element_handling(first_field),
+                    "should_skip_element_handling should return false for the first field with attribute set to false"
+                );
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct data");
+        }
+    }
 }
 
 // Add impl_generics and where_clause as parameters
