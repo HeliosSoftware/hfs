@@ -4,8 +4,8 @@ use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote}; // Add format_ident here
 use syn::{
-    Data, DeriveInput, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type, TypePath,
-    parse_macro_input, punctuated::Punctuated, token,
+    Attribute, Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments,
+    Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
 
 // Helper function to get the effective field name for serialization/deserialization
@@ -260,10 +260,116 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
-fn generate_serialize_impl(_data: &Data, _name: &Ident) -> proc_macro2::TokenStream {
-    quote! { // nothing for now
-             return serializer.serialize_none();
+fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
+    match *data {
+        Data::Struct(ref data) => {
+            match data.fields {
+                Fields::Named(ref fields) => {
+                    let mut field_serializers = Vec::new();
+                    let mut field_counts = Vec::new();
+                    for field in fields.named.iter() {
+                        let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
+                        let field_ty = &field.ty;
+                        let effective_field_name_str = get_effective_field_name(field);
+                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) =
+                            get_element_info(field_ty);
+
+                        // Only treat as FHIR element if it looks like one AND handling is NOT skipped
+                        let is_fhir_element = is_element || is_decimal_element;
+
+                        // Use field_name_ident for accessing the struct field
+                        let field_access = quote! { self.#field_name_ident };
+
+                        // Function to find and extract the path
+                        fn get_path(attrs: &[Attribute]) -> Option<Path> {
+                            attrs.iter().find_map(|attr| {
+                                match attr.parse_args_with(
+                                    Punctuated::<Meta, token::Comma>::parse_terminated,
+                                ) {
+                                    Ok(args) => {
+                                        args.iter().find_map(|meta| {
+                                            if let Meta::NameValue(nv) = meta {
+                                                // The value is now an Expr, check if it's a Lit::Str
+                                                if let syn::Expr::Lit(expr_lit) = &nv.value {
+                                                    if let Lit::Str(lit_str) = &expr_lit.lit {
+                                                        return syn::parse_str::<Path>(
+                                                            &lit_str.value(),
+                                                        )
+                                                        .ok();
+                                                    }
+                                                }
+                                            }
+                                            None // Not the meta item we are looking for
+                                        })
+                                    }
+                                    Err(_) => None, // Failed to parse args, ignore this attribute
+                                }
+                            })
+                        }
+
+                        let skip_path = get_path(&field.attrs);
+
+                        let skip_check = if let Some(condition_path) = &skip_path {
+                            quote! { #condition_path(&#field_access) }
+                        } else if is_option {
+                            quote! { #field_access.is_some() }
+                        } else {
+                            quote! { true }
+                        };
+
+                        let field_counting_code = if is_option {
+                            quote! { if #skip_check { count += 1; } }
+                        } else {
+                            quote! { count += 1; }
+                        };
+
+                        // If this is a "regular" field, just serialize it normally
+                        let field_serializing_code = if should_skip_element_handling(field) {
+                            if is_option {
+                                quote! {
+                                    if #skip_check {
+                                        state.serialize_field(&#effective_field_name_str, self.#field_name_ident)?;
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    state.serialize_field(&#effective_field_name_str, self.#field_name_ident)?;
+                                }
+                            }
+                        } else {
+                            // TODO
+                            if is_option {
+                                quote! {
+                                    if #skip_check {
+
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    let field_value = & self.#field_name_ident;
+                                    let has_extension = field_value.extension.is_some();
+                                }
+                            }
+                        };
+
+                        field_counts.push(field_counting_code);
+                        field_serializers.push(field_serializing_code);
+                    }
+                    quote! {
+                        let mut count = 0;
+                        #(#field_counts)*
+                        let mut state = serializer.serialize_struct(stringify!(#name), count)?;
+                        #(#field_serializers)*
+                        state.end()
+                    }
+                }
+                Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
+                Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
+            }
+        }
+        Data::Enum(_) | Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
     }
+
     /*
         match *data {
             Data::Struct(ref data) => {

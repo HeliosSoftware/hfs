@@ -2,9 +2,8 @@ use fhir::DecimalElement;
 use fhir::Element;
 use fhir::PreciseDecimal;
 use fhir::r4::*;
-use serde::Deserialize;
-
 use rust_decimal_macros::dec;
+use serde::Deserialize;
 use serde_json;
 
 #[test]
@@ -620,8 +619,10 @@ use fhir_macro::FhirSerde;
 #[derive(Debug, PartialEq, FhirSerde, Default)]
 struct FhirSerdeTestStruct {
     // Regular fields
+    #[fhirserde(skip_element_handling = true)]
     name1: std::string::String,
     name2: String,
+    #[fhirserde(skip_element_handling = true)]
     name3: Option<std::string::String>,
     name4: Option<String>,
 
@@ -636,6 +637,7 @@ struct FhirSerdeTestStruct {
     is_active2: Option<Boolean>,
 
     // A non-element field for good measure
+    #[fhirserde(skip_element_handling = true)]
     count: Option<i32>,
 
     // A field with potental extension (_decimal1) using type alias.
@@ -649,7 +651,7 @@ struct FhirSerdeTestStruct {
     money2: Option<Money>,
 
     // A field that uses Vec - need to handle nulls in extensions correctly - https://hl7.org/fhir/json.html#primitive
-    pub given: Option<Vec<String>>,
+    given: Option<Vec<String>>,
 }
 
 #[test]
@@ -759,7 +761,8 @@ fn test_fhir_serde_serialize() {
             extension: None,
             value: Some(PreciseDecimal::new(dec!(123.45), "123.45".to_string())),
         },
-        decimal2: Some(Decimal { // Optional field with only value
+        decimal2: Some(Decimal {
+            // Optional field with only value
             id: None,
             extension: None,
             value: Some(PreciseDecimal::new(dec!(98.7), "98.7".to_string())),
@@ -774,7 +777,8 @@ fn test_fhir_serde_serialize() {
     // Case 7: Test Money serialization (always object)
     let s7 = FhirSerdeTestStruct {
         name1: "Test7".to_string(),
-        money1: Money { // Required Money field
+        money1: Money {
+            // Required Money field
             id: Some("money-id".to_string()),
             extension: None,
             // Wrap dec! in PreciseDecimal and DecimalElement
@@ -783,20 +787,24 @@ fn test_fhir_serde_serialize() {
                 extension: None,
                 value: Some(PreciseDecimal::new(dec!(100.50), "100.50".to_string())),
             }),
-            currency: Some(Code { // Assuming Code is Element<String, Extension>
-                id: None, extension: None, value: Some("USD".to_string())
+            currency: Some(Code {
+                // Assuming Code is Element<String, Extension>
+                id: None,
+                extension: None,
+                value: Some("USD".to_string()),
             }),
         },
-        money2: Some(Money { // Optional Money field
-             id: None,
-             extension: Some(vec![default_extension()]),
-             // Wrap dec! in PreciseDecimal and DecimalElement
-             value: Some(Decimal {
-                 id: None,
-                 extension: None,
-                 value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
-             }),
-             currency: None,
+        money2: Some(Money {
+            // Optional Money field
+            id: None,
+            extension: Some(vec![default_extension()]),
+            // Wrap dec! in PreciseDecimal and DecimalElement
+            value: Some(Decimal {
+                id: None,
+                extension: None,
+                value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
+            }),
+            currency: None,
         }),
         ..Default::default()
     };
@@ -810,10 +818,26 @@ fn test_fhir_serde_serialize() {
     let s8 = FhirSerdeTestStruct {
         name1: "Test8".to_string(),
         given: Some(vec![
-            String { id: None, extension: None, value: Some("Peter".to_string()) }, // Primitive only
-            String { id: Some("given-id-2".to_string()), extension: None, value: Some("James".to_string()) }, // Value + ID
-            String { id: None, extension: Some(vec![default_extension()]), value: None }, // Extension only
-            String { id: Some("given-id-4".to_string()), extension: Some(vec![default_extension()]), value: Some("Smith".to_string()) }, // Value + ID + Extension
+            String {
+                id: None,
+                extension: None,
+                value: Some("Peter".to_string()),
+            }, // Primitive only
+            String {
+                id: Some("given-id-2".to_string()),
+                extension: None,
+                value: Some("James".to_string()),
+            }, // Value + ID
+            String {
+                id: None,
+                extension: Some(vec![default_extension()]),
+                value: None,
+            }, // Extension only
+            String {
+                id: Some("given-id-4".to_string()),
+                extension: Some(vec![default_extension()]),
+                value: Some("Smith".to_string()),
+            }, // Value + ID + Extension
         ]),
         ..Default::default()
     };
@@ -822,12 +846,20 @@ fn test_fhir_serde_serialize() {
     let expected8 = r#"{"name1":"Test8","name2":"","birthDate1":null,"isActive1":null,"decimal1":null,"money1":null,"given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
     assert_eq!(json8, expected8);
 
-     // Case 9: Test Vec<String> with only primitives
+    // Case 9: Test Vec<String> with only primitives
     let s9 = FhirSerdeTestStruct {
         name1: "Test9".to_string(),
         given: Some(vec![
-            String { id: None, extension: None, value: Some("Alice".to_string()) },
-            String { id: None, extension: None, value: Some("Bob".to_string()) },
+            String {
+                id: None,
+                extension: None,
+                value: Some("Alice".to_string()),
+            },
+            String {
+                id: None,
+                extension: None,
+                value: Some("Bob".to_string()),
+            },
         ]),
         ..Default::default()
     };
@@ -840,8 +872,16 @@ fn test_fhir_serde_serialize() {
     let s10 = FhirSerdeTestStruct {
         name1: "Test10".to_string(),
         given: Some(vec![
-            String { id: Some("g1".to_string()), extension: None, value: None },
-            String { id: None, extension: Some(vec![default_extension()]), value: None },
+            String {
+                id: Some("g1".to_string()),
+                extension: None,
+                value: None,
+            },
+            String {
+                id: None,
+                extension: Some(vec![default_extension()]),
+                value: None,
+            },
         ]),
         ..Default::default()
     };
@@ -854,9 +894,21 @@ fn test_fhir_serde_serialize() {
     let s11 = FhirSerdeTestStruct {
         name1: "Test11".to_string(),
         given: Some(vec![
-            String { id: None, extension: None, value: Some("First".to_string()) },
-            String { id: Some("g-null".to_string()), extension: None, value: None }, // Value is None
-            String { id: None, extension: None, value: Some("Last".to_string()) },
+            String {
+                id: None,
+                extension: None,
+                value: Some("First".to_string()),
+            },
+            String {
+                id: Some("g-null".to_string()),
+                extension: None,
+                value: None,
+            }, // Value is None
+            String {
+                id: None,
+                extension: None,
+                value: Some("Last".to_string()),
+            },
         ]),
         ..Default::default()
     };
@@ -1062,19 +1114,22 @@ fn test_fhir_serde_deserialize() {
                 // but for direct comparison, we construct it. Assume "100.50" was the input.
                 value: Some(PreciseDecimal::new(dec!(100.50), "100.50".to_string())),
             }),
-            currency: Some(Code { value: Some("USD".to_string()), ..Default::default() }),
+            currency: Some(Code {
+                value: Some("USD".to_string()),
+                ..Default::default()
+            }),
         },
         money2: Some(Money {
-             id: None,
-             extension: Some(vec![default_extension()]),
-             // Wrap dec! in PreciseDecimal and DecimalElement for comparison
-             value: Some(Decimal {
-                 id: None,
-                 extension: None,
-                 // Assume "200" was the input.
-                 value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
-             }),
-             currency: None,
+            id: None,
+            extension: Some(vec![default_extension()]),
+            // Wrap dec! in PreciseDecimal and DecimalElement for comparison
+            value: Some(Decimal {
+                id: None,
+                extension: None,
+                // Assume "200" was the input.
+                value: Some(PreciseDecimal::new(dec!(200), "200".to_string())),
+            }),
+            currency: None,
         }),
         ..Default::default()
     };
@@ -1086,10 +1141,26 @@ fn test_fhir_serde_deserialize() {
     let expected12 = FhirSerdeTestStruct {
         name1: "Test12".to_string(),
         given: Some(vec![
-            String { id: None, extension: None, value: Some("Peter".to_string()) },
-            String { id: Some("given-id-2".to_string()), extension: None, value: Some("James".to_string()) },
-            String { id: None, extension: Some(vec![default_extension()]), value: None },
-            String { id: Some("given-id-4".to_string()), extension: Some(vec![default_extension()]), value: Some("Smith".to_string()) },
+            String {
+                id: None,
+                extension: None,
+                value: Some("Peter".to_string()),
+            },
+            String {
+                id: Some("given-id-2".to_string()),
+                extension: None,
+                value: Some("James".to_string()),
+            },
+            String {
+                id: None,
+                extension: Some(vec![default_extension()]),
+                value: None,
+            },
+            String {
+                id: Some("given-id-4".to_string()),
+                extension: Some(vec![default_extension()]),
+                value: Some("Smith".to_string()),
+            },
         ]),
         ..Default::default()
     };
@@ -1100,15 +1171,22 @@ fn test_fhir_serde_deserialize() {
     let json13_err = r#"{"given":["Peter"],"_given":[null, {"id":"extra-id"}]}"#;
     let res13: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json13_err);
     assert!(res13.is_err());
-    assert!(res13.unwrap_err().to_string().contains("array lengths differ for field 'given'"));
+    assert!(
+        res13
+            .unwrap_err()
+            .to_string()
+            .contains("array lengths differ for field 'given'")
+    );
 
     // Case 14: Deserialize Vec<String> with null primitive but non-null extension element
     let json14 = r#"{"name1":"Test14","given":[null],"_given":[{"id":"g-null"}]}"#;
     let expected14 = FhirSerdeTestStruct {
         name1: "Test14".to_string(),
-        given: Some(vec![
-            String { id: Some("g-null".to_string()), extension: None, value: None },
-        ]),
+        given: Some(vec![String {
+            id: Some("g-null".to_string()),
+            extension: None,
+            value: None,
+        }]),
         ..Default::default()
     };
     let s14: FhirSerdeTestStruct = serde_json::from_str(json14).unwrap();
@@ -1116,14 +1194,15 @@ fn test_fhir_serde_deserialize() {
 
     // Case 15: Deserialize Vec<String> with primitive value but null extension element (should be ok)
     let json15 = r#"{"name1":"Test15","given":["Value"],"_given":[null]}"#;
-     let expected15 = FhirSerdeTestStruct {
+    let expected15 = FhirSerdeTestStruct {
         name1: "Test15".to_string(),
-        given: Some(vec![
-            String { id: None, extension: None, value: Some("Value".to_string()) },
-        ]),
+        given: Some(vec![String {
+            id: None,
+            extension: None,
+            value: Some("Value".to_string()),
+        }]),
         ..Default::default()
     };
     let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
     assert_eq!(s15, expected15);
-
 }
