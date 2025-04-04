@@ -80,7 +80,7 @@ fn test_serialize_decimal_with_all_fields() {
             Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/ext2".to_string(),
+                url: "http://example.com/ext2".to_string().into(), // Convert String to Url
                 // Construct String explicitly, initializing all fields
                 value: Some(ExtensionValue::String(String {
                     id: None,
@@ -349,7 +349,7 @@ fn test_serialize_element_object() {
         extension: Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext1".to_string(),
+            url: "http://example.com/ext1".to_string().into(), // Convert String to Url
             // Construct Boolean explicitly, initializing all fields
             value: Some(ExtensionValue::Boolean(Boolean {
                 id: None,
@@ -380,7 +380,7 @@ fn test_serialize_element_object() {
         extension: Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext2".to_string(),
+            url: "http://example.com/ext2".to_string().into(), // Convert String to Url
             // Construct String explicitly, initializing all fields
             value: Some(ExtensionValue::String(String {
                 id: None,
@@ -400,7 +400,7 @@ fn test_serialize_element_object() {
         extension: Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext3".to_string(),
+            url: "http://example.com/ext3".to_string().into(), // Convert String to Url
             // Construct Integer explicitly, initializing all fields
             value: Some(ExtensionValue::Integer(Integer {
                 id: None,
@@ -460,7 +460,7 @@ fn test_deserialize_element_object() {
         Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext1".to_string(),
+            url: "http://example.com/ext1".to_string().into(), // Convert String to Url
             // Construct Boolean explicitly, initializing all fields
             value: Some(ExtensionValue::Boolean(Boolean {
                 id: None,
@@ -481,7 +481,7 @@ fn test_deserialize_element_object() {
         Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext3".to_string(),
+            url: "http://example.com/ext3".to_string().into(), // Convert String to Url
             // Construct Integer explicitly, initializing all fields
             value: Some(ExtensionValue::Integer(Integer {
                 id: None,
@@ -510,7 +510,7 @@ fn test_deserialize_element_object() {
         Some(vec![Extension {
             id: None,
             extension: None,
-            url: "http://example.com/ext2".to_string(),
+            url: "http://example.com/ext2".to_string().into(), // Convert String to Url
             // Construct String explicitly, initializing all fields
             value: Some(ExtensionValue::String(String {
                 id: None,
@@ -660,7 +660,7 @@ fn test_fhir_serde_serialize() {
     let default_extension = || Extension {
         id: None,
         extension: None,
-        url: "http://example.com/ext".to_string(),
+        url: "http://example.com/ext".to_string().into(), // Convert String to Url
         value: Some(ExtensionValue::String(String {
             id: None,
             extension: None,
@@ -727,7 +727,7 @@ fn test_fhir_serde_serialize() {
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/flag".to_string(),
+                url: "http://example.com/flag".to_string().into(), // Convert String to Url
                 value: Some(ExtensionValue::Boolean(Boolean {
                     id: None,
                     extension: None,
@@ -779,7 +779,7 @@ fn test_fhir_serde_serialize() {
         name1: "Test7".to_string(),
         money1: Money {
             // Required Money field
-            id: Some("money-id".to_string()),
+            id: Some("money-id".to_string().into()), // Convert String to Id
             extension: None,
             // Wrap dec! in PreciseDecimal and DecimalElement
             value: Some(Decimal {
@@ -924,7 +924,7 @@ fn test_fhir_serde_deserialize() {
     let default_extension = || Extension {
         id: None,
         extension: None,
-        url: "http://example.com/ext".to_string(),
+        url: "http://example.com/ext".to_string().into(), // Convert String to Url
         value: Some(ExtensionValue::String(String {
             id: None,
             extension: None,
@@ -956,7 +956,7 @@ fn test_fhir_serde_deserialize() {
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/note".to_string(),
+                url: "http://example.com/note".to_string().into(), // Convert String to Url
                 value: Some(ExtensionValue::String(String {
                     id: None,
                     extension: None,
@@ -979,7 +979,7 @@ fn test_fhir_serde_deserialize() {
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/test".to_string(),
+                url: "http://example.com/test".to_string().into(), // Convert String to Url
                 value: Some(ExtensionValue::String(String {
                     id: None,
                     extension: None,
@@ -1008,7 +1008,7 @@ fn test_fhir_serde_deserialize() {
             extension: Some(vec![Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/flag".to_string(),
+                url: "http://example.com/flag".to_string().into(), // Convert String to Url
                 value: Some(ExtensionValue::Boolean(Boolean {
                     id: None,
                     extension: None,
@@ -1104,7 +1104,7 @@ fn test_fhir_serde_deserialize() {
     let expected11 = FhirSerdeTestStruct {
         name1: "Test11".to_string(),
         money1: Money {
-            id: Some("money-id".to_string()),
+            id: Some("money-id".to_string().into()), // Convert String to Id
             extension: None,
             // Wrap dec! in PreciseDecimal and DecimalElement for comparison
             value: Some(Decimal {
