@@ -271,11 +271,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
-                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) =
+                        let (is_element, is_decimal_element, is_option, _is_vec, _inner_ty_opt) =
                             get_element_info(field_ty);
 
                         // Only treat as FHIR element if it looks like one AND handling is NOT skipped
-                        let is_fhir_element = is_element || is_decimal_element;
+                        let _is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
                         let field_access = quote! { self.#field_name_ident };
@@ -328,12 +328,12 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             if is_option {
                                 quote! {
                                     if #skip_check {
-                                        state.serialize_field(&#effective_field_name_str, self.#field_name_ident)?;
+                                        state.serialize_field(&#effective_field_name_str, &self.#field_name_ident)?;
                                     }
                                 }
                             } else {
                                 quote! {
-                                    state.serialize_field(&#effective_field_name_str, self.#field_name_ident)?;
+                                    state.serialize_field(&#effective_field_name_str, &self.#field_name_ident)?;
                                 }
                             }
                         } else {
@@ -346,7 +346,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             } else {
                                 quote! {
-                                    let field_value = & self.#field_name_ident;
+                                    let field_value = &self.#field_name_ident;
                                     let has_extension = field_value.extension.is_some();
                                 }
                             }
