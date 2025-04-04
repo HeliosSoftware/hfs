@@ -358,6 +358,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     quote! {
                         let mut count = 0;
                         #(#field_counts)*
+                        use serde::ser::SerializeStruct; // Import trait for state methods
                         let mut state = serializer.serialize_struct(stringify!(#name), count)?;
                         #(#field_serializers)*
                         state.end()

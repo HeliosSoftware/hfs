@@ -69,7 +69,7 @@ fn test_serialize_decimal_with_all_fields() {
             Extension {
                 id: None,
                 extension: None,
-                url: "http://example.com/ext1".to_string(),
+                url: "http://example.com/ext1".to_string().into(), // Convert String to Url (Element<String, Extension>)
                 // Construct Boolean explicitly, initializing all fields
                 value: Some(ExtensionValue::Boolean(Boolean {
                     id: None,
