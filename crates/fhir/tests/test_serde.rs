@@ -740,7 +740,7 @@ fn test_fhir_serde_serialize() {
     };
     let json5 = serde_json::to_string(&s5).unwrap();
     // Expected: Only required fields (name1, name2) and non-optional elements (birthDate1, isActive1, decimal1, money1) serialized as null
-    let expected5 = r#"{"name1":"Test5""#;
+    let expected5 = r#"{"name1":"Test5"}"#;
     assert_eq!(json5, expected5);
 
     // Case 6: Test Decimal serialization (primitive and extension)
