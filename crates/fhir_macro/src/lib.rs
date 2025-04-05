@@ -354,9 +354,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else {
                                 // For non-Option types, check if it's a struct with all None/null fields
                                 quote! {
-                                    // Use serde_json to check if the field serializes to null
+                                    // Use serde_json to check if the field serializes to null or empty object
                                     let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() {
+                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
                                 }
