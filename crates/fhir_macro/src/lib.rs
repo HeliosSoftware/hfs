@@ -39,7 +39,7 @@ fn get_effective_field_name(field: &syn::Field) -> String {
         .to_lower_camel_case()
 }
 
-#[proc_macro_derive(FhirSerde, attributes(fhirserde))] // Add attributes(fhirserde) here
+#[proc_macro_derive(FhirSerde, attributes(fhir_serde))] // Add attributes(fhirserde) here
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = input.ident;

@@ -578,10 +578,8 @@ fn generate_element_definition(
             serde_attrs.push("flatten".to_string());
             format!("Option<{}>", enum_name)
         } else if is_array {
-            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<Vec<{}>>", base_type)
         } else if element.min.unwrap_or(0) == 0 {
-            serde_attrs.push("skip_serializing_if = \"Option::is_none\"".to_string());
             format!("Option<{}>", base_type)
         } else {
             base_type.to_string()
@@ -603,6 +601,11 @@ fn generate_element_definition(
                     }
                 }
             }
+        }
+
+        // Output consolidated serde attributes if any exist
+        if !serde_attrs.is_empty() {
+            output.push_str(&format!("    #[fhir_serde({})]\n", serde_attrs.join(", ")));
         }
 
         // For choice fields, strip the [x] from the field name
