@@ -317,7 +317,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         } else {
                             if !is_vec && is_fhir_element {
                                 quote! {
-                                    state.serialize_field(&#effective_field_name_str, #field_access.value.as_ref().unwrap())?;
+                                    if let Some(value) = #field_access.value.as_ref() {
+                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                    }
                                     if #extension_field_ident {
                                                 #[derive(serde::Serialize)]
                                                 struct IdAndExtensionHelper<'a, Extension> {
