@@ -9,10 +9,10 @@ use syn::{
 };
 
 // Helper function to get the effective field name for serialization/deserialization
-// Respects #[serde(rename = "...")] attribute, otherwise defaults to camelCase.
+// Respects #[fhir_serde(rename = "...")] attribute, otherwise defaults to camelCase.
 fn get_effective_field_name(field: &syn::Field) -> String {
     for attr in &field.attrs {
-        if attr.path().is_ident("serde") {
+        if attr.path().is_ident("fhir_serde") {
             if let Ok(list) =
                 attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
             {
