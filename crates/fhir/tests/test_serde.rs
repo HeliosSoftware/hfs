@@ -730,7 +730,7 @@ fn test_fhir_serde_serialize() {
     };
     let json4 = serde_json::to_string(&s4).unwrap();
     // Expected: name1, _isActive1 (object with extension)
-    let expected4 = r#"{"name1":"Test4","_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]}}"#;
+    let expected4 = r#"{"name1":"Test4","_isActive1":{"extension":[{"url":"http://example.com/flag","value":{"valueBoolean":true}}]}}"#;
     assert_eq!(json4, expected4);
 
     // Case 5: All optional fields are None/Default
