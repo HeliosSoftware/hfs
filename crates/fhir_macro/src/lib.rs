@@ -286,8 +286,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             } else {
-                                quote! {
-                                    count += 1;
+                                // Only count non-Option fields or Some Option fields
+                                if is_option {
+                                    quote! {
+                                        if #field_access.is_some() {
+                                            count += 1;
+                                        }
+                                    }
+                                } else {
+                                    quote! {
+                                        count += 1;
+                                    }
                                 }
                             }
                         };
@@ -335,9 +344,21 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 state.serialize_field(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
-                            } else {
+                            } else if is_option {
+                                // Skip serializing if the Option is None
                                 quote! {
-                                    state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                    if let Some(value) = &#field_access {
+                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                    }
+                                }
+                            } else {
+                                // For non-Option types, check if it's a struct with all None/null fields
+                                quote! {
+                                    // Use serde_json to check if the field serializes to null
+                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    if !json_value.is_null() {
+                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                    }
                                 }
                             }
                         };

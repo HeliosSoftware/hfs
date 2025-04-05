@@ -670,7 +670,7 @@ fn test_fhir_serde_serialize() {
         ..Default::default() // Initialize other fields with default
     };
     let json1 = serde_json::to_string(&s1).unwrap();
-    // Expected: name1, birthDate1 (primitive), count
+    // Expected: name1, birthDate1 (primitive) - null fields should be omitted
     let expected1 = r#"{"name1":"Test1","birthDate1":"1970-03-30"}"#;
     assert_eq!(json1, expected1);
 
