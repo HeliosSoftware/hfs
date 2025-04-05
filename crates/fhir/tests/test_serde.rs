@@ -802,7 +802,7 @@ fn test_fhir_serde_serialize() {
     let json7 = serde_json::to_string(&s7).unwrap();
     // Expected: money1 (object), money2 (object)
     // Note: Money always serializes as an object, so no _money1/_money2 split
-    let expected7 = r#"{"name1":"Test7","money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
+    let expected7 = r#"{"name1":"Test7","money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","value":{"valueString":"ext-val"}}],"value":200}}"#;
     assert_eq!(json7, expected7);
 
     // Case 8: Test Vec<String> serialization (primitive and extension)
