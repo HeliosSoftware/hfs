@@ -730,7 +730,7 @@ fn test_fhir_serde_serialize() {
     };
     let json4 = serde_json::to_string(&s4).unwrap();
     // Expected: name1, _isActive1 (object with extension)
-    let expected4 = r#"{"name1":"Test4","_isActive1":{"extension":[{"url":"http://example.com/flag","value":{"valueBoolean":true}}]}}"#;
+    let expected4 = r#"{"name1":"Test4","_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]}}"#;
     assert_eq!(json4, expected4);
 
     // Case 5: All optional fields are None/Default
@@ -802,7 +802,7 @@ fn test_fhir_serde_serialize() {
     let json7 = serde_json::to_string(&s7).unwrap();
     // Expected: money1 (object), money2 (object)
     // Note: Money always serializes as an object, so no _money1/_money2 split
-    let expected7 = r#"{"name1":"Test7","money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","value":{"valueString":"ext-val"}}],"value":200}}"#;
+    let expected7 = r#"{"name1":"Test7","money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
     assert_eq!(json7, expected7);
 
     // Case 8: Test Vec<String> serialization (primitive and extension)
