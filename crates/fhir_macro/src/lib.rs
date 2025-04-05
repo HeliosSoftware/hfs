@@ -271,83 +271,95 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
-                        let (is_element, is_decimal_element, is_option, _is_vec, _inner_ty_opt) =
+                        let underscore_field_name_str = format!("_{}", effective_field_name_str);
+                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty_opt) =
                             get_element_info(field_ty);
 
                         // Only treat as FHIR element if it looks like one AND handling is NOT skipped
-                        let _is_fhir_element = is_element || is_decimal_element;
+                        let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
                         let field_access = quote! { self.#field_name_ident };
 
-                        // Function to find and extract the path
-                        fn get_path(attrs: &[Attribute]) -> Option<Path> {
-                            attrs.iter().find_map(|attr| {
-                                match attr.parse_args_with(
-                                    Punctuated::<Meta, token::Comma>::parse_terminated,
-                                ) {
-                                    Ok(args) => {
-                                        args.iter().find_map(|meta| {
-                                            if let Meta::NameValue(nv) = meta {
-                                                // The value is now an Expr, check if it's a Lit::Str
-                                                if let syn::Expr::Lit(expr_lit) = &nv.value {
-                                                    if let Lit::Str(lit_str) = &expr_lit.lit {
-                                                        return syn::parse_str::<Path>(
-                                                            &lit_str.value(),
-                                                        )
-                                                        .ok();
-                                                    }
-                                                }
-                                            }
-                                            None // Not the meta item we are looking for
-                                        })
+                        let extension_field_ident =
+                            format_ident!("is_{}_extension", field_name_ident);
+
+                        let field_counting_code = if is_option && !is_vec && is_fhir_element {
+                            quote! {
+                                let mut #extension_field_ident = false;
+                                if let Some(field) = &#field_access {
+                                    if field.value.is_some() {
+                                        count += 1;
                                     }
-                                    Err(_) => None, // Failed to parse args, ignore this attribute
-                                }
-                            })
-                        }
-
-                        let skip_path = get_path(&field.attrs);
-
-                        let skip_check = if let Some(condition_path) = &skip_path {
-                            quote! { #condition_path(&#field_access) }
-                        } else if is_option {
-                            quote! { #field_access.is_some() }
-                        } else {
-                            quote! { true }
-                        };
-
-                        let field_counting_code = if is_option {
-                            quote! { if #skip_check { count += 1; } }
-                        } else {
-                            quote! { count += 1; }
-                        };
-
-                        // If this is a "regular" field, just serialize it normally
-                        let field_serializing_code = if should_skip_element_handling(field) {
-                            if is_option {
-                                quote! {
-                                    if #skip_check {
-                                        state.serialize_field(&#effective_field_name_str, &self.#field_name_ident)?;
+                                    if field.id.is_some() || field.extension.is_some() {
+                                        count += 1;
+                                        #extension_field_ident = true;
                                     }
-                                }
-                            } else {
-                                quote! {
-                                    state.serialize_field(&#effective_field_name_str, &self.#field_name_ident)?;
                                 }
                             }
                         } else {
-                            // TODO
-                            if is_option {
+                            if !is_vec && is_fhir_element {
                                 quote! {
-                                    if #skip_check {
-
+                                    let mut #extension_field_ident = false;
+                                    if #field_access.value.is_some() {
+                                        count += 1;
+                                    }
+                                    if #field_access.id.is_some() || #field_access.extension.is_some() {
+                                        count += 1;
+                                        #extension_field_ident = true;
                                     }
                                 }
                             } else {
                                 quote! {
-                                    let field_value = &self.#field_name_ident;
-                                    let has_extension = field_value.extension.is_some();
+                                    count += 1;
+                                }
+                            }
+                        };
+
+                        let field_serializing_code = if is_option && !is_vec && is_fhir_element {
+                            quote! {
+                                        if let Some(field) = &#field_access {
+                                            if let Some(value) = field.value.as_ref() {
+                                                state.serialize_field(&#effective_field_name_str, value)?;
+                                            }
+                                            if #extension_field_ident {
+                                                #[derive(serde::Serialize)]
+                                                struct IdAndExtensionHelper<'a, Extension> {
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    id: &'a Option<std::string::String>,
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    extension: &'a Option<Vec<Extension>>,
+                                                }
+                                                let extension_part = IdAndExtensionHelper {
+                                                    id: &field.id,
+                                                    extension: &field.extension,
+                                                };
+                                                state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                            }
+                                        }
+                            }
+                        } else {
+                            if !is_vec && is_fhir_element {
+                                quote! {
+                                    state.serialize_field(&#effective_field_name_str, #field_access.value.as_ref().unwrap())?;
+                                    if #extension_field_ident {
+                                                #[derive(serde::Serialize)]
+                                                struct IdAndExtensionHelper<'a, Extension> {
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    id: &'a Option<std::string::String>,
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    extension: &'a Option<Vec<Extension>>,
+                                                }
+                                                let extension_part = IdAndExtensionHelper {
+                                                    id: &#field_access.id,
+                                                    extension: &#field_access.extension,
+                                                };
+                                                state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                    }
+                                }
+                            } else {
+                                quote! {
+                                    state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                 }
                             }
                         };
@@ -899,87 +911,6 @@ mod tests {
             type_option_to_string(inner_ty),
             Some("Element < String , Extension >".to_string())
         );
-    }
-
-    #[test]
-    fn test_should_skip_element_handling() {
-        // Struct with the attribute on the first field
-        let input_true: DeriveInput = parse_str(
-            r#"
-            struct TestStructTrue {
-                #[fhirserde(skip_element_handling = true)]
-                field1: String,
-                field2: i32,
-            }
-        "#,
-        )
-        .unwrap();
-
-        if let Data::Struct(data) = input_true.data {
-            if let Fields::Named(fields) = data.fields {
-                let first_field = fields.named.first().unwrap();
-                assert!(
-                    should_skip_element_handling(first_field),
-                    "should_skip_element_handling should return true for the first field with the attribute"
-                );
-            } else {
-                panic!("Expected named fields");
-            }
-        } else {
-            panic!("Expected struct data");
-        }
-
-        // Struct without the attribute on the first field
-        let input_false: DeriveInput = parse_str(
-            r#"
-            struct TestStructFalse {
-                field1: String,
-                #[fhirserde(skip_element_handling = true)]
-                field2: i32,
-            }
-        "#,
-        )
-        .unwrap();
-
-        if let Data::Struct(data) = input_false.data {
-            if let Fields::Named(fields) = data.fields {
-                let first_field = fields.named.first().unwrap();
-                assert!(
-                    !should_skip_element_handling(first_field),
-                    "should_skip_element_handling should return false for the first field without the attribute"
-                );
-            } else {
-                panic!("Expected named fields");
-            }
-        } else {
-            panic!("Expected struct data");
-        }
-
-        // Struct with the attribute but set to false
-        let input_attr_false: DeriveInput = parse_str(
-            r#"
-            struct TestStructAttrFalse {
-                #[fhirserde(skip_element_handling = false)]
-                field1: String,
-                field2: i32,
-            }
-        "#,
-        )
-        .unwrap();
-
-        if let Data::Struct(data) = input_attr_false.data {
-            if let Fields::Named(fields) = data.fields {
-                let first_field = fields.named.first().unwrap();
-                assert!(
-                    !should_skip_element_handling(first_field),
-                    "should_skip_element_handling should return false for the first field with attribute set to false"
-                );
-            } else {
-                panic!("Expected named fields");
-            }
-        } else {
-            panic!("Expected struct data");
-        }
     }
 }
 
