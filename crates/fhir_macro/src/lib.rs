@@ -642,6 +642,31 @@ mod tests {
             Some("Element < String , Extension >".to_string())
         );
     }
+
+    #[test]
+    fn test_is_flattened() {
+        let stream: TokenStream = quote! {
+            struct TestStruct {
+                #[fhir_serde(flatten)]
+                field_a: String,
+                field_b: i32,
+            }
+        }
+        .into();
+        let input = parse_macro_input!(stream as DeriveInput);
+        if let Data::Struct(data) = input.data {
+            if let Fields::Named(fields) = data.fields {
+                let field_a = fields.named.iter().find(|f| f.ident.as_ref().unwrap() == "field_a").unwrap();
+                let field_b = fields.named.iter().find(|f| f.ident.as_ref().unwrap() == "field_b").unwrap();
+                assert!(is_flattened(field_a));
+                assert!(!is_flattened(field_b));
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct");
+        }
+    }
 }
 
 // Add impl_generics and where_clause as parameters
