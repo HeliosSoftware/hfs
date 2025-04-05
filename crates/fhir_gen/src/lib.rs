@@ -503,16 +503,14 @@ fn generate_element_definition(
         // Handle field renaming, ensuring we don't add duplicate rename attributes
         if field_name != rust_field_name {
             // For choice fields, use the name without [x]
-            /*
-                        if field_name.ends_with("[x]") {
-                            serde_attrs.push(format!(
-                                "rename = \"{}\"",
-                                field_name.trim_end_matches("[x]")
-                            ));
-                        } else {
-                            serde_attrs.push(format!("rename = \"{}\"", field_name));
-                        }
-            */
+            if field_name.ends_with("[x]") {
+                serde_attrs.push(format!(
+                    "rename = \"{}\"",
+                    field_name.trim_end_matches("[x]")
+                ));
+            } else {
+                serde_attrs.push(format!("rename = \"{}\"", field_name));
+            }
         }
 
         let ty = match element.r#type.as_ref().and_then(|t| t.first()) {
