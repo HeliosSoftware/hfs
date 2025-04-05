@@ -706,7 +706,7 @@ fn test_fhir_serde_serialize() {
     };
     let json3 = serde_json::to_string(&s3).unwrap();
     // Expected: name1, birthDate1 (primitive), _birthDate1 (id), isActive1 (primitive), count
-    let expected3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3"}"#;
+    let expected3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3"},"isActive1":true}"#;
     assert_eq!(json3, expected3);
 
     // Case 4: birthDate1 is default (null), isActive1 has only extension
