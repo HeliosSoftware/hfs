@@ -39,6 +39,26 @@ fn get_effective_field_name(field: &syn::Field) -> String {
         .to_lower_camel_case()
 }
 
+// Helper function to check if a field has #[fhir_serde(flatten)]
+fn is_flattened(field: &syn::Field) -> bool {
+    for attr in &field.attrs {
+        if attr.path().is_ident("fhir_serde") {
+            if let Ok(list) =
+                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+            {
+                for meta in list {
+                    if let Meta::Path(path) = meta {
+                        if path.is_ident("flatten") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[proc_macro_derive(FhirSerde, attributes(fhir_serde))] // Add attributes(fhirserde) here
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
