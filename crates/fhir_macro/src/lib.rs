@@ -4,8 +4,8 @@ use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote}; // Add format_ident here
 use syn::{
-    Attribute, Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments,
-    Type, TypePath, parse_macro_input, punctuated::Punctuated, token,
+    Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
+    TypePath, parse_macro_input, punctuated::Punctuated, token,
 };
 
 // Helper function to get the effective field name for serialization/deserialization
@@ -37,30 +37,6 @@ fn get_effective_field_name(field: &syn::Field) -> String {
         .unwrap()
         .to_string()
         .to_lower_camel_case()
-}
-
-// Helper function to check for #[fhirserde(skip_element_handling = true)]
-fn should_skip_element_handling(field: &syn::Field) -> bool {
-    for attr in &field.attrs {
-        if attr.path().is_ident("fhirserde") {
-            if let Ok(list) =
-                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
-            {
-                for meta in list {
-                    if let Meta::NameValue(nv) = meta {
-                        if nv.path.is_ident("skip_element_handling") {
-                            if let syn::Expr::Lit(expr_lit) = nv.value {
-                                if let Lit::Bool(lit_bool) = expr_lit.lit {
-                                    return lit_bool.value();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false // Default to false if attribute not found or not true
 }
 
 #[proc_macro_derive(FhirSerde, attributes(fhirserde))] // Add attributes(fhirserde) here

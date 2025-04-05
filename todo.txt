@@ -1,4 +1,4 @@
-- test_serde tests may not be completely correct - need to review
+- Search for SLM TODO - need to change the others I think
 - Remember to remove Default on all structs - needed for initial draft implementation of fhir_macro
 - Thinking that what we have for PreciseDecimal is overkill and that rust_decimal should be able to handle the preservation of trailing zeros - e.g. 3.0000
 - Need to figure out how to support extensions on primitives (or any json _ attribute) and placement into the extension Vec.

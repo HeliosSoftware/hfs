@@ -1,7 +1,7 @@
-use crate::{DecimalElement, Element};
 use fhir_macro::FhirSerde;
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
+
+use crate::{DecimalElement, Element};
 
 pub type Base64Binary = Element<std::string::String, Extension>;
 
@@ -45,7 +45,7 @@ pub type Xhtml = Element<std::string::String, Extension>;
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Address {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#use: Option<Code>,
     pub r#type: Option<Code>,
@@ -61,7 +61,7 @@ pub struct Address {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Age {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub comparator: Option<Code>,
@@ -84,7 +84,7 @@ pub enum AnnotationAuthor {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Annotation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub author: Option<AnnotationAuthor>,
     pub time: Option<DateTime>,
@@ -93,7 +93,7 @@ pub struct Annotation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Attachment {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub content_type: Option<Code>,
     pub language: Option<Code>,
@@ -107,7 +107,7 @@ pub struct Attachment {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CodeableConcept {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub coding: Option<Vec<Coding>>,
     pub text: Option<String>,
@@ -115,7 +115,7 @@ pub struct CodeableConcept {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Coding {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub system: Option<Uri>,
     pub version: Option<String>,
@@ -126,7 +126,7 @@ pub struct Coding {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContactDetail {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub name: Option<String>,
     pub telecom: Option<Vec<ContactPoint>>,
@@ -134,7 +134,7 @@ pub struct ContactDetail {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContactPoint {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub system: Option<Code>,
     pub value: Option<String>,
@@ -145,7 +145,7 @@ pub struct ContactPoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Contributor {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#type: Code,
     pub name: String,
@@ -154,7 +154,7 @@ pub struct Contributor {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Count {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub comparator: Option<Code>,
@@ -163,35 +163,9 @@ pub struct Count {
     pub code: Option<Code>,
 }
 
-/// Choice of types for the subject[x] field in DataRequirement
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum DataRequirementSubject {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "subjectCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "subjectReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DataRequirement {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub profile: Option<Vec<Canonical>>,
-    pub subject: Option<DataRequirementSubject>,
-    pub must_support: Option<Vec<String>>,
-    pub code_filter: Option<Vec<DataRequirementCodeFilter>>,
-    pub date_filter: Option<Vec<DataRequirementDateFilter>>,
-    pub limit: Option<PositiveInt>,
-    pub sort: Option<Vec<DataRequirementSort>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DataRequirementSort {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub path: String,
     pub direction: Code,
@@ -199,7 +173,7 @@ pub struct DataRequirementSort {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DataRequirementCodeFilter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub path: Option<String>,
     pub search_param: Option<String>,
@@ -224,16 +198,42 @@ pub enum DataRequirementDateFilterValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DataRequirementDateFilter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub path: Option<String>,
     pub search_param: Option<String>,
     pub value: Option<DataRequirementDateFilterValue>,
 }
 
+/// Choice of types for the subject[x] field in DataRequirement
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DataRequirementSubject {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "subjectCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "subjectReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DataRequirement {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub profile: Option<Vec<Canonical>>,
+    pub subject: Option<DataRequirementSubject>,
+    pub must_support: Option<Vec<String>>,
+    pub code_filter: Option<Vec<DataRequirementCodeFilter>>,
+    pub date_filter: Option<Vec<DataRequirementDateFilter>>,
+    pub limit: Option<PositiveInt>,
+    pub sort: Option<Vec<DataRequirementSort>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Distance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub comparator: Option<Code>,
@@ -256,7 +256,7 @@ pub enum DosageAsNeeded {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Dosage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: Option<Integer>,
@@ -303,7 +303,7 @@ pub enum DosageDoseAndRateRate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DosageDoseAndRate {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
     pub dose: Option<DosageDoseAndRateDose>,
@@ -312,13 +312,210 @@ pub struct DosageDoseAndRate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Duration {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub comparator: Option<Code>,
     pub unit: Option<String>,
     pub system: Option<Uri>,
     pub code: Option<Code>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ElementDefinitionConstraint {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub key: Id,
+    pub requirements: Option<String>,
+    pub severity: Code,
+    pub human: String,
+    pub expression: Option<String>,
+    pub xpath: Option<String>,
+    pub source: Option<Canonical>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ElementDefinitionMapping {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub identity: Id,
+    pub language: Option<Code>,
+    pub map: String,
+    pub comment: Option<String>,
+}
+
+/// Choice of types for the value[x] field in ElementDefinitionExample
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ElementDefinitionExampleValue {
+    /// Variant accepting the Base64Binary type.
+    #[serde(rename = "valueBase64Binary")]
+    Base64Binary(Base64Binary),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Canonical type.
+    #[serde(rename = "valueCanonical")]
+    Canonical(Canonical),
+    /// Variant accepting the Code type.
+    #[serde(rename = "valueCode")]
+    Code(Code),
+    /// Variant accepting the Date type.
+    #[serde(rename = "valueDate")]
+    Date(Date),
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "valueDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "valueDecimal")]
+    Decimal(Decimal),
+    /// Variant accepting the Id type.
+    #[serde(rename = "valueId")]
+    Id(Id),
+    /// Variant accepting the Instant type.
+    #[serde(rename = "valueInstant")]
+    Instant(Instant),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Markdown type.
+    #[serde(rename = "valueMarkdown")]
+    Markdown(Markdown),
+    /// Variant accepting the Oid type.
+    #[serde(rename = "valueOid")]
+    Oid(Oid),
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "valuePositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Time type.
+    #[serde(rename = "valueTime")]
+    Time(Time),
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "valueUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the Uri type.
+    #[serde(rename = "valueUri")]
+    Uri(Uri),
+    /// Variant accepting the Url type.
+    #[serde(rename = "valueUrl")]
+    Url(Url),
+    /// Variant accepting the Uuid type.
+    #[serde(rename = "valueUuid")]
+    Uuid(Uuid),
+    /// Variant accepting the Address type.
+    #[serde(rename = "valueAddress")]
+    Address(Address),
+    /// Variant accepting the Age type.
+    #[serde(rename = "valueAge")]
+    Age(Age),
+    /// Variant accepting the Annotation type.
+    #[serde(rename = "valueAnnotation")]
+    Annotation(Annotation),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "valueCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "valueCoding")]
+    Coding(Coding),
+    /// Variant accepting the ContactPoint type.
+    #[serde(rename = "valueContactPoint")]
+    ContactPoint(ContactPoint),
+    /// Variant accepting the Count type.
+    #[serde(rename = "valueCount")]
+    Count(Count),
+    /// Variant accepting the Distance type.
+    #[serde(rename = "valueDistance")]
+    Distance(Distance),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "valueDuration")]
+    Duration(Duration),
+    /// Variant accepting the HumanName type.
+    #[serde(rename = "valueHumanName")]
+    HumanName(HumanName),
+    /// Variant accepting the Identifier type.
+    #[serde(rename = "valueIdentifier")]
+    Identifier(Identifier),
+    /// Variant accepting the Money type.
+    #[serde(rename = "valueMoney")]
+    Money(Money),
+    /// Variant accepting the Period type.
+    #[serde(rename = "valuePeriod")]
+    Period(Period),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "valueRange")]
+    Range(Range),
+    /// Variant accepting the Ratio type.
+    #[serde(rename = "valueRatio")]
+    Ratio(Ratio),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+    /// Variant accepting the SampledData type.
+    #[serde(rename = "valueSampledData")]
+    SampledData(SampledData),
+    /// Variant accepting the Signature type.
+    #[serde(rename = "valueSignature")]
+    Signature(Signature),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "valueTiming")]
+    Timing(Timing),
+    /// Variant accepting the ContactDetail type.
+    #[serde(rename = "valueContactDetail")]
+    ContactDetail(ContactDetail),
+    /// Variant accepting the Contributor type.
+    #[serde(rename = "valueContributor")]
+    Contributor(Contributor),
+    /// Variant accepting the DataRequirement type.
+    #[serde(rename = "valueDataRequirement")]
+    DataRequirement(DataRequirement),
+    /// Variant accepting the Expression type.
+    #[serde(rename = "valueExpression")]
+    Expression(Expression),
+    /// Variant accepting the ParameterDefinition type.
+    #[serde(rename = "valueParameterDefinition")]
+    ParameterDefinition(ParameterDefinition),
+    /// Variant accepting the RelatedArtifact type.
+    #[serde(rename = "valueRelatedArtifact")]
+    RelatedArtifact(RelatedArtifact),
+    /// Variant accepting the TriggerDefinition type.
+    #[serde(rename = "valueTriggerDefinition")]
+    TriggerDefinition(TriggerDefinition),
+    /// Variant accepting the UsageContext type.
+    #[serde(rename = "valueUsageContext")]
+    UsageContext(UsageContext),
+    /// Variant accepting the Dosage type.
+    #[serde(rename = "valueDosage")]
+    Dosage(Dosage),
+    /// Variant accepting the Meta type.
+    #[serde(rename = "valueMeta")]
+    Meta(Meta),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ElementDefinitionExample {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub label: String,
+    pub value: Option<ElementDefinitionExampleValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ElementDefinitionSlicing {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
+    pub description: Option<String>,
+    pub ordered: Option<Boolean>,
+    pub rules: Code,
 }
 
 /// Choice of types for the defaultValue[x] field in ElementDefinition
@@ -857,7 +1054,7 @@ pub enum ElementDefinitionMaxValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ElementDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub path: String,
@@ -897,31 +1094,34 @@ pub struct ElementDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionSlicing {
-    pub id: Option<std::string::String>,
+pub struct ElementDefinitionSlicingDiscriminator {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
-    pub discriminator: Option<Vec<ElementDefinitionSlicingDiscriminator>>,
-    pub description: Option<String>,
-    pub ordered: Option<Boolean>,
-    pub rules: Code,
+    pub r#type: Code,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionConstraint {
-    pub id: Option<std::string::String>,
+pub struct ElementDefinitionBase {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
-    pub key: Id,
-    pub requirements: Option<String>,
-    pub severity: Code,
-    pub human: String,
-    pub expression: Option<String>,
-    pub xpath: Option<String>,
-    pub source: Option<Canonical>,
+    pub path: String,
+    pub min: UnsignedInt,
+    pub max: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ElementDefinitionBinding {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub strength: Code,
+    pub description: Option<String>,
+    pub value_set: Option<Canonical>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ElementDefinitionType {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub code: Uri,
     pub profile: Option<Vec<Canonical>>,
@@ -931,208 +1131,8 @@ pub struct ElementDefinitionType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionSlicingDiscriminator {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionMapping {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub identity: Id,
-    pub language: Option<Code>,
-    pub map: String,
-    pub comment: Option<String>,
-}
-
-/// Choice of types for the value[x] field in ElementDefinitionExample
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ElementDefinitionExampleValue {
-    /// Variant accepting the Base64Binary type.
-    #[serde(rename = "valueBase64Binary")]
-    Base64Binary(Base64Binary),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Canonical type.
-    #[serde(rename = "valueCanonical")]
-    Canonical(Canonical),
-    /// Variant accepting the Code type.
-    #[serde(rename = "valueCode")]
-    Code(Code),
-    /// Variant accepting the Date type.
-    #[serde(rename = "valueDate")]
-    Date(Date),
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "valueDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "valueDecimal")]
-    Decimal(Decimal),
-    /// Variant accepting the Id type.
-    #[serde(rename = "valueId")]
-    Id(Id),
-    /// Variant accepting the Instant type.
-    #[serde(rename = "valueInstant")]
-    Instant(Instant),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Markdown type.
-    #[serde(rename = "valueMarkdown")]
-    Markdown(Markdown),
-    /// Variant accepting the Oid type.
-    #[serde(rename = "valueOid")]
-    Oid(Oid),
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "valuePositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Time type.
-    #[serde(rename = "valueTime")]
-    Time(Time),
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "valueUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the Uri type.
-    #[serde(rename = "valueUri")]
-    Uri(Uri),
-    /// Variant accepting the Url type.
-    #[serde(rename = "valueUrl")]
-    Url(Url),
-    /// Variant accepting the Uuid type.
-    #[serde(rename = "valueUuid")]
-    Uuid(Uuid),
-    /// Variant accepting the Address type.
-    #[serde(rename = "valueAddress")]
-    Address(Address),
-    /// Variant accepting the Age type.
-    #[serde(rename = "valueAge")]
-    Age(Age),
-    /// Variant accepting the Annotation type.
-    #[serde(rename = "valueAnnotation")]
-    Annotation(Annotation),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "valueCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "valueCoding")]
-    Coding(Coding),
-    /// Variant accepting the ContactPoint type.
-    #[serde(rename = "valueContactPoint")]
-    ContactPoint(ContactPoint),
-    /// Variant accepting the Count type.
-    #[serde(rename = "valueCount")]
-    Count(Count),
-    /// Variant accepting the Distance type.
-    #[serde(rename = "valueDistance")]
-    Distance(Distance),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "valueDuration")]
-    Duration(Duration),
-    /// Variant accepting the HumanName type.
-    #[serde(rename = "valueHumanName")]
-    HumanName(HumanName),
-    /// Variant accepting the Identifier type.
-    #[serde(rename = "valueIdentifier")]
-    Identifier(Identifier),
-    /// Variant accepting the Money type.
-    #[serde(rename = "valueMoney")]
-    Money(Money),
-    /// Variant accepting the Period type.
-    #[serde(rename = "valuePeriod")]
-    Period(Period),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "valueRange")]
-    Range(Range),
-    /// Variant accepting the Ratio type.
-    #[serde(rename = "valueRatio")]
-    Ratio(Ratio),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-    /// Variant accepting the SampledData type.
-    #[serde(rename = "valueSampledData")]
-    SampledData(SampledData),
-    /// Variant accepting the Signature type.
-    #[serde(rename = "valueSignature")]
-    Signature(Signature),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "valueTiming")]
-    Timing(Timing),
-    /// Variant accepting the ContactDetail type.
-    #[serde(rename = "valueContactDetail")]
-    ContactDetail(ContactDetail),
-    /// Variant accepting the Contributor type.
-    #[serde(rename = "valueContributor")]
-    Contributor(Contributor),
-    /// Variant accepting the DataRequirement type.
-    #[serde(rename = "valueDataRequirement")]
-    DataRequirement(DataRequirement),
-    /// Variant accepting the Expression type.
-    #[serde(rename = "valueExpression")]
-    Expression(Expression),
-    /// Variant accepting the ParameterDefinition type.
-    #[serde(rename = "valueParameterDefinition")]
-    ParameterDefinition(ParameterDefinition),
-    /// Variant accepting the RelatedArtifact type.
-    #[serde(rename = "valueRelatedArtifact")]
-    RelatedArtifact(RelatedArtifact),
-    /// Variant accepting the TriggerDefinition type.
-    #[serde(rename = "valueTriggerDefinition")]
-    TriggerDefinition(TriggerDefinition),
-    /// Variant accepting the UsageContext type.
-    #[serde(rename = "valueUsageContext")]
-    UsageContext(UsageContext),
-    /// Variant accepting the Dosage type.
-    #[serde(rename = "valueDosage")]
-    Dosage(Dosage),
-    /// Variant accepting the Meta type.
-    #[serde(rename = "valueMeta")]
-    Meta(Meta),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionExample {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub label: String,
-    pub value: Option<ElementDefinitionExampleValue>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionBinding {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    pub description: Option<String>,
-    pub value_set: Option<Canonical>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ElementDefinitionBase {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub path: String,
-    pub min: UnsignedInt,
-    pub max: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Expression {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub description: Option<String>,
     pub name: Option<Id>,
@@ -1299,15 +1299,15 @@ pub enum ExtensionValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Extension {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
-    pub url: std::string::String,
+    pub url: String,
     pub value: Option<ExtensionValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct HumanName {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#use: Option<Code>,
     pub text: Option<String>,
@@ -1320,7 +1320,7 @@ pub struct HumanName {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Identifier {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#use: Option<Code>,
     pub r#type: Option<CodeableConcept>,
@@ -1332,7 +1332,7 @@ pub struct Identifier {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MarketingStatus {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub country: CodeableConcept,
@@ -1344,7 +1344,7 @@ pub struct MarketingStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Meta {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub version_id: Option<Id>,
     pub last_updated: Option<Instant>,
@@ -1356,7 +1356,7 @@ pub struct Meta {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Money {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub currency: Option<Code>,
@@ -1364,7 +1364,7 @@ pub struct Money {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Narrative {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub status: Code,
     pub div: Xhtml,
@@ -1372,7 +1372,7 @@ pub struct Narrative {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ParameterDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub name: Option<Code>,
     pub r#use: Code,
@@ -1385,7 +1385,7 @@ pub struct ParameterDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Period {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub start: Option<DateTime>,
     pub end: Option<DateTime>,
@@ -1405,7 +1405,7 @@ pub enum PopulationAge {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Population {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub age: Option<PopulationAge>,
@@ -1416,7 +1416,7 @@ pub struct Population {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ProdCharacteristic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub height: Option<Quantity>,
@@ -1434,7 +1434,7 @@ pub struct ProdCharacteristic {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ProductShelfLife {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Identifier>,
@@ -1445,7 +1445,7 @@ pub struct ProductShelfLife {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Quantity {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub value: Option<Decimal>,
     pub comparator: Option<Code>,
@@ -1456,7 +1456,7 @@ pub struct Quantity {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Range {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub low: Option<Quantity>,
     pub high: Option<Quantity>,
@@ -1464,7 +1464,7 @@ pub struct Range {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Ratio {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub numerator: Option<Quantity>,
     pub denominator: Option<Quantity>,
@@ -1472,7 +1472,7 @@ pub struct Ratio {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Reference {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub reference: Option<String>,
     pub r#type: Option<Uri>,
@@ -1482,7 +1482,7 @@ pub struct Reference {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RelatedArtifact {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#type: Code,
     pub label: Option<String>,
@@ -1495,7 +1495,7 @@ pub struct RelatedArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SampledData {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub origin: Quantity,
     pub period: Decimal,
@@ -1508,7 +1508,7 @@ pub struct SampledData {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Signature {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#type: Option<Vec<Coding>>,
     pub when: Instant,
@@ -1517,6 +1517,14 @@ pub struct Signature {
     pub target_format: Option<Code>,
     pub sig_format: Option<Code>,
     pub data: Option<Base64Binary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceAmountReferenceRange {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub low_limit: Option<Quantity>,
+    pub high_limit: Option<Quantity>,
 }
 
 /// Choice of types for the amount[x] field in SubstanceAmount
@@ -1536,7 +1544,7 @@ pub enum SubstanceAmountAmount {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceAmount {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub amount: Option<SubstanceAmountAmount>,
@@ -1546,16 +1554,8 @@ pub struct SubstanceAmount {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceAmountReferenceRange {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub low_limit: Option<Quantity>,
-    pub high_limit: Option<Quantity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Timing {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub event: Option<Vec<DateTime>>,
@@ -1580,7 +1580,7 @@ pub enum TimingRepeatBounds {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TimingRepeat {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub bounds: Option<TimingRepeatBounds>,
     pub count: Option<PositiveInt>,
@@ -1619,7 +1619,7 @@ pub enum TriggerDefinitionTiming {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TriggerDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub r#type: Code,
     pub name: Option<String>,
@@ -1648,34 +1648,15 @@ pub enum UsageContextValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct UsageContext {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub code: Coding,
     pub value: Option<UsageContextValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AccountGuarantor {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub party: Reference,
-    pub on_hold: Option<Boolean>,
-    pub period: Option<Period>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AccountCoverage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub coverage: Reference,
-    pub priority: Option<PositiveInt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Account {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -1697,21 +1678,31 @@ pub struct Account {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct AccountCoverage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub coverage: Reference,
+    pub priority: Option<PositiveInt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct AccountGuarantor {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub party: Reference,
+    pub on_hold: Option<Boolean>,
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ActivityDefinitionDynamicValue {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub path: String,
     pub expression: Expression,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ActivityDefinitionParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub role: Option<CodeableConcept>,
 }
 
 /// Choice of types for the subject[x] field in ActivityDefinition
@@ -1764,7 +1755,7 @@ pub enum ActivityDefinitionProduct {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ActivityDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -1821,8 +1812,37 @@ pub struct ActivityDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ActivityDefinitionParticipant {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub role: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct AdverseEventSuspectEntityCausality {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub assessment: Option<CodeableConcept>,
+    pub product_relatedness: Option<String>,
+    pub author: Option<Reference>,
+    pub method: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct AdverseEventSuspectEntity {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub instance: Reference,
+    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AdverseEvent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -1852,40 +1872,6 @@ pub struct AdverseEvent {
     pub study: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AdverseEventSuspectEntity {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub instance: Reference,
-    pub causality: Option<Vec<AdverseEventSuspectEntityCausality>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AdverseEventSuspectEntityCausality {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub assessment: Option<CodeableConcept>,
-    pub product_relatedness: Option<String>,
-    pub author: Option<Reference>,
-    pub method: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AllergyIntoleranceReaction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub substance: Option<CodeableConcept>,
-    pub manifestation: Option<Vec<CodeableConcept>>,
-    pub description: Option<String>,
-    pub onset: Option<DateTime>,
-    pub severity: Option<Code>,
-    pub exposure_route: Option<CodeableConcept>,
-    pub note: Option<Vec<Annotation>>,
-}
-
 /// Choice of types for the onset[x] field in AllergyIntolerance
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1909,7 +1895,7 @@ pub enum AllergyIntoleranceOnset {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AllergyIntolerance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -1936,8 +1922,22 @@ pub struct AllergyIntolerance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct AllergyIntoleranceReaction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub substance: Option<CodeableConcept>,
+    pub manifestation: Option<Vec<CodeableConcept>>,
+    pub description: Option<String>,
+    pub onset: Option<DateTime>,
+    pub severity: Option<Code>,
+    pub exposure_route: Option<CodeableConcept>,
+    pub note: Option<Vec<Annotation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AppointmentParticipant {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Vec<CodeableConcept>>,
@@ -1949,7 +1949,7 @@ pub struct AppointmentParticipant {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Appointment {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -1983,7 +1983,7 @@ pub struct Appointment {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AppointmentResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2003,7 +2003,7 @@ pub struct AppointmentResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AuditEventEntity {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub what: Option<Reference>,
@@ -2017,19 +2017,30 @@ pub struct AuditEventEntity {
     pub detail: Option<Vec<AuditEventEntityDetail>>,
 }
 
+/// Choice of types for the value[x] field in AuditEventEntityDetail
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AuditEventEntityDetailValue {
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Base64Binary type.
+    #[serde(rename = "valueBase64Binary")]
+    Base64Binary(Base64Binary),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AuditEventSource {
-    pub id: Option<std::string::String>,
+pub struct AuditEventEntityDetail {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub site: Option<String>,
-    pub observer: Reference,
-    pub r#type: Option<Vec<Coding>>,
+    pub r#type: String,
+    pub value: Option<AuditEventEntityDetailValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AuditEventAgent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -2047,7 +2058,7 @@ pub struct AuditEventAgent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AuditEvent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2068,30 +2079,19 @@ pub struct AuditEvent {
     pub entity: Option<Vec<AuditEventEntity>>,
 }
 
-/// Choice of types for the value[x] field in AuditEventEntityDetail
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum AuditEventEntityDetailValue {
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Base64Binary type.
-    #[serde(rename = "valueBase64Binary")]
-    Base64Binary(Base64Binary),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct AuditEventEntityDetail {
-    pub id: Option<std::string::String>,
+pub struct AuditEventSource {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: String,
-    pub value: Option<AuditEventEntityDetailValue>,
+    pub site: Option<String>,
+    pub observer: Reference,
+    pub r#type: Option<Vec<Coding>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct AuditEventAgentNetwork {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub address: Option<String>,
@@ -2100,7 +2100,7 @@ pub struct AuditEventAgentNetwork {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Basic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2117,7 +2117,7 @@ pub struct Basic {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Binary {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2126,27 +2126,27 @@ pub struct Binary {
     pub data: Option<Base64Binary>,
 }
 
+/// Choice of types for the time[x] field in BiologicallyDerivedProductProcessing
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BiologicallyDerivedProductProcessingTime {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timeDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timePeriod")]
+    Period(Period),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BiologicallyDerivedProduct {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
+pub struct BiologicallyDerivedProductProcessing {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub product_category: Option<Code>,
-    pub product_code: Option<CodeableConcept>,
-    pub status: Option<Code>,
-    pub request: Option<Vec<Reference>>,
-    pub quantity: Option<Integer>,
-    pub parent: Option<Vec<Reference>>,
-    pub collection: Option<BiologicallyDerivedProductCollection>,
-    pub processing: Option<Vec<BiologicallyDerivedProductProcessing>>,
-    pub manipulation: Option<BiologicallyDerivedProductManipulation>,
-    pub storage: Option<Vec<BiologicallyDerivedProductStorage>>,
+    pub description: Option<String>,
+    pub procedure: Option<CodeableConcept>,
+    pub additive: Option<Reference>,
+    pub time: Option<BiologicallyDerivedProductProcessingTime>,
 }
 
 /// Choice of types for the collected[x] field in BiologicallyDerivedProductCollection
@@ -2163,7 +2163,7 @@ pub enum BiologicallyDerivedProductCollectionCollected {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct BiologicallyDerivedProductCollection {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub collector: Option<Reference>,
@@ -2185,39 +2185,39 @@ pub enum BiologicallyDerivedProductManipulationTime {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct BiologicallyDerivedProductManipulation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: Option<String>,
     pub time: Option<BiologicallyDerivedProductManipulationTime>,
 }
 
-/// Choice of types for the time[x] field in BiologicallyDerivedProductProcessing
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum BiologicallyDerivedProductProcessingTime {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timeDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timePeriod")]
-    Period(Period),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BiologicallyDerivedProductProcessing {
-    pub id: Option<std::string::String>,
+pub struct BiologicallyDerivedProduct {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub procedure: Option<CodeableConcept>,
-    pub additive: Option<Reference>,
-    pub time: Option<BiologicallyDerivedProductProcessingTime>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub product_category: Option<Code>,
+    pub product_code: Option<CodeableConcept>,
+    pub status: Option<Code>,
+    pub request: Option<Vec<Reference>>,
+    pub quantity: Option<Integer>,
+    pub parent: Option<Vec<Reference>>,
+    pub collection: Option<BiologicallyDerivedProductCollection>,
+    pub processing: Option<Vec<BiologicallyDerivedProductProcessing>>,
+    pub manipulation: Option<BiologicallyDerivedProductManipulation>,
+    pub storage: Option<Vec<BiologicallyDerivedProductStorage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct BiologicallyDerivedProductStorage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: Option<String>,
@@ -2228,7 +2228,7 @@ pub struct BiologicallyDerivedProductStorage {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct BodyStructure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2247,29 +2247,8 @@ pub struct BodyStructure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BundleLink {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub relation: String,
-    pub url: Uri,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BundleEntryResponse {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: String,
-    pub location: Option<Uri>,
-    pub etag: Option<String>,
-    pub last_modified: Option<Instant>,
-    pub outcome: Option<Resource>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Bundle {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2283,30 +2262,8 @@ pub struct Bundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BundleEntrySearch {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Option<Code>,
-    pub score: Option<Decimal>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct BundleEntryRequest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub method: Code,
-    pub url: Uri,
-    pub if_none_match: Option<String>,
-    pub if_modified_since: Option<Instant>,
-    pub if_match: Option<String>,
-    pub if_none_exist: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct BundleEntry {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub link: Option<Vec<BundleLink>>,
@@ -2318,125 +2275,51 @@ pub struct BundleEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementRest {
-    pub id: Option<std::string::String>,
+pub struct BundleLink {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub documentation: Option<Markdown>,
-    pub security: Option<CapabilityStatementRestSecurity>,
-    pub resource: Option<Vec<CapabilityStatementRestResource>>,
-    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
-    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
-    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
-    pub compartment: Option<Vec<Canonical>>,
+    pub relation: String,
+    pub url: Uri,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementMessagingEndpoint {
-    pub id: Option<std::string::String>,
+pub struct BundleEntryRequest {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub protocol: Coding,
-    pub address: Url,
+    pub method: Code,
+    pub url: Uri,
+    pub if_none_match: Option<String>,
+    pub if_modified_since: Option<Instant>,
+    pub if_match: Option<String>,
+    pub if_none_exist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementRestResourceInteraction {
-    pub id: Option<std::string::String>,
+pub struct BundleEntrySearch {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub documentation: Option<Markdown>,
+    pub mode: Option<Code>,
+    pub score: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementRestSecurity {
-    pub id: Option<std::string::String>,
+pub struct BundleEntryResponse {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub cors: Option<Boolean>,
-    pub service: Option<Vec<CodeableConcept>>,
-    pub description: Option<Markdown>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementRestResource {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub profile: Option<Canonical>,
-    pub supported_profile: Option<Vec<Canonical>>,
-    pub documentation: Option<Markdown>,
-    pub interaction: Option<Vec<CapabilityStatementRestResourceInteraction>>,
-    pub versioning: Option<Code>,
-    pub read_history: Option<Boolean>,
-    pub update_create: Option<Boolean>,
-    pub conditional_create: Option<Boolean>,
-    pub conditional_read: Option<Code>,
-    pub conditional_update: Option<Boolean>,
-    pub conditional_delete: Option<Code>,
-    pub reference_policy: Option<Vec<Code>>,
-    pub search_include: Option<Vec<String>>,
-    pub search_rev_include: Option<Vec<String>>,
-    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
-    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementRestResourceSearchParam {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub definition: Option<Canonical>,
-    pub r#type: Code,
-    pub documentation: Option<Markdown>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementMessagingSupportedMessage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub definition: Canonical,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementDocument {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub documentation: Option<Markdown>,
-    pub profile: Canonical,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementSoftware {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub version: Option<String>,
-    pub release_date: Option<DateTime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementImplementation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub url: Option<Url>,
-    pub custodian: Option<Reference>,
+    pub status: String,
+    pub location: Option<Uri>,
+    pub etag: Option<String>,
+    pub last_modified: Option<Instant>,
+    pub outcome: Option<Resource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CapabilityStatementRestResourceOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
@@ -2446,7 +2329,7 @@ pub struct CapabilityStatementRestResourceOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CapabilityStatementRestInteraction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
@@ -2454,19 +2337,8 @@ pub struct CapabilityStatementRestInteraction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CapabilityStatementMessaging {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub endpoint: Option<Vec<CapabilityStatementMessagingEndpoint>>,
-    pub reliable_cache: Option<UnsignedInt>,
-    pub documentation: Option<Markdown>,
-    pub supported_message: Option<Vec<CapabilityStatementMessagingSupportedMessage>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CapabilityStatement {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2503,20 +2375,187 @@ pub struct CapabilityStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CarePlanActivity {
-    pub id: Option<std::string::String>,
+pub struct CapabilityStatementMessagingEndpoint {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub outcome_codeable_concept: Option<Vec<CodeableConcept>>,
-    pub outcome_reference: Option<Vec<Reference>>,
-    pub progress: Option<Vec<Annotation>>,
-    pub reference: Option<Reference>,
-    pub detail: Option<CarePlanActivityDetail>,
+    pub protocol: Coding,
+    pub address: Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementRestSecurity {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub cors: Option<Boolean>,
+    pub service: Option<Vec<CodeableConcept>>,
+    pub description: Option<Markdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementImplementation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: String,
+    pub url: Option<Url>,
+    pub custodian: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementRest {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub documentation: Option<Markdown>,
+    pub security: Option<CapabilityStatementRestSecurity>,
+    pub resource: Option<Vec<CapabilityStatementRestResource>>,
+    pub interaction: Option<Vec<CapabilityStatementRestInteraction>>,
+    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
+    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
+    pub compartment: Option<Vec<Canonical>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementSoftware {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub version: Option<String>,
+    pub release_date: Option<DateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementRestResourceSearchParam {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub definition: Option<Canonical>,
+    pub r#type: Code,
+    pub documentation: Option<Markdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementMessaging {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub endpoint: Option<Vec<CapabilityStatementMessagingEndpoint>>,
+    pub reliable_cache: Option<UnsignedInt>,
+    pub documentation: Option<Markdown>,
+    pub supported_message: Option<Vec<CapabilityStatementMessagingSupportedMessage>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementMessagingSupportedMessage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub definition: Canonical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementDocument {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub documentation: Option<Markdown>,
+    pub profile: Canonical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementRestResource {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub profile: Option<Canonical>,
+    pub supported_profile: Option<Vec<Canonical>>,
+    pub documentation: Option<Markdown>,
+    pub interaction: Option<Vec<CapabilityStatementRestResourceInteraction>>,
+    pub versioning: Option<Code>,
+    pub read_history: Option<Boolean>,
+    pub update_create: Option<Boolean>,
+    pub conditional_create: Option<Boolean>,
+    pub conditional_read: Option<Code>,
+    pub conditional_update: Option<Boolean>,
+    pub conditional_delete: Option<Code>,
+    pub reference_policy: Option<Vec<Code>>,
+    pub search_include: Option<Vec<String>>,
+    pub search_rev_include: Option<Vec<String>>,
+    pub search_param: Option<Vec<CapabilityStatementRestResourceSearchParam>>,
+    pub operation: Option<Vec<CapabilityStatementRestResourceOperation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CapabilityStatementRestResourceInteraction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub documentation: Option<Markdown>,
+}
+
+/// Choice of types for the scheduled[x] field in CarePlanActivityDetail
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CarePlanActivityDetailScheduled {
+    /// Variant accepting the Timing type.
+    #[serde(rename = "scheduledTiming")]
+    Timing(Timing),
+    /// Variant accepting the Period type.
+    #[serde(rename = "scheduledPeriod")]
+    Period(Period),
+    /// Variant accepting the String type.
+    #[serde(rename = "scheduledString")]
+    String(String),
+}
+
+/// Choice of types for the product[x] field in CarePlanActivityDetail
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CarePlanActivityDetailProduct {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "productCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "productReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CarePlanActivityDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub kind: Option<Code>,
+    pub instantiates_canonical: Option<Vec<Canonical>>,
+    pub instantiates_uri: Option<Vec<Uri>>,
+    pub code: Option<CodeableConcept>,
+    pub reason_code: Option<Vec<CodeableConcept>>,
+    pub reason_reference: Option<Vec<Reference>>,
+    pub goal: Option<Vec<Reference>>,
+    pub status: Code,
+    pub status_reason: Option<CodeableConcept>,
+    pub do_not_perform: Option<Boolean>,
+    pub scheduled: Option<CarePlanActivityDetailScheduled>,
+    pub location: Option<Reference>,
+    pub performer: Option<Vec<Reference>>,
+    pub product: Option<CarePlanActivityDetailProduct>,
+    pub daily_amount: Option<Quantity>,
+    pub quantity: Option<Quantity>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CarePlan {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2549,60 +2588,21 @@ pub struct CarePlan {
     pub note: Option<Vec<Annotation>>,
 }
 
-/// Choice of types for the scheduled[x] field in CarePlanActivityDetail
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CarePlanActivityDetailScheduled {
-    /// Variant accepting the Timing type.
-    #[serde(rename = "scheduledTiming")]
-    Timing(Timing),
-    /// Variant accepting the Period type.
-    #[serde(rename = "scheduledPeriod")]
-    Period(Period),
-    /// Variant accepting the String type.
-    #[serde(rename = "scheduledString")]
-    String(String),
-}
-
-/// Choice of types for the product[x] field in CarePlanActivityDetail
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CarePlanActivityDetailProduct {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "productCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "productReference")]
-    Reference(Reference),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CarePlanActivityDetail {
-    pub id: Option<std::string::String>,
+pub struct CarePlanActivity {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub kind: Option<Code>,
-    pub instantiates_canonical: Option<Vec<Canonical>>,
-    pub instantiates_uri: Option<Vec<Uri>>,
-    pub code: Option<CodeableConcept>,
-    pub reason_code: Option<Vec<CodeableConcept>>,
-    pub reason_reference: Option<Vec<Reference>>,
-    pub goal: Option<Vec<Reference>>,
-    pub status: Code,
-    pub status_reason: Option<CodeableConcept>,
-    pub do_not_perform: Option<Boolean>,
-    pub scheduled: Option<CarePlanActivityDetailScheduled>,
-    pub location: Option<Reference>,
-    pub performer: Option<Vec<Reference>>,
-    pub product: Option<CarePlanActivityDetailProduct>,
-    pub daily_amount: Option<Quantity>,
-    pub quantity: Option<Quantity>,
-    pub description: Option<String>,
+    pub outcome_codeable_concept: Option<Vec<CodeableConcept>>,
+    pub outcome_reference: Option<Vec<Reference>>,
+    pub progress: Option<Vec<Annotation>>,
+    pub reference: Option<Reference>,
+    pub detail: Option<CarePlanActivityDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CareTeamParticipant {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub role: Option<Vec<CodeableConcept>>,
@@ -2613,7 +2613,7 @@ pub struct CareTeamParticipant {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CareTeam {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2637,8 +2637,17 @@ pub struct CareTeam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CatalogEntryRelatedEntry {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub relationtype: Code,
+    pub item: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CatalogEntry {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2662,17 +2671,8 @@ pub struct CatalogEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CatalogEntryRelatedEntry {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub relationtype: Code,
-    pub item: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ChargeItemPerformer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub function: Option<CodeableConcept>,
@@ -2708,7 +2708,7 @@ pub enum ChargeItemProduct {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ChargeItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2745,18 +2745,8 @@ pub struct ChargeItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ChargeItemDefinitionApplicability {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub language: Option<String>,
-    pub expression: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ChargeItemDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -2791,7 +2781,7 @@ pub struct ChargeItemDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ChargeItemDefinitionPropertyGroupPriceComponent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -2801,197 +2791,22 @@ pub struct ChargeItemDefinitionPropertyGroupPriceComponent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ChargeItemDefinitionApplicability {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    pub language: Option<String>,
+    pub expression: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ChargeItemDefinitionPropertyGroup {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub applicability: Option<Vec<ChargeItemDefinitionApplicability>>,
     pub price_component: Option<Vec<ChargeItemDefinitionPropertyGroupPriceComponent>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimCareTeam {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub provider: Reference,
-    pub responsible: Option<Boolean>,
-    pub role: Option<CodeableConcept>,
-    pub qualification: Option<CodeableConcept>,
-}
-
-/// Choice of types for the timing[x] field in ClaimSupportingInfo
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimSupportingInfoTiming {
-    /// Variant accepting the Date type.
-    #[serde(rename = "timingDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timingPeriod")]
-    Period(Period),
-}
-
-/// Choice of types for the value[x] field in ClaimSupportingInfo
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimSupportingInfoValue {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimSupportingInfo {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub category: CodeableConcept,
-    pub code: Option<CodeableConcept>,
-    pub timing: Option<ClaimSupportingInfoTiming>,
-    pub value: Option<ClaimSupportingInfoValue>,
-    pub reason: Option<CodeableConcept>,
-}
-
-/// Choice of types for the diagnosis[x] field in ClaimDiagnosis
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimDiagnosisDiagnosis {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "diagnosisCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "diagnosisReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimDiagnosis {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub diagnosis: Option<ClaimDiagnosisDiagnosis>,
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub on_admission: Option<CodeableConcept>,
-    pub package_code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimRelated {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub claim: Option<Reference>,
-    pub relationship: Option<CodeableConcept>,
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub focal: Boolean,
-    pub identifier: Option<Identifier>,
-    pub coverage: Reference,
-    pub business_arrangement: Option<String>,
-    pub pre_auth_ref: Option<Vec<String>>,
-    pub claim_response: Option<Reference>,
-}
-
-/// Choice of types for the location[x] field in ClaimAccident
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ClaimAccidentLocation {
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimAccident {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub date: Date,
-    pub r#type: Option<CodeableConcept>,
-    pub location: Option<ClaimAccidentLocation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Claim {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub status: Code,
-    pub r#type: CodeableConcept,
-    pub sub_type: Option<CodeableConcept>,
-    pub r#use: Code,
-    pub patient: Reference,
-    pub billable_period: Option<Period>,
-    pub created: DateTime,
-    pub enterer: Option<Reference>,
-    pub insurer: Option<Reference>,
-    pub provider: Reference,
-    pub priority: CodeableConcept,
-    pub funds_reserve: Option<CodeableConcept>,
-    pub related: Option<Vec<ClaimRelated>>,
-    pub prescription: Option<Reference>,
-    pub original_prescription: Option<Reference>,
-    pub payee: Option<ClaimPayee>,
-    pub referral: Option<Reference>,
-    pub facility: Option<Reference>,
-    pub care_team: Option<Vec<ClaimCareTeam>>,
-    pub supporting_info: Option<Vec<ClaimSupportingInfo>>,
-    pub diagnosis: Option<Vec<ClaimDiagnosis>>,
-    pub procedure: Option<Vec<ClaimProcedure>>,
-    pub insurance: Option<Vec<ClaimInsurance>>,
-    pub accident: Option<ClaimAccident>,
-    pub item: Option<Vec<ClaimItem>>,
-    pub total: Option<Money>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
 }
 
 /// Choice of types for the procedure[x] field in ClaimProcedure
@@ -3008,7 +2823,7 @@ pub enum ClaimProcedureProcedure {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimProcedure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
@@ -3047,7 +2862,7 @@ pub enum ClaimItemLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
@@ -3073,9 +2888,55 @@ pub struct ClaimItem {
     pub detail: Option<Vec<ClaimItemDetail>>,
 }
 
+/// Choice of types for the diagnosis[x] field in ClaimDiagnosis
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimDiagnosisDiagnosis {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "diagnosisCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "diagnosisReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimDiagnosis {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub diagnosis: Option<ClaimDiagnosisDiagnosis>,
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub on_admission: Option<CodeableConcept>,
+    pub package_code: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimCareTeam {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    pub responsible: Option<Boolean>,
+    pub role: Option<CodeableConcept>,
+    pub qualification: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimRelated {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub claim: Option<Reference>,
+    pub relationship: Option<CodeableConcept>,
+    pub reference: Option<Identifier>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimItemDetail {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
@@ -3094,16 +2955,166 @@ pub struct ClaimItemDetail {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimPayee {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
     pub party: Option<Reference>,
 }
 
+/// Choice of types for the timing[x] field in ClaimSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimSupportingInfoTiming {
+    /// Variant accepting the Date type.
+    #[serde(rename = "timingDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timingPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the value[x] field in ClaimSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimSupportingInfoValue {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimSupportingInfo {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub category: CodeableConcept,
+    pub code: Option<CodeableConcept>,
+    pub timing: Option<ClaimSupportingInfoTiming>,
+    pub value: Option<ClaimSupportingInfoValue>,
+    pub reason: Option<CodeableConcept>,
+}
+
+/// Choice of types for the location[x] field in ClaimAccident
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimAccidentLocation {
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "locationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimAccident {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub date: Date,
+    pub r#type: Option<CodeableConcept>,
+    pub location: Option<ClaimAccidentLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct Claim {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub status: Code,
+    pub r#type: CodeableConcept,
+    pub sub_type: Option<CodeableConcept>,
+    pub r#use: Code,
+    pub patient: Reference,
+    pub billable_period: Option<Period>,
+    pub created: DateTime,
+    pub enterer: Option<Reference>,
+    pub insurer: Option<Reference>,
+    pub provider: Reference,
+    pub priority: CodeableConcept,
+    pub funds_reserve: Option<CodeableConcept>,
+    pub related: Option<Vec<ClaimRelated>>,
+    pub prescription: Option<Reference>,
+    pub original_prescription: Option<Reference>,
+    pub payee: Option<ClaimPayee>,
+    pub referral: Option<Reference>,
+    pub facility: Option<Reference>,
+    pub care_team: Option<Vec<ClaimCareTeam>>,
+    pub supporting_info: Option<Vec<ClaimSupportingInfo>>,
+    pub diagnosis: Option<Vec<ClaimDiagnosis>>,
+    pub procedure: Option<Vec<ClaimProcedure>>,
+    pub insurance: Option<Vec<ClaimInsurance>>,
+    pub accident: Option<ClaimAccident>,
+    pub item: Option<Vec<ClaimItem>>,
+    pub total: Option<Money>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimItemDetailSubDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub program_code: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimInsurance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub focal: Boolean,
+    pub identifier: Option<Identifier>,
+    pub coverage: Reference,
+    pub business_arrangement: Option<String>,
+    pub pre_auth_ref: Option<Vec<String>>,
+    pub claim_response: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseItemDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub detail_sequence: PositiveInt,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+    pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3169,7 +3180,7 @@ pub enum ClaimResponseAddItemLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimResponseAddItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub item_sequence: Option<Vec<PositiveInt>>,
@@ -3193,87 +3204,8 @@ pub struct ClaimResponseAddItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    pub business_arrangement: Option<String>,
-    pub claim_response: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseError {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub item_sequence: Option<PositiveInt>,
-    pub detail_sequence: Option<PositiveInt>,
-    pub sub_detail_sequence: Option<PositiveInt>,
-    pub code: CodeableConcept,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseAddItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseTotal {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub amount: Money,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sub_detail_sequence: PositiveInt,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseItemDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub detail_sequence: PositiveInt,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
-    pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponseProcessNote {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub number: Option<PositiveInt>,
-    pub r#type: Option<Code>,
-    pub text: String,
-    pub language: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimResponseItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub item_sequence: PositiveInt,
@@ -3283,21 +3215,8 @@ pub struct ClaimResponseItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClaimResponsePayment {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub adjustment: Option<Money>,
-    pub adjustment_reason: Option<CodeableConcept>,
-    pub date: Option<Date>,
-    pub amount: Money,
-    pub identifier: Option<Identifier>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimResponseAddItemDetail {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub product_or_service: CodeableConcept,
@@ -3312,8 +3231,77 @@ pub struct ClaimResponseAddItemDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseTotal {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub amount: Money,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseAddItemDetailSubDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponsePayment {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub adjustment: Option<Money>,
+    pub adjustment_reason: Option<CodeableConcept>,
+    pub date: Option<Date>,
+    pub amount: Money,
+    pub identifier: Option<Identifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseProcessNote {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number: Option<PositiveInt>,
+    pub r#type: Option<Code>,
+    pub text: String,
+    pub language: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseItemDetailSubDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sub_detail_sequence: PositiveInt,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ClaimResponseItemAdjudication>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseError {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub item_sequence: Option<PositiveInt>,
+    pub detail_sequence: Option<PositiveInt>,
+    pub sub_detail_sequence: Option<PositiveInt>,
+    pub code: CodeableConcept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClaimResponseItemAdjudication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub category: CodeableConcept,
@@ -3323,8 +3311,29 @@ pub struct ClaimResponseItemAdjudication {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClaimResponseInsurance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    pub business_arrangement: Option<String>,
+    pub claim_response: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ClinicalImpressionInvestigation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub item: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClinicalImpressionFinding {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub item_codeable_concept: Option<CodeableConcept>,
@@ -3346,7 +3355,7 @@ pub enum ClinicalImpressionEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ClinicalImpression {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3376,18 +3385,69 @@ pub struct ClinicalImpression {
     pub note: Option<Vec<Annotation>>,
 }
 
+/// Choice of types for the value[x] field in CodeSystemConceptProperty
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CodeSystemConceptPropertyValue {
+    /// Variant accepting the Code type.
+    #[serde(rename = "valueCode")]
+    Code(Code),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "valueCoding")]
+    Coding(Coding),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "valueDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "valueDecimal")]
+    Decimal(Decimal),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ClinicalImpressionInvestigation {
-    pub id: Option<std::string::String>,
+pub struct CodeSystemConceptProperty {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub item: Option<Vec<Reference>>,
+    pub code: Code,
+    pub value: Option<CodeSystemConceptPropertyValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CodeSystemProperty {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub uri: Option<Uri>,
+    pub description: Option<String>,
+    pub r#type: Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CodeSystemConcept {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub display: Option<String>,
+    pub definition: Option<String>,
+    pub designation: Option<Vec<CodeSystemConceptDesignation>>,
+    pub property: Option<Vec<CodeSystemConceptProperty>>,
+    pub concept: Option<Vec<CodeSystemConcept>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CodeSystem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3424,21 +3484,8 @@ pub struct CodeSystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CodeSystemConcept {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub display: Option<String>,
-    pub definition: Option<String>,
-    pub designation: Option<Vec<CodeSystemConceptDesignation>>,
-    pub property: Option<Vec<CodeSystemConceptProperty>>,
-    pub concept: Option<Vec<CodeSystemConcept>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CodeSystemFilter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
@@ -3449,7 +3496,7 @@ pub struct CodeSystemFilter {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CodeSystemConceptDesignation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub language: Option<Code>,
@@ -3458,78 +3505,8 @@ pub struct CodeSystemConceptDesignation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CodeSystemProperty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub uri: Option<Uri>,
-    pub description: Option<String>,
-    pub r#type: Code,
-}
-
-/// Choice of types for the value[x] field in CodeSystemConceptProperty
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CodeSystemConceptPropertyValue {
-    /// Variant accepting the Code type.
-    #[serde(rename = "valueCode")]
-    Code(Code),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "valueCoding")]
-    Coding(Coding),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "valueDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "valueDecimal")]
-    Decimal(Decimal),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CodeSystemConceptProperty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub value: Option<CodeSystemConceptPropertyValue>,
-}
-
-/// Choice of types for the content[x] field in CommunicationPayload
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum CommunicationPayloadContent {
-    /// Variant accepting the String type.
-    #[serde(rename = "contentString")]
-    String(String),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CommunicationPayload {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub content: Option<CommunicationPayloadContent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Communication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3562,6 +3539,29 @@ pub struct Communication {
     pub note: Option<Vec<Annotation>>,
 }
 
+/// Choice of types for the content[x] field in CommunicationPayload
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CommunicationPayloadContent {
+    /// Variant accepting the String type.
+    #[serde(rename = "contentString")]
+    String(String),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CommunicationPayload {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub content: Option<CommunicationPayloadContent>,
+}
+
 /// Choice of types for the occurrence[x] field in CommunicationRequest
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -3576,7 +3576,7 @@ pub enum CommunicationRequestOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CommunicationRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3625,7 +3625,7 @@ pub enum CommunicationRequestPayloadContent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CommunicationRequestPayload {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub content: Option<CommunicationRequestPayloadContent>,
@@ -3633,7 +3633,7 @@ pub struct CommunicationRequestPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CompartmentDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3659,7 +3659,7 @@ pub struct CompartmentDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CompartmentDefinitionResource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
@@ -3669,7 +3669,7 @@ pub struct CompartmentDefinitionResource {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Composition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3694,33 +3694,6 @@ pub struct Composition {
     pub section: Option<Vec<CompositionSection>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CompositionAttester {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub mode: Code,
-    pub time: Option<DateTime>,
-    pub party: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CompositionSection {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub title: Option<String>,
-    pub code: Option<CodeableConcept>,
-    pub author: Option<Vec<Reference>>,
-    pub focus: Option<Reference>,
-    pub text: Option<Narrative>,
-    pub mode: Option<Code>,
-    pub ordered_by: Option<CodeableConcept>,
-    pub entry: Option<Vec<Reference>>,
-    pub empty_reason: Option<CodeableConcept>,
-    pub section: Option<Vec<CompositionSection>>,
-}
-
 /// Choice of types for the target[x] field in CompositionRelatesTo
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -3735,7 +3708,7 @@ pub enum CompositionRelatesToTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CompositionRelatesTo {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
@@ -3743,8 +3716,35 @@ pub struct CompositionRelatesTo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CompositionSection {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub title: Option<String>,
+    pub code: Option<CodeableConcept>,
+    pub author: Option<Vec<Reference>>,
+    pub focus: Option<Reference>,
+    pub text: Option<Narrative>,
+    pub mode: Option<Code>,
+    pub ordered_by: Option<CodeableConcept>,
+    pub entry: Option<Vec<Reference>>,
+    pub empty_reason: Option<CodeableConcept>,
+    pub section: Option<Vec<CompositionSection>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CompositionAttester {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub mode: Code,
+    pub time: Option<DateTime>,
+    pub party: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CompositionEvent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<Vec<CodeableConcept>>,
@@ -3754,7 +3754,7 @@ pub struct CompositionEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConceptMapGroupElementTarget {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<Code>,
@@ -3767,12 +3767,25 @@ pub struct ConceptMapGroupElementTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConceptMapGroupElement {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<Code>,
     pub display: Option<String>,
     pub target: Option<Vec<ConceptMapGroupElementTarget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ConceptMapGroup {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub source: Option<Uri>,
+    pub source_version: Option<String>,
+    pub target: Option<Uri>,
+    pub target_version: Option<String>,
+    pub element: Option<Vec<ConceptMapGroupElement>>,
+    pub unmapped: Option<ConceptMapGroupUnmapped>,
 }
 
 /// Choice of types for the source[x] field in ConceptMap
@@ -3801,7 +3814,7 @@ pub enum ConceptMapTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConceptMap {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3831,7 +3844,7 @@ pub struct ConceptMap {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConceptMapGroupElementTargetDependsOn {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub property: Uri,
@@ -3842,35 +3855,13 @@ pub struct ConceptMapGroupElementTargetDependsOn {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConceptMapGroupUnmapped {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub mode: Code,
     pub code: Option<Code>,
     pub display: Option<String>,
     pub url: Option<Canonical>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ConceptMapGroup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub source: Option<Uri>,
-    pub source_version: Option<String>,
-    pub target: Option<Uri>,
-    pub target_version: Option<String>,
-    pub element: Option<Vec<ConceptMapGroupElement>>,
-    pub unmapped: Option<ConceptMapGroupUnmapped>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ConditionEvidence {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub detail: Option<Vec<Reference>>,
 }
 
 /// Choice of types for the onset[x] field in Condition
@@ -3917,7 +3908,7 @@ pub enum ConditionAbatement {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Condition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3946,12 +3937,49 @@ pub struct Condition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConditionStage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub summary: Option<CodeableConcept>,
     pub assessment: Option<Vec<Reference>>,
     pub r#type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ConditionEvidence {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub detail: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ConsentProvisionData {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub meaning: Code,
+    pub reference: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ConsentPolicy {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub authority: Option<Uri>,
+    pub uri: Option<Uri>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ConsentVerification {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub verified: Boolean,
+    pub verified_with: Option<Reference>,
+    pub verification_date: Option<DateTime>,
 }
 
 /// Choice of types for the source[x] field in Consent
@@ -3968,7 +3996,7 @@ pub enum ConsentSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Consent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -3993,7 +4021,7 @@ pub struct Consent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConsentProvision {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Code>,
@@ -4010,36 +4038,8 @@ pub struct ConsentProvision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ConsentVerification {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub verified: Boolean,
-    pub verified_with: Option<Reference>,
-    pub verification_date: Option<DateTime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ConsentProvisionData {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub meaning: Code,
-    pub reference: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ConsentPolicy {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub authority: Option<Uri>,
-    pub uri: Option<Uri>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ConsentProvisionActor {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub role: CodeableConcept,
@@ -4047,20 +4047,13 @@ pub struct ConsentProvisionActor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermOffer {
-    pub id: Option<std::string::String>,
+pub struct ContractSigner {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub party: Option<Vec<ContractTermOfferParty>>,
-    pub topic: Option<Reference>,
-    pub r#type: Option<CodeableConcept>,
-    pub decision: Option<CodeableConcept>,
-    pub decision_mode: Option<Vec<CodeableConcept>>,
-    pub answer: Option<Vec<ContractTermOfferAnswer>>,
-    pub text: Option<String>,
-    pub link_id: Option<Vec<String>>,
-    pub security_label_number: Option<Vec<UnsignedInt>>,
+    pub r#type: Coding,
+    pub party: Reference,
+    pub signature: Option<Vec<Signature>>,
 }
 
 /// Choice of types for the content[x] field in ContractFriendly
@@ -4077,10 +4070,78 @@ pub enum ContractFriendlyContent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContractFriendly {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub content: Option<ContractFriendlyContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractTermSecurityLabel {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number: Option<Vec<UnsignedInt>>,
+    pub classification: Coding,
+    pub category: Option<Vec<Coding>>,
+    pub control: Option<Vec<Coding>>,
+}
+
+/// Choice of types for the content[x] field in ContractRule
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractRuleContent {
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractRule {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub content: Option<ContractRuleContent>,
+}
+
+/// Choice of types for the content[x] field in ContractLegal
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContractLegalContent {
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "contentAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "contentReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractLegal {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub content: Option<ContractLegalContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractTermOffer {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub party: Option<Vec<ContractTermOfferParty>>,
+    pub topic: Option<Reference>,
+    pub r#type: Option<CodeableConcept>,
+    pub decision: Option<CodeableConcept>,
+    pub decision_mode: Option<Vec<CodeableConcept>>,
+    pub answer: Option<Vec<ContractTermOfferAnswer>>,
+    pub text: Option<String>,
+    pub link_id: Option<Vec<String>>,
+    pub security_label_number: Option<Vec<UnsignedInt>>,
 }
 
 /// Choice of types for the topic[x] field in Contract
@@ -4109,7 +4170,7 @@ pub enum ContractLegallyBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Contract {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4152,58 +4213,6 @@ pub struct Contract {
     pub legally_binding: Option<ContractLegallyBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractSigner {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Coding,
-    pub party: Reference,
-    pub signature: Option<Vec<Signature>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermOfferParty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Option<Vec<Reference>>,
-    pub role: CodeableConcept,
-}
-
-/// Choice of types for the entity[x] field in ContractTermAssetValuedItem
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractTermAssetValuedItemEntity {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "entityCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "entityReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermAssetValuedItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub entity: Option<ContractTermAssetValuedItemEntity>,
-    pub identifier: Option<Identifier>,
-    pub effective_time: Option<DateTime>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub points: Option<Decimal>,
-    pub net: Option<Money>,
-    pub payment: Option<String>,
-    pub payment_date: Option<DateTime>,
-    pub responsible: Option<Reference>,
-    pub recipient: Option<Reference>,
-    pub link_id: Option<Vec<String>>,
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-}
-
 /// Choice of types for the topic[x] field in ContractTerm
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -4218,7 +4227,7 @@ pub enum ContractTermTopic {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContractTerm {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Identifier>,
@@ -4233,38 +4242,6 @@ pub struct ContractTerm {
     pub asset: Option<Vec<ContractTermAsset>>,
     pub action: Option<Vec<ContractTermAction>>,
     pub group: Option<Vec<ContractTerm>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermAsset {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub scope: Option<CodeableConcept>,
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub type_reference: Option<Vec<Reference>>,
-    pub subtype: Option<Vec<CodeableConcept>>,
-    pub relationship: Option<Coding>,
-    pub context: Option<Vec<ContractTermAssetContext>>,
-    pub condition: Option<String>,
-    pub period_type: Option<Vec<CodeableConcept>>,
-    pub period: Option<Vec<Period>>,
-    pub use_period: Option<Vec<Period>>,
-    pub text: Option<String>,
-    pub link_id: Option<Vec<String>>,
-    pub answer: Option<Vec<ContractTermOfferAnswer>>,
-    pub security_label_number: Option<Vec<UnsignedInt>>,
-    pub valued_item: Option<Vec<ContractTermAssetValuedItem>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermAssetContext {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub reference: Option<Reference>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub text: Option<String>,
 }
 
 /// Choice of types for the value[x] field in ContractTermOfferAnswer
@@ -4311,10 +4288,23 @@ pub enum ContractTermOfferAnswerValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContractTermOfferAnswer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub value: Option<ContractTermOfferAnswerValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractContentDefinition {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub sub_type: Option<CodeableConcept>,
+    pub publisher: Option<Reference>,
+    pub publication_date: Option<DateTime>,
+    pub publication_status: Code,
+    pub copyright: Option<Markdown>,
 }
 
 /// Choice of types for the occurrence[x] field in ContractTermAction
@@ -4334,7 +4324,7 @@ pub enum ContractTermActionOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContractTermAction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub do_not_perform: Option<Boolean>,
@@ -4362,80 +4352,100 @@ pub struct ContractTermAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ContractTermActionSubject {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub reference: Option<Vec<Reference>>,
     pub role: Option<CodeableConcept>,
 }
 
-/// Choice of types for the content[x] field in ContractLegal
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractTermOfferParty {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Option<Vec<Reference>>,
+    pub role: CodeableConcept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractTermAssetContext {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub reference: Option<Reference>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ContractTermAsset {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub scope: Option<CodeableConcept>,
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub type_reference: Option<Vec<Reference>>,
+    pub subtype: Option<Vec<CodeableConcept>>,
+    pub relationship: Option<Coding>,
+    pub context: Option<Vec<ContractTermAssetContext>>,
+    pub condition: Option<String>,
+    pub period_type: Option<Vec<CodeableConcept>>,
+    pub period: Option<Vec<Period>>,
+    pub use_period: Option<Vec<Period>>,
+    pub text: Option<String>,
+    pub link_id: Option<Vec<String>>,
+    pub answer: Option<Vec<ContractTermOfferAnswer>>,
+    pub security_label_number: Option<Vec<UnsignedInt>>,
+    pub valued_item: Option<Vec<ContractTermAssetValuedItem>>,
+}
+
+/// Choice of types for the entity[x] field in ContractTermAssetValuedItem
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum ContractLegalContent {
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
+pub enum ContractTermAssetValuedItemEntity {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "entityCodeableConcept")]
+    CodeableConcept(CodeableConcept),
     /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
+    #[serde(rename = "entityReference")]
     Reference(Reference),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractLegal {
-    pub id: Option<std::string::String>,
+pub struct ContractTermAssetValuedItem {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub content: Option<ContractLegalContent>,
+    pub entity: Option<ContractTermAssetValuedItemEntity>,
+    pub identifier: Option<Identifier>,
+    pub effective_time: Option<DateTime>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub points: Option<Decimal>,
+    pub net: Option<Money>,
+    pub payment: Option<String>,
+    pub payment_date: Option<DateTime>,
+    pub responsible: Option<Reference>,
+    pub recipient: Option<Reference>,
+    pub link_id: Option<Vec<String>>,
+    pub security_label_number: Option<Vec<UnsignedInt>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractTermSecurityLabel {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub number: Option<Vec<UnsignedInt>>,
-    pub classification: Coding,
-    pub category: Option<Vec<Coding>>,
-    pub control: Option<Vec<Coding>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractContentDefinition {
-    pub id: Option<std::string::String>,
+pub struct CoverageClass {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
-    pub sub_type: Option<CodeableConcept>,
-    pub publisher: Option<Reference>,
-    pub publication_date: Option<DateTime>,
-    pub publication_status: Code,
-    pub copyright: Option<Markdown>,
-}
-
-/// Choice of types for the content[x] field in ContractRule
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ContractRuleContent {
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "contentAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "contentReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ContractRule {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub content: Option<ContractRuleContent>,
+    pub value: String,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Coverage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4476,7 +4486,7 @@ pub enum CoverageCostToBeneficiaryValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageCostToBeneficiary {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -4486,21 +4496,11 @@ pub struct CoverageCostToBeneficiary {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageCostToBeneficiaryException {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
     pub period: Option<Period>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CoverageClass {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub value: String,
-    pub name: Option<String>,
 }
 
 /// Choice of types for the serviced[x] field in CoverageEligibilityRequest
@@ -4517,7 +4517,7 @@ pub enum CoverageEligibilityRequestServiced {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4543,7 +4543,7 @@ pub struct CoverageEligibilityRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityRequestItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub supporting_info_sequence: Option<Vec<PositiveInt>>,
@@ -4556,6 +4556,26 @@ pub struct CoverageEligibilityRequestItem {
     pub facility: Option<Reference>,
     pub diagnosis: Option<Vec<CoverageEligibilityRequestItemDiagnosis>>,
     pub detail: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CoverageEligibilityRequestInsurance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub focal: Option<Boolean>,
+    pub coverage: Reference,
+    pub business_arrangement: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct CoverageEligibilityRequestSupportingInfo {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub information: Reference,
+    pub applies_to_all: Option<Boolean>,
 }
 
 /// Choice of types for the diagnosis[x] field in CoverageEligibilityRequestItemDiagnosis
@@ -4572,35 +4592,15 @@ pub enum CoverageEligibilityRequestItemDiagnosisDiagnosis {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityRequestItemDiagnosis {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub diagnosis: Option<CoverageEligibilityRequestItemDiagnosisDiagnosis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CoverageEligibilityRequestInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub focal: Option<Boolean>,
-    pub coverage: Reference,
-    pub business_arrangement: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct CoverageEligibilityRequestSupportingInfo {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub information: Reference,
-    pub applies_to_all: Option<Boolean>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityResponseInsuranceItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub category: Option<CodeableConcept>,
@@ -4651,7 +4651,7 @@ pub enum CoverageEligibilityResponseInsuranceItemBenefitUsed {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityResponseInsuranceItemBenefit {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
@@ -4661,7 +4661,7 @@ pub struct CoverageEligibilityResponseInsuranceItemBenefit {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityResponseError {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -4669,7 +4669,7 @@ pub struct CoverageEligibilityResponseError {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityResponseInsurance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub coverage: Reference,
@@ -4692,7 +4692,7 @@ pub enum CoverageEligibilityResponseServiced {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct CoverageEligibilityResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4719,7 +4719,7 @@ pub struct CoverageEligibilityResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DetectedIssueMitigation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub action: CodeableConcept,
@@ -4729,7 +4729,7 @@ pub struct DetectedIssueMitigation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DetectedIssueEvidence {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<Vec<CodeableConcept>>,
@@ -4750,7 +4750,7 @@ pub enum DetectedIssueIdentified {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DetectedIssue {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4773,41 +4773,8 @@ pub struct DetectedIssue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceProperty {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub value_quantity: Option<Vec<Quantity>>,
-    pub value_code: Option<Vec<CodeableConcept>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceVersion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub component: Option<Identifier>,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceUdiCarrier {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub device_identifier: Option<String>,
-    pub issuer: Option<Uri>,
-    pub jurisdiction: Option<Uri>,
-    pub carrier_a_i_d_c: Option<Base64Binary>,
-    pub carrier_h_r_f: Option<String>,
-    pub entry_type: Option<Code>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Device {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4844,17 +4811,8 @@ pub struct Device {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDeviceName {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub r#type: Code,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceSpecialization {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub system_type: CodeableConcept,
@@ -4862,41 +4820,45 @@ pub struct DeviceSpecialization {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDefinitionMaterial {
-    pub id: Option<std::string::String>,
+pub struct DeviceVersion {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub substance: CodeableConcept,
-    pub alternate: Option<Boolean>,
-    pub allergenic_indicator: Option<Boolean>,
+    pub r#type: Option<CodeableConcept>,
+    pub component: Option<Identifier>,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDefinitionCapability {
-    pub id: Option<std::string::String>,
+pub struct DeviceDeviceName {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub r#type: Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceProperty {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
-    pub description: Option<Vec<CodeableConcept>>,
+    pub value_quantity: Option<Vec<Quantity>>,
+    pub value_code: Option<Vec<CodeableConcept>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDefinitionUdiDeviceIdentifier {
-    pub id: Option<std::string::String>,
+pub struct DeviceUdiCarrier {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub device_identifier: String,
-    pub issuer: Uri,
-    pub jurisdiction: Uri,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDefinitionSpecialization {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub system_type: String,
-    pub version: Option<String>,
+    pub device_identifier: Option<String>,
+    pub issuer: Option<Uri>,
+    pub jurisdiction: Option<Uri>,
+    pub carrier_a_i_d_c: Option<Base64Binary>,
+    pub carrier_h_r_f: Option<String>,
+    pub entry_type: Option<Code>,
 }
 
 /// Choice of types for the manufacturer[x] field in DeviceDefinition
@@ -4913,7 +4875,7 @@ pub enum DeviceDefinitionManufacturer {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4946,8 +4908,45 @@ pub struct DeviceDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceDefinitionMaterial {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub substance: CodeableConcept,
+    pub alternate: Option<Boolean>,
+    pub allergenic_indicator: Option<Boolean>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceDefinitionSpecialization {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub system_type: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceDefinitionCapability {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub description: Option<Vec<CodeableConcept>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceDefinitionDeviceName {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub r#type: Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceDefinitionProperty {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
@@ -4956,17 +4955,18 @@ pub struct DeviceDefinitionProperty {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceDefinitionDeviceName {
-    pub id: Option<std::string::String>,
+pub struct DeviceDefinitionUdiDeviceIdentifier {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub r#type: Code,
+    pub device_identifier: String,
+    pub issuer: Uri,
+    pub jurisdiction: Uri,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceMetric {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -4988,39 +4988,12 @@ pub struct DeviceMetric {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceMetricCalibration {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Code>,
     pub state: Option<Code>,
     pub time: Option<Instant>,
-}
-
-/// Choice of types for the value[x] field in DeviceRequestParameter
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum DeviceRequestParameterValue {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "valueCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "valueRange")]
-    Range(Range),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DeviceRequestParameter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub value: Option<DeviceRequestParameterValue>,
 }
 
 /// Choice of types for the code[x] field in DeviceRequest
@@ -5052,7 +5025,7 @@ pub enum DeviceRequestOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5086,6 +5059,33 @@ pub struct DeviceRequest {
     pub relevant_history: Option<Vec<Reference>>,
 }
 
+/// Choice of types for the value[x] field in DeviceRequestParameter
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeviceRequestParameterValue {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "valueCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "valueRange")]
+    Range(Range),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DeviceRequestParameter {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub value: Option<DeviceRequestParameterValue>,
+}
+
 /// Choice of types for the timing[x] field in DeviceUseStatement
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -5103,7 +5103,7 @@ pub enum DeviceUseStatementTiming {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DeviceUseStatement {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5126,6 +5126,15 @@ pub struct DeviceUseStatement {
     pub note: Option<Vec<Annotation>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct DiagnosticReportMedia {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub comment: Option<String>,
+    pub link: Reference,
+}
+
 /// Choice of types for the effective[x] field in DiagnosticReport
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -5140,7 +5149,7 @@ pub enum DiagnosticReportEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DiagnosticReport {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5169,17 +5178,17 @@ pub struct DiagnosticReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DiagnosticReportMedia {
-    pub id: Option<std::string::String>,
+pub struct DocumentManifestRelated {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub comment: Option<String>,
-    pub link: Reference,
+    pub identifier: Option<Identifier>,
+    pub r#ref: Option<Reference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DocumentManifest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5202,49 +5211,8 @@ pub struct DocumentManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DocumentManifestRelated {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub r#ref: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DocumentReferenceRelatesTo {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub target: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DocumentReferenceContent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub attachment: Attachment,
-    pub format: Option<Coding>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct DocumentReferenceContext {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub encounter: Option<Vec<Reference>>,
-    pub event: Option<Vec<CodeableConcept>>,
-    pub period: Option<Period>,
-    pub facility_type: Option<CodeableConcept>,
-    pub practice_setting: Option<CodeableConcept>,
-    pub source_patient_info: Option<Reference>,
-    pub related: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct DocumentReference {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5271,52 +5239,40 @@ pub struct DocumentReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EffectEvidenceSynthesisSampleSize {
-    pub id: Option<std::string::String>,
+pub struct DocumentReferenceRelatesTo {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub number_of_studies: Option<Integer>,
-    pub number_of_participants: Option<Integer>,
+    pub code: Code,
+    pub target: Reference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EffectEvidenceSynthesisEffectEstimate {
-    pub id: Option<std::string::String>,
+pub struct DocumentReferenceContext {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub r#type: Option<CodeableConcept>,
-    pub variant_state: Option<CodeableConcept>,
-    pub value: Option<Decimal>,
-    pub unit_of_measure: Option<CodeableConcept>,
-    pub precision_estimate: Option<Vec<EffectEvidenceSynthesisEffectEstimatePrecisionEstimate>>,
+    pub encounter: Option<Vec<Reference>>,
+    pub event: Option<Vec<CodeableConcept>>,
+    pub period: Option<Period>,
+    pub facility_type: Option<CodeableConcept>,
+    pub practice_setting: Option<CodeableConcept>,
+    pub source_patient_info: Option<Reference>,
+    pub related: Option<Vec<Reference>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
-    pub id: Option<std::string::String>,
+pub struct DocumentReferenceContent {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub rating: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EffectEvidenceSynthesisResultsByExposure {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub exposure_state: Option<Code>,
-    pub variant_state: Option<CodeableConcept>,
-    pub risk_evidence_synthesis: Reference,
+    pub attachment: Attachment,
+    pub format: Option<Coding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -5327,7 +5283,7 @@ pub struct EffectEvidenceSynthesisEffectEstimatePrecisionEstimate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EffectEvidenceSynthesisCertainty {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub rating: Option<Vec<CodeableConcept>>,
@@ -5336,8 +5292,29 @@ pub struct EffectEvidenceSynthesisCertainty {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EffectEvidenceSynthesisCertaintyCertaintySubcomponent {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub rating: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EffectEvidenceSynthesisResultsByExposure {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    pub exposure_state: Option<Code>,
+    pub variant_state: Option<CodeableConcept>,
+    pub risk_evidence_synthesis: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EffectEvidenceSynthesis {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5381,45 +5358,40 @@ pub struct EffectEvidenceSynthesis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EncounterDiagnosis {
-    pub id: Option<std::string::String>,
+pub struct EffectEvidenceSynthesisEffectEstimate {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub condition: Reference,
-    pub r#use: Option<CodeableConcept>,
-    pub rank: Option<PositiveInt>,
+    pub description: Option<String>,
+    pub r#type: Option<CodeableConcept>,
+    pub variant_state: Option<CodeableConcept>,
+    pub value: Option<Decimal>,
+    pub unit_of_measure: Option<CodeableConcept>,
+    pub precision_estimate: Option<Vec<EffectEvidenceSynthesisEffectEstimatePrecisionEstimate>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EncounterHospitalization {
-    pub id: Option<std::string::String>,
+pub struct EffectEvidenceSynthesisSampleSize {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub pre_admission_identifier: Option<Identifier>,
-    pub origin: Option<Reference>,
-    pub admit_source: Option<CodeableConcept>,
-    pub re_admission: Option<CodeableConcept>,
-    pub diet_preference: Option<Vec<CodeableConcept>>,
-    pub special_courtesy: Option<Vec<CodeableConcept>>,
-    pub special_arrangement: Option<Vec<CodeableConcept>>,
-    pub destination: Option<Reference>,
-    pub discharge_disposition: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub number_of_studies: Option<Integer>,
+    pub number_of_participants: Option<Integer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EncounterLocation {
-    pub id: Option<std::string::String>,
+pub struct EncounterClassHistory {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub location: Reference,
-    pub status: Option<Code>,
-    pub physical_type: Option<CodeableConcept>,
-    pub period: Option<Period>,
+    pub class: Coding,
+    pub period: Period,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Encounter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5453,8 +5425,18 @@ pub struct Encounter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EncounterDiagnosis {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub condition: Reference,
+    pub r#use: Option<CodeableConcept>,
+    pub rank: Option<PositiveInt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EncounterStatusHistory {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub status: Code,
@@ -5462,8 +5444,35 @@ pub struct EncounterStatusHistory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EncounterHospitalization {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub pre_admission_identifier: Option<Identifier>,
+    pub origin: Option<Reference>,
+    pub admit_source: Option<CodeableConcept>,
+    pub re_admission: Option<CodeableConcept>,
+    pub diet_preference: Option<Vec<CodeableConcept>>,
+    pub special_courtesy: Option<Vec<CodeableConcept>>,
+    pub special_arrangement: Option<Vec<CodeableConcept>>,
+    pub destination: Option<Reference>,
+    pub discharge_disposition: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EncounterLocation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub location: Reference,
+    pub status: Option<Code>,
+    pub physical_type: Option<CodeableConcept>,
+    pub period: Option<Period>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EncounterParticipant {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Vec<CodeableConcept>>,
@@ -5472,17 +5481,8 @@ pub struct EncounterParticipant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EncounterClassHistory {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub class: Coding,
-    pub period: Period,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Endpoint {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5505,7 +5505,7 @@ pub struct Endpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EnrollmentRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5524,7 +5524,7 @@ pub struct EnrollmentRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EnrollmentResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5543,27 +5543,8 @@ pub struct EnrollmentResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EpisodeOfCareDiagnosis {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub condition: Reference,
-    pub role: Option<CodeableConcept>,
-    pub rank: Option<PositiveInt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EpisodeOfCareStatusHistory {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub status: Code,
-    pub period: Period,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EpisodeOfCare {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5585,6 +5566,25 @@ pub struct EpisodeOfCare {
     pub account: Option<Vec<Reference>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EpisodeOfCareDiagnosis {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub condition: Reference,
+    pub role: Option<CodeableConcept>,
+    pub rank: Option<PositiveInt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct EpisodeOfCareStatusHistory {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub status: Code,
+    pub period: Period,
+}
+
 /// Choice of types for the subject[x] field in EventDefinition
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -5599,7 +5599,7 @@ pub enum EventDefinitionSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EventDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5639,7 +5639,7 @@ pub struct EventDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Evidence {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5675,45 +5675,6 @@ pub struct Evidence {
     pub exposure_background: Reference,
     pub exposure_variant: Option<Vec<Reference>>,
     pub outcome: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct EvidenceVariable {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Option<Uri>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub version: Option<String>,
-    pub name: Option<String>,
-    pub title: Option<String>,
-    pub short_title: Option<String>,
-    pub subtitle: Option<String>,
-    pub status: Code,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    pub note: Option<Vec<Annotation>>,
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub copyright: Option<Markdown>,
-    pub approval_date: Option<Date>,
-    pub last_review_date: Option<Date>,
-    pub effective_period: Option<Period>,
-    pub topic: Option<Vec<CodeableConcept>>,
-    pub author: Option<Vec<ContactDetail>>,
-    pub editor: Option<Vec<ContactDetail>>,
-    pub reviewer: Option<Vec<ContactDetail>>,
-    pub endorser: Option<Vec<ContactDetail>>,
-    pub related_artifact: Option<Vec<RelatedArtifact>>,
-    pub r#type: Option<Code>,
-    pub characteristic: Option<Vec<EvidenceVariableCharacteristic>>,
 }
 
 /// Choice of types for the definition[x] field in EvidenceVariableCharacteristic
@@ -5760,7 +5721,7 @@ pub enum EvidenceVariableCharacteristicParticipantEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct EvidenceVariableCharacteristic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: Option<String>,
@@ -5773,17 +5734,68 @@ pub struct EvidenceVariableCharacteristic {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExampleScenarioInstanceVersion {
-    pub id: Option<std::string::String>,
+pub struct EvidenceVariable {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub version_id: String,
-    pub description: Markdown,
+    pub url: Option<Uri>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub short_title: Option<String>,
+    pub subtitle: Option<String>,
+    pub status: Code,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    pub note: Option<Vec<Annotation>>,
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub copyright: Option<Markdown>,
+    pub approval_date: Option<Date>,
+    pub last_review_date: Option<Date>,
+    pub effective_period: Option<Period>,
+    pub topic: Option<Vec<CodeableConcept>>,
+    pub author: Option<Vec<ContactDetail>>,
+    pub editor: Option<Vec<ContactDetail>>,
+    pub reviewer: Option<Vec<ContactDetail>>,
+    pub endorser: Option<Vec<ContactDetail>>,
+    pub related_artifact: Option<Vec<RelatedArtifact>>,
+    pub r#type: Option<Code>,
+    pub characteristic: Option<Vec<EvidenceVariableCharacteristic>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExampleScenarioInstanceContainedInstance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub resource_id: String,
+    pub version_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExampleScenarioProcess {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub title: String,
+    pub description: Option<Markdown>,
+    pub pre_conditions: Option<Markdown>,
+    pub post_conditions: Option<Markdown>,
+    pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExampleScenarioProcessStep {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub process: Option<Vec<ExampleScenarioProcess>>,
@@ -5793,19 +5805,8 @@ pub struct ExampleScenarioProcessStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExampleScenarioActor {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub actor_id: String,
-    pub r#type: Code,
-    pub name: Option<String>,
-    pub description: Option<Markdown>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExampleScenarioInstance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub resource_id: String,
@@ -5817,17 +5818,19 @@ pub struct ExampleScenarioInstance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExampleScenarioInstanceContainedInstance {
-    pub id: Option<std::string::String>,
+pub struct ExampleScenarioActor {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub resource_id: String,
-    pub version_id: Option<String>,
+    pub actor_id: String,
+    pub r#type: Code,
+    pub name: Option<String>,
+    pub description: Option<Markdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExampleScenario {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5855,30 +5858,17 @@ pub struct ExampleScenario {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExampleScenarioProcess {
-    pub id: Option<std::string::String>,
+pub struct ExampleScenarioInstanceVersion {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub title: String,
-    pub description: Option<Markdown>,
-    pub pre_conditions: Option<Markdown>,
-    pub post_conditions: Option<Markdown>,
-    pub step: Option<Vec<ExampleScenarioProcessStep>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExampleScenarioProcessStepAlternative {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub title: String,
-    pub description: Option<Markdown>,
-    pub step: Option<Vec<ExampleScenarioProcessStep>>,
+    pub version_id: String,
+    pub description: Markdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExampleScenarioProcessStepOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub number: String,
@@ -5894,8 +5884,188 @@ pub struct ExampleScenarioProcessStepOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExampleScenarioProcessStepAlternative {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub title: String,
+    pub description: Option<Markdown>,
+    pub step: Option<Vec<ExampleScenarioProcessStep>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitProcessNote {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number: Option<PositiveInt>,
+    pub r#type: Option<Code>,
+    pub text: Option<String>,
+    pub language: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitPayee {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub party: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitTotal {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub amount: Money,
+}
+
+/// Choice of types for the diagnosis[x] field in ExplanationOfBenefitDiagnosis
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitDiagnosisDiagnosis {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "diagnosisCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "diagnosisReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitDiagnosis {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub diagnosis: Option<ExplanationOfBenefitDiagnosisDiagnosis>,
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub on_admission: Option<CodeableConcept>,
+    pub package_code: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitAddItemDetailSubDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+}
+
+/// Choice of types for the timing[x] field in ExplanationOfBenefitSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitSupportingInfoTiming {
+    /// Variant accepting the Date type.
+    #[serde(rename = "timingDate")]
+    Date(Date),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timingPeriod")]
+    Period(Period),
+}
+
+/// Choice of types for the value[x] field in ExplanationOfBenefitSupportingInfo
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitSupportingInfoValue {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitSupportingInfo {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub category: CodeableConcept,
+    pub code: Option<CodeableConcept>,
+    pub timing: Option<ExplanationOfBenefitSupportingInfoTiming>,
+    pub value: Option<ExplanationOfBenefitSupportingInfoValue>,
+    pub reason: Option<Coding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitRelated {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub claim: Option<Reference>,
+    pub relationship: Option<CodeableConcept>,
+    pub reference: Option<Identifier>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitInsurance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub focal: Boolean,
+    pub coverage: Reference,
+    pub pre_auth_ref: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitAddItemDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+    pub sub_detail: Option<Vec<ExplanationOfBenefitAddItemDetailSubDetail>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitItemDetailSubDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub revenue: Option<CodeableConcept>,
+    pub category: Option<CodeableConcept>,
+    pub product_or_service: CodeableConcept,
+    pub modifier: Option<Vec<CodeableConcept>>,
+    pub program_code: Option<Vec<CodeableConcept>>,
+    pub quantity: Option<Quantity>,
+    pub unit_price: Option<Money>,
+    pub factor: Option<Decimal>,
+    pub net: Option<Money>,
+    pub udi: Option<Vec<Reference>>,
+    pub note_number: Option<Vec<PositiveInt>>,
+    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExplanationOfBenefit {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -5949,173 +6119,8 @@ pub struct ExplanationOfBenefit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitAddItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitBenefitBalance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub excluded: Option<Boolean>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub network: Option<CodeableConcept>,
-    pub unit: Option<CodeableConcept>,
-    pub term: Option<CodeableConcept>,
-    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
-}
-
-/// Choice of types for the allowed[x] field in ExplanationOfBenefitBenefitBalanceFinancial
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "allowedUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "allowedString")]
-    String(String),
-    /// Variant accepting the Money type.
-    #[serde(rename = "allowedMoney")]
-    Money(Money),
-}
-
-/// Choice of types for the used[x] field in ExplanationOfBenefitBenefitBalanceFinancial
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "usedUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the Money type.
-    #[serde(rename = "usedMoney")]
-    Money(Money),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitBenefitBalanceFinancial {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub allowed: Option<ExplanationOfBenefitBenefitBalanceFinancialAllowed>,
-    pub used: Option<ExplanationOfBenefitBenefitBalanceFinancialUsed>,
-}
-
-/// Choice of types for the timing[x] field in ExplanationOfBenefitSupportingInfo
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitSupportingInfoTiming {
-    /// Variant accepting the Date type.
-    #[serde(rename = "timingDate")]
-    Date(Date),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timingPeriod")]
-    Period(Period),
-}
-
-/// Choice of types for the value[x] field in ExplanationOfBenefitSupportingInfo
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitSupportingInfoValue {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitSupportingInfo {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub category: CodeableConcept,
-    pub code: Option<CodeableConcept>,
-    pub timing: Option<ExplanationOfBenefitSupportingInfoTiming>,
-    pub value: Option<ExplanationOfBenefitSupportingInfoValue>,
-    pub reason: Option<Coding>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitInsurance {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub focal: Boolean,
-    pub coverage: Reference,
-    pub pre_auth_ref: Option<Vec<String>>,
-}
-
-/// Choice of types for the location[x] field in ExplanationOfBenefitAccident
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitAccidentLocation {
-    /// Variant accepting the Address type.
-    #[serde(rename = "locationAddress")]
-    Address(Address),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "locationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitAccident {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub date: Option<Date>,
-    pub r#type: Option<CodeableConcept>,
-    pub location: Option<ExplanationOfBenefitAccidentLocation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitItemAdjudication {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub reason: Option<CodeableConcept>,
-    pub amount: Option<Money>,
-    pub value: Option<Decimal>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitTotal {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub amount: Money,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExplanationOfBenefitItemDetail {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
@@ -6134,110 +6139,39 @@ pub struct ExplanationOfBenefitItemDetail {
     pub sub_detail: Option<Vec<ExplanationOfBenefitItemDetailSubDetail>>,
 }
 
-/// Choice of types for the diagnosis[x] field in ExplanationOfBenefitDiagnosis
+/// Choice of types for the location[x] field in ExplanationOfBenefitAccident
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitDiagnosisDiagnosis {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "diagnosisCodeableConcept")]
-    CodeableConcept(CodeableConcept),
+pub enum ExplanationOfBenefitAccidentLocation {
+    /// Variant accepting the Address type.
+    #[serde(rename = "locationAddress")]
+    Address(Address),
     /// Variant accepting the Reference type.
-    #[serde(rename = "diagnosisReference")]
+    #[serde(rename = "locationReference")]
     Reference(Reference),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitDiagnosis {
-    pub id: Option<std::string::String>,
+pub struct ExplanationOfBenefitAccident {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub diagnosis: Option<ExplanationOfBenefitDiagnosisDiagnosis>,
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub on_admission: Option<CodeableConcept>,
-    pub package_code: Option<CodeableConcept>,
+    pub date: Option<Date>,
+    pub r#type: Option<CodeableConcept>,
+    pub location: Option<ExplanationOfBenefitAccidentLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitPayee {
-    pub id: Option<std::string::String>,
+pub struct ExplanationOfBenefitPayment {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
-    pub party: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitAddItemDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
-    pub sub_detail: Option<Vec<ExplanationOfBenefitAddItemDetailSubDetail>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitProcessNote {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub number: Option<PositiveInt>,
-    pub r#type: Option<Code>,
-    pub text: Option<String>,
-    pub language: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitRelated {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub claim: Option<Reference>,
-    pub relationship: Option<CodeableConcept>,
-    pub reference: Option<Identifier>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitCareTeam {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub provider: Reference,
-    pub responsible: Option<Boolean>,
-    pub role: Option<CodeableConcept>,
-    pub qualification: Option<CodeableConcept>,
-}
-
-/// Choice of types for the procedure[x] field in ExplanationOfBenefitProcedure
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplanationOfBenefitProcedureProcedure {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "procedureCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "procedureReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitProcedure {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub date: Option<DateTime>,
-    pub procedure: Option<ExplanationOfBenefitProcedureProcedure>,
-    pub udi: Option<Vec<Reference>>,
+    pub adjustment: Option<Money>,
+    pub adjustment_reason: Option<CodeableConcept>,
+    pub date: Option<Date>,
+    pub amount: Option<Money>,
+    pub identifier: Option<Identifier>,
 }
 
 /// Choice of types for the serviced[x] field in ExplanationOfBenefitItem
@@ -6269,7 +6203,7 @@ pub enum ExplanationOfBenefitItemLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExplanationOfBenefitItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: PositiveInt,
@@ -6295,26 +6229,6 @@ pub struct ExplanationOfBenefitItem {
     pub note_number: Option<Vec<PositiveInt>>,
     pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
     pub detail: Option<Vec<ExplanationOfBenefitItemDetail>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitItemDetailSubDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub sequence: PositiveInt,
-    pub revenue: Option<CodeableConcept>,
-    pub category: Option<CodeableConcept>,
-    pub product_or_service: CodeableConcept,
-    pub modifier: Option<Vec<CodeableConcept>>,
-    pub program_code: Option<Vec<CodeableConcept>>,
-    pub quantity: Option<Quantity>,
-    pub unit_price: Option<Money>,
-    pub factor: Option<Decimal>,
-    pub net: Option<Money>,
-    pub udi: Option<Vec<Reference>>,
-    pub note_number: Option<Vec<PositiveInt>>,
-    pub adjudication: Option<Vec<ExplanationOfBenefitItemAdjudication>>,
 }
 
 /// Choice of types for the serviced[x] field in ExplanationOfBenefitAddItem
@@ -6346,7 +6260,7 @@ pub enum ExplanationOfBenefitAddItemLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ExplanationOfBenefitAddItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub item_sequence: Option<Vec<PositiveInt>>,
@@ -6369,17 +6283,133 @@ pub struct ExplanationOfBenefitAddItem {
     pub detail: Option<Vec<ExplanationOfBenefitAddItemDetail>>,
 }
 
+/// Choice of types for the allowed[x] field in ExplanationOfBenefitBenefitBalanceFinancial
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialAllowed {
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "allowedUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "allowedString")]
+    String(String),
+    /// Variant accepting the Money type.
+    #[serde(rename = "allowedMoney")]
+    Money(Money),
+}
+
+/// Choice of types for the used[x] field in ExplanationOfBenefitBenefitBalanceFinancial
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitBenefitBalanceFinancialUsed {
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "usedUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the Money type.
+    #[serde(rename = "usedMoney")]
+    Money(Money),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ExplanationOfBenefitPayment {
-    pub id: Option<std::string::String>,
+pub struct ExplanationOfBenefitBenefitBalanceFinancial {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub adjustment: Option<Money>,
-    pub adjustment_reason: Option<CodeableConcept>,
-    pub date: Option<Date>,
+    pub r#type: CodeableConcept,
+    pub allowed: Option<ExplanationOfBenefitBenefitBalanceFinancialAllowed>,
+    pub used: Option<ExplanationOfBenefitBenefitBalanceFinancialUsed>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitItemAdjudication {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub reason: Option<CodeableConcept>,
     pub amount: Option<Money>,
-    pub identifier: Option<Identifier>,
+    pub value: Option<Decimal>,
+}
+
+/// Choice of types for the procedure[x] field in ExplanationOfBenefitProcedure
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ExplanationOfBenefitProcedureProcedure {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "procedureCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "procedureReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitProcedure {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub r#type: Option<Vec<CodeableConcept>>,
+    pub date: Option<DateTime>,
+    pub procedure: Option<ExplanationOfBenefitProcedureProcedure>,
+    pub udi: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitBenefitBalance {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub excluded: Option<Boolean>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub network: Option<CodeableConcept>,
+    pub unit: Option<CodeableConcept>,
+    pub term: Option<CodeableConcept>,
+    pub financial: Option<Vec<ExplanationOfBenefitBenefitBalanceFinancial>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ExplanationOfBenefitCareTeam {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub sequence: PositiveInt,
+    pub provider: Reference,
+    pub responsible: Option<Boolean>,
+    pub role: Option<CodeableConcept>,
+    pub qualification: Option<CodeableConcept>,
+}
+
+/// Choice of types for the onset[x] field in FamilyMemberHistoryCondition
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FamilyMemberHistoryConditionOnset {
+    /// Variant accepting the Age type.
+    #[serde(rename = "onsetAge")]
+    Age(Age),
+    /// Variant accepting the Range type.
+    #[serde(rename = "onsetRange")]
+    Range(Range),
+    /// Variant accepting the Period type.
+    #[serde(rename = "onsetPeriod")]
+    Period(Period),
+    /// Variant accepting the String type.
+    #[serde(rename = "onsetString")]
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct FamilyMemberHistoryCondition {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub outcome: Option<CodeableConcept>,
+    pub contributed_to_death: Option<Boolean>,
+    pub onset: Option<FamilyMemberHistoryConditionOnset>,
+    pub note: Option<Vec<Annotation>>,
 }
 
 /// Choice of types for the born[x] field in FamilyMemberHistory
@@ -6435,7 +6465,7 @@ pub enum FamilyMemberHistoryDeceased {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct FamilyMemberHistory {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6463,39 +6493,9 @@ pub struct FamilyMemberHistory {
     pub condition: Option<Vec<FamilyMemberHistoryCondition>>,
 }
 
-/// Choice of types for the onset[x] field in FamilyMemberHistoryCondition
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum FamilyMemberHistoryConditionOnset {
-    /// Variant accepting the Age type.
-    #[serde(rename = "onsetAge")]
-    Age(Age),
-    /// Variant accepting the Range type.
-    #[serde(rename = "onsetRange")]
-    Range(Range),
-    /// Variant accepting the Period type.
-    #[serde(rename = "onsetPeriod")]
-    Period(Period),
-    /// Variant accepting the String type.
-    #[serde(rename = "onsetString")]
-    String(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct FamilyMemberHistoryCondition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub outcome: Option<CodeableConcept>,
-    pub contributed_to_death: Option<Boolean>,
-    pub onset: Option<FamilyMemberHistoryConditionOnset>,
-    pub note: Option<Vec<Annotation>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Flag {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6527,7 +6527,7 @@ pub enum GoalStart {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Goal {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6594,7 +6594,7 @@ pub enum GoalTargetDue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct GoalTarget {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub measure: Option<CodeableConcept>,
@@ -6603,8 +6603,45 @@ pub struct GoalTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct GraphDefinitionLinkTarget {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub params: Option<String>,
+    pub profile: Option<Canonical>,
+    pub compartment: Option<Vec<GraphDefinitionLinkTargetCompartment>>,
+    pub link: Option<Vec<GraphDefinitionLink>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct GraphDefinitionLinkTargetCompartment {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#use: Code,
+    pub code: Code,
+    pub rule: Code,
+    pub expression: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct GraphDefinitionLink {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub path: Option<String>,
+    pub slice_name: Option<String>,
+    pub min: Option<Integer>,
+    pub max: Option<String>,
+    pub description: Option<String>,
+    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct GraphDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6627,65 +6664,6 @@ pub struct GraphDefinition {
     pub start: Code,
     pub profile: Option<Canonical>,
     pub link: Option<Vec<GraphDefinitionLink>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct GraphDefinitionLinkTargetCompartment {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#use: Code,
-    pub code: Code,
-    pub rule: Code,
-    pub expression: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct GraphDefinitionLinkTarget {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub params: Option<String>,
-    pub profile: Option<Canonical>,
-    pub compartment: Option<Vec<GraphDefinitionLinkTargetCompartment>>,
-    pub link: Option<Vec<GraphDefinitionLink>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct GraphDefinitionLink {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub path: Option<String>,
-    pub slice_name: Option<String>,
-    pub min: Option<Integer>,
-    pub max: Option<String>,
-    pub description: Option<String>,
-    pub target: Option<Vec<GraphDefinitionLinkTarget>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Group {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub active: Option<Boolean>,
-    pub r#type: Code,
-    pub actual: Boolean,
-    pub code: Option<CodeableConcept>,
-    pub name: Option<String>,
-    pub quantity: Option<UnsignedInt>,
-    pub managing_entity: Option<Reference>,
-    pub characteristic: Option<Vec<GroupCharacteristic>>,
-    pub member: Option<Vec<GroupMember>>,
 }
 
 /// Choice of types for the value[x] field in GroupCharacteristic
@@ -6711,7 +6689,7 @@ pub enum GroupCharacteristicValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct GroupCharacteristic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -6722,12 +6700,34 @@ pub struct GroupCharacteristic {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct GroupMember {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub entity: Reference,
     pub period: Option<Period>,
     pub inactive: Option<Boolean>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct Group {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub active: Option<Boolean>,
+    pub r#type: Code,
+    pub actual: Boolean,
+    pub code: Option<CodeableConcept>,
+    pub name: Option<String>,
+    pub quantity: Option<UnsignedInt>,
+    pub managing_entity: Option<Reference>,
+    pub characteristic: Option<Vec<GroupCharacteristic>>,
+    pub member: Option<Vec<GroupMember>>,
 }
 
 /// Choice of types for the module[x] field in GuidanceResponse
@@ -6747,7 +6747,7 @@ pub enum GuidanceResponseModule {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct GuidanceResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6773,8 +6773,17 @@ pub struct GuidanceResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct HealthcareServiceEligibility {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub comment: Option<Markdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct HealthcareServiceNotAvailable {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: String,
@@ -6782,8 +6791,19 @@ pub struct HealthcareServiceNotAvailable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct HealthcareServiceAvailableTime {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub days_of_week: Option<Vec<Code>>,
+    pub all_day: Option<Boolean>,
+    pub available_start_time: Option<Time>,
+    pub available_end_time: Option<Time>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct HealthcareService {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6818,28 +6838,17 @@ pub struct HealthcareService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct HealthcareServiceEligibility {
-    pub id: Option<std::string::String>,
+pub struct ImagingStudySeriesPerformer {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub comment: Option<Markdown>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct HealthcareServiceAvailableTime {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub days_of_week: Option<Vec<Code>>,
-    pub all_day: Option<Boolean>,
-    pub available_start_time: Option<Time>,
-    pub available_end_time: Option<Time>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImagingStudySeriesInstance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub uid: Id,
@@ -6849,36 +6858,8 @@ pub struct ImagingStudySeriesInstance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImagingStudySeries {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uid: Id,
-    pub number: Option<UnsignedInt>,
-    pub modality: Coding,
-    pub description: Option<String>,
-    pub number_of_instances: Option<UnsignedInt>,
-    pub endpoint: Option<Vec<Reference>>,
-    pub body_site: Option<Coding>,
-    pub laterality: Option<Coding>,
-    pub specimen: Option<Vec<Reference>>,
-    pub started: Option<DateTime>,
-    pub performer: Option<Vec<ImagingStudySeriesPerformer>>,
-    pub instance: Option<Vec<ImagingStudySeriesInstance>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImagingStudySeriesPerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImagingStudy {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -6909,49 +6890,41 @@ pub struct ImagingStudy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImagingStudySeries {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uid: Id,
+    pub number: Option<UnsignedInt>,
+    pub modality: Coding,
+    pub description: Option<String>,
+    pub number_of_instances: Option<UnsignedInt>,
+    pub endpoint: Option<Vec<Reference>>,
+    pub body_site: Option<Coding>,
+    pub laterality: Option<Coding>,
+    pub specimen: Option<Vec<Reference>>,
+    pub started: Option<DateTime>,
+    pub performer: Option<Vec<ImagingStudySeriesPerformer>>,
+    pub instance: Option<Vec<ImagingStudySeriesInstance>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImmunizationPerformer {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImmunizationReaction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub date: Option<DateTime>,
     pub detail: Option<Reference>,
     pub reported: Option<Boolean>,
-}
-
-/// Choice of types for the doseNumber[x] field in ImmunizationProtocolApplied
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedDoseNumber {
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "doseNumberPositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "doseNumberString")]
-    String(String),
-}
-
-/// Choice of types for the seriesDoses[x] field in ImmunizationProtocolApplied
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ImmunizationProtocolAppliedSeriesDoses {
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "seriesDosesPositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "seriesDosesString")]
-    String(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImmunizationProtocolApplied {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub series: Option<String>,
-    pub authority: Option<Reference>,
-    pub target_disease: Option<Vec<CodeableConcept>>,
-    pub dose_number: Option<ImmunizationProtocolAppliedDoseNumber>,
-    pub series_doses: Option<ImmunizationProtocolAppliedSeriesDoses>,
 }
 
 /// Choice of types for the occurrence[x] field in Immunization
@@ -6968,7 +6941,7 @@ pub enum ImmunizationOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Immunization {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7006,24 +6979,51 @@ pub struct Immunization {
     pub protocol_applied: Option<Vec<ImmunizationProtocolApplied>>,
 }
 
+/// Choice of types for the doseNumber[x] field in ImmunizationProtocolApplied
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedDoseNumber {
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "doseNumberPositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "doseNumberString")]
+    String(String),
+}
+
+/// Choice of types for the seriesDoses[x] field in ImmunizationProtocolApplied
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImmunizationProtocolAppliedSeriesDoses {
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "seriesDosesPositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "seriesDosesString")]
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImmunizationProtocolApplied {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub series: Option<String>,
+    pub authority: Option<Reference>,
+    pub target_disease: Option<Vec<CodeableConcept>>,
+    pub dose_number: Option<ImmunizationProtocolAppliedDoseNumber>,
+    pub series_doses: Option<ImmunizationProtocolAppliedSeriesDoses>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImmunizationEducation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub document_type: Option<String>,
     pub reference: Option<Uri>,
     pub publication_date: Option<DateTime>,
     pub presentation_date: Option<DateTime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImmunizationPerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
 }
 
 /// Choice of types for the doseNumber[x] field in ImmunizationEvaluation
@@ -7052,7 +7052,7 @@ pub enum ImmunizationEvaluationSeriesDoses {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImmunizationEvaluation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7073,32 +7073,6 @@ pub struct ImmunizationEvaluation {
     pub series: Option<String>,
     pub dose_number: Option<ImmunizationEvaluationDoseNumber>,
     pub series_doses: Option<ImmunizationEvaluationSeriesDoses>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImmunizationRecommendationRecommendationDateCriterion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub value: DateTime,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImmunizationRecommendation {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub patient: Reference,
-    pub date: DateTime,
-    pub authority: Option<Reference>,
-    pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
 }
 
 /// Choice of types for the doseNumber[x] field in ImmunizationRecommendationRecommendation
@@ -7127,7 +7101,7 @@ pub enum ImmunizationRecommendationRecommendationSeriesDoses {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImmunizationRecommendationRecommendation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub vaccine_code: Option<Vec<CodeableConcept>>,
@@ -7145,15 +7119,38 @@ pub struct ImmunizationRecommendationRecommendation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDefinition {
-    pub id: Option<std::string::String>,
+pub struct ImmunizationRecommendationRecommendationDateCriterion {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
-    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
-    pub page: Option<ImplementationGuideDefinitionPage>,
-    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
-    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
+    pub code: CodeableConcept,
+    pub value: DateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImmunizationRecommendation {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub patient: Reference,
+    pub date: DateTime,
+    pub authority: Option<Reference>,
+    pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideGlobal {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub profile: Canonical,
 }
 
 /// Choice of types for the example[x] field in ImplementationGuideDefinitionResource
@@ -7170,7 +7167,7 @@ pub enum ImplementationGuideDefinitionResourceExample {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImplementationGuideDefinitionResource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub reference: Reference,
@@ -7179,79 +7176,6 @@ pub struct ImplementationGuideDefinitionResource {
     pub description: Option<String>,
     pub example: Option<ImplementationGuideDefinitionResourceExample>,
     pub grouping_id: Option<Id>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideManifestPage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub title: Option<String>,
-    pub anchor: Option<Vec<String>>,
-}
-
-/// Choice of types for the name[x] field in ImplementationGuideDefinitionPage
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ImplementationGuideDefinitionPageName {
-    /// Variant accepting the Url type.
-    #[serde(rename = "nameUrl")]
-    Url(Url),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "nameReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDefinitionPage {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<ImplementationGuideDefinitionPageName>,
-    pub title: String,
-    pub generation: Code,
-    pub page: Option<Vec<ImplementationGuideDefinitionPage>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDefinitionGrouping {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDependsOn {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub uri: Canonical,
-    pub package_id: Option<Id>,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDefinitionParameter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideManifest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub rendering: Option<Url>,
-    pub resource: Option<Vec<ImplementationGuideManifestResource>>,
-    pub page: Option<Vec<ImplementationGuideManifestPage>>,
-    pub image: Option<Vec<String>>,
-    pub other: Option<Vec<String>>,
 }
 
 /// Choice of types for the example[x] field in ImplementationGuideManifestResource
@@ -7268,7 +7192,7 @@ pub enum ImplementationGuideManifestResourceExample {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImplementationGuideManifestResource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub reference: Reference,
@@ -7277,27 +7201,30 @@ pub struct ImplementationGuideManifestResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideDefinitionTemplate {
-    pub id: Option<std::string::String>,
+pub struct ImplementationGuideDefinition {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub source: String,
-    pub scope: Option<String>,
+    pub grouping: Option<Vec<ImplementationGuideDefinitionGrouping>>,
+    pub resource: Option<Vec<ImplementationGuideDefinitionResource>>,
+    pub page: Option<ImplementationGuideDefinitionPage>,
+    pub parameter: Option<Vec<ImplementationGuideDefinitionParameter>>,
+    pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ImplementationGuideGlobal {
-    pub id: Option<std::string::String>,
+pub struct ImplementationGuideManifestPage {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub profile: Canonical,
+    pub name: String,
+    pub title: Option<String>,
+    pub anchor: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ImplementationGuide {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7328,8 +7255,81 @@ pub struct ImplementationGuide {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideDefinitionTemplate {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub source: String,
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideManifest {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub rendering: Option<Url>,
+    pub resource: Option<Vec<ImplementationGuideManifestResource>>,
+    pub page: Option<Vec<ImplementationGuideManifestPage>>,
+    pub image: Option<Vec<String>>,
+    pub other: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideDefinitionParameter {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideDefinitionGrouping {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Choice of types for the name[x] field in ImplementationGuideDefinitionPage
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImplementationGuideDefinitionPageName {
+    /// Variant accepting the Url type.
+    #[serde(rename = "nameUrl")]
+    Url(Url),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "nameReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideDefinitionPage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Option<ImplementationGuideDefinitionPageName>,
+    pub title: String,
+    pub generation: Code,
+    pub page: Option<Vec<ImplementationGuideDefinitionPage>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ImplementationGuideDependsOn {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub uri: Canonical,
+    pub package_id: Option<Id>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlanPlanGeneralCost {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -7339,8 +7339,17 @@ pub struct InsurancePlanPlanGeneralCost {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct InsurancePlanPlanSpecificCost {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: CodeableConcept,
+    pub benefit: Option<Vec<InsurancePlanPlanSpecificCostBenefit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlan {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7366,7 +7375,7 @@ pub struct InsurancePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlanCoverage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
@@ -7376,7 +7385,7 @@ pub struct InsurancePlanCoverage {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlanContact {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub purpose: Option<CodeableConcept>,
@@ -7386,27 +7395,8 @@ pub struct InsurancePlanContact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InsurancePlanCoverageBenefit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub requirement: Option<String>,
-    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InsurancePlanPlanSpecificCostBenefit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub cost: Option<Vec<InsurancePlanPlanSpecificCostBenefitCost>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlanPlanSpecificCostBenefitCost {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
@@ -7416,17 +7406,36 @@ pub struct InsurancePlanPlanSpecificCostBenefitCost {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InsurancePlanPlanSpecificCost {
-    pub id: Option<std::string::String>,
+pub struct InsurancePlanCoverageBenefitLimit {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: CodeableConcept,
-    pub benefit: Option<Vec<InsurancePlanPlanSpecificCostBenefit>>,
+    pub value: Option<Quantity>,
+    pub code: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct InsurancePlanPlanSpecificCostBenefit {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub cost: Option<Vec<InsurancePlanPlanSpecificCostBenefitCost>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct InsurancePlanCoverageBenefit {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub requirement: Option<String>,
+    pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InsurancePlanPlan {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Vec<Identifier>>,
@@ -7438,37 +7447,8 @@ pub struct InsurancePlanPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InsurancePlanCoverageBenefitLimit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub value: Option<Quantity>,
-    pub code: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InvoiceParticipant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Option<CodeableConcept>,
-    pub actor: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct InvoiceLineItemPriceComponent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub code: Option<CodeableConcept>,
-    pub factor: Option<Decimal>,
-    pub amount: Option<Money>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Invoice {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7494,6 +7474,26 @@ pub struct Invoice {
     pub note: Option<Vec<Annotation>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct InvoiceLineItemPriceComponent {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub code: Option<CodeableConcept>,
+    pub factor: Option<Decimal>,
+    pub amount: Option<Money>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct InvoiceParticipant {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub role: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
 /// Choice of types for the chargeItem[x] field in InvoiceLineItem
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -7508,7 +7508,7 @@ pub enum InvoiceLineItemChargeItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct InvoiceLineItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub sequence: Option<PositiveInt>,
@@ -7530,7 +7530,7 @@ pub enum LibrarySubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Library {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7572,8 +7572,17 @@ pub struct Library {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct LinkageItem {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub resource: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Linkage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7587,28 +7596,8 @@ pub struct Linkage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct LinkageItem {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub resource: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ListEntry {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub flag: Option<CodeableConcept>,
-    pub deleted: Option<Boolean>,
-    pub date: Option<DateTime>,
-    pub item: Reference,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct List {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7632,8 +7621,19 @@ pub struct List {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ListEntry {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub flag: Option<CodeableConcept>,
+    pub deleted: Option<Boolean>,
+    pub date: Option<DateTime>,
+    pub item: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Location {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7662,7 +7662,7 @@ pub struct Location {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct LocationHoursOfOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub days_of_week: Option<Vec<Code>>,
@@ -7673,7 +7673,7 @@ pub struct LocationHoursOfOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct LocationPosition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub longitude: Decimal,
@@ -7682,41 +7682,8 @@ pub struct LocationPosition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureGroup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub description: Option<String>,
-    pub population: Option<Vec<MeasureGroupPopulation>>,
-    pub stratifier: Option<Vec<MeasureGroupStratifier>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureGroupStratifier {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub description: Option<String>,
-    pub criteria: Option<Expression>,
-    pub component: Option<Vec<MeasureGroupStratifierComponent>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureSupplementalData {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub usage: Option<Vec<CodeableConcept>>,
-    pub description: Option<String>,
-    pub criteria: Expression,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureGroupStratifierComponent {
-    pub id: Option<std::string::String>,
+pub struct MeasureGroupPopulation {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
@@ -7738,7 +7705,7 @@ pub enum MeasureSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Measure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7790,8 +7757,41 @@ pub struct Measure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureGroupPopulation {
-    pub id: Option<std::string::String>,
+pub struct MeasureSupplementalData {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub usage: Option<Vec<CodeableConcept>>,
+    pub description: Option<String>,
+    pub criteria: Expression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureGroupStratifier {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub criteria: Option<Expression>,
+    pub component: Option<Vec<MeasureGroupStratifierComponent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureGroup {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub population: Option<Vec<MeasureGroupPopulation>>,
+    pub stratifier: Option<Vec<MeasureGroupStratifier>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureGroupStratifierComponent {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
@@ -7800,40 +7800,8 @@ pub struct MeasureGroupPopulation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureReportGroup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub population: Option<Vec<MeasureReportGroupPopulation>>,
-    pub measure_score: Option<Quantity>,
-    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureReportGroupPopulation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub count: Option<Integer>,
-    pub subject_results: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureReportGroupStratifierStratum {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub value: Option<CodeableConcept>,
-    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
-    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
-    pub measure_score: Option<Quantity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MeasureReportGroupStratifierStratumComponent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -7841,18 +7809,17 @@ pub struct MeasureReportGroupStratifierStratumComponent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureReportGroupStratifierStratumPopulation {
-    pub id: Option<std::string::String>,
+pub struct MeasureReportGroupStratifier {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<CodeableConcept>,
-    pub count: Option<Integer>,
-    pub subject_results: Option<Reference>,
+    pub code: Option<Vec<CodeableConcept>>,
+    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MeasureReport {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7874,12 +7841,45 @@ pub struct MeasureReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MeasureReportGroupStratifier {
-    pub id: Option<std::string::String>,
+pub struct MeasureReportGroup {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Option<Vec<CodeableConcept>>,
-    pub stratum: Option<Vec<MeasureReportGroupStratifierStratum>>,
+    pub code: Option<CodeableConcept>,
+    pub population: Option<Vec<MeasureReportGroupPopulation>>,
+    pub measure_score: Option<Quantity>,
+    pub stratifier: Option<Vec<MeasureReportGroupStratifier>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureReportGroupStratifierStratum {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub value: Option<CodeableConcept>,
+    pub component: Option<Vec<MeasureReportGroupStratifierStratumComponent>>,
+    pub population: Option<Vec<MeasureReportGroupStratifierStratumPopulation>>,
+    pub measure_score: Option<Quantity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureReportGroupStratifierStratumPopulation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub count: Option<Integer>,
+    pub subject_results: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MeasureReportGroupPopulation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Option<CodeableConcept>,
+    pub count: Option<Integer>,
+    pub subject_results: Option<Reference>,
 }
 
 /// Choice of types for the created[x] field in Media
@@ -7896,7 +7896,7 @@ pub enum MediaCreated {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Media {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7928,15 +7928,6 @@ pub struct Media {
     pub note: Option<Vec<Annotation>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationBatch {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub lot_number: Option<String>,
-    pub expiration_date: Option<DateTime>,
-}
-
 /// Choice of types for the item[x] field in MedicationIngredient
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -7951,7 +7942,7 @@ pub enum MedicationIngredientItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationIngredient {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub item: Option<MedicationIngredientItem>,
@@ -7960,8 +7951,17 @@ pub struct MedicationIngredient {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationBatch {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub lot_number: Option<String>,
+    pub expiration_date: Option<DateTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Medication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -7993,7 +7993,7 @@ pub enum MedicationAdministrationDosageRate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationAdministrationDosage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub text: Option<String>,
@@ -8006,7 +8006,7 @@ pub struct MedicationAdministrationDosage {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationAdministrationPerformer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub function: Option<CodeableConcept>,
@@ -8039,7 +8039,7 @@ pub enum MedicationAdministrationEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationAdministration {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8070,22 +8070,13 @@ pub struct MedicationAdministration {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationDispenseSubstitution {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub was_substituted: Boolean,
     pub r#type: Option<CodeableConcept>,
     pub reason: Option<Vec<CodeableConcept>>,
     pub responsible_party: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationDispensePerformer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub function: Option<CodeableConcept>,
-    pub actor: Reference,
 }
 
 /// Choice of types for the statusReason[x] field in MedicationDispense
@@ -8114,7 +8105,7 @@ pub enum MedicationDispenseMedication {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationDispense {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8149,17 +8140,81 @@ pub struct MedicationDispense {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeMonograph {
-    pub id: Option<std::string::String>,
+pub struct MedicationDispensePerformer {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub function: Option<CodeableConcept>,
+    pub actor: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeMonitoringProgram {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
-    pub source: Option<Reference>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeRelatedMedicationKnowledge {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub reference: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeRegulatoryMaxDispense {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub quantity: Quantity,
+    pub period: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeCost {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub source: Option<String>,
+    pub cost: Money,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: CodeableConcept,
+    pub dosage: Option<Vec<Dosage>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeRegulatorySchedule {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub schedule: CodeableConcept,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeKinetics {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub area_under_curve: Option<Vec<Quantity>>,
+    pub lethal_dose50: Option<Vec<Quantity>>,
+    pub half_life_period: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationKnowledge {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8191,102 +8246,22 @@ pub struct MedicationKnowledge {
     pub kinetics: Option<Vec<MedicationKnowledgeKinetics>>,
 }
 
-/// Choice of types for the item[x] field in MedicationKnowledgeIngredient
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationKnowledgeIngredientItem {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "itemCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "itemReference")]
-    Reference(Reference),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeIngredient {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub item: Option<MedicationKnowledgeIngredientItem>,
-    pub is_active: Option<Boolean>,
-    pub strength: Option<Ratio>,
-}
-
-/// Choice of types for the characteristic[x] field in MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "characteristicCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "characteristicQuantity")]
-    Quantity(Quantity),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub characteristic:
-        Option<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic>,
-    pub value: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeAdministrationGuidelinesDosage {
-    pub id: Option<std::string::String>,
+pub struct MedicationKnowledgeMedicineClassification {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
-    pub dosage: Option<Vec<Dosage>>,
+    pub classification: Option<Vec<CodeableConcept>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeMonitoringProgram {
-    pub id: Option<std::string::String>,
+pub struct MedicationKnowledgeMonograph {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeRegulatorySchedule {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub schedule: CodeableConcept,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeRegulatoryMaxDispense {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub quantity: Quantity,
-    pub period: Option<Duration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeKinetics {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub area_under_curve: Option<Vec<Quantity>>,
-    pub lethal_dose50: Option<Vec<Quantity>>,
-    pub half_life_period: Option<Duration>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeRegulatorySubstitution {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub allowed: Boolean,
+    pub source: Option<Reference>,
 }
 
 /// Choice of types for the value[x] field in MedicationKnowledgeDrugCharacteristic
@@ -8309,39 +8284,42 @@ pub enum MedicationKnowledgeDrugCharacteristicValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationKnowledgeDrugCharacteristic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
     pub value: Option<MedicationKnowledgeDrugCharacteristicValue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeRelatedMedicationKnowledge {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub reference: Option<Vec<Reference>>,
+/// Choice of types for the characteristic[x] field in MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "characteristicCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "characteristicQuantity")]
+    Quantity(Quantity),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeMedicineClassification {
-    pub id: Option<std::string::String>,
+pub struct MedicationKnowledgeAdministrationGuidelinesPatientCharacteristics {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub classification: Option<Vec<CodeableConcept>>,
+    pub characteristic:
+        Option<MedicationKnowledgeAdministrationGuidelinesPatientCharacteristicsCharacteristic>,
+    pub value: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationKnowledgeCost {
-    pub id: Option<std::string::String>,
+pub struct MedicationKnowledgeRegulatorySubstitution {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
-    pub source: Option<String>,
-    pub cost: Money,
+    pub allowed: Boolean,
 }
 
 /// Choice of types for the indication[x] field in MedicationKnowledgeAdministrationGuidelines
@@ -8358,7 +8336,7 @@ pub enum MedicationKnowledgeAdministrationGuidelinesIndication {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationKnowledgeAdministrationGuidelines {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub dosage: Option<Vec<MedicationKnowledgeAdministrationGuidelinesDosage>>,
@@ -8369,7 +8347,7 @@ pub struct MedicationKnowledgeAdministrationGuidelines {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationKnowledgePackaging {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -8378,13 +8356,35 @@ pub struct MedicationKnowledgePackaging {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationKnowledgeRegulatory {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub regulatory_authority: Reference,
     pub substitution: Option<Vec<MedicationKnowledgeRegulatorySubstitution>>,
     pub schedule: Option<Vec<MedicationKnowledgeRegulatorySchedule>>,
     pub max_dispense: Option<MedicationKnowledgeRegulatoryMaxDispense>,
+}
+
+/// Choice of types for the item[x] field in MedicationKnowledgeIngredient
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicationKnowledgeIngredientItem {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "itemCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "itemReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationKnowledgeIngredient {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub item: Option<MedicationKnowledgeIngredientItem>,
+    pub is_active: Option<Boolean>,
+    pub strength: Option<Ratio>,
 }
 
 /// Choice of types for the reported[x] field in MedicationRequest
@@ -8413,7 +8413,7 @@ pub enum MedicationRequestMedication {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8455,20 +8455,6 @@ pub struct MedicationRequest {
     pub event_history: Option<Vec<Reference>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicationRequestDispenseRequest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub initial_fill: Option<MedicationRequestDispenseRequestInitialFill>,
-    pub dispense_interval: Option<Duration>,
-    pub validity_period: Option<Period>,
-    pub number_of_repeats_allowed: Option<UnsignedInt>,
-    pub quantity: Option<Quantity>,
-    pub expected_supply_duration: Option<Duration>,
-    pub performer: Option<Reference>,
-}
-
 /// Choice of types for the allowed[x] field in MedicationRequestSubstitution
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -8483,7 +8469,7 @@ pub enum MedicationRequestSubstitutionAllowed {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationRequestSubstitution {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub allowed: Option<MedicationRequestSubstitutionAllowed>,
@@ -8491,8 +8477,22 @@ pub struct MedicationRequestSubstitution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicationRequestDispenseRequest {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub initial_fill: Option<MedicationRequestDispenseRequestInitialFill>,
+    pub dispense_interval: Option<Duration>,
+    pub validity_period: Option<Period>,
+    pub number_of_repeats_allowed: Option<UnsignedInt>,
+    pub quantity: Option<Quantity>,
+    pub expected_supply_duration: Option<Duration>,
+    pub performer: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationRequestDispenseRequestInitialFill {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub quantity: Option<Quantity>,
@@ -8525,7 +8525,7 @@ pub enum MedicationStatementEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicationStatement {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8553,53 +8553,18 @@ pub struct MedicationStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductNameCountryLanguage {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductName {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub country: CodeableConcept,
-    pub jurisdiction: Option<CodeableConcept>,
-    pub language: CodeableConcept,
-}
-
-/// Choice of types for the indication[x] field in MedicinalProductSpecialDesignation
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductSpecialDesignationIndication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "indicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "indicationReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductSpecialDesignation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub r#type: Option<CodeableConcept>,
-    pub intended_use: Option<CodeableConcept>,
-    pub indication: Option<MedicinalProductSpecialDesignationIndication>,
-    pub status: Option<CodeableConcept>,
-    pub date: Option<DateTime>,
-    pub species: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductNameNamePart {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub part: String,
-    pub r#type: Coding,
+    pub product_name: String,
+    pub name_part: Option<Vec<MedicinalProductNameNamePart>>,
+    pub country_language: Option<Vec<MedicinalProductNameCountryLanguage>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductManufacturingBusinessOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub operation_type: Option<CodeableConcept>,
@@ -8612,7 +8577,7 @@ pub struct MedicinalProductManufacturingBusinessOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProduct {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8644,25 +8609,48 @@ pub struct MedicinalProduct {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductName {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductNameNamePart {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub product_name: String,
-    pub name_part: Option<Vec<MedicinalProductNameNamePart>>,
-    pub country_language: Option<Vec<MedicinalProductNameCountryLanguage>>,
+    pub part: String,
+    pub r#type: Coding,
+}
+
+/// Choice of types for the indication[x] field in MedicinalProductSpecialDesignation
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductSpecialDesignationIndication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "indicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "indicationReference")]
+    Reference(Reference),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductAuthorizationJurisdictionalAuthorization {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductSpecialDesignation {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Vec<Identifier>>,
-    pub country: Option<CodeableConcept>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub legal_status_of_supply: Option<CodeableConcept>,
-    pub validity_period: Option<Period>,
+    pub r#type: Option<CodeableConcept>,
+    pub intended_use: Option<CodeableConcept>,
+    pub indication: Option<MedicinalProductSpecialDesignationIndication>,
+    pub status: Option<CodeableConcept>,
+    pub date: Option<DateTime>,
+    pub species: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductNameCountryLanguage {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub country: CodeableConcept,
+    pub jurisdiction: Option<CodeableConcept>,
+    pub language: CodeableConcept,
 }
 
 /// Choice of types for the date[x] field in MedicinalProductAuthorizationProcedure
@@ -8679,7 +8667,7 @@ pub enum MedicinalProductAuthorizationProcedureDate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductAuthorizationProcedure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Identifier>,
@@ -8690,7 +8678,7 @@ pub struct MedicinalProductAuthorizationProcedure {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductAuthorization {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8717,30 +8705,21 @@ pub struct MedicinalProductAuthorization {
     pub procedure: Option<MedicinalProductAuthorizationProcedure>,
 }
 
-/// Choice of types for the medication[x] field in MedicinalProductContraindicationOtherTherapy
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductContraindicationOtherTherapyMedication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "medicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "medicationReference")]
-    Reference(Reference),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductContraindicationOtherTherapy {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductAuthorizationJurisdictionalAuthorization {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub therapy_relationship_type: CodeableConcept,
-    pub medication: Option<MedicinalProductContraindicationOtherTherapyMedication>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub country: Option<CodeableConcept>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub legal_status_of_supply: Option<CodeableConcept>,
+    pub validity_period: Option<Period>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductContraindication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8757,9 +8736,51 @@ pub struct MedicinalProductContraindication {
     pub population: Option<Vec<Population>>,
 }
 
+/// Choice of types for the medication[x] field in MedicinalProductContraindicationOtherTherapy
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductContraindicationOtherTherapyMedication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "medicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "medicationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductContraindicationOtherTherapy {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub therapy_relationship_type: CodeableConcept,
+    pub medication: Option<MedicinalProductContraindicationOtherTherapyMedication>,
+}
+
+/// Choice of types for the medication[x] field in MedicinalProductIndicationOtherTherapy
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductIndicationOtherTherapyMedication {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "medicationCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "medicationReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductIndicationOtherTherapy {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub therapy_relationship_type: CodeableConcept,
+    pub medication: Option<MedicinalProductIndicationOtherTherapyMedication>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductIndication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8778,30 +8799,24 @@ pub struct MedicinalProductIndication {
     pub population: Option<Vec<Population>>,
 }
 
-/// Choice of types for the medication[x] field in MedicinalProductIndicationOtherTherapy
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductIndicationOtherTherapyMedication {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "medicationCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "medicationReference")]
-    Reference(Reference),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductIndicationOtherTherapy {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub therapy_relationship_type: CodeableConcept,
-    pub medication: Option<MedicinalProductIndicationOtherTherapyMedication>,
+    pub presentation: Ratio,
+    pub presentation_low_limit: Option<Ratio>,
+    pub concentration: Option<Ratio>,
+    pub concentration_low_limit: Option<Ratio>,
+    pub measurement_point: Option<String>,
+    pub country: Option<Vec<CodeableConcept>>,
+    pub reference_strength:
+        Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductIngredient {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8819,7 +8834,7 @@ pub struct MedicinalProductIngredient {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductIngredientSubstance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -8827,23 +8842,8 @@ pub struct MedicinalProductIngredientSubstance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductIngredientSpecifiedSubstanceStrength {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub presentation: Ratio,
-    pub presentation_low_limit: Option<Ratio>,
-    pub concentration: Option<Ratio>,
-    pub concentration_low_limit: Option<Ratio>,
-    pub measurement_point: Option<String>,
-    pub country: Option<Vec<CodeableConcept>>,
-    pub reference_strength:
-        Option<Vec<MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductIngredientSpecifiedSubstance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -8854,7 +8854,7 @@ pub struct MedicinalProductIngredientSpecifiedSubstance {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub substance: Option<CodeableConcept>,
@@ -8864,29 +8864,9 @@ pub struct MedicinalProductIngredientSpecifiedSubstanceStrengthReferenceStrength
     pub country: Option<Vec<CodeableConcept>>,
 }
 
-/// Choice of types for the item[x] field in MedicinalProductInteractionInteractant
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MedicinalProductInteractionInteractantItem {
-    /// Variant accepting the Reference type.
-    #[serde(rename = "itemReference")]
-    Reference(Reference),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "itemCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductInteractionInteractant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub item: Option<MedicinalProductInteractionInteractantItem>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductInteraction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8903,9 +8883,29 @@ pub struct MedicinalProductInteraction {
     pub management: Option<CodeableConcept>,
 }
 
+/// Choice of types for the item[x] field in MedicinalProductInteractionInteractant
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MedicinalProductInteractionInteractantItem {
+    /// Variant accepting the Reference type.
+    #[serde(rename = "itemReference")]
+    Reference(Reference),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "itemCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductInteractionInteractant {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub item: Option<MedicinalProductInteractionInteractantItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductManufactured {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8923,27 +8923,17 @@ pub struct MedicinalProductManufactured {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductPackagedPackageItem {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductPackagedBatchIdentifier {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub r#type: CodeableConcept,
-    pub quantity: Quantity,
-    pub material: Option<Vec<CodeableConcept>>,
-    pub alternate_material: Option<Vec<CodeableConcept>>,
-    pub device: Option<Vec<Reference>>,
-    pub manufactured_item: Option<Vec<Reference>>,
-    pub package_item: Option<Vec<MedicinalProductPackagedPackageItem>>,
-    pub physical_characteristics: Option<ProdCharacteristic>,
-    pub other_characteristics: Option<Vec<CodeableConcept>>,
-    pub shelf_life_storage: Option<Vec<ProductShelfLife>>,
-    pub manufacturer: Option<Vec<Reference>>,
+    pub outer_packaging: Identifier,
+    pub immediate_packaging: Option<Identifier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductPackaged {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -8963,27 +8953,27 @@ pub struct MedicinalProductPackaged {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductPackagedBatchIdentifier {
-    pub id: Option<std::string::String>,
+pub struct MedicinalProductPackagedPackageItem {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub outer_packaging: Identifier,
-    pub immediate_packaging: Option<Identifier>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub tissue: CodeableConcept,
-    pub value: Quantity,
-    pub supporting_information: Option<String>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub r#type: CodeableConcept,
+    pub quantity: Quantity,
+    pub material: Option<Vec<CodeableConcept>>,
+    pub alternate_material: Option<Vec<CodeableConcept>>,
+    pub device: Option<Vec<Reference>>,
+    pub manufactured_item: Option<Vec<Reference>>,
+    pub package_item: Option<Vec<MedicinalProductPackagedPackageItem>>,
+    pub physical_characteristics: Option<ProdCharacteristic>,
+    pub other_characteristics: Option<Vec<CodeableConcept>>,
+    pub shelf_life_storage: Option<Vec<ProductShelfLife>>,
+    pub manufacturer: Option<Vec<Reference>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductPharmaceutical {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9002,7 +8992,7 @@ pub struct MedicinalProductPharmaceutical {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductPharmaceuticalCharacteristics {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -9010,8 +9000,29 @@ pub struct MedicinalProductPharmaceuticalCharacteristics {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: CodeableConcept,
+    pub withdrawal_period: Option<
+        Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>,
+    >,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub tissue: CodeableConcept,
+    pub value: Quantity,
+    pub supporting_information: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -9025,19 +9036,8 @@ pub struct MedicinalProductPharmaceuticalRouteOfAdministration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpecies {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: CodeableConcept,
-    pub withdrawal_period: Option<
-        Vec<MedicinalProductPharmaceuticalRouteOfAdministrationTargetSpeciesWithdrawalPeriod>,
-    >,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MedicinalProductUndesirableEffect {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9054,7 +9054,7 @@ pub struct MedicinalProductUndesirableEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MessageDefinitionAllowedResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub message: Canonical,
@@ -9063,7 +9063,7 @@ pub struct MessageDefinitionAllowedResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MessageDefinitionFocus {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Code,
@@ -9086,7 +9086,7 @@ pub enum MessageDefinitionEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MessageDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9121,14 +9121,13 @@ pub struct MessageDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MessageHeaderDestination {
-    pub id: Option<std::string::String>,
+pub struct MessageHeaderResponse {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<String>,
-    pub target: Option<Reference>,
-    pub endpoint: Url,
-    pub receiver: Option<Reference>,
+    pub identifier: Id,
+    pub code: Code,
+    pub details: Option<Reference>,
 }
 
 /// Choice of types for the event[x] field in MessageHeader
@@ -9145,7 +9144,7 @@ pub enum MessageHeaderEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MessageHeader {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9167,18 +9166,19 @@ pub struct MessageHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MessageHeaderResponse {
-    pub id: Option<std::string::String>,
+pub struct MessageHeaderDestination {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Id,
-    pub code: Code,
-    pub details: Option<Reference>,
+    pub name: Option<String>,
+    pub target: Option<Reference>,
+    pub endpoint: Url,
+    pub receiver: Option<Reference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MessageHeaderSource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Option<String>,
@@ -9189,69 +9189,8 @@ pub struct MessageHeaderSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceVariant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub start: Option<Integer>,
-    pub end: Option<Integer>,
-    pub observed_allele: Option<String>,
-    pub reference_allele: Option<String>,
-    pub cigar: Option<String>,
-    pub variant_pointer: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceStructureVariantInner {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub start: Option<Integer>,
-    pub end: Option<Integer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceQualityRoc {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub score: Option<Vec<Integer>>,
-    pub num_t_p: Option<Vec<Integer>>,
-    pub num_f_p: Option<Vec<Integer>>,
-    pub num_f_n: Option<Vec<Integer>>,
-    pub precision: Option<Vec<Decimal>>,
-    pub sensitivity: Option<Vec<Decimal>>,
-    pub f_measure: Option<Vec<Decimal>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceStructureVariantOuter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub start: Option<Integer>,
-    pub end: Option<Integer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceReferenceSeq {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub chromosome: Option<CodeableConcept>,
-    pub genome_build: Option<String>,
-    pub orientation: Option<Code>,
-    pub reference_seq_id: Option<CodeableConcept>,
-    pub reference_seq_pointer: Option<Reference>,
-    pub reference_seq_string: Option<String>,
-    pub strand: Option<Code>,
-    pub window_start: Option<Integer>,
-    pub window_end: Option<Integer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MolecularSequenceQuality {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -9272,20 +9211,8 @@ pub struct MolecularSequenceQuality {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct MolecularSequenceStructureVariant {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub variant_type: Option<CodeableConcept>,
-    pub exact: Option<Boolean>,
-    pub length: Option<Integer>,
-    pub outer: Option<MolecularSequenceStructureVariantOuter>,
-    pub inner: Option<MolecularSequenceStructureVariantInner>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MolecularSequenceRepository {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -9297,8 +9224,65 @@ pub struct MolecularSequenceRepository {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceStructureVariant {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub variant_type: Option<CodeableConcept>,
+    pub exact: Option<Boolean>,
+    pub length: Option<Integer>,
+    pub outer: Option<MolecularSequenceStructureVariantOuter>,
+    pub inner: Option<MolecularSequenceStructureVariantInner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceStructureVariantInner {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub start: Option<Integer>,
+    pub end: Option<Integer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceVariant {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub start: Option<Integer>,
+    pub end: Option<Integer>,
+    pub observed_allele: Option<String>,
+    pub reference_allele: Option<String>,
+    pub cigar: Option<String>,
+    pub variant_pointer: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceStructureVariantOuter {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub start: Option<Integer>,
+    pub end: Option<Integer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceQualityRoc {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub score: Option<Vec<Integer>>,
+    pub num_t_p: Option<Vec<Integer>>,
+    pub num_f_p: Option<Vec<Integer>>,
+    pub num_f_n: Option<Vec<Integer>>,
+    pub precision: Option<Vec<Decimal>>,
+    pub sensitivity: Option<Vec<Decimal>>,
+    pub f_measure: Option<Vec<Decimal>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct MolecularSequence {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9325,8 +9309,24 @@ pub struct MolecularSequence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct MolecularSequenceReferenceSeq {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub chromosome: Option<CodeableConcept>,
+    pub genome_build: Option<String>,
+    pub orientation: Option<Code>,
+    pub reference_seq_id: Option<CodeableConcept>,
+    pub reference_seq_pointer: Option<Reference>,
+    pub reference_seq_string: Option<String>,
+    pub strand: Option<Code>,
+    pub window_start: Option<Integer>,
+    pub window_end: Option<Integer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct NamingSystemUniqueId {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -9338,7 +9338,7 @@ pub struct NamingSystemUniqueId {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct NamingSystem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9362,45 +9362,30 @@ pub struct NamingSystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct NutritionOrderSupplement {
-    pub id: Option<std::string::String>,
+pub struct NutritionOrderOralDiet {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub product_name: Option<String>,
+    pub r#type: Option<Vec<CodeableConcept>>,
     pub schedule: Option<Vec<Timing>>,
-    pub quantity: Option<Quantity>,
+    pub nutrient: Option<Vec<NutritionOrderOralDietNutrient>>,
+    pub texture: Option<Vec<NutritionOrderOralDietTexture>>,
+    pub fluid_consistency_type: Option<Vec<CodeableConcept>>,
     pub instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct NutritionOrderOralDietTexture {
-    pub id: Option<std::string::String>,
+pub struct NutritionOrderOralDietNutrient {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub modifier: Option<CodeableConcept>,
-    pub food_type: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct NutritionOrderEnteralFormula {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub base_formula_type: Option<CodeableConcept>,
-    pub base_formula_product_name: Option<String>,
-    pub additive_type: Option<CodeableConcept>,
-    pub additive_product_name: Option<String>,
-    pub caloric_density: Option<Quantity>,
-    pub routeof_administration: Option<CodeableConcept>,
-    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
-    pub max_volume_to_deliver: Option<Quantity>,
-    pub administration_instruction: Option<String>,
+    pub amount: Option<Quantity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct NutritionOrder {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9427,6 +9412,27 @@ pub struct NutritionOrder {
     pub note: Option<Vec<Annotation>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct NutritionOrderOralDietTexture {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub modifier: Option<CodeableConcept>,
+    pub food_type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct NutritionOrderSupplement {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub product_name: Option<String>,
+    pub schedule: Option<Vec<Timing>>,
+    pub quantity: Option<Quantity>,
+    pub instruction: Option<String>,
+}
+
 /// Choice of types for the rate[x] field in NutritionOrderEnteralFormulaAdministration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -9441,7 +9447,7 @@ pub enum NutritionOrderEnteralFormulaAdministrationRate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct NutritionOrderEnteralFormulaAdministration {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub schedule: Option<Timing>,
@@ -9450,38 +9456,19 @@ pub struct NutritionOrderEnteralFormulaAdministration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct NutritionOrderOralDietNutrient {
-    pub id: Option<std::string::String>,
+pub struct NutritionOrderEnteralFormula {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub modifier: Option<CodeableConcept>,
-    pub amount: Option<Quantity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct NutritionOrderOralDiet {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<Vec<CodeableConcept>>,
-    pub schedule: Option<Vec<Timing>>,
-    pub nutrient: Option<Vec<NutritionOrderOralDietNutrient>>,
-    pub texture: Option<Vec<NutritionOrderOralDietTexture>>,
-    pub fluid_consistency_type: Option<Vec<CodeableConcept>>,
-    pub instruction: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ObservationReferenceRange {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub low: Option<Quantity>,
-    pub high: Option<Quantity>,
-    pub r#type: Option<CodeableConcept>,
-    pub applies_to: Option<Vec<CodeableConcept>>,
-    pub age: Option<Range>,
-    pub text: Option<String>,
+    pub base_formula_type: Option<CodeableConcept>,
+    pub base_formula_product_name: Option<String>,
+    pub additive_type: Option<CodeableConcept>,
+    pub additive_product_name: Option<String>,
+    pub caloric_density: Option<Quantity>,
+    pub routeof_administration: Option<CodeableConcept>,
+    pub administration: Option<Vec<NutritionOrderEnteralFormulaAdministration>>,
+    pub max_volume_to_deliver: Option<Quantity>,
+    pub administration_instruction: Option<String>,
 }
 
 /// Choice of types for the value[x] field in ObservationComponent
@@ -9525,7 +9512,7 @@ pub enum ObservationComponentValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ObservationComponent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
@@ -9533,6 +9520,19 @@ pub struct ObservationComponent {
     pub data_absent_reason: Option<CodeableConcept>,
     pub interpretation: Option<Vec<CodeableConcept>>,
     pub reference_range: Option<Vec<ObservationReferenceRange>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ObservationReferenceRange {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub low: Option<Quantity>,
+    pub high: Option<Quantity>,
+    pub r#type: Option<CodeableConcept>,
+    pub applies_to: Option<Vec<CodeableConcept>>,
+    pub age: Option<Range>,
+    pub text: Option<String>,
 }
 
 /// Choice of types for the effective[x] field in Observation
@@ -9594,7 +9594,7 @@ pub enum ObservationValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Observation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9629,23 +9629,8 @@ pub struct Observation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ObservationDefinitionQualifiedInterval {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub category: Option<Code>,
-    pub range: Option<Range>,
-    pub context: Option<CodeableConcept>,
-    pub applies_to: Option<Vec<CodeableConcept>>,
-    pub gender: Option<Code>,
-    pub age: Option<Range>,
-    pub gestational_age: Option<Range>,
-    pub condition: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ObservationDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9670,7 +9655,7 @@ pub struct ObservationDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ObservationDefinitionQuantitativeDetails {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub customary_unit: Option<CodeableConcept>,
@@ -9680,8 +9665,32 @@ pub struct ObservationDefinitionQuantitativeDetails {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ObservationDefinitionQualifiedInterval {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub category: Option<Code>,
+    pub range: Option<Range>,
+    pub context: Option<CodeableConcept>,
+    pub applies_to: Option<Vec<CodeableConcept>>,
+    pub gender: Option<Code>,
+    pub age: Option<Range>,
+    pub gestational_age: Option<Range>,
+    pub condition: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct OperationDefinitionOverload {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub parameter_name: Option<Vec<String>>,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OperationDefinitionParameterReferencedFrom {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub source: String,
@@ -9689,8 +9698,17 @@ pub struct OperationDefinitionParameterReferencedFrom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct OperationDefinitionParameterBinding {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub strength: Code,
+    pub value_set: Canonical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OperationDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9728,7 +9746,7 @@ pub struct OperationDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OperationDefinitionParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Code,
@@ -9745,39 +9763,8 @@ pub struct OperationDefinitionParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct OperationDefinitionParameterBinding {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub strength: Code,
-    pub value_set: Canonical,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct OperationDefinitionOverload {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub parameter_name: Option<Vec<String>>,
-    pub comment: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct OperationOutcomeIssue {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub severity: Code,
-    pub code: Code,
-    pub details: Option<CodeableConcept>,
-    pub diagnostics: Option<String>,
-    pub location: Option<Vec<String>>,
-    pub expression: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OperationOutcome {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9789,8 +9776,21 @@ pub struct OperationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct OperationOutcomeIssue {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub severity: Code,
+    pub code: Code,
+    pub details: Option<CodeableConcept>,
+    pub diagnostics: Option<String>,
+    pub location: Option<Vec<String>>,
+    pub expression: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OrganizationContact {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub purpose: Option<CodeableConcept>,
@@ -9801,7 +9801,7 @@ pub struct OrganizationContact {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Organization {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9823,7 +9823,7 @@ pub struct Organization {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct OrganizationAffiliation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -9843,15 +9843,6 @@ pub struct OrganizationAffiliation {
     pub healthcare_service: Option<Vec<Reference>>,
     pub telecom: Option<Vec<ContactPoint>>,
     pub endpoint: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Parameters {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub parameter: Option<Vec<ParametersParameter>>,
 }
 
 /// Choice of types for the value[x] field in ParametersParameter
@@ -10012,7 +10003,7 @@ pub enum ParametersParameterValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ParametersParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
@@ -10022,17 +10013,17 @@ pub struct ParametersParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PatientCommunication {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub language: CodeableConcept,
-    pub preferred: Option<Boolean>,
+pub struct Parameters {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub parameter: Option<Vec<ParametersParameter>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PatientContact {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub relationship: Option<Vec<CodeableConcept>>,
@@ -10046,11 +10037,20 @@ pub struct PatientContact {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PatientLink {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub other: Reference,
     pub r#type: Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct PatientCommunication {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub language: CodeableConcept,
+    pub preferred: Option<Boolean>,
 }
 
 /// Choice of types for the deceased[x] field in Patient
@@ -10079,7 +10079,7 @@ pub enum PatientMultipleBirth {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Patient {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10107,7 +10107,7 @@ pub struct Patient {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PaymentNotice {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10130,25 +10130,8 @@ pub struct PaymentNotice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PaymentReconciliationDetail {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub predecessor: Option<Identifier>,
-    pub r#type: CodeableConcept,
-    pub request: Option<Reference>,
-    pub submitter: Option<Reference>,
-    pub response: Option<Reference>,
-    pub date: Option<Date>,
-    pub responsible: Option<Reference>,
-    pub payee: Option<Reference>,
-    pub amount: Option<Money>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PaymentReconciliation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10174,8 +10157,25 @@ pub struct PaymentReconciliation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct PaymentReconciliationDetail {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub predecessor: Option<Identifier>,
+    pub r#type: CodeableConcept,
+    pub request: Option<Reference>,
+    pub submitter: Option<Reference>,
+    pub response: Option<Reference>,
+    pub date: Option<Date>,
+    pub responsible: Option<Reference>,
+    pub payee: Option<Reference>,
+    pub amount: Option<Money>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PaymentReconciliationProcessNote {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Code>,
@@ -10183,17 +10183,8 @@ pub struct PaymentReconciliationProcessNote {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PersonLink {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub target: Reference,
-    pub assurance: Option<Code>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Person {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10214,12 +10205,12 @@ pub struct Person {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PlanDefinitionActionDynamicValue {
-    pub id: Option<std::string::String>,
+pub struct PersonLink {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub path: Option<String>,
-    pub expression: Option<Expression>,
+    pub target: Reference,
+    pub assurance: Option<Code>,
 }
 
 /// Choice of types for the subject[x] field in PlanDefinitionAction
@@ -10272,7 +10263,7 @@ pub enum PlanDefinitionActionDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PlanDefinitionAction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub prefix: Option<String>,
@@ -10305,12 +10296,12 @@ pub struct PlanDefinitionAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PlanDefinitionActionParticipant {
-    pub id: Option<std::string::String>,
+pub struct PlanDefinitionActionCondition {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub role: Option<CodeableConcept>,
+    pub kind: Code,
+    pub expression: Option<Expression>,
 }
 
 /// Choice of types for the subject[x] field in PlanDefinition
@@ -10327,7 +10318,7 @@ pub enum PlanDefinitionSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PlanDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10369,34 +10360,26 @@ pub struct PlanDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PlanDefinitionActionCondition {
-    pub id: Option<std::string::String>,
+pub struct PlanDefinitionGoal {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub kind: Code,
-    pub expression: Option<Expression>,
-}
-
-/// Choice of types for the offset[x] field in PlanDefinitionActionRelatedAction
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum PlanDefinitionActionRelatedActionOffset {
-    /// Variant accepting the Duration type.
-    #[serde(rename = "offsetDuration")]
-    Duration(Duration),
-    /// Variant accepting the Range type.
-    #[serde(rename = "offsetRange")]
-    Range(Range),
+    pub category: Option<CodeableConcept>,
+    pub description: CodeableConcept,
+    pub priority: Option<CodeableConcept>,
+    pub start: Option<CodeableConcept>,
+    pub addresses: Option<Vec<CodeableConcept>>,
+    pub documentation: Option<Vec<RelatedArtifact>>,
+    pub target: Option<Vec<PlanDefinitionGoalTarget>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PlanDefinitionActionRelatedAction {
-    pub id: Option<std::string::String>,
+pub struct PlanDefinitionActionDynamicValue {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub action_id: Id,
-    pub relationship: Code,
-    pub offset: Option<PlanDefinitionActionRelatedActionOffset>,
+    pub path: Option<String>,
+    pub expression: Option<Expression>,
 }
 
 /// Choice of types for the detail[x] field in PlanDefinitionGoalTarget
@@ -10416,7 +10399,7 @@ pub enum PlanDefinitionGoalTargetDetail {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PlanDefinitionGoalTarget {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub measure: Option<CodeableConcept>,
@@ -10425,22 +10408,39 @@ pub struct PlanDefinitionGoalTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PlanDefinitionGoal {
-    pub id: Option<std::string::String>,
+pub struct PlanDefinitionActionParticipant {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub category: Option<CodeableConcept>,
-    pub description: CodeableConcept,
-    pub priority: Option<CodeableConcept>,
-    pub start: Option<CodeableConcept>,
-    pub addresses: Option<Vec<CodeableConcept>>,
-    pub documentation: Option<Vec<RelatedArtifact>>,
-    pub target: Option<Vec<PlanDefinitionGoalTarget>>,
+    pub r#type: Code,
+    pub role: Option<CodeableConcept>,
+}
+
+/// Choice of types for the offset[x] field in PlanDefinitionActionRelatedAction
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanDefinitionActionRelatedActionOffset {
+    /// Variant accepting the Duration type.
+    #[serde(rename = "offsetDuration")]
+    Duration(Duration),
+    /// Variant accepting the Range type.
+    #[serde(rename = "offsetRange")]
+    Range(Range),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct PlanDefinitionActionRelatedAction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action_id: Id,
+    pub relationship: Code,
+    pub offset: Option<PlanDefinitionActionRelatedActionOffset>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Practitioner {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10462,7 +10462,7 @@ pub struct Practitioner {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PractitionerQualification {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Vec<Identifier>>,
@@ -10472,19 +10472,8 @@ pub struct PractitionerQualification {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct PractitionerRoleAvailableTime {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub days_of_week: Option<Vec<Code>>,
-    pub all_day: Option<Boolean>,
-    pub available_start_time: Option<Time>,
-    pub available_end_time: Option<Time>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PractitionerRoleNotAvailable {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: String,
@@ -10493,7 +10482,7 @@ pub struct PractitionerRoleNotAvailable {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct PractitionerRole {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10518,22 +10507,33 @@ pub struct PractitionerRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct PractitionerRoleAvailableTime {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub days_of_week: Option<Vec<Code>>,
+    pub all_day: Option<Boolean>,
+    pub available_start_time: Option<Time>,
+    pub available_end_time: Option<Time>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ProcedureFocalDevice {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<CodeableConcept>,
+    pub manipulated: Reference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ProcedurePerformer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub function: Option<CodeableConcept>,
     pub actor: Reference,
     pub on_behalf_of: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ProcedureFocalDevice {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<CodeableConcept>,
-    pub manipulated: Reference,
 }
 
 /// Choice of types for the performed[x] field in Procedure
@@ -10559,7 +10559,7 @@ pub enum ProcedurePerformed {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Procedure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10597,6 +10597,27 @@ pub struct Procedure {
     pub used_code: Option<Vec<CodeableConcept>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ProvenanceEntity {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub role: Code,
+    pub what: Reference,
+    pub agent: Option<Vec<ProvenanceAgent>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ProvenanceAgent {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub role: Option<Vec<CodeableConcept>>,
+    pub who: Reference,
+    pub on_behalf_of: Option<Reference>,
+}
+
 /// Choice of types for the occurred[x] field in Provenance
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -10611,7 +10632,7 @@ pub enum ProvenanceOccurred {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Provenance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10629,73 +10650,6 @@ pub struct Provenance {
     pub agent: Option<Vec<ProvenanceAgent>>,
     pub entity: Option<Vec<ProvenanceEntity>>,
     pub signature: Option<Vec<Signature>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ProvenanceAgent {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub role: Option<Vec<CodeableConcept>>,
-    pub who: Reference,
-    pub on_behalf_of: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ProvenanceEntity {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Code,
-    pub what: Reference,
-    pub agent: Option<Vec<ProvenanceAgent>>,
-}
-
-/// Choice of types for the answer[x] field in QuestionnaireItemEnableWhen
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum QuestionnaireItemEnableWhenAnswer {
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "answerBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "answerDecimal")]
-    Decimal(Decimal),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "answerInteger")]
-    Integer(Integer),
-    /// Variant accepting the Date type.
-    #[serde(rename = "answerDate")]
-    Date(Date),
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "answerDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Time type.
-    #[serde(rename = "answerTime")]
-    Time(Time),
-    /// Variant accepting the String type.
-    #[serde(rename = "answerString")]
-    String(String),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "answerCoding")]
-    Coding(Coding),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "answerQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "answerReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct QuestionnaireItemEnableWhen {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub question: String,
-    pub operator: Code,
-    pub answer: Option<QuestionnaireItemEnableWhenAnswer>,
 }
 
 /// Choice of types for the value[x] field in QuestionnaireItemAnswerOption
@@ -10724,11 +10678,45 @@ pub enum QuestionnaireItemAnswerOptionValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct QuestionnaireItemAnswerOption {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub value: Option<QuestionnaireItemAnswerOptionValue>,
     pub initial_selected: Option<Boolean>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct Questionnaire {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Option<Uri>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub derived_from: Option<Vec<Canonical>>,
+    pub status: Code,
+    pub experimental: Option<Boolean>,
+    pub subject_type: Option<Vec<Code>>,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<Markdown>,
+    pub copyright: Option<Markdown>,
+    pub approval_date: Option<Date>,
+    pub last_review_date: Option<Date>,
+    pub effective_period: Option<Period>,
+    pub code: Option<Vec<Coding>>,
+    pub item: Option<Vec<QuestionnaireItem>>,
 }
 
 /// Choice of types for the value[x] field in QuestionnaireItemInitial
@@ -10775,49 +10763,15 @@ pub enum QuestionnaireItemInitialValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct QuestionnaireItemInitial {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub value: Option<QuestionnaireItemInitialValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Questionnaire {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Option<Uri>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub version: Option<String>,
-    pub name: Option<String>,
-    pub title: Option<String>,
-    pub derived_from: Option<Vec<Canonical>>,
-    pub status: Code,
-    pub experimental: Option<Boolean>,
-    pub subject_type: Option<Vec<Code>>,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub purpose: Option<Markdown>,
-    pub copyright: Option<Markdown>,
-    pub approval_date: Option<Date>,
-    pub last_review_date: Option<Date>,
-    pub effective_period: Option<Period>,
-    pub code: Option<Vec<Coding>>,
-    pub item: Option<Vec<QuestionnaireItem>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct QuestionnaireItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub link_id: String,
@@ -10838,21 +10792,55 @@ pub struct QuestionnaireItem {
     pub item: Option<Vec<QuestionnaireItem>>,
 }
 
+/// Choice of types for the answer[x] field in QuestionnaireItemEnableWhen
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionnaireItemEnableWhenAnswer {
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "answerBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "answerDecimal")]
+    Decimal(Decimal),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "answerInteger")]
+    Integer(Integer),
+    /// Variant accepting the Date type.
+    #[serde(rename = "answerDate")]
+    Date(Date),
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "answerDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Time type.
+    #[serde(rename = "answerTime")]
+    Time(Time),
+    /// Variant accepting the String type.
+    #[serde(rename = "answerString")]
+    String(String),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "answerCoding")]
+    Coding(Coding),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "answerQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "answerReference")]
+    Reference(Reference),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct QuestionnaireResponseItem {
-    pub id: Option<std::string::String>,
+pub struct QuestionnaireItemEnableWhen {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub link_id: String,
-    pub definition: Option<Uri>,
-    pub text: Option<String>,
-    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
-    pub item: Option<Vec<QuestionnaireResponseItem>>,
+    pub question: String,
+    pub operator: Code,
+    pub answer: Option<QuestionnaireItemEnableWhenAnswer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct QuestionnaireResponse {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10870,6 +10858,18 @@ pub struct QuestionnaireResponse {
     pub authored: Option<DateTime>,
     pub author: Option<Reference>,
     pub source: Option<Reference>,
+    pub item: Option<Vec<QuestionnaireResponseItem>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct QuestionnaireResponseItem {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub link_id: String,
+    pub definition: Option<Uri>,
+    pub text: Option<String>,
+    pub answer: Option<Vec<QuestionnaireResponseItemAnswer>>,
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
@@ -10917,7 +10917,7 @@ pub enum QuestionnaireResponseItemAnswerValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct QuestionnaireResponseItemAnswer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub value: Option<QuestionnaireResponseItemAnswerValue>,
@@ -10926,7 +10926,7 @@ pub struct QuestionnaireResponseItemAnswer {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RelatedPerson {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -10950,11 +10950,20 @@ pub struct RelatedPerson {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RelatedPersonCommunication {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub language: CodeableConcept,
     pub preferred: Option<Boolean>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct RequestGroupActionCondition {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub kind: Code,
+    pub expression: Option<Expression>,
 }
 
 /// Choice of types for the timing[x] field in RequestGroupAction
@@ -10983,7 +10992,7 @@ pub enum RequestGroupActionTiming {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RequestGroupAction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub prefix: Option<String>,
@@ -11009,7 +11018,7 @@ pub struct RequestGroupAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RequestGroup {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11051,21 +11060,12 @@ pub enum RequestGroupActionRelatedActionOffset {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RequestGroupActionRelatedAction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub action_id: Id,
     pub relationship: Code,
     pub offset: Option<RequestGroupActionRelatedActionOffset>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct RequestGroupActionCondition {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub kind: Code,
-    pub expression: Option<Expression>,
 }
 
 /// Choice of types for the subject[x] field in ResearchDefinition
@@ -11082,7 +11082,7 @@ pub enum ResearchDefinitionSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11140,7 +11140,7 @@ pub enum ResearchElementDefinitionSubject {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchElementDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11239,7 +11239,7 @@ pub enum ResearchElementDefinitionCharacteristicParticipantEffective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchElementDefinitionCharacteristic {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub definition: Option<ResearchElementDefinitionCharacteristicDefinition>,
@@ -11258,7 +11258,7 @@ pub struct ResearchElementDefinitionCharacteristic {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchStudyArm {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
@@ -11268,7 +11268,7 @@ pub struct ResearchStudyArm {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchStudy {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11304,7 +11304,7 @@ pub struct ResearchStudy {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchStudyObjective {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Option<String>,
@@ -11313,7 +11313,7 @@ pub struct ResearchStudyObjective {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ResearchSubject {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11357,7 +11357,7 @@ pub enum RiskAssessmentPredictionWhen {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskAssessmentPrediction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub outcome: Option<CodeableConcept>,
@@ -11382,7 +11382,7 @@ pub enum RiskAssessmentOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskAssessment {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11411,7 +11411,7 @@ pub struct RiskAssessment {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskEvidenceSynthesis {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11453,18 +11453,8 @@ pub struct RiskEvidenceSynthesis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct RiskEvidenceSynthesisSampleSize {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub number_of_studies: Option<Integer>,
-    pub number_of_participants: Option<Integer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskEvidenceSynthesisRiskEstimate {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub description: Option<String>,
@@ -11478,7 +11468,7 @@ pub struct RiskEvidenceSynthesisRiskEstimate {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -11488,18 +11478,18 @@ pub struct RiskEvidenceSynthesisRiskEstimatePrecisionEstimate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
-    pub id: Option<std::string::String>,
+pub struct RiskEvidenceSynthesisSampleSize {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Option<CodeableConcept>,
-    pub rating: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
+    pub description: Option<String>,
+    pub number_of_studies: Option<Integer>,
+    pub number_of_participants: Option<Integer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct RiskEvidenceSynthesisCertainty {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub rating: Option<Vec<CodeableConcept>>,
@@ -11508,8 +11498,18 @@ pub struct RiskEvidenceSynthesisCertainty {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct RiskEvidenceSynthesisCertaintyCertaintySubcomponent {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub rating: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Schedule {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11529,7 +11529,7 @@ pub struct Schedule {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SearchParameterComponent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub definition: Canonical,
@@ -11538,7 +11538,7 @@ pub struct SearchParameterComponent {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SearchParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11618,7 +11618,7 @@ pub enum ServiceRequestAsNeeded {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ServiceRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11663,7 +11663,7 @@ pub struct ServiceRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Slot {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11682,79 +11682,6 @@ pub struct Slot {
     pub end: Instant,
     pub overbooked: Option<Boolean>,
     pub comment: Option<String>,
-}
-
-/// Choice of types for the additive[x] field in SpecimenContainer
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum SpecimenContainerAdditive {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "additiveCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "additiveReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SpecimenContainer {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub description: Option<String>,
-    pub r#type: Option<CodeableConcept>,
-    pub capacity: Option<Quantity>,
-    pub specimen_quantity: Option<Quantity>,
-    pub additive: Option<SpecimenContainerAdditive>,
-}
-
-/// Choice of types for the time[x] field in SpecimenProcessing
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum SpecimenProcessingTime {
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "timeDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Period type.
-    #[serde(rename = "timePeriod")]
-    Period(Period),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SpecimenProcessing {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: Option<String>,
-    pub procedure: Option<CodeableConcept>,
-    pub additive: Option<Vec<Reference>>,
-    pub time: Option<SpecimenProcessingTime>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Specimen {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub accession_identifier: Option<Identifier>,
-    pub status: Option<Code>,
-    pub r#type: Option<CodeableConcept>,
-    pub subject: Option<Reference>,
-    pub received_time: Option<DateTime>,
-    pub parent: Option<Vec<Reference>>,
-    pub request: Option<Vec<Reference>>,
-    pub collection: Option<SpecimenCollection>,
-    pub processing: Option<Vec<SpecimenProcessing>>,
-    pub container: Option<Vec<SpecimenContainer>>,
-    pub condition: Option<Vec<CodeableConcept>>,
-    pub note: Option<Vec<Annotation>>,
 }
 
 /// Choice of types for the collected[x] field in SpecimenCollection
@@ -11783,7 +11710,7 @@ pub enum SpecimenCollectionFastingStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SpecimenCollection {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub collector: Option<Reference>,
@@ -11796,14 +11723,76 @@ pub struct SpecimenCollection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SpecimenDefinitionTypeTestedHandling {
-    pub id: Option<std::string::String>,
+pub struct Specimen {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub temperature_qualifier: Option<CodeableConcept>,
-    pub temperature_range: Option<Range>,
-    pub max_duration: Option<Duration>,
-    pub instruction: Option<String>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub accession_identifier: Option<Identifier>,
+    pub status: Option<Code>,
+    pub r#type: Option<CodeableConcept>,
+    pub subject: Option<Reference>,
+    pub received_time: Option<DateTime>,
+    pub parent: Option<Vec<Reference>>,
+    pub request: Option<Vec<Reference>>,
+    pub collection: Option<SpecimenCollection>,
+    pub processing: Option<Vec<SpecimenProcessing>>,
+    pub container: Option<Vec<SpecimenContainer>>,
+    pub condition: Option<Vec<CodeableConcept>>,
+    pub note: Option<Vec<Annotation>>,
+}
+
+/// Choice of types for the additive[x] field in SpecimenContainer
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecimenContainerAdditive {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "additiveCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "additiveReference")]
+    Reference(Reference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SpecimenContainer {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub description: Option<String>,
+    pub r#type: Option<CodeableConcept>,
+    pub capacity: Option<Quantity>,
+    pub specimen_quantity: Option<Quantity>,
+    pub additive: Option<SpecimenContainerAdditive>,
+}
+
+/// Choice of types for the time[x] field in SpecimenProcessing
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecimenProcessingTime {
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "timeDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Period type.
+    #[serde(rename = "timePeriod")]
+    Period(Period),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SpecimenProcessing {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub description: Option<String>,
+    pub procedure: Option<CodeableConcept>,
+    pub additive: Option<Vec<Reference>>,
+    pub time: Option<SpecimenProcessingTime>,
 }
 
 /// Choice of types for the minimumVolume[x] field in SpecimenDefinitionTypeTestedContainer
@@ -11820,7 +11809,7 @@ pub enum SpecimenDefinitionTypeTestedContainerMinimumVolume {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SpecimenDefinitionTypeTestedContainer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub material: Option<CodeableConcept>,
@@ -11834,36 +11823,14 @@ pub struct SpecimenDefinitionTypeTestedContainer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SpecimenDefinitionTypeTested {
-    pub id: Option<std::string::String>,
+pub struct SpecimenDefinitionTypeTestedHandling {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub is_derived: Option<Boolean>,
-    pub r#type: Option<CodeableConcept>,
-    pub preference: Code,
-    pub container: Option<SpecimenDefinitionTypeTestedContainer>,
-    pub requirement: Option<String>,
-    pub retention_time: Option<Duration>,
-    pub rejection_criterion: Option<Vec<CodeableConcept>>,
-    pub handling: Option<Vec<SpecimenDefinitionTypeTestedHandling>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SpecimenDefinition {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub type_collected: Option<CodeableConcept>,
-    pub patient_preparation: Option<Vec<CodeableConcept>>,
-    pub time_aspect: Option<String>,
-    pub collection: Option<Vec<CodeableConcept>>,
-    pub type_tested: Option<Vec<SpecimenDefinitionTypeTested>>,
+    pub temperature_qualifier: Option<CodeableConcept>,
+    pub temperature_range: Option<Range>,
+    pub max_duration: Option<Duration>,
+    pub instruction: Option<String>,
 }
 
 /// Choice of types for the additive[x] field in SpecimenDefinitionTypeTestedContainerAdditive
@@ -11880,15 +11847,48 @@ pub enum SpecimenDefinitionTypeTestedContainerAdditiveAdditive {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SpecimenDefinitionTypeTestedContainerAdditive {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub additive: Option<SpecimenDefinitionTypeTestedContainerAdditiveAdditive>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SpecimenDefinition {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub type_collected: Option<CodeableConcept>,
+    pub patient_preparation: Option<Vec<CodeableConcept>>,
+    pub time_aspect: Option<String>,
+    pub collection: Option<Vec<CodeableConcept>>,
+    pub type_tested: Option<Vec<SpecimenDefinitionTypeTested>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SpecimenDefinitionTypeTested {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub is_derived: Option<Boolean>,
+    pub r#type: Option<CodeableConcept>,
+    pub preference: Code,
+    pub container: Option<SpecimenDefinitionTypeTestedContainer>,
+    pub requirement: Option<String>,
+    pub retention_time: Option<Duration>,
+    pub rejection_criterion: Option<Vec<CodeableConcept>>,
+    pub handling: Option<Vec<SpecimenDefinitionTypeTestedHandling>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureDefinitionContext {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -11896,8 +11896,8 @@ pub struct StructureDefinitionContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureDefinitionDifferential {
-    pub id: Option<std::string::String>,
+pub struct StructureDefinitionSnapshot {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub element: Option<Vec<ElementDefinition>>,
@@ -11905,7 +11905,7 @@ pub struct StructureDefinitionDifferential {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureDefinitionMapping {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identity: Id,
@@ -11915,8 +11915,16 @@ pub struct StructureDefinitionMapping {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct StructureDefinitionDifferential {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub element: Option<Vec<ElementDefinition>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureDefinition {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -11954,16 +11962,8 @@ pub struct StructureDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureDefinitionSnapshot {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub element: Option<Vec<ElementDefinition>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureMapGroupRuleDependent {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Id,
@@ -11971,43 +11971,8 @@ pub struct StructureMapGroupRuleDependent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureMapGroupInput {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    pub r#type: Option<String>,
-    pub mode: Code,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureMapStructure {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Canonical,
-    pub mode: Code,
-    pub alias: Option<String>,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureMapGroupRule {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Id,
-    pub source: Option<Vec<StructureMapGroupRuleSource>>,
-    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
-    pub rule: Option<Vec<StructureMapGroupRule>>,
-    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
-    pub documentation: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureMapGroupRuleTarget {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub context: Option<Id>,
@@ -12022,7 +11987,7 @@ pub struct StructureMapGroupRuleTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureMapGroup {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Id,
@@ -12031,6 +11996,36 @@ pub struct StructureMapGroup {
     pub documentation: Option<String>,
     pub input: Option<Vec<StructureMapGroupInput>>,
     pub rule: Option<Vec<StructureMapGroupRule>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct StructureMap {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Uri,
+    pub identifier: Option<Vec<Identifier>>,
+    pub version: Option<String>,
+    pub name: String,
+    pub title: Option<String>,
+    pub status: Code,
+    pub experimental: Option<Boolean>,
+    pub date: Option<DateTime>,
+    pub publisher: Option<String>,
+    pub contact: Option<Vec<ContactDetail>>,
+    pub description: Option<Markdown>,
+    pub use_context: Option<Vec<UsageContext>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub purpose: Option<Markdown>,
+    pub copyright: Option<Markdown>,
+    pub structure: Option<Vec<StructureMapStructure>>,
+    pub import: Option<Vec<Canonical>>,
+    pub group: Option<Vec<StructureMapGroup>>,
 }
 
 /// Choice of types for the defaultValue[x] field in StructureMapGroupRuleSource
@@ -12191,7 +12186,7 @@ pub enum StructureMapGroupRuleSourceDefaultValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureMapGroupRuleSource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub context: Id,
@@ -12230,45 +12225,61 @@ pub enum StructureMapGroupRuleTargetParameterValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct StructureMapGroupRuleTargetParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub value: Option<StructureMapGroupRuleTargetParameterValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct StructureMap {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
+pub struct StructureMapGroupInput {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Uri,
-    pub identifier: Option<Vec<Identifier>>,
-    pub version: Option<String>,
-    pub name: String,
-    pub title: Option<String>,
-    pub status: Code,
-    pub experimental: Option<Boolean>,
-    pub date: Option<DateTime>,
-    pub publisher: Option<String>,
-    pub contact: Option<Vec<ContactDetail>>,
-    pub description: Option<Markdown>,
-    pub use_context: Option<Vec<UsageContext>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub purpose: Option<Markdown>,
-    pub copyright: Option<Markdown>,
-    pub structure: Option<Vec<StructureMapStructure>>,
-    pub import: Option<Vec<Canonical>>,
-    pub group: Option<Vec<StructureMapGroup>>,
+    pub name: Id,
+    pub r#type: Option<String>,
+    pub mode: Code,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct StructureMapGroupRule {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Id,
+    pub source: Option<Vec<StructureMapGroupRuleSource>>,
+    pub target: Option<Vec<StructureMapGroupRuleTarget>>,
+    pub rule: Option<Vec<StructureMapGroupRule>>,
+    pub dependent: Option<Vec<StructureMapGroupRuleDependent>>,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct StructureMapStructure {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Canonical,
+    pub mode: Code,
+    pub alias: Option<String>,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubscriptionChannel {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Code,
+    pub endpoint: Option<Url>,
+    pub payload: Option<Code>,
+    pub header: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Subscription {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12286,19 +12297,8 @@ pub struct Subscription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubscriptionChannel {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: Code,
-    pub endpoint: Option<Url>,
-    pub payload: Option<Code>,
-    pub header: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceInstance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub identifier: Option<Identifier>,
@@ -12306,30 +12306,9 @@ pub struct SubstanceInstance {
     pub quantity: Option<Quantity>,
 }
 
-/// Choice of types for the substance[x] field in SubstanceIngredient
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceIngredientSubstance {
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "substanceCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "substanceReference")]
-    Reference(Reference),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceIngredient {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub quantity: Option<Ratio>,
-    pub substance: Option<SubstanceIngredientSubstance>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct Substance {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12346,34 +12325,30 @@ pub struct Substance {
     pub ingredient: Option<Vec<SubstanceIngredient>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceNucleicAcidSubunit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub subunit: Option<Integer>,
-    pub sequence: Option<String>,
-    pub length: Option<Integer>,
-    pub sequence_attachment: Option<Attachment>,
-    pub five_prime: Option<CodeableConcept>,
-    pub three_prime: Option<CodeableConcept>,
-    pub linkage: Option<Vec<SubstanceNucleicAcidSubunitLinkage>>,
-    pub sugar: Option<Vec<SubstanceNucleicAcidSubunitSugar>>,
+/// Choice of types for the substance[x] field in SubstanceIngredient
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceIngredientSubstance {
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "substanceCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "substanceReference")]
+    Reference(Reference),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceNucleicAcidSubunitSugar {
-    pub id: Option<std::string::String>,
+pub struct SubstanceIngredient {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub name: Option<String>,
-    pub residue_site: Option<String>,
+    pub quantity: Option<Ratio>,
+    pub substance: Option<SubstanceIngredientSubstance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceNucleicAcid {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12389,8 +12364,33 @@ pub struct SubstanceNucleicAcid {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceNucleicAcidSubunitSugar {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub name: Option<String>,
+    pub residue_site: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceNucleicAcidSubunit {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub subunit: Option<Integer>,
+    pub sequence: Option<String>,
+    pub length: Option<Integer>,
+    pub sequence_attachment: Option<Attachment>,
+    pub five_prime: Option<CodeableConcept>,
+    pub three_prime: Option<CodeableConcept>,
+    pub linkage: Option<Vec<SubstanceNucleicAcidSubunitLinkage>>,
+    pub sugar: Option<Vec<SubstanceNucleicAcidSubunitSugar>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceNucleicAcidSubunitLinkage {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub connectivity: Option<String>,
@@ -12400,28 +12400,22 @@ pub struct SubstanceNucleicAcidSubunitLinkage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstancePolymerRepeat {
-    pub id: Option<std::string::String>,
+pub struct SubstancePolymerRepeatRepeatUnit {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub number_of_units: Option<Integer>,
-    pub average_molecular_formula: Option<String>,
-    pub repeat_unit_amount_type: Option<CodeableConcept>,
-    pub repeat_unit: Option<Vec<SubstancePolymerRepeatRepeatUnit>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub degree: Option<CodeableConcept>,
+    pub orientation_of_polymerisation: Option<CodeableConcept>,
+    pub repeat_unit: Option<String>,
     pub amount: Option<SubstanceAmount>,
+    pub degree_of_polymerisation:
+        Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
+    pub structural_representation:
+        Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -12431,7 +12425,7 @@ pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstancePolymer {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12448,22 +12442,8 @@ pub struct SubstancePolymer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstancePolymerRepeatRepeatUnit {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub orientation_of_polymerisation: Option<CodeableConcept>,
-    pub repeat_unit: Option<String>,
-    pub amount: Option<SubstanceAmount>,
-    pub degree_of_polymerisation:
-        Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
-    pub structural_representation:
-        Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstancePolymerMonomerSetStartingMaterial {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub material: Option<CodeableConcept>,
@@ -12474,7 +12454,7 @@ pub struct SubstancePolymerMonomerSetStartingMaterial {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstancePolymerMonomerSet {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub ratio_type: Option<CodeableConcept>,
@@ -12482,8 +12462,28 @@ pub struct SubstancePolymerMonomerSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstancePolymerRepeat {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub number_of_units: Option<Integer>,
+    pub average_molecular_formula: Option<String>,
+    pub repeat_unit_amount_type: Option<CodeableConcept>,
+    pub repeat_unit: Option<Vec<SubstancePolymerRepeatRepeatUnit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub degree: Option<CodeableConcept>,
+    pub amount: Option<SubstanceAmount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceProtein {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12499,7 +12499,7 @@ pub struct SubstanceProtein {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceProteinSubunit {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub subunit: Option<Integer>,
@@ -12514,39 +12514,12 @@ pub struct SubstanceProteinSubunit {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceReferenceInformationClassification {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub domain: Option<CodeableConcept>,
     pub classification: Option<CodeableConcept>,
     pub subtype: Option<Vec<CodeableConcept>>,
-    pub source: Option<Vec<Reference>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceReferenceInformation {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub comment: Option<String>,
-    pub gene: Option<Vec<SubstanceReferenceInformationGene>>,
-    pub gene_element: Option<Vec<SubstanceReferenceInformationGeneElement>>,
-    pub classification: Option<Vec<SubstanceReferenceInformationClassification>>,
-    pub target: Option<Vec<SubstanceReferenceInformationTarget>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceReferenceInformationGene {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub gene_sequence_origin: Option<CodeableConcept>,
-    pub gene: Option<CodeableConcept>,
     pub source: Option<Vec<Reference>>,
 }
 
@@ -12567,7 +12540,7 @@ pub enum SubstanceReferenceInformationTargetAmount {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceReferenceInformationTarget {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub target: Option<Identifier>,
@@ -12581,8 +12554,35 @@ pub struct SubstanceReferenceInformationTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceReferenceInformation {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub comment: Option<String>,
+    pub gene: Option<Vec<SubstanceReferenceInformationGene>>,
+    pub gene_element: Option<Vec<SubstanceReferenceInformationGeneElement>>,
+    pub classification: Option<Vec<SubstanceReferenceInformationClassification>>,
+    pub target: Option<Vec<SubstanceReferenceInformationTarget>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceReferenceInformationGene {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub gene_sequence_origin: Option<CodeableConcept>,
+    pub gene: Option<CodeableConcept>,
+    pub source: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceReferenceInformationGeneElement {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<CodeableConcept>,
@@ -12591,17 +12591,17 @@ pub struct SubstanceReferenceInformationGeneElement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSourceMaterialOrganismAuthor {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSourceMaterialFractionDescription {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub author_type: Option<CodeableConcept>,
-    pub author_description: Option<String>,
+    pub fraction: Option<String>,
+    pub material_type: Option<CodeableConcept>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSourceMaterial {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12625,20 +12625,8 @@ pub struct SubstanceSourceMaterial {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSourceMaterialOrganismHybrid {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub maternal_organism_id: Option<String>,
-    pub maternal_organism_name: Option<String>,
-    pub paternal_organism_id: Option<String>,
-    pub paternal_organism_name: Option<String>,
-    pub hybrid_type: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSourceMaterialOrganism {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub family: Option<CodeableConcept>,
@@ -12652,8 +12640,38 @@ pub struct SubstanceSourceMaterialOrganism {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceSourceMaterialPartDescription {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub part: Option<CodeableConcept>,
+    pub part_location: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceSourceMaterialOrganismHybrid {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub maternal_organism_id: Option<String>,
+    pub maternal_organism_name: Option<String>,
+    pub paternal_organism_id: Option<String>,
+    pub paternal_organism_name: Option<String>,
+    pub hybrid_type: Option<CodeableConcept>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceSourceMaterialOrganismAuthor {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub author_type: Option<CodeableConcept>,
+    pub author_description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub kingdom: Option<CodeableConcept>,
@@ -12663,89 +12681,57 @@ pub struct SubstanceSourceMaterialOrganismOrganismGeneral {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSourceMaterialFractionDescription {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationNameOfficial {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub fraction: Option<String>,
-    pub material_type: Option<CodeableConcept>,
+    pub authority: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
+    pub date: Option<DateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSourceMaterialPartDescription {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationName {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub part: Option<CodeableConcept>,
-    pub part_location: Option<CodeableConcept>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecification {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
+    pub name: String,
     pub r#type: Option<CodeableConcept>,
     pub status: Option<CodeableConcept>,
-    pub domain: Option<CodeableConcept>,
-    pub description: Option<String>,
+    pub preferred: Option<Boolean>,
+    pub language: Option<Vec<CodeableConcept>>,
+    pub domain: Option<Vec<CodeableConcept>>,
+    pub jurisdiction: Option<Vec<CodeableConcept>>,
+    pub synonym: Option<Vec<SubstanceSpecificationName>>,
+    pub translation: Option<Vec<SubstanceSpecificationName>>,
+    pub official: Option<Vec<SubstanceSpecificationNameOfficial>>,
     pub source: Option<Vec<Reference>>,
-    pub comment: Option<String>,
-    pub moiety: Option<Vec<SubstanceSpecificationMoiety>>,
-    pub property: Option<Vec<SubstanceSpecificationProperty>>,
-    pub reference_information: Option<Reference>,
-    pub structure: Option<SubstanceSpecificationStructure>,
-    pub code: Option<Vec<SubstanceSpecificationCode>>,
-    pub name: Option<Vec<SubstanceSpecificationName>>,
-    pub molecular_weight: Option<Vec<SubstanceSpecificationStructureIsotopeMolecularWeight>>,
-    pub relationship: Option<Vec<SubstanceSpecificationRelationship>>,
-    pub nucleic_acid: Option<Reference>,
-    pub polymer: Option<Reference>,
-    pub protein: Option<Reference>,
-    pub source_material: Option<Reference>,
+}
+
+/// Choice of types for the amount[x] field in SubstanceSpecificationMoiety
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubstanceSpecificationMoietyAmount {
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "amountQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the String type.
+    #[serde(rename = "amountString")]
+    String(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationStructure {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationMoiety {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
+    pub role: Option<CodeableConcept>,
+    pub identifier: Option<Identifier>,
+    pub name: Option<String>,
     pub stereochemistry: Option<CodeableConcept>,
     pub optical_activity: Option<CodeableConcept>,
     pub molecular_formula: Option<String>,
-    pub molecular_formula_by_moiety: Option<String>,
-    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
-    pub source: Option<Vec<Reference>>,
-    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationStructureIsotope {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Identifier>,
-    pub name: Option<CodeableConcept>,
-    pub substitution: Option<CodeableConcept>,
-    pub half_life: Option<Quantity>,
-    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub method: Option<CodeableConcept>,
-    pub r#type: Option<CodeableConcept>,
-    pub amount: Option<Quantity>,
+    pub amount: Option<SubstanceSpecificationMoietyAmount>,
 }
 
 /// Choice of types for the definingSubstance[x] field in SubstanceSpecificationProperty
@@ -12774,7 +12760,7 @@ pub enum SubstanceSpecificationPropertyAmount {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSpecificationProperty {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub category: Option<CodeableConcept>,
@@ -12782,16 +12768,6 @@ pub struct SubstanceSpecificationProperty {
     pub parameters: Option<String>,
     pub defining_substance: Option<SubstanceSpecificationPropertyDefiningSubstance>,
     pub amount: Option<SubstanceSpecificationPropertyAmount>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationNameOfficial {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub authority: Option<CodeableConcept>,
-    pub status: Option<CodeableConcept>,
-    pub date: Option<DateTime>,
 }
 
 /// Choice of types for the substance[x] field in SubstanceSpecificationRelationship
@@ -12826,7 +12802,7 @@ pub enum SubstanceSpecificationRelationshipAmount {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSpecificationRelationship {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub substance: Option<SubstanceSpecificationRelationshipSubstance>,
@@ -12838,45 +12814,62 @@ pub struct SubstanceSpecificationRelationship {
     pub source: Option<Vec<Reference>>,
 }
 
-/// Choice of types for the amount[x] field in SubstanceSpecificationMoiety
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum SubstanceSpecificationMoietyAmount {
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "amountQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the String type.
-    #[serde(rename = "amountString")]
-    String(String),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationMoiety {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationStructureIsotope {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub role: Option<CodeableConcept>,
     pub identifier: Option<Identifier>,
-    pub name: Option<String>,
-    pub stereochemistry: Option<CodeableConcept>,
-    pub optical_activity: Option<CodeableConcept>,
-    pub molecular_formula: Option<String>,
-    pub amount: Option<SubstanceSpecificationMoietyAmount>,
+    pub name: Option<CodeableConcept>,
+    pub substitution: Option<CodeableConcept>,
+    pub half_life: Option<Quantity>,
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationStructureRepresentation {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationStructureIsotopeMolecularWeight {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
+    pub method: Option<CodeableConcept>,
     pub r#type: Option<CodeableConcept>,
-    pub representation: Option<String>,
-    pub attachment: Option<Attachment>,
+    pub amount: Option<Quantity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceSpecification {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Identifier>,
+    pub r#type: Option<CodeableConcept>,
+    pub status: Option<CodeableConcept>,
+    pub domain: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub source: Option<Vec<Reference>>,
+    pub comment: Option<String>,
+    pub moiety: Option<Vec<SubstanceSpecificationMoiety>>,
+    pub property: Option<Vec<SubstanceSpecificationProperty>>,
+    pub reference_information: Option<Reference>,
+    pub structure: Option<SubstanceSpecificationStructure>,
+    pub code: Option<Vec<SubstanceSpecificationCode>>,
+    pub name: Option<Vec<SubstanceSpecificationName>>,
+    pub molecular_weight: Option<Vec<SubstanceSpecificationStructureIsotopeMolecularWeight>>,
+    pub relationship: Option<Vec<SubstanceSpecificationRelationship>>,
+    pub nucleic_acid: Option<Reference>,
+    pub polymer: Option<Reference>,
+    pub protein: Option<Reference>,
+    pub source_material: Option<Reference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SubstanceSpecificationCode {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
@@ -12887,21 +12880,28 @@ pub struct SubstanceSpecificationCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct SubstanceSpecificationName {
-    pub id: Option<std::string::String>,
+pub struct SubstanceSpecificationStructure {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub r#type: Option<CodeableConcept>,
-    pub status: Option<CodeableConcept>,
-    pub preferred: Option<Boolean>,
-    pub language: Option<Vec<CodeableConcept>>,
-    pub domain: Option<Vec<CodeableConcept>>,
-    pub jurisdiction: Option<Vec<CodeableConcept>>,
-    pub synonym: Option<Vec<SubstanceSpecificationName>>,
-    pub translation: Option<Vec<SubstanceSpecificationName>>,
-    pub official: Option<Vec<SubstanceSpecificationNameOfficial>>,
+    pub stereochemistry: Option<CodeableConcept>,
+    pub optical_activity: Option<CodeableConcept>,
+    pub molecular_formula: Option<String>,
+    pub molecular_formula_by_moiety: Option<String>,
+    pub isotope: Option<Vec<SubstanceSpecificationStructureIsotope>>,
+    pub molecular_weight: Option<SubstanceSpecificationStructureIsotopeMolecularWeight>,
     pub source: Option<Vec<Reference>>,
+    pub representation: Option<Vec<SubstanceSpecificationStructureRepresentation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct SubstanceSpecificationStructureRepresentation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub r#type: Option<CodeableConcept>,
+    pub representation: Option<String>,
+    pub attachment: Option<Attachment>,
 }
 
 /// Choice of types for the occurrence[x] field in SupplyDelivery
@@ -12921,7 +12921,7 @@ pub enum SupplyDeliveryOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SupplyDelivery {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -12956,7 +12956,7 @@ pub enum SupplyDeliverySuppliedItemItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SupplyDeliverySuppliedItem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub quantity: Option<Quantity>,
@@ -12992,7 +12992,7 @@ pub enum SupplyRequestOccurrence {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SupplyRequest {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -13037,229 +13037,11 @@ pub enum SupplyRequestParameterValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct SupplyRequestParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<CodeableConcept>,
     pub value: Option<SupplyRequestParameterValue>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TaskRestriction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub repetitions: Option<PositiveInt>,
-    pub period: Option<Period>,
-    pub recipient: Option<Vec<Reference>>,
-}
-
-/// Choice of types for the value[x] field in TaskOutput
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum TaskOutputValue {
-    /// Variant accepting the Base64Binary type.
-    #[serde(rename = "valueBase64Binary")]
-    Base64Binary(Base64Binary),
-    /// Variant accepting the Boolean type.
-    #[serde(rename = "valueBoolean")]
-    Boolean(Boolean),
-    /// Variant accepting the Canonical type.
-    #[serde(rename = "valueCanonical")]
-    Canonical(Canonical),
-    /// Variant accepting the Code type.
-    #[serde(rename = "valueCode")]
-    Code(Code),
-    /// Variant accepting the Date type.
-    #[serde(rename = "valueDate")]
-    Date(Date),
-    /// Variant accepting the DateTime type.
-    #[serde(rename = "valueDateTime")]
-    DateTime(DateTime),
-    /// Variant accepting the Decimal type.
-    #[serde(rename = "valueDecimal")]
-    Decimal(Decimal),
-    /// Variant accepting the Id type.
-    #[serde(rename = "valueId")]
-    Id(Id),
-    /// Variant accepting the Instant type.
-    #[serde(rename = "valueInstant")]
-    Instant(Instant),
-    /// Variant accepting the Integer type.
-    #[serde(rename = "valueInteger")]
-    Integer(Integer),
-    /// Variant accepting the Markdown type.
-    #[serde(rename = "valueMarkdown")]
-    Markdown(Markdown),
-    /// Variant accepting the Oid type.
-    #[serde(rename = "valueOid")]
-    Oid(Oid),
-    /// Variant accepting the PositiveInt type.
-    #[serde(rename = "valuePositiveInt")]
-    PositiveInt(PositiveInt),
-    /// Variant accepting the String type.
-    #[serde(rename = "valueString")]
-    String(String),
-    /// Variant accepting the Time type.
-    #[serde(rename = "valueTime")]
-    Time(Time),
-    /// Variant accepting the UnsignedInt type.
-    #[serde(rename = "valueUnsignedInt")]
-    UnsignedInt(UnsignedInt),
-    /// Variant accepting the Uri type.
-    #[serde(rename = "valueUri")]
-    Uri(Uri),
-    /// Variant accepting the Url type.
-    #[serde(rename = "valueUrl")]
-    Url(Url),
-    /// Variant accepting the Uuid type.
-    #[serde(rename = "valueUuid")]
-    Uuid(Uuid),
-    /// Variant accepting the Address type.
-    #[serde(rename = "valueAddress")]
-    Address(Address),
-    /// Variant accepting the Age type.
-    #[serde(rename = "valueAge")]
-    Age(Age),
-    /// Variant accepting the Annotation type.
-    #[serde(rename = "valueAnnotation")]
-    Annotation(Annotation),
-    /// Variant accepting the Attachment type.
-    #[serde(rename = "valueAttachment")]
-    Attachment(Attachment),
-    /// Variant accepting the CodeableConcept type.
-    #[serde(rename = "valueCodeableConcept")]
-    CodeableConcept(CodeableConcept),
-    /// Variant accepting the Coding type.
-    #[serde(rename = "valueCoding")]
-    Coding(Coding),
-    /// Variant accepting the ContactPoint type.
-    #[serde(rename = "valueContactPoint")]
-    ContactPoint(ContactPoint),
-    /// Variant accepting the Count type.
-    #[serde(rename = "valueCount")]
-    Count(Count),
-    /// Variant accepting the Distance type.
-    #[serde(rename = "valueDistance")]
-    Distance(Distance),
-    /// Variant accepting the Duration type.
-    #[serde(rename = "valueDuration")]
-    Duration(Duration),
-    /// Variant accepting the HumanName type.
-    #[serde(rename = "valueHumanName")]
-    HumanName(HumanName),
-    /// Variant accepting the Identifier type.
-    #[serde(rename = "valueIdentifier")]
-    Identifier(Identifier),
-    /// Variant accepting the Money type.
-    #[serde(rename = "valueMoney")]
-    Money(Money),
-    /// Variant accepting the Period type.
-    #[serde(rename = "valuePeriod")]
-    Period(Period),
-    /// Variant accepting the Quantity type.
-    #[serde(rename = "valueQuantity")]
-    Quantity(Quantity),
-    /// Variant accepting the Range type.
-    #[serde(rename = "valueRange")]
-    Range(Range),
-    /// Variant accepting the Ratio type.
-    #[serde(rename = "valueRatio")]
-    Ratio(Ratio),
-    /// Variant accepting the Reference type.
-    #[serde(rename = "valueReference")]
-    Reference(Reference),
-    /// Variant accepting the SampledData type.
-    #[serde(rename = "valueSampledData")]
-    SampledData(SampledData),
-    /// Variant accepting the Signature type.
-    #[serde(rename = "valueSignature")]
-    Signature(Signature),
-    /// Variant accepting the Timing type.
-    #[serde(rename = "valueTiming")]
-    Timing(Timing),
-    /// Variant accepting the ContactDetail type.
-    #[serde(rename = "valueContactDetail")]
-    ContactDetail(ContactDetail),
-    /// Variant accepting the Contributor type.
-    #[serde(rename = "valueContributor")]
-    Contributor(Contributor),
-    /// Variant accepting the DataRequirement type.
-    #[serde(rename = "valueDataRequirement")]
-    DataRequirement(DataRequirement),
-    /// Variant accepting the Expression type.
-    #[serde(rename = "valueExpression")]
-    Expression(Expression),
-    /// Variant accepting the ParameterDefinition type.
-    #[serde(rename = "valueParameterDefinition")]
-    ParameterDefinition(ParameterDefinition),
-    /// Variant accepting the RelatedArtifact type.
-    #[serde(rename = "valueRelatedArtifact")]
-    RelatedArtifact(RelatedArtifact),
-    /// Variant accepting the TriggerDefinition type.
-    #[serde(rename = "valueTriggerDefinition")]
-    TriggerDefinition(TriggerDefinition),
-    /// Variant accepting the UsageContext type.
-    #[serde(rename = "valueUsageContext")]
-    UsageContext(UsageContext),
-    /// Variant accepting the Dosage type.
-    #[serde(rename = "valueDosage")]
-    Dosage(Dosage),
-    /// Variant accepting the Meta type.
-    #[serde(rename = "valueMeta")]
-    Meta(Meta),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TaskOutput {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub r#type: CodeableConcept,
-    pub value: Option<TaskOutputValue>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct Task {
-    pub id: Option<std::string::String>,
-    pub meta: Option<Meta>,
-    pub implicit_rules: Option<Uri>,
-    pub language: Option<Code>,
-    pub text: Option<Narrative>,
-    pub contained: Option<Vec<Resource>>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Vec<Identifier>>,
-    pub instantiates_canonical: Option<Canonical>,
-    pub instantiates_uri: Option<Uri>,
-    pub based_on: Option<Vec<Reference>>,
-    pub group_identifier: Option<Identifier>,
-    pub part_of: Option<Vec<Reference>>,
-    pub status: Code,
-    pub status_reason: Option<CodeableConcept>,
-    pub business_status: Option<CodeableConcept>,
-    pub intent: Code,
-    pub priority: Option<Code>,
-    pub code: Option<CodeableConcept>,
-    pub description: Option<String>,
-    pub focus: Option<Reference>,
-    pub r#for: Option<Reference>,
-    pub encounter: Option<Reference>,
-    pub execution_period: Option<Period>,
-    pub authored_on: Option<DateTime>,
-    pub last_modified: Option<DateTime>,
-    pub requester: Option<Reference>,
-    pub performer_type: Option<Vec<CodeableConcept>>,
-    pub owner: Option<Reference>,
-    pub location: Option<Reference>,
-    pub reason_code: Option<CodeableConcept>,
-    pub reason_reference: Option<Reference>,
-    pub insurance: Option<Vec<Reference>>,
-    pub note: Option<Vec<Annotation>>,
-    pub relevant_history: Option<Vec<Reference>>,
-    pub restriction: Option<TaskRestriction>,
-    pub input: Option<Vec<TaskInput>>,
-    pub output: Option<Vec<TaskOutput>>,
 }
 
 /// Choice of types for the value[x] field in TaskInput
@@ -13420,24 +13202,254 @@ pub enum TaskInputValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TaskInput {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: CodeableConcept,
     pub value: Option<TaskInputValue>,
 }
 
+/// Choice of types for the value[x] field in TaskOutput
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskOutputValue {
+    /// Variant accepting the Base64Binary type.
+    #[serde(rename = "valueBase64Binary")]
+    Base64Binary(Base64Binary),
+    /// Variant accepting the Boolean type.
+    #[serde(rename = "valueBoolean")]
+    Boolean(Boolean),
+    /// Variant accepting the Canonical type.
+    #[serde(rename = "valueCanonical")]
+    Canonical(Canonical),
+    /// Variant accepting the Code type.
+    #[serde(rename = "valueCode")]
+    Code(Code),
+    /// Variant accepting the Date type.
+    #[serde(rename = "valueDate")]
+    Date(Date),
+    /// Variant accepting the DateTime type.
+    #[serde(rename = "valueDateTime")]
+    DateTime(DateTime),
+    /// Variant accepting the Decimal type.
+    #[serde(rename = "valueDecimal")]
+    Decimal(Decimal),
+    /// Variant accepting the Id type.
+    #[serde(rename = "valueId")]
+    Id(Id),
+    /// Variant accepting the Instant type.
+    #[serde(rename = "valueInstant")]
+    Instant(Instant),
+    /// Variant accepting the Integer type.
+    #[serde(rename = "valueInteger")]
+    Integer(Integer),
+    /// Variant accepting the Markdown type.
+    #[serde(rename = "valueMarkdown")]
+    Markdown(Markdown),
+    /// Variant accepting the Oid type.
+    #[serde(rename = "valueOid")]
+    Oid(Oid),
+    /// Variant accepting the PositiveInt type.
+    #[serde(rename = "valuePositiveInt")]
+    PositiveInt(PositiveInt),
+    /// Variant accepting the String type.
+    #[serde(rename = "valueString")]
+    String(String),
+    /// Variant accepting the Time type.
+    #[serde(rename = "valueTime")]
+    Time(Time),
+    /// Variant accepting the UnsignedInt type.
+    #[serde(rename = "valueUnsignedInt")]
+    UnsignedInt(UnsignedInt),
+    /// Variant accepting the Uri type.
+    #[serde(rename = "valueUri")]
+    Uri(Uri),
+    /// Variant accepting the Url type.
+    #[serde(rename = "valueUrl")]
+    Url(Url),
+    /// Variant accepting the Uuid type.
+    #[serde(rename = "valueUuid")]
+    Uuid(Uuid),
+    /// Variant accepting the Address type.
+    #[serde(rename = "valueAddress")]
+    Address(Address),
+    /// Variant accepting the Age type.
+    #[serde(rename = "valueAge")]
+    Age(Age),
+    /// Variant accepting the Annotation type.
+    #[serde(rename = "valueAnnotation")]
+    Annotation(Annotation),
+    /// Variant accepting the Attachment type.
+    #[serde(rename = "valueAttachment")]
+    Attachment(Attachment),
+    /// Variant accepting the CodeableConcept type.
+    #[serde(rename = "valueCodeableConcept")]
+    CodeableConcept(CodeableConcept),
+    /// Variant accepting the Coding type.
+    #[serde(rename = "valueCoding")]
+    Coding(Coding),
+    /// Variant accepting the ContactPoint type.
+    #[serde(rename = "valueContactPoint")]
+    ContactPoint(ContactPoint),
+    /// Variant accepting the Count type.
+    #[serde(rename = "valueCount")]
+    Count(Count),
+    /// Variant accepting the Distance type.
+    #[serde(rename = "valueDistance")]
+    Distance(Distance),
+    /// Variant accepting the Duration type.
+    #[serde(rename = "valueDuration")]
+    Duration(Duration),
+    /// Variant accepting the HumanName type.
+    #[serde(rename = "valueHumanName")]
+    HumanName(HumanName),
+    /// Variant accepting the Identifier type.
+    #[serde(rename = "valueIdentifier")]
+    Identifier(Identifier),
+    /// Variant accepting the Money type.
+    #[serde(rename = "valueMoney")]
+    Money(Money),
+    /// Variant accepting the Period type.
+    #[serde(rename = "valuePeriod")]
+    Period(Period),
+    /// Variant accepting the Quantity type.
+    #[serde(rename = "valueQuantity")]
+    Quantity(Quantity),
+    /// Variant accepting the Range type.
+    #[serde(rename = "valueRange")]
+    Range(Range),
+    /// Variant accepting the Ratio type.
+    #[serde(rename = "valueRatio")]
+    Ratio(Ratio),
+    /// Variant accepting the Reference type.
+    #[serde(rename = "valueReference")]
+    Reference(Reference),
+    /// Variant accepting the SampledData type.
+    #[serde(rename = "valueSampledData")]
+    SampledData(SampledData),
+    /// Variant accepting the Signature type.
+    #[serde(rename = "valueSignature")]
+    Signature(Signature),
+    /// Variant accepting the Timing type.
+    #[serde(rename = "valueTiming")]
+    Timing(Timing),
+    /// Variant accepting the ContactDetail type.
+    #[serde(rename = "valueContactDetail")]
+    ContactDetail(ContactDetail),
+    /// Variant accepting the Contributor type.
+    #[serde(rename = "valueContributor")]
+    Contributor(Contributor),
+    /// Variant accepting the DataRequirement type.
+    #[serde(rename = "valueDataRequirement")]
+    DataRequirement(DataRequirement),
+    /// Variant accepting the Expression type.
+    #[serde(rename = "valueExpression")]
+    Expression(Expression),
+    /// Variant accepting the ParameterDefinition type.
+    #[serde(rename = "valueParameterDefinition")]
+    ParameterDefinition(ParameterDefinition),
+    /// Variant accepting the RelatedArtifact type.
+    #[serde(rename = "valueRelatedArtifact")]
+    RelatedArtifact(RelatedArtifact),
+    /// Variant accepting the TriggerDefinition type.
+    #[serde(rename = "valueTriggerDefinition")]
+    TriggerDefinition(TriggerDefinition),
+    /// Variant accepting the UsageContext type.
+    #[serde(rename = "valueUsageContext")]
+    UsageContext(UsageContext),
+    /// Variant accepting the Dosage type.
+    #[serde(rename = "valueDosage")]
+    Dosage(Dosage),
+    /// Variant accepting the Meta type.
+    #[serde(rename = "valueMeta")]
+    Meta(Meta),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesTranslation {
-    pub id: Option<std::string::String>,
+pub struct TaskOutput {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub needs_map: Boolean,
+    pub r#type: CodeableConcept,
+    pub value: Option<TaskOutputValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TaskRestriction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub repetitions: Option<PositiveInt>,
+    pub period: Option<Period>,
+    pub recipient: Option<Vec<Reference>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct Task {
+    pub id: Option<String>,
+    pub meta: Option<Meta>,
+    pub implicit_rules: Option<Uri>,
+    pub language: Option<Code>,
+    pub text: Option<Narrative>,
+    pub contained: Option<Vec<Resource>>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Vec<Identifier>>,
+    pub instantiates_canonical: Option<Canonical>,
+    pub instantiates_uri: Option<Uri>,
+    pub based_on: Option<Vec<Reference>>,
+    pub group_identifier: Option<Identifier>,
+    pub part_of: Option<Vec<Reference>>,
+    pub status: Code,
+    pub status_reason: Option<CodeableConcept>,
+    pub business_status: Option<CodeableConcept>,
+    pub intent: Code,
+    pub priority: Option<Code>,
+    pub code: Option<CodeableConcept>,
+    pub description: Option<String>,
+    pub focus: Option<Reference>,
+    pub r#for: Option<Reference>,
+    pub encounter: Option<Reference>,
+    pub execution_period: Option<Period>,
+    pub authored_on: Option<DateTime>,
+    pub last_modified: Option<DateTime>,
+    pub requester: Option<Reference>,
+    pub performer_type: Option<Vec<CodeableConcept>>,
+    pub owner: Option<Reference>,
+    pub location: Option<Reference>,
+    pub reason_code: Option<CodeableConcept>,
+    pub reason_reference: Option<Reference>,
+    pub insurance: Option<Vec<Reference>>,
+    pub note: Option<Vec<Annotation>>,
+    pub relevant_history: Option<Vec<Reference>>,
+    pub restriction: Option<TaskRestriction>,
+    pub input: Option<Vec<TaskInput>>,
+    pub output: Option<Vec<TaskOutput>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TerminologyCapabilitiesExpansion {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub hierarchical: Option<Boolean>,
+    pub paging: Option<Boolean>,
+    pub incomplete: Option<Boolean>,
+    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
+    pub text_filter: Option<Markdown>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TerminologyCapabilitiesValidateCode {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub translations: Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TerminologyCapabilitiesExpansionParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: Code,
@@ -13445,33 +13457,25 @@ pub struct TerminologyCapabilitiesExpansionParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesValidateCode {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub translations: Boolean,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesImplementation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub description: String,
-    pub url: Option<Url>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TerminologyCapabilitiesClosure {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub translation: Option<Boolean>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub op: Option<Vec<Code>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TerminologyCapabilitiesCodeSystem {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub uri: Option<Canonical>,
@@ -13480,17 +13484,8 @@ pub struct TerminologyCapabilitiesCodeSystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesSoftware {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TerminologyCapabilitiesCodeSystemVersion {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: Option<String>,
@@ -13502,20 +13497,8 @@ pub struct TerminologyCapabilitiesCodeSystemVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesExpansion {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub hierarchical: Option<Boolean>,
-    pub paging: Option<Boolean>,
-    pub incomplete: Option<Boolean>,
-    pub parameter: Option<Vec<TerminologyCapabilitiesExpansionParameter>>,
-    pub text_filter: Option<Markdown>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TerminologyCapabilities {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -13550,63 +13533,34 @@ pub struct TerminologyCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TerminologyCapabilitiesCodeSystemVersionFilter {
-    pub id: Option<std::string::String>,
+pub struct TerminologyCapabilitiesTranslation {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub op: Option<Vec<Code>>,
+    pub needs_map: Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportTestAction {
-    pub id: Option<std::string::String>,
+pub struct TerminologyCapabilitiesSoftware {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestReportSetupActionOperation>,
-    pub assert: Option<TestReportSetupActionAssert>,
+    pub name: String,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportSetupActionAssert {
-    pub id: Option<std::string::String>,
+pub struct TerminologyCapabilitiesImplementation {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub result: Code,
-    pub message: Option<Markdown>,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportTest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub action: Option<Vec<TestReportTestAction>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportSetup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestReportSetupAction>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportSetupAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestReportSetupActionOperation>,
-    pub assert: Option<TestReportSetupActionAssert>,
+    pub description: String,
+    pub url: Option<Url>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestReportSetupActionOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub result: Code,
@@ -13615,24 +13569,54 @@ pub struct TestReportSetupActionOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestReportTeardown {
-    pub id: Option<std::string::String>,
+pub struct TestReportTestAction {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestReportTeardownAction>>,
+    pub operation: Option<TestReportSetupActionOperation>,
+    pub assert: Option<TestReportSetupActionAssert>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestReportTeardownAction {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub operation: TestReportSetupActionOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestReportTest {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub action: Option<Vec<TestReportTestAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestReportSetupAction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: Option<TestReportSetupActionOperation>,
+    pub assert: Option<TestReportSetupActionAssert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestReportSetupActionAssert {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub result: Code,
+    pub message: Option<Markdown>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestReport {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -13656,7 +13640,7 @@ pub struct TestReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestReportParticipant {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Code,
@@ -13665,8 +13649,32 @@ pub struct TestReportParticipant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestReportSetup {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestReportSetupAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestReportTeardown {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestReportTeardownAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptTeardownAction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: TestScriptSetupActionOperation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestScriptMetadataCapability {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub required: Boolean,
@@ -13679,17 +13687,37 @@ pub struct TestScriptMetadataCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptOrigin {
-    pub id: Option<std::string::String>,
+pub struct TestScriptSetupActionAssert {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub index: Integer,
-    pub profile: Coding,
+    pub label: Option<String>,
+    pub description: Option<String>,
+    pub direction: Option<Code>,
+    pub compare_to_source_id: Option<String>,
+    pub compare_to_source_expression: Option<String>,
+    pub compare_to_source_path: Option<String>,
+    pub content_type: Option<Code>,
+    pub expression: Option<String>,
+    pub header_field: Option<String>,
+    pub minimum_id: Option<String>,
+    pub navigation_links: Option<Boolean>,
+    pub operator: Option<Code>,
+    pub path: Option<String>,
+    pub request_method: Option<Code>,
+    pub request_u_r_l: Option<String>,
+    pub resource: Option<Code>,
+    pub response: Option<Code>,
+    pub response_code: Option<String>,
+    pub source_id: Option<Id>,
+    pub validate_profile_id: Option<Id>,
+    pub value: Option<String>,
+    pub warning_only: Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestScript {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -13724,99 +13752,8 @@ pub struct TestScript {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptFixture {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub autocreate: Boolean,
-    pub autodelete: Boolean,
-    pub resource: Option<Reference>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptMetadata {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub link: Option<Vec<TestScriptMetadataLink>>,
-    pub capability: Option<Vec<TestScriptMetadataCapability>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptMetadataLink {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub url: Uri,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptTeardownAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: TestScriptSetupActionOperation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptSetup {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestScriptSetupAction>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptSetupActionAssert {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub label: Option<String>,
-    pub description: Option<String>,
-    pub direction: Option<Code>,
-    pub compare_to_source_id: Option<String>,
-    pub compare_to_source_expression: Option<String>,
-    pub compare_to_source_path: Option<String>,
-    pub content_type: Option<Code>,
-    pub expression: Option<String>,
-    pub header_field: Option<String>,
-    pub minimum_id: Option<String>,
-    pub navigation_links: Option<Boolean>,
-    pub operator: Option<Code>,
-    pub path: Option<String>,
-    pub request_method: Option<Code>,
-    pub request_u_r_l: Option<String>,
-    pub resource: Option<Code>,
-    pub response: Option<Code>,
-    pub response_code: Option<String>,
-    pub source_id: Option<Id>,
-    pub validate_profile_id: Option<Id>,
-    pub value: Option<String>,
-    pub warning_only: Boolean,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptTest {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub action: Option<Vec<TestScriptTestAction>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptTeardown {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub action: Option<Vec<TestScriptTeardownAction>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestScriptSetupActionOperationRequestHeader {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub field: String,
@@ -13824,50 +13761,8 @@ pub struct TestScriptSetupActionOperationRequestHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptTestAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestScriptSetupActionOperation>,
-    pub assert: Option<TestScriptSetupActionAssert>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptVariable {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub name: String,
-    pub default_value: Option<String>,
-    pub description: Option<String>,
-    pub expression: Option<String>,
-    pub header_field: Option<String>,
-    pub hint: Option<String>,
-    pub path: Option<String>,
-    pub source_id: Option<Id>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptDestination {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub index: Integer,
-    pub profile: Coding,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct TestScriptSetupAction {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub operation: Option<TestScriptSetupActionOperation>,
-    pub assert: Option<TestScriptSetupActionAssert>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct TestScriptSetupActionOperation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub r#type: Option<Coding>,
@@ -13890,8 +13785,194 @@ pub struct TestScriptSetupActionOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptTestAction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: Option<TestScriptSetupActionOperation>,
+    pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptDestination {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub index: Integer,
+    pub profile: Coding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptMetadataLink {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub url: Uri,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptMetadata {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub link: Option<Vec<TestScriptMetadataLink>>,
+    pub capability: Option<Vec<TestScriptMetadataCapability>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptVariable {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: String,
+    pub default_value: Option<String>,
+    pub description: Option<String>,
+    pub expression: Option<String>,
+    pub header_field: Option<String>,
+    pub hint: Option<String>,
+    pub path: Option<String>,
+    pub source_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptSetup {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestScriptSetupAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptFixture {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub autocreate: Boolean,
+    pub autodelete: Boolean,
+    pub resource: Option<Reference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptSetupAction {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub operation: Option<TestScriptSetupActionOperation>,
+    pub assert: Option<TestScriptSetupActionAssert>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptTest {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub action: Option<Vec<TestScriptTestAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptTeardown {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub action: Option<Vec<TestScriptTeardownAction>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct TestScriptOrigin {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub index: Integer,
+    pub profile: Coding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetComposeIncludeConceptDesignation {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub language: Option<Code>,
+    pub r#use: Option<Coding>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetExpansion {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub identifier: Option<Uri>,
+    pub timestamp: DateTime,
+    pub total: Option<Integer>,
+    pub offset: Option<Integer>,
+    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
+    pub contains: Option<Vec<ValueSetExpansionContains>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetComposeIncludeConcept {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub code: Code,
+    pub display: Option<String>,
+    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetComposeInclude {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub system: Option<Uri>,
+    pub version: Option<String>,
+    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
+    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
+    pub value_set: Option<Vec<Canonical>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetComposeIncludeFilter {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub property: Code,
+    pub op: Code,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetCompose {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub locked_date: Option<Date>,
+    pub inactive: Option<Boolean>,
+    pub include: Option<Vec<ValueSetComposeInclude>>,
+    pub exclude: Option<Vec<ValueSetComposeInclude>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
+pub struct ValueSetExpansionContains {
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub system: Option<Uri>,
+    pub r#abstract: Option<Boolean>,
+    pub inactive: Option<Boolean>,
+    pub version: Option<String>,
+    pub code: Option<Code>,
+    pub display: Option<String>,
+    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
+    pub contains: Option<Vec<ValueSetExpansionContains>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ValueSet {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -13917,51 +13998,6 @@ pub struct ValueSet {
     pub copyright: Option<Markdown>,
     pub compose: Option<ValueSetCompose>,
     pub expansion: Option<ValueSetExpansion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetComposeIncludeFilter {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub property: Code,
-    pub op: Code,
-    pub value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetExpansionContains {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub system: Option<Uri>,
-    pub r#abstract: Option<Boolean>,
-    pub inactive: Option<Boolean>,
-    pub version: Option<String>,
-    pub code: Option<Code>,
-    pub display: Option<String>,
-    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
-    pub contains: Option<Vec<ValueSetExpansionContains>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetComposeIncludeConcept {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub code: Code,
-    pub display: Option<String>,
-    pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetComposeIncludeConceptDesignation {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub language: Option<Code>,
-    pub r#use: Option<Coding>,
-    pub value: String,
 }
 
 /// Choice of types for the value[x] field in ValueSetExpansionParameter
@@ -13993,7 +14029,7 @@ pub enum ValueSetExpansionParameterValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct ValueSetExpansionParameter {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub name: String,
@@ -14001,44 +14037,18 @@ pub struct ValueSetExpansionParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetExpansion {
-    pub id: Option<std::string::String>,
+pub struct VerificationResultValidator {
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
-    pub identifier: Option<Uri>,
-    pub timestamp: DateTime,
-    pub total: Option<Integer>,
-    pub offset: Option<Integer>,
-    pub parameter: Option<Vec<ValueSetExpansionParameter>>,
-    pub contains: Option<Vec<ValueSetExpansionContains>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetCompose {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub locked_date: Option<Date>,
-    pub inactive: Option<Boolean>,
-    pub include: Option<Vec<ValueSetComposeInclude>>,
-    pub exclude: Option<Vec<ValueSetComposeInclude>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct ValueSetComposeInclude {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub system: Option<Uri>,
-    pub version: Option<String>,
-    pub concept: Option<Vec<ValueSetComposeIncludeConcept>>,
-    pub filter: Option<Vec<ValueSetComposeIncludeFilter>>,
-    pub value_set: Option<Vec<Canonical>>,
+    pub organization: Reference,
+    pub identity_certificate: Option<String>,
+    pub attestation_signature: Option<Signature>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VerificationResult {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -14063,18 +14073,8 @@ pub struct VerificationResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
-pub struct VerificationResultValidator {
-    pub id: Option<std::string::String>,
-    pub extension: Option<Vec<Extension>>,
-    pub modifier_extension: Option<Vec<Extension>>,
-    pub organization: Reference,
-    pub identity_certificate: Option<String>,
-    pub attestation_signature: Option<Signature>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VerificationResultPrimarySource {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub who: Option<Reference>,
@@ -14088,7 +14088,7 @@ pub struct VerificationResultPrimarySource {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VerificationResultAttestation {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub who: Option<Reference>,
@@ -14103,7 +14103,7 @@ pub struct VerificationResultAttestation {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VisionPrescription {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub meta: Option<Meta>,
     pub implicit_rules: Option<Uri>,
     pub language: Option<Code>,
@@ -14123,7 +14123,7 @@ pub struct VisionPrescription {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VisionPrescriptionLensSpecification {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub product: CodeableConcept,
@@ -14144,7 +14144,7 @@ pub struct VisionPrescriptionLensSpecification {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VisionPrescriptionLensSpecificationPrism {
-    pub id: Option<std::string::String>,
+    pub id: Option<String>,
     pub extension: Option<Vec<Extension>>,
     pub modifier_extension: Option<Vec<Extension>>,
     pub amount: Decimal,

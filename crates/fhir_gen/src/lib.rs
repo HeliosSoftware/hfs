@@ -24,7 +24,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Create the version-specific output file with initial content
     std::fs::write(
         &version_path,
-        "use fhir_macro::FhirSerde;\nuse serde::{Serialize, Deserialize};\nuse serde::ser::SerializeStruct;\n
+        "use fhir_macro::FhirSerde;\nuse serde::{Serialize, Deserialize};\n
 use crate::{Element, DecimalElement};\n\n",
     )?;
 
@@ -543,7 +543,8 @@ fn generate_element_definition(
         let base_type = match ty.code.as_str() {
             // https://build.fhir.org/fhirpath.html#types
             "http://hl7.org/fhirpath/System.Boolean" => "bool",
-            "http://hl7.org/fhirpath/System.String" => "std::string::String",
+            "http://hl7.org/fhirpath/System.String" => "String", // SLM TODO - compete
+            // remainder!?!?!
             "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
             "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
             "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
