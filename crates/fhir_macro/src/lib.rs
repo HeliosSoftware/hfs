@@ -451,6 +451,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     }
                     // Check if any fields have the flatten attribute
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
+                    
+                    // Create a token for has_flattened_fields to use in field serializers
+                    let has_flattened_fields_token = quote! { let has_flattened_fields = true; };
+                    let no_flattened_fields_token = quote! { let has_flattened_fields = false; };
 
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
@@ -459,6 +463,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             #(#field_counts)*
                             use serde::ser::SerializeMap; // Import trait for map methods
                             let mut state = serializer.serialize_map(Some(count))?;
+                            #has_flattened_fields_token
                             #(#field_serializers)*
                             state.end()
                         }
@@ -469,6 +474,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             #(#field_counts)*
                             use serde::ser::SerializeStruct; // Import trait for struct methods
                             let mut state = serializer.serialize_struct(stringify!(#name), count)?;
+                            #no_flattened_fields_token
                             #(#field_serializers)*
                             state.end()
                         }
