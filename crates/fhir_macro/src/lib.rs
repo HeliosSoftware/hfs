@@ -342,6 +342,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         let field_serializing_code = if field_is_flattened {
                             // For flattened fields, use FlatMapSerializer
+                            // This works with both SerializeMap and SerializeStruct
                             quote! {
                                 // Use serde::Serialize::serialize with FlatMapSerializer
                                 serde::Serialize::serialize(
@@ -353,7 +354,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             quote! {
                                 if let Some(field) = &#field_access {
                                     if let Some(value) = field.value.as_ref() {
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(&#effective_field_name_str, value)?;
                                     }
                                     if #extension_field_ident {
                                         #[derive(serde::Serialize)]
@@ -367,7 +369,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             id: &field.id,
                                             extension: &field.extension,
                                         };
-                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
                             }
@@ -384,7 +387,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else if !is_vec && is_fhir_element {
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(&#effective_field_name_str, value)?;
                                     }
                                     if #extension_field_ident {
                                         #[derive(serde::Serialize)]
@@ -398,14 +402,16 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             id: &#field_access.id,
                                             extension: &#field_access.extension,
                                         };
-                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
                             } else if is_option {
                                 // Skip serializing if the Option is None
                                 quote! {
                                     if let Some(value) = &#field_access {
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(&#effective_field_name_str, value)?;
                                     }
                                 }
                             } else {
@@ -414,7 +420,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     // Use serde_json to check if the field serializes to null or empty object
                                     let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                        // Works with both SerializeMap and SerializeStruct
+                                        state.serialize_entry(&#effective_field_name_str, &#field_access)?;
                                     }
                                 }
                             }
@@ -423,13 +430,29 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         field_counts.push(field_counting_code);
                         field_serializers.push(field_serializing_code);
                     }
-                    quote! {
-                        let mut count = 0;
-                        #(#field_counts)*
-                        use serde::ser::SerializeStruct; // Import trait for state methods
-                        let mut state = serializer.serialize_struct(stringify!(#name), count)?;
-                        #(#field_serializers)*
-                        state.end()
+                    // Check if any fields have the flatten attribute
+                    let has_flattened_fields = fields.named.iter().any(is_flattened);
+
+                    if has_flattened_fields {
+                        // If we have flattened fields, use serialize_map instead of serialize_struct
+                        quote! {
+                            let mut count = 0;
+                            #(#field_counts)*
+                            use serde::ser::SerializeMap; // Import trait for map methods
+                            let mut state = serializer.serialize_map(Some(count))?;
+                            #(#field_serializers)*
+                            state.end()
+                        }
+                    } else {
+                        // If no flattened fields, use serialize_struct as before
+                        quote! {
+                            let mut count = 0;
+                            #(#field_counts)*
+                            use serde::ser::SerializeStruct; // Import trait for struct methods
+                            let mut state = serializer.serialize_struct(stringify!(#name), count)?;
+                            #(#field_serializers)*
+                            state.end()
+                        }
                     }
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
