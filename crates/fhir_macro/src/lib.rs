@@ -281,9 +281,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             format_ident!("is_{}_extension", field_name_ident);
 
                         // Check if field has flatten attribute
-                        let is_flattened = is_flattened(field);
+                        let field_is_flattened = is_flattened(field);
 
-                        let field_counting_code = if is_flattened {
+                        let field_counting_code = if field_is_flattened {
                             // For flattened fields, we don't increment the count
                             // as they will be flattened into the parent object
                             quote! {
@@ -304,7 +304,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             }
                         } else {
-                            if is_flattened {
+                            if field_is_flattened {
                                 // For flattened fields, we don't increment the count
                                 quote! {
                                     // No count increment for flattened fields
@@ -338,9 +338,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         };
 
                         // Check if field has flatten attribute
-                        let is_flattened = is_flattened(field);
+                        let field_is_flattened = is_flattened(field);
 
-                        let field_serializing_code = if is_flattened {
+                        let field_serializing_code = if field_is_flattened {
                             // For flattened fields, use FlatMapSerializer
                             quote! {
                                 // Use serde::Serialize::serialize with FlatMapSerializer
@@ -372,7 +372,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             }
                         } else {
-                            if is_flattened {
+                            if field_is_flattened {
                                 // For flattened fields, use FlatMapSerializer
                                 quote! {
                                     // Use serde::Serialize::serialize with FlatMapSerializer
@@ -682,15 +682,14 @@ mod tests {
 
     #[test]
     fn test_is_flattened() {
-        let stream: TokenStream = quote! {
+        let stream = quote! {
             struct TestStruct {
                 #[fhir_serde(flatten)]
                 field_a: String,
                 field_b: i32,
             }
-        }
-        .into();
-        let input = parse_macro_input!(stream as DeriveInput);
+        };
+        let input: DeriveInput = syn::parse2(stream).unwrap();
         if let Data::Struct(data) = input.data {
             if let Fields::Named(fields) = data.fields {
                 let field_a = fields.named.iter().find(|f| f.ident.as_ref().unwrap() == "field_a").unwrap();
@@ -710,17 +709,16 @@ mod tests {
         // This test verifies that the flatten attribute is correctly processed
         // by checking the generated code for a struct with a flattened field
         
-        let stream: TokenStream = quote! {
+        let stream = quote! {
             #[derive(FhirSerde)]
             struct TestWithFlatten {
                 regular_field: String,
                 #[fhir_serde(flatten)]
                 flattened_field: NestedStruct,
             }
-        }
-        .into();
+        };
         
-        let input = parse_macro_input!(stream as DeriveInput);
+        let input: DeriveInput = syn::parse2(stream).unwrap();
         let name = &input.ident;
         let serialize_impl = generate_serialize_impl(&input.data, name);
         
