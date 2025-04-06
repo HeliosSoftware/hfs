@@ -280,7 +280,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let extension_field_ident =
                             format_ident!("is_{}_extension", field_name_ident);
 
-                        let field_counting_code = if is_option && !is_vec && is_fhir_element {
+                        // Check if field has flatten attribute
+                        let is_flattened = is_flattened(field);
+
+                        let field_counting_code = if is_flattened {
+                            // For flattened fields, we don't increment the count
+                            // as they will be flattened into the parent object
+                            quote! {
+                                // No count increment for flattened fields
+                                let mut #extension_field_ident = false;
+                            }
+                        } else if is_option && !is_vec && is_fhir_element {
                             quote! {
                                 let mut #extension_field_ident = false;
                                 if let Some(field) = &#field_access {
@@ -294,7 +304,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             }
                         } else {
-                            if !is_vec && is_fhir_element {
+                            if is_flattened {
+                                // For flattened fields, we don't increment the count
+                                quote! {
+                                    // No count increment for flattened fields
+                                    let mut #extension_field_ident = false;
+                                }
+                            } else if !is_vec && is_fhir_element {
                                 quote! {
                                     let mut #extension_field_ident = false;
                                     if #field_access.value.is_some() {
@@ -321,47 +337,68 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             }
                         };
 
-                        let field_serializing_code = if is_option && !is_vec && is_fhir_element {
+                        // Check if field has flatten attribute
+                        let is_flattened = is_flattened(field);
+
+                        let field_serializing_code = if is_flattened {
+                            // For flattened fields, use FlatMapSerializer
                             quote! {
-                                        if let Some(field) = &#field_access {
-                                            if let Some(value) = field.value.as_ref() {
-                                                state.serialize_field(&#effective_field_name_str, value)?;
-                                            }
-                                            if #extension_field_ident {
-                                                #[derive(serde::Serialize)]
-                                                struct IdAndExtensionHelper<'a, Extension> {
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    id: &'a Option<std::string::String>,
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    extension: &'a Option<Vec<Extension>>,
-                                                }
-                                                let extension_part = IdAndExtensionHelper {
-                                                    id: &field.id,
-                                                    extension: &field.extension,
-                                                };
-                                                state.serialize_field(#underscore_field_name_str, &extension_part)?;
-                                            }
+                                // Use serde::Serialize::serialize with FlatMapSerializer
+                                serde::Serialize::serialize(
+                                    &#field_access,
+                                    serde::__private::ser::FlatMapSerializer(&mut state)
+                                )?;
+                            }
+                        } else if is_option && !is_vec && is_fhir_element {
+                            quote! {
+                                if let Some(field) = &#field_access {
+                                    if let Some(value) = field.value.as_ref() {
+                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                    }
+                                    if #extension_field_ident {
+                                        #[derive(serde::Serialize)]
+                                        struct IdAndExtensionHelper<'a, Extension> {
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            id: &'a Option<std::string::String>,
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            extension: &'a Option<Vec<Extension>>,
                                         }
+                                        let extension_part = IdAndExtensionHelper {
+                                            id: &field.id,
+                                            extension: &field.extension,
+                                        };
+                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                    }
+                                }
                             }
                         } else {
-                            if !is_vec && is_fhir_element {
+                            if is_flattened {
+                                // For flattened fields, use FlatMapSerializer
+                                quote! {
+                                    // Use serde::Serialize::serialize with FlatMapSerializer
+                                    serde::Serialize::serialize(
+                                        &#field_access,
+                                        serde::__private::ser::FlatMapSerializer(&mut state)
+                                    )?;
+                                }
+                            } else if !is_vec && is_fhir_element {
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
                                         state.serialize_field(&#effective_field_name_str, value)?;
                                     }
                                     if #extension_field_ident {
-                                                #[derive(serde::Serialize)]
-                                                struct IdAndExtensionHelper<'a, Extension> {
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    id: &'a Option<std::string::String>,
-                                                    #[serde(skip_serializing_if = "Option::is_none")]
-                                                    extension: &'a Option<Vec<Extension>>,
-                                                }
-                                                let extension_part = IdAndExtensionHelper {
-                                                    id: &#field_access.id,
-                                                    extension: &#field_access.extension,
-                                                };
-                                                state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        #[derive(serde::Serialize)]
+                                        struct IdAndExtensionHelper<'a, Extension> {
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            id: &'a Option<std::string::String>,
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            extension: &'a Option<Vec<Extension>>,
+                                        }
+                                        let extension_part = IdAndExtensionHelper {
+                                            id: &#field_access.id,
+                                            extension: &#field_access.extension,
+                                        };
+                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
                             } else if is_option {
@@ -666,6 +703,35 @@ mod tests {
         } else {
             panic!("Expected struct");
         }
+    }
+    
+    #[test]
+    fn test_flatten_serialization() {
+        // This test verifies that the flatten attribute is correctly processed
+        // by checking the generated code for a struct with a flattened field
+        
+        let stream: TokenStream = quote! {
+            #[derive(FhirSerde)]
+            struct TestWithFlatten {
+                regular_field: String,
+                #[fhir_serde(flatten)]
+                flattened_field: NestedStruct,
+            }
+        }
+        .into();
+        
+        let input = parse_macro_input!(stream as DeriveInput);
+        let name = &input.ident;
+        let serialize_impl = generate_serialize_impl(&input.data, name);
+        
+        // Convert to string to check if FlatMapSerializer is used
+        let serialize_impl_str = serialize_impl.to_string();
+        
+        // Check that FlatMapSerializer is used for the flattened field
+        assert!(serialize_impl_str.contains("FlatMapSerializer"));
+        
+        // Check that regular serialization is used for the non-flattened field
+        assert!(serialize_impl_str.contains("serialize_field"));
     }
 }
 

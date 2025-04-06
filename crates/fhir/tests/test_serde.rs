@@ -910,6 +910,47 @@ fn test_fhir_serde_serialize() {
     assert_eq!(json11, expected11);
 }
 
+// Test struct with flattened field
+#[derive(Debug, PartialEq, FhirSerde, Default)]
+struct FlattenTestStruct {
+    name: String,
+    
+    #[fhir_serde(flatten)]
+    nested: NestedStruct,
+}
+
+#[derive(Debug, PartialEq, FhirSerde, Default, Serialize, Deserialize)]
+struct NestedStruct {
+    field1: String,
+    field2: i32,
+}
+
+#[test]
+fn test_flatten_serialization() {
+    // Create a test struct with flattened field
+    let test_struct = FlattenTestStruct {
+        name: "Test".to_string(),
+        nested: NestedStruct {
+            field1: "Nested".to_string(),
+            field2: 42,
+        },
+    };
+    
+    // Serialize to JSON
+    let json = serde_json::to_string(&test_struct).unwrap();
+    
+    // Parse the JSON to verify structure
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    
+    // The flattened fields should be at the top level
+    assert_eq!(value["name"], "Test");
+    assert_eq!(value["field1"], "Nested");
+    assert_eq!(value["field2"], 42);
+    
+    // There should be no "nested" field
+    assert!(value.get("nested").is_none());
+}
+
 #[test]
 fn test_fhir_serde_deserialize() {
     // Helper to create default extension for comparison
