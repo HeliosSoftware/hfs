@@ -353,12 +353,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             quote! {
                                 if let Some(field) = &#field_access {
                                     if let Some(value) = field.value.as_ref() {
-                                        // Use the appropriate method based on serializer type
-                                        if has_flattened_fields {
-                                            state.serialize_entry(&#effective_field_name_str, value)?;
-                                        } else {
-                                            state.serialize_field(&#effective_field_name_str, value)?;
-                                        }
+                                        // Always use serialize_field for both SerializeMap and SerializeStruct
+                                        // (both traits have this method)
+                                        state.serialize_field(&#effective_field_name_str, value)?;
                                     }
                                     if #extension_field_ident {
                                         #[derive(serde::Serialize)]
@@ -372,12 +369,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             id: &field.id,
                                             extension: &field.extension,
                                         };
-                                        // Use the appropriate method based on serializer type
-                                        if has_flattened_fields {
-                                            state.serialize_entry(#underscore_field_name_str, &extension_part)?;
-                                        } else {
-                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
-                                        }
+                                        // Always use serialize_field for both SerializeMap and SerializeStruct
+                                        // (both traits have this method)
+                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
                             }
@@ -394,12 +388,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             } else if !is_vec && is_fhir_element {
                                 quote! {
                                     if let Some(value) = #field_access.value.as_ref() {
-                                        // Use the appropriate method based on serializer type
-                                        if has_flattened_fields {
-                                            state.serialize_entry(&#effective_field_name_str, value)?;
-                                        } else {
-                                            state.serialize_field(&#effective_field_name_str, value)?;
-                                        }
+                                        // Always use serialize_field for both SerializeMap and SerializeStruct
+                                        // (both traits have this method)
+                                        state.serialize_field(&#effective_field_name_str, value)?;
                                     }
                                     if #extension_field_ident {
                                         #[derive(serde::Serialize)]
@@ -413,12 +404,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             id: &#field_access.id,
                                             extension: &#field_access.extension,
                                         };
-                                        // Use the appropriate method based on serializer type
-                                        if has_flattened_fields {
-                                            state.serialize_entry(#underscore_field_name_str, &extension_part)?;
-                                        } else {
-                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
-                                        }
+                                        // Always use serialize_field for both SerializeMap and SerializeStruct
+                                        // (both traits have this method)
+                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
                                     }
                                 }
                             } else if is_option {
@@ -435,12 +423,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     // Use serde_json to check if the field serializes to null or empty object
                                     let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Use the appropriate method based on serializer type
-                                        if has_flattened_fields {
-                                            state.serialize_entry(&#effective_field_name_str, &#field_access)?;
-                                        } else {
-                                            state.serialize_field(&#effective_field_name_str, &#field_access)?;
-                                        }
+                                        // Always use serialize_field for both SerializeMap and SerializeStruct
+                                        // (both traits have this method)
+                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
                                 }
                             }
