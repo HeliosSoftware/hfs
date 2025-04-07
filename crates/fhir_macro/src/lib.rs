@@ -171,20 +171,22 @@ fn get_box_inner_type(ty: &Type) -> Option<&Type> {
 fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) {
     // List of known FHIR primitive type aliases that wrap Element or DecimalElement
     // Note: This list might need adjustment based on the specific FHIR version/implementation details.
+    // IMPORTANT: Do not include base Rust types like "String", "bool", "i32" here.
+    // This list is for type aliases that *wrap* fhir::Element or fhir::DecimalElement.
     const KNOWN_ELEMENT_ALIASES: &[&str] = &[
         "Base64Binary",
-        "Boolean",
+        // "Boolean", // Base Rust type `bool` is not an Element alias
         "Canonical",
         "Code",
         "Date",
         "DateTime",
         "Id",
         "Instant",
-        "Integer",
+        // "Integer", // Base Rust integer types are not Element aliases
         "Markdown",
         "Oid",
         "PositiveInt",
-        "String",
+        // "String", // Base Rust type `String` is not an Element alias
         "Time",
         "UnsignedInt",
         "Uri",
@@ -933,9 +935,9 @@ mod tests {
         
         // Check that FlatMapSerializer is used for the flattened field
         assert!(serialize_impl_str.contains("FlatMapSerializer"));
-        
-        // Check that regular serialization is used for the non-flattened field
-        assert!(serialize_impl_str.contains("serialize_field"));
+
+        // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
+        assert!(serialize_impl_str.contains("serialize_entry"));
     }
 }
 
