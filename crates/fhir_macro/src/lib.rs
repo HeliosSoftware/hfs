@@ -413,8 +413,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // Skip serializing if the Option is None
                                 quote! {
                                     if let Some(value) = &#field_access {
-                                        // Works with both SerializeMap and SerializeStruct
-                                        state.serialize_entry(&#effective_field_name_str, value)?;
+                                        // Use serialize_field which works with both SerializeMap and SerializeStruct
+                                        state.serialize_field(&#effective_field_name_str, value)?;
                                     }
                                 }
                             } else {
@@ -424,7 +424,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
                                     if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
                                         // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        // (both traits have this method)
                                         state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
                                 }
