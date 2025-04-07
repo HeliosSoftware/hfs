@@ -261,6 +261,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
+                    // Check if any fields have the flatten attribute - define this at the top level
+                    let has_flattened_fields = fields.named.iter().any(is_flattened);
+                    
                     let mut field_serializers = Vec::new();
                     let mut field_counts = Vec::new();
                     for field in fields.named.iter() {
@@ -339,9 +342,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         // Check if field has flatten attribute
                         let field_is_flattened = is_flattened(field);
-                        
-                        // Get has_flattened_fields from the outer scope
-                        let has_flattened_fields = fields.named.iter().any(is_flattened);
                         
                         let field_serializing_code = if field_is_flattened {
                             // For flattened fields, use FlatMapSerializer
@@ -510,7 +510,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         field_counts.push(field_counting_code);
                         field_serializers.push(field_serializing_code);
                     }
-                    // Use the has_flattened_fields variable from above
+                    // Use the has_flattened_fields variable defined at the top of the function
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
