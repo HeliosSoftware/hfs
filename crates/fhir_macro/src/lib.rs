@@ -425,8 +425,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Serialize extension array if needed, using the correct method
                                         if has_extensions {
-                                            let underscore_field_name = format!("_{}", #effective_field_name_str); // Store formatted string
-                                            #serialize_call(&underscore_field_name, &extension_array)?; // Pass the variable
+                                            // Use the existing underscore_field_name_str variable which lives longer
+                                            #serialize_call(&#underscore_field_name_str, &extension_array)?;
                                         }
                                     }
                                 }
