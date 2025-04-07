@@ -291,6 +291,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // as they will be flattened into the parent object
                             quote! {
                                 // No count increment for flattened fields
+                                #[allow(unused_variables)]
                                 let mut #extension_field_ident = false;
                             }
                         } else if is_option && !is_vec && is_fhir_element {
@@ -311,6 +312,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 // For flattened fields, we don't increment the count
                                 quote! {
                                     // No count increment for flattened fields
+                                    #[allow(unused_variables)]
                                     let mut #extension_field_ident = false;
                                 }
                             } else if !is_vec && is_fhir_element {
