@@ -175,18 +175,18 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     // This list is for type aliases that *wrap* fhir::Element or fhir::DecimalElement.
     const KNOWN_ELEMENT_ALIASES: &[&str] = &[
         "Base64Binary",
-        // "Boolean", // Base Rust type `bool` is not an Element alias
+        "Boolean",
         "Canonical",
         "Code",
         "Date",
         "DateTime",
         "Id",
         "Instant",
-        // "Integer", // Base Rust integer types are not Element aliases
+        "Integer",
         "Markdown",
         "Oid",
         "PositiveInt",
-        // "String", // Base Rust type `String` is not an Element alias
+        "String",
         "Time",
         "UnsignedInt",
         "Uri",
@@ -265,7 +265,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 Fields::Named(ref fields) => {
                     // Check if any fields have the flatten attribute - define this at the top level
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
-                    
+
                     let mut field_serializers = Vec::new();
                     let mut field_counts = Vec::new();
                     for field in fields.named.iter() {
@@ -346,7 +346,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                         // Check if field has flatten attribute
                         let field_is_flattened = is_flattened(field);
-                        
+
                         let field_serializing_code = if field_is_flattened {
                             // For flattened fields, use FlatMapSerializer
                             quote! {
@@ -356,7 +356,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     serde::__private::ser::FlatMapSerializer(&mut state)
                                 )?;
                             }
-                        } else if is_vec && is_fhir_element { // Handles Vec<Element> or Option<Vec<Element>>
+                        } else if is_vec && is_fhir_element {
+                            // Handles Vec<Element> or Option<Vec<Element>>
                             // Determine how to access the vector based on whether it's wrapped in Option
                             let vec_access = if is_option {
                                 quote! { #field_access.as_ref() } // Access Option<Vec<T>> as Option<&Vec<T>>
@@ -433,7 +434,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             }
-                        } else if is_option && !is_vec && is_fhir_element { // Handles Option<Element> (but not Vec)
+                        } else if is_option && !is_vec && is_fhir_element {
+                            // Handles Option<Element> (but not Vec)
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
@@ -661,7 +663,7 @@ mod tests {
 
     #[test]
     fn test_get_element_info_option_element() {
-        let ty: Type = parse_str("Option<Element<String, Extension>>").unwrap();
+        let ty: Type = parse_str("Option<Element<Markdown, Extension>>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
@@ -669,7 +671,7 @@ mod tests {
         assert!(!is_vec);
         assert_eq!(
             type_option_to_string(inner_ty),
-            Some("Element < String , Extension >".to_string())
+            Some("Element < Markdown , Extension >".to_string())
         );
     }
 
@@ -688,10 +690,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_element_info_option_string() {
-        let ty: Type = parse_str("Option<String>").unwrap();
+    fn test_get_element_info_option_markdown() {
+        let ty: Type = parse_str("Option<Markdown>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element); // String should NOT be identified as Element
+        assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // It is an Option
         assert!(!is_vec);
@@ -727,10 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_element_info_option_vec_string() {
-        let ty: Type = parse_str("Option<Vec<String>>").unwrap();
+    fn test_get_element_info_option_vec_markdown() {
+        let ty: Type = parse_str("Option<Vec<Markdown>>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element); // String should NOT be identified as Element
+        assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
@@ -766,10 +768,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_element_info_string() {
-        let ty: Type = parse_str("String").unwrap();
+    fn test_get_element_info_markdown() {
+        let ty: Type = parse_str("Markdown").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element); // String should NOT be identified as Element
+        assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
@@ -900,8 +902,16 @@ mod tests {
         let input: DeriveInput = syn::parse2(stream).unwrap();
         if let Data::Struct(data) = input.data {
             if let Fields::Named(fields) = data.fields {
-                let field_a = fields.named.iter().find(|f| f.ident.as_ref().unwrap() == "field_a").unwrap();
-                let field_b = fields.named.iter().find(|f| f.ident.as_ref().unwrap() == "field_b").unwrap();
+                let field_a = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_a")
+                    .unwrap();
+                let field_b = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_b")
+                    .unwrap();
                 assert!(is_flattened(field_a));
                 assert!(!is_flattened(field_b));
             } else {
@@ -911,12 +921,12 @@ mod tests {
             panic!("Expected struct");
         }
     }
-    
+
     #[test]
     fn test_flatten_serialization() {
         // This test verifies that the flatten attribute is correctly processed
         // by checking the generated code for a struct with a flattened field
-        
+
         let stream = quote! {
             #[derive(FhirSerde)]
             struct TestWithFlatten {
@@ -925,14 +935,14 @@ mod tests {
                 flattened_field: NestedStruct,
             }
         };
-        
+
         let input: DeriveInput = syn::parse2(stream).unwrap();
         let name = &input.ident;
         let serialize_impl = generate_serialize_impl(&input.data, name);
-        
+
         // Convert to string to check if FlatMapSerializer is used
         let serialize_impl_str = serialize_impl.to_string();
-        
+
         // Check that FlatMapSerializer is used for the flattened field
         assert!(serialize_impl_str.contains("FlatMapSerializer"));
 
