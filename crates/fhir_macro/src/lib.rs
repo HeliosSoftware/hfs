@@ -502,17 +502,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
-                                                        // Extract the primitive value directly
-                                                        match serde_json::to_value(value).unwrap() {
-                                                            serde_json::Value::Object(obj) => {
-                                                                if let Some(inner_value) = obj.get("value") {
-                                                                    primitive_array.push(inner_value.clone());
-                                                                } else {
-                                                                    primitive_array.push(serde_json::Value::Null);
-                                                                }
-                                                            },
-                                                            other => primitive_array.push(other),
-                                                        }
+                                                        // For primitive values, extract the string value directly
+                                                        primitive_array.push(serde_json::to_value(&value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
@@ -571,17 +562,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
-                                                        // Extract the primitive value directly
-                                                        match serde_json::to_value(value).unwrap() {
-                                                            serde_json::Value::Object(obj) => {
-                                                                if let Some(inner_value) = obj.get("value") {
-                                                                    primitive_array.push(inner_value.clone());
-                                                                } else {
-                                                                    primitive_array.push(serde_json::Value::Null);
-                                                                }
-                                                            },
-                                                            other => primitive_array.push(other),
-                                                        }
+                                                        // For primitive values, extract the string value directly
+                                                        primitive_array.push(serde_json::to_value(&value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
