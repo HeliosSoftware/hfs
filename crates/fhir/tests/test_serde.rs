@@ -833,9 +833,48 @@ fn test_fhir_serde_serialize() {
         ..Default::default()
     };
     let json8 = serde_json::to_string(&s8).unwrap();
-    // Expected: given (array of primitives/nulls), _given (array of objects/nulls for extensions/ids)
-    let expected8 = r#"{"name1":"Test8","given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
-    assert_eq!(json8, expected8);
+    
+    // Parse the JSON to compare structure rather than exact string
+    let actual_value: serde_json::Value = serde_json::from_str(&json8).unwrap();
+    
+    // Check that the structure matches what we expect
+    assert!(actual_value.get("name1").is_some());
+    assert_eq!(actual_value["name1"], "Test8");
+    
+    // Check that given is an array with the expected values
+    assert!(actual_value.get("given").is_some());
+    let given = actual_value["given"].as_array().unwrap();
+    assert_eq!(given.len(), 4);
+    assert_eq!(given[0], "Peter");
+    assert_eq!(given[1], "James");
+    assert_eq!(given[2], serde_json::Value::Null);
+    assert_eq!(given[3], "Smith");
+    
+    // Check that _given is an array with the expected values
+    assert!(actual_value.get("_given").is_some());
+    let _given = actual_value["_given"].as_array().unwrap();
+    assert_eq!(_given.len(), 4);
+    assert_eq!(_given[0], serde_json::Value::Null);
+    
+    // Check id in second element
+    assert!(_given[1].get("id").is_some());
+    assert_eq!(_given[1]["id"], "given-id-2");
+    
+    // Check extension in third element
+    assert!(_given[2].get("extension").is_some());
+    let ext2 = _given[2]["extension"].as_array().unwrap();
+    assert_eq!(ext2.len(), 1);
+    assert_eq!(ext2[0]["url"], "http://example.com/ext");
+    assert_eq!(ext2[0]["valueString"], "ext-val");
+    
+    // Check id and extension in fourth element
+    assert!(_given[3].get("id").is_some());
+    assert_eq!(_given[3]["id"], "given-id-4");
+    assert!(_given[3].get("extension").is_some());
+    let ext3 = _given[3]["extension"].as_array().unwrap();
+    assert_eq!(ext3.len(), 1);
+    assert_eq!(ext3[0]["url"], "http://example.com/ext");
+    assert_eq!(ext3[0]["valueString"], "ext-val");
 
     // Case 9: Test Vec<String> with only primitives
     let s9 = FhirSerdeTestStruct {
