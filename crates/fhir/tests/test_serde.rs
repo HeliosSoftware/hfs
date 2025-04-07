@@ -3,7 +3,7 @@ use fhir::Element;
 use fhir::PreciseDecimal;
 use fhir::r4::*;
 use rust_decimal_macros::dec;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json;
 
 #[test]
