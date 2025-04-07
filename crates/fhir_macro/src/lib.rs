@@ -504,7 +504,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, we need to extract the actual value
                                                         // not the Element object itself
-                                                        primitive_array.push(value.clone());
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
@@ -565,7 +565,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, we need to extract the actual value
                                                         // not the Element object itself
-                                                        primitive_array.push(value.clone());
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
