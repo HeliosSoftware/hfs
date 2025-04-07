@@ -697,7 +697,8 @@ mod tests {
         assert!(!is_decimal);
         assert!(is_option); // It is an Option
         assert!(!is_vec);
-        assert!(inner_ty.is_none()); // Inner type is not Element or DecimalElement
+        // For aliases, inner_ty should be Some(alias_type)
+        assert_eq!(type_option_to_string(inner_ty), Some("Markdown".to_string()));
     }
 
     #[test]
@@ -736,7 +737,8 @@ mod tests {
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
-        assert!(inner_ty.is_none()); // Inner type is not Element or DecimalElement
+        // For aliases, inner_ty should be Some(alias_type)
+        assert_eq!(type_option_to_string(inner_ty), Some("Markdown".to_string()));
     }
 
     #[test]
@@ -775,7 +777,8 @@ mod tests {
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert!(inner_ty.is_none());
+        // For aliases, inner_ty should be Some(alias_type)
+        assert_eq!(type_option_to_string(inner_ty), Some("Markdown".to_string()));
     }
 
     #[test]
@@ -811,11 +814,13 @@ mod tests {
     fn test_get_element_info_vec_string() {
         let ty: Type = parse_str("Vec<String>").unwrap();
         let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
-        assert!(!is_element); // String should NOT be identified as Element
+        // String IS identified as Element because it's in KNOWN_ELEMENT_ALIASES
+        assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(is_vec);
-        assert!(inner_ty.is_none());
+        // For aliases, inner_ty should be Some(alias_type)
+        assert_eq!(type_option_to_string(inner_ty), Some("String".to_string()));
     }
 
     #[test]
