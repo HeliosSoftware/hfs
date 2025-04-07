@@ -3,7 +3,7 @@ use fhir::Element;
 use fhir::PreciseDecimal;
 use fhir::r4::*;
 use rust_decimal_macros::dec;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json;
 
 #[test]
@@ -919,7 +919,7 @@ struct FlattenTestStruct {
     nested: NestedStruct,
 }
 
-#[derive(Debug, PartialEq, FhirSerde, Default, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, FhirSerde, Default)]
 struct NestedStruct {
     field1: String,
     field2: i32,
@@ -929,9 +929,9 @@ struct NestedStruct {
 fn test_flatten_serialization() {
     // Create a test struct with flattened field
     let test_struct = FlattenTestStruct {
-        name: "Test".to_string(),
+        name: "Test".to_string().into(),
         nested: NestedStruct {
-            field1: "Nested".to_string(),
+            field1: "Nested".to_string().into(),
             field2: 42,
         },
     };
