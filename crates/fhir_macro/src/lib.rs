@@ -340,6 +340,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Check if field has flatten attribute
                         let field_is_flattened = is_flattened(field);
 
+                        // Check if any fields have the flatten attribute
+                        let has_flattened_fields = fields.named.iter().any(is_flattened);
+                        
                         let field_serializing_code = if field_is_flattened {
                             // For flattened fields, use FlatMapSerializer
                             quote! {
@@ -507,9 +510,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         field_counts.push(field_counting_code);
                         field_serializers.push(field_serializing_code);
                     }
-                    // Check if any fields have the flatten attribute
-                    let has_flattened_fields = fields.named.iter().any(is_flattened);
-
+                    // Use the has_flattened_fields variable from above
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
                         quote! {
