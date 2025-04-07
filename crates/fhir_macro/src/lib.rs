@@ -503,7 +503,16 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, extract just the string value
-                                                        primitive_array.push(serde_json::to_value(value).unwrap());
+                                                        let value_json = serde_json::to_value(value).unwrap();
+                                                        // If the value is an object with a "value" field, extract that
+                                                        if let serde_json::Value::Object(map) = &value_json {
+                                                            if let Some(inner_value) = map.get("value") {
+                                                                primitive_array.push(inner_value.clone());
+                                                                continue;
+                                                            }
+                                                        }
+                                                        // Otherwise use the value directly
+                                                        primitive_array.push(value_json);
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
@@ -563,7 +572,16 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, extract just the string value
-                                                        primitive_array.push(serde_json::to_value(value).unwrap());
+                                                        let value_json = serde_json::to_value(value).unwrap();
+                                                        // If the value is an object with a "value" field, extract that
+                                                        if let serde_json::Value::Object(map) = &value_json {
+                                                            if let Some(inner_value) = map.get("value") {
+                                                                primitive_array.push(inner_value.clone());
+                                                                continue;
+                                                            }
+                                                        }
+                                                        // Otherwise use the value directly
+                                                        primitive_array.push(value_json);
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
