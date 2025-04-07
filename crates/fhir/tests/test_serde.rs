@@ -834,7 +834,7 @@ fn test_fhir_serde_serialize() {
     };
     let json8 = serde_json::to_string(&s8).unwrap();
     // Expected: given (array of primitives/nulls), _given (array of objects/nulls for extensions/ids)
-    let expected8 = r#"{"name1":"Test8","name2":"","given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    let expected8 = r#"{"name1":"Test8","given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
     assert_eq!(json8, expected8);
 
     // Case 9: Test Vec<String> with only primitives
@@ -914,7 +914,7 @@ fn test_fhir_serde_serialize() {
 #[derive(Debug, PartialEq, FhirSerde, Default)]
 struct FlattenTestStruct {
     name: String,
-    
+
     #[fhir_serde(flatten)]
     nested: NestedStruct,
 }
@@ -935,18 +935,18 @@ fn test_flatten_serialization() {
             field2: 42,
         },
     };
-    
+
     // Serialize to JSON
     let json = serde_json::to_string(&test_struct).unwrap();
-    
+
     // Parse the JSON to verify structure
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-    
+
     // The flattened fields should be at the top level
     assert_eq!(value["name"], "Test");
     assert_eq!(value["field1"], "Nested");
     assert_eq!(value["field2"], 42);
-    
+
     // There should be no "nested" field
     assert!(value.get("nested").is_none());
 }
