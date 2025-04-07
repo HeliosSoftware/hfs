@@ -425,7 +425,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 
                                         // Serialize extension array if needed, using the correct method
                                         if has_extensions {
-                                            #serialize_call(&format!("_{}", #effective_field_name_str), &extension_array)?;
+                                            let underscore_field_name = format!("_{}", #effective_field_name_str); // Store formatted string
+                                            #serialize_call(&underscore_field_name, &extension_array)?; // Pass the variable
                                         }
                                     }
                                 }
@@ -452,7 +453,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 extension: &field.extension,
                                             };
                                             // Use serialize_entry for SerializeMap
-                                            state.serialize_entry(#underscore_field_name_str, &extension_part)?;
+                                            // No format! here, #underscore_field_name_str is already a string literal
+                                            state.serialize_entry(&#underscore_field_name_str, &extension_part)?;
                                         }
                                     }
                                 }
@@ -477,7 +479,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 extension: &field.extension,
                                             };
                                             // Use serialize_field for SerializeStruct
-                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                            // No format! here, #underscore_field_name_str is already a string literal
+                                            state.serialize_field(&#underscore_field_name_str, &extension_part)?;
                                         }
                                     }
                                 }
@@ -536,7 +539,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 extension: &#field_access.extension,
                                             };
                                             // Use serialize_field for SerializeStruct
-                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                            // No format! here, #underscore_field_name_str is already a string literal
+                                            state.serialize_field(&#underscore_field_name_str, &extension_part)?;
                                         }
                                     }
                                 }
