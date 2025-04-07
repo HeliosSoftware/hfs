@@ -835,7 +835,8 @@ fn test_fhir_serde_serialize() {
     let json8 = serde_json::to_string(&s8).unwrap();
     
     // Expected: given (array of primitives/nulls), _given (array of objects/nulls for extensions/ids)
-    let expected8 = r#"{"name1":"Test8","given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    // Note: Keys in the _given objects are sorted alphabetically by serde_json ("extension" before "id").
+    let expected8 = r#"{"name1":"Test8","given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"id":"given-id-4"}]}"#;
     assert_eq!(json8, expected8);
 
     // Case 9: Test Vec<String> with only primitives
