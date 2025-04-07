@@ -502,9 +502,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
-                                                        // For primitive values, we need to extract the actual string value
-                                                        // not the Element object itself
-                                                        primitive_array.push(value.clone());
+                                                        // For primitive values, extract the string value directly
+                                                        primitive_array.push(serde_json::to_value(&value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
@@ -563,9 +562,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
-                                                        // For primitive values, we need to extract the actual string value
-                                                        // not the Element object itself
-                                                        primitive_array.push(value.clone());
+                                                        // For primitive values, extract the string value directly
+                                                        primitive_array.push(serde_json::to_value(&value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
