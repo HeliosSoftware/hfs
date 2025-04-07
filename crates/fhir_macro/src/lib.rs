@@ -503,16 +503,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, extract just the string value
-                                                        match serde_json::to_value(value).unwrap() {
-                                                            serde_json::Value::Object(obj) => {
-                                                                if let Some(inner_value) = obj.get("value") {
-                                                                    primitive_array.push(inner_value.clone());
-                                                                } else {
-                                                                    primitive_array.push(serde_json::Value::Null);
-                                                                }
-                                                            },
-                                                            other => primitive_array.push(other),
-                                                        }
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
@@ -572,16 +563,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                     // Add primitive value or null
                                                     if let Some(value) = &element.value {
                                                         // For primitive values, extract just the string value
-                                                        match serde_json::to_value(value).unwrap() {
-                                                            serde_json::Value::Object(obj) => {
-                                                                if let Some(inner_value) = obj.get("value") {
-                                                                    primitive_array.push(inner_value.clone());
-                                                                } else {
-                                                                    primitive_array.push(serde_json::Value::Null);
-                                                                }
-                                                            },
-                                                            other => primitive_array.push(other),
-                                                        }
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
                                                     } else {
                                                         primitive_array.push(serde_json::Value::Null);
                                                     }
