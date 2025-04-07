@@ -501,7 +501,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Process each element
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
-                                                    primitive_array.push(element.value.clone());
+                                                    if let Some(value) = &element.value {
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
+                                                    } else {
+                                                        primitive_array.push(serde_json::Value::Null);
+                                                    }
                                                     
                                                     // Check if this element has id or extension
                                                     if element.id.is_some() || element.extension.is_some() {
@@ -556,7 +560,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Process each element
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
-                                                    primitive_array.push(element.value.clone());
+                                                    if let Some(value) = &element.value {
+                                                        primitive_array.push(serde_json::to_value(value).unwrap());
+                                                    } else {
+                                                        primitive_array.push(serde_json::Value::Null);
+                                                    }
                                                     
                                                     // Check if this element has id or extension
                                                     if element.id.is_some() || element.extension.is_some() {
