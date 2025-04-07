@@ -501,27 +501,28 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Process each element
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
-                                                    primitive_array.push(element.value.as_ref());
+                                                    primitive_array.push(element.value.clone());
                                                     
                                                     // Check if this element has id or extension
                                                     if element.id.is_some() || element.extension.is_some() {
                                                         has_extensions = true;
                                                         // Create extension object
-                                                        let ext_obj = serde_json::json!({
-                                                            "id": element.id,
-                                                            "extension": element.extension
-                                                        });
-                                                        // Remove null fields
-                                                        let ext_obj = serde_json::to_value(
-                                                            ext_obj.as_object().unwrap()
-                                                                .iter()
-                                                                .filter(|(_, v)| !v.is_null())
-                                                                .collect::<serde_json::Map<String, serde_json::Value>>()
-                                                        ).unwrap();
-                                                        extension_array.push(if ext_obj.as_object().unwrap().is_empty() { 
+                                                        let mut ext_obj = serde_json::Map::new();
+                                                        
+                                                        // Add id if present
+                                                        if let Some(id) = &element.id {
+                                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                                                        }
+                                                        
+                                                        // Add extension if present
+                                                        if let Some(ext) = &element.extension {
+                                                            ext_obj.insert("extension".to_string(), serde_json::to_value(ext).unwrap());
+                                                        }
+                                                        
+                                                        extension_array.push(if ext_obj.is_empty() { 
                                                             serde_json::Value::Null 
                                                         } else { 
-                                                            ext_obj 
+                                                            serde_json::Value::Object(ext_obj)
                                                         });
                                                     } else {
                                                         // No id or extension
@@ -555,27 +556,28 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                                 // Process each element
                                                 for element in vec_value.iter() {
                                                     // Add primitive value or null
-                                                    primitive_array.push(element.value.as_ref());
+                                                    primitive_array.push(element.value.clone());
                                                     
                                                     // Check if this element has id or extension
                                                     if element.id.is_some() || element.extension.is_some() {
                                                         has_extensions = true;
                                                         // Create extension object
-                                                        let ext_obj = serde_json::json!({
-                                                            "id": element.id,
-                                                            "extension": element.extension
-                                                        });
-                                                        // Remove null fields
-                                                        let ext_obj = serde_json::to_value(
-                                                            ext_obj.as_object().unwrap()
-                                                                .iter()
-                                                                .filter(|(_, v)| !v.is_null())
-                                                                .collect::<serde_json::Map<String, serde_json::Value>>()
-                                                        ).unwrap();
-                                                        extension_array.push(if ext_obj.as_object().unwrap().is_empty() { 
+                                                        let mut ext_obj = serde_json::Map::new();
+                                                        
+                                                        // Add id if present
+                                                        if let Some(id) = &element.id {
+                                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                                                        }
+                                                        
+                                                        // Add extension if present
+                                                        if let Some(ext) = &element.extension {
+                                                            ext_obj.insert("extension".to_string(), serde_json::to_value(ext).unwrap());
+                                                        }
+                                                        
+                                                        extension_array.push(if ext_obj.is_empty() { 
                                                             serde_json::Value::Null 
                                                         } else { 
-                                                            ext_obj 
+                                                            serde_json::Value::Object(ext_obj)
                                                         });
                                                     } else {
                                                         // No id or extension
