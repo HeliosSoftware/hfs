@@ -354,7 +354,83 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     serde::__private::ser::FlatMapSerializer(&mut state)
                                 )?;
                             }
-                        } else if is_option && !is_vec && is_fhir_element {
+                        } else if is_vec && is_fhir_element { // Handles Vec<Element> or Option<Vec<Element>>
+                            // Determine how to access the vector based on whether it's wrapped in Option
+                            let vec_access = if is_option {
+                                quote! { #field_access.as_ref() } // Access Option<Vec<T>> as Option<&Vec<T>>
+                            } else {
+                                quote! { Some(&#field_access) } // Treat Vec<T> as Some(&Vec<T>) for consistent handling
+                            };
+
+                            // Determine which serialization method to call (map vs struct)
+                            let serialize_call = if has_flattened_fields {
+                                quote! { state.serialize_entry }
+                            } else {
+                                quote! { state.serialize_field }
+                            };
+
+                            quote! {
+                                // Handle Vec<Element> by splitting into primitive and extension arrays
+                                if let Some(vec_value) = #vec_access { // Use the adjusted access logic
+                                    if !vec_value.is_empty() {
+                                        // Create primitive array
+                                        let mut primitive_array = Vec::with_capacity(vec_value.len());
+                                        // Create extension array
+                                        let mut extension_array = Vec::with_capacity(vec_value.len());
+                                        // Track if we need to include _fieldName
+                                        let mut has_extensions = false;
+
+                                        // Process each element
+                                        for element in vec_value.iter() {
+                                            // Add primitive value or null
+                                            match &element.value {
+                                                Some(value) => {
+                                                    match serde_json::to_value(value) {
+                                                        Ok(json_val) => primitive_array.push(json_val),
+                                                        Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize primitive value: {}", e))),
+                                                    }
+                                                },
+                                                None => primitive_array.push(serde_json::Value::Null),
+                                            }
+
+                                            // Check if this element has id or extension
+                                            if element.id.is_some() || element.extension.is_some() {
+                                                has_extensions = true;
+                                                // Use helper struct for consistent serialization of id/extension
+                                                #[derive(serde::Serialize)]
+                                                struct IdAndExtensionHelper<'a, Extension> {
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    id: &'a Option<std::string::String>,
+                                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                                    extension: &'a Option<Vec<Extension>>,
+                                                }
+                                                let extension_part = IdAndExtensionHelper {
+                                                    id: &element.id,
+                                                    extension: &element.extension,
+                                                };
+                                                // Serialize the helper and push null if it serializes to null (e.g., both fields are None)
+                                                match serde_json::to_value(&extension_part) {
+                                                    Ok(json_val) if !json_val.is_null() => extension_array.push(json_val),
+                                                    Ok(_) => extension_array.push(serde_json::Value::Null), // Push null if helper serialized to null
+                                                    Err(e) => return Err(serde::ser::Error::custom(format!("Failed to serialize extension part: {}", e))),
+                                                }
+                                            } else {
+                                                // No id or extension
+                                                extension_array.push(serde_json::Value::Null);
+                                            }
+                                        }
+
+                                        // Serialize primitive array using the correct method (entry or field)
+                                        #serialize_call(&#effective_field_name_str, &primitive_array)?;
+
+                                        // Serialize extension array if needed, using the correct method
+                                        if has_extensions {
+                                            #serialize_call(&format!("_{}", #effective_field_name_str), &extension_array)?;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if is_option && !is_vec && is_fhir_element { // Handles Option<Element> (but not Vec)
                             if has_flattened_fields {
                                 // For SerializeMap
                                 quote! {
@@ -480,129 +556,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         if let Some(value) = &#field_access {
                                             // Use serialize_field for SerializeStruct
                                             state.serialize_field(&#effective_field_name_str, value)?;
-                                        }
-                                    }
-                                }
-                            } else if is_vec && is_fhir_element {
-                                // Special handling for Vec<Element> - split into primitive and extension arrays
-                                if has_flattened_fields {
-                                    // For SerializeMap
-                                    quote! {
-                                        // Handle Vec<Element> by splitting into primitive and extension arrays
-                                        if let Some(vec_value) = &#field_access {
-                                            if !vec_value.is_empty() {
-                                                // Create primitive array
-                                                let mut primitive_array = Vec::with_capacity(vec_value.len());
-                                                // Create extension array
-                                                let mut extension_array = Vec::with_capacity(vec_value.len());
-                                                // Track if we need to include _fieldName
-                                                let mut has_extensions = false;
-                                                
-                                                // Process each element
-                                                for element in vec_value.iter() {
-                                                    // Add primitive value or null
-                                                    if let Some(value) = &element.value {
-                                                        // For primitive values, extract just the string value
-                                                        primitive_array.push(serde_json::to_value(value).unwrap());
-                                                    } else {
-                                                        primitive_array.push(serde_json::Value::Null);
-                                                    }
-                                                    
-                                                    // Check if this element has id or extension
-                                                    if element.id.is_some() || element.extension.is_some() {
-                                                        has_extensions = true;
-                                                        // Create extension object
-                                                        let mut ext_obj = serde_json::Map::new();
-                                                        
-                                                        // Add id if present
-                                                        if let Some(id) = &element.id {
-                                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                                        }
-                                                        
-                                                        // Add extension if present
-                                                        if let Some(ext) = &element.extension {
-                                                            ext_obj.insert("extension".to_string(), serde_json::to_value(ext).unwrap());
-                                                        }
-                                                        
-                                                        extension_array.push(if ext_obj.is_empty() { 
-                                                            serde_json::Value::Null 
-                                                        } else { 
-                                                            serde_json::Value::Object(ext_obj)
-                                                        });
-                                                    } else {
-                                                        // No id or extension
-                                                        extension_array.push(serde_json::Value::Null);
-                                                    }
-                                                }
-                                                
-                                                // Serialize primitive array
-                                                state.serialize_entry(&#effective_field_name_str, &primitive_array)?;
-                                                
-                                                // Serialize extension array if needed
-                                                if has_extensions {
-                                                    state.serialize_entry(&format!("_{}", #effective_field_name_str), &extension_array)?;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // For SerializeStruct
-                                    quote! {
-                                        // Handle Vec<Element> by splitting into primitive and extension arrays
-                                        if let Some(vec_value) = &#field_access {
-                                            if !vec_value.is_empty() {
-                                                // Create primitive array
-                                                let mut primitive_array = Vec::with_capacity(vec_value.len());
-                                                // Create extension array
-                                                let mut extension_array = Vec::with_capacity(vec_value.len());
-                                                // Track if we need to include _fieldName
-                                                let mut has_extensions = false;
-                                                
-                                                // Process each element
-                                                for element in vec_value.iter() {
-                                                    // Add primitive value or null
-                                                    if let Some(value) = &element.value {
-                                                        // For primitive values, extract just the string value
-                                                        primitive_array.push(serde_json::to_value(value).unwrap());
-                                                    } else {
-                                                        primitive_array.push(serde_json::Value::Null);
-                                                    }
-                                                    
-                                                    // Check if this element has id or extension
-                                                    if element.id.is_some() || element.extension.is_some() {
-                                                        has_extensions = true;
-                                                        // Create extension object
-                                                        let mut ext_obj = serde_json::Map::new();
-                                                        
-                                                        // Add id if present
-                                                        if let Some(id) = &element.id {
-                                                            ext_obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                                                        }
-                                                        
-                                                        // Add extension if present
-                                                        if let Some(ext) = &element.extension {
-                                                            ext_obj.insert("extension".to_string(), serde_json::to_value(ext).unwrap());
-                                                        }
-                                                        
-                                                        extension_array.push(if ext_obj.is_empty() { 
-                                                            serde_json::Value::Null 
-                                                        } else { 
-                                                            serde_json::Value::Object(ext_obj)
-                                                        });
-                                                    } else {
-                                                        // No id or extension
-                                                        extension_array.push(serde_json::Value::Null);
-                                                    }
-                                                }
-                                                
-                                                // Serialize primitive array
-                                                state.serialize_field(&#effective_field_name_str, &primitive_array)?;
-                                                
-                                                // Serialize extension array if needed
-                                                if has_extensions {
-                                                    state.serialize_field(&format!("_{}", #effective_field_name_str), &extension_array)?;
-                                                }
-                                            }
                                         }
                                     }
                                 }
