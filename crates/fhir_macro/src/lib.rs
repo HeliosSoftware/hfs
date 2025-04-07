@@ -350,28 +350,54 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 )?;
                             }
                         } else if is_option && !is_vec && is_fhir_element {
-                            quote! {
-                                if let Some(field) = &#field_access {
-                                    if let Some(value) = field.value.as_ref() {
-                                        // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        // (both traits have this method)
-                                        state.serialize_field(&#effective_field_name_str, value)?;
-                                    }
-                                    if #extension_field_ident {
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a, Extension> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<std::string::String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<Extension>>,
+                            if has_flattened_fields {
+                                // For SerializeMap
+                                quote! {
+                                    if let Some(field) = &#field_access {
+                                        if let Some(value) = field.value.as_ref() {
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(&#effective_field_name_str, value)?;
                                         }
-                                        let extension_part = IdAndExtensionHelper {
-                                            id: &field.id,
-                                            extension: &field.extension,
-                                        };
-                                        // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        // (both traits have this method)
-                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        if #extension_field_ident {
+                                            #[derive(serde::Serialize)]
+                                            struct IdAndExtensionHelper<'a, Extension> {
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<std::string::String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<Extension>>,
+                                            }
+                                            let extension_part = IdAndExtensionHelper {
+                                                id: &field.id,
+                                                extension: &field.extension,
+                                            };
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(#underscore_field_name_str, &extension_part)?;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // For SerializeStruct
+                                quote! {
+                                    if let Some(field) = &#field_access {
+                                        if let Some(value) = field.value.as_ref() {
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                        }
+                                        if #extension_field_ident {
+                                            #[derive(serde::Serialize)]
+                                            struct IdAndExtensionHelper<'a, Extension> {
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<std::string::String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<Extension>>,
+                                            }
+                                            let extension_part = IdAndExtensionHelper {
+                                                id: &field.id,
+                                                extension: &field.extension,
+                                            };
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        }
                                     }
                                 }
                             }
@@ -386,45 +412,93 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     )?;
                                 }
                             } else if !is_vec && is_fhir_element {
-                                quote! {
-                                    if let Some(value) = #field_access.value.as_ref() {
-                                        // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        // (both traits have this method)
-                                        state.serialize_field(&#effective_field_name_str, value)?;
-                                    }
-                                    if #extension_field_ident {
-                                        #[derive(serde::Serialize)]
-                                        struct IdAndExtensionHelper<'a, Extension> {
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            id: &'a Option<std::string::String>,
-                                            #[serde(skip_serializing_if = "Option::is_none")]
-                                            extension: &'a Option<Vec<Extension>>,
+                                if has_flattened_fields {
+                                    // For SerializeMap
+                                    quote! {
+                                        if let Some(value) = #field_access.value.as_ref() {
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(&#effective_field_name_str, value)?;
                                         }
-                                        let extension_part = IdAndExtensionHelper {
-                                            id: &#field_access.id,
-                                            extension: &#field_access.extension,
-                                        };
-                                        // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        // (both traits have this method)
-                                        state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        if #extension_field_ident {
+                                            #[derive(serde::Serialize)]
+                                            struct IdAndExtensionHelper<'a, Extension> {
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<std::string::String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<Extension>>,
+                                            }
+                                            let extension_part = IdAndExtensionHelper {
+                                                id: &#field_access.id,
+                                                extension: &#field_access.extension,
+                                            };
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(#underscore_field_name_str, &extension_part)?;
+                                        }
+                                    }
+                                } else {
+                                    // For SerializeStruct
+                                    quote! {
+                                        if let Some(value) = #field_access.value.as_ref() {
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                        }
+                                        if #extension_field_ident {
+                                            #[derive(serde::Serialize)]
+                                            struct IdAndExtensionHelper<'a, Extension> {
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                id: &'a Option<std::string::String>,
+                                                #[serde(skip_serializing_if = "Option::is_none")]
+                                                extension: &'a Option<Vec<Extension>>,
+                                            }
+                                            let extension_part = IdAndExtensionHelper {
+                                                id: &#field_access.id,
+                                                extension: &#field_access.extension,
+                                            };
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(#underscore_field_name_str, &extension_part)?;
+                                        }
                                     }
                                 }
                             } else if is_option {
                                 // Skip serializing if the Option is None
-                                quote! {
-                                    if let Some(value) = &#field_access {
-                                        // Use serialize_field which works with both SerializeMap and SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, value)?;
+                                if has_flattened_fields {
+                                    // For SerializeMap
+                                    quote! {
+                                        if let Some(value) = &#field_access {
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(&#effective_field_name_str, value)?;
+                                        }
+                                    }
+                                } else {
+                                    // For SerializeStruct
+                                    quote! {
+                                        if let Some(value) = &#field_access {
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(&#effective_field_name_str, value)?;
+                                        }
                                     }
                                 }
                             } else {
                                 // For non-Option types, check if it's a struct with all None/null fields
-                                quote! {
-                                    // Use serde_json to check if the field serializes to null or empty object
-                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                        // Always use serialize_field for both SerializeMap and SerializeStruct
-                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                if has_flattened_fields {
+                                    // For SerializeMap
+                                    quote! {
+                                        // Use serde_json to check if the field serializes to null or empty object
+                                        let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                        if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                            // Use serialize_entry for SerializeMap
+                                            state.serialize_entry(&#effective_field_name_str, &#field_access)?;
+                                        }
+                                    }
+                                } else {
+                                    // For SerializeStruct
+                                    quote! {
+                                        // Use serde_json to check if the field serializes to null or empty object
+                                        let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                        if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                            // Use serialize_field for SerializeStruct
+                                            state.serialize_field(&#effective_field_name_str, &#field_access)?;
+                                        }
                                     }
                                 }
                             }
@@ -435,10 +509,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                     }
                     // Check if any fields have the flatten attribute
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
-                    
-                    // Create a token for has_flattened_fields to use in field serializers
-                    let has_flattened_fields_token = quote! { let has_flattened_fields = true; };
-                    let no_flattened_fields_token = quote! { let has_flattened_fields = false; };
 
                     if has_flattened_fields {
                         // If we have flattened fields, use serialize_map instead of serialize_struct
@@ -447,7 +517,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             #(#field_counts)*
                             use serde::ser::SerializeMap; // Import trait for map methods
                             let mut state = serializer.serialize_map(Some(count))?;
-                            #has_flattened_fields_token
                             #(#field_serializers)*
                             state.end()
                         }
@@ -458,7 +527,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             #(#field_counts)*
                             use serde::ser::SerializeStruct; // Import trait for struct methods
                             let mut state = serializer.serialize_struct(stringify!(#name), count)?;
-                            #no_flattened_fields_token
                             #(#field_serializers)*
                             state.end()
                         }
