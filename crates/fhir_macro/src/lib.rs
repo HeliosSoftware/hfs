@@ -1254,10 +1254,6 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             }
                         } else {
                             // Not an FHIR element type
-                            let field_is_flattened = is_flattened(field);
-                            // Always assign the field from the temp struct, whether flattened or not.
-                            // Serde handles the flattening during deserialization into the temp struct.
-                            // The final construction needs all fields.
                             quote! {
                                 #field_name_ident: temp_struct.#field_name_ident,
                             }
