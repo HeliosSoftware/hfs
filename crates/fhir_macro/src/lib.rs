@@ -1097,8 +1097,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             #underscore_attribute
                         };
 
-                        // Generate constructor logic into an intermediate variable
-                        let field_constructor_logic = if is_fhir_element {
+                        let constructor_attribute = if is_fhir_element {
                             if is_vec { // Handle Vec<Element> or Option<Vec<Element>> first
                                 let element_type = if is_decimal_element {
                                     // Get the inner type T from Vec<T> or Option<Vec<T>>
@@ -1234,12 +1233,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     #field_name_ident: temp_struct.#field_name_ident,
                                 }
                             }
-                        };
-                        // Assign the generated logic to the final constructor_attribute variable
-                        let constructor_attribute = field_constructor_logic;
+                        }; // Semicolon ends the let constructor_attribute binding
 
                         temp_struct_attributes.push(temp_struct_attribute);
-                        constructor_attributes.push(constructor_attribute);
+                        constructor_attributes.push(constructor_attribute); // Push the result
                     }
                 }
                 Fields::Unnamed(_) => panic!("Tuple structs not supported by FhirSerde"),
