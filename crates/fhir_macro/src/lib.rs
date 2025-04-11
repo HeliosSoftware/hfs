@@ -2,7 +2,7 @@ extern crate proc_macro;
 
 use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
-use quote::{format_ident, quote}; // Add format_ident here
+use quote::{format_ident, quote, ToTokens}; // Add ToTokens here
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
     TypePath, parse_macro_input, punctuated::Punctuated, token,
