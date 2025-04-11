@@ -1097,7 +1097,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             #underscore_attribute
                         };
 
-                        let constructor_attribute = if is_fhir_element {
+                        // Generate constructor logic into an intermediate variable
+                        let field_constructor_logic = if is_fhir_element {
                             if is_vec { // Handle Vec<Element> or Option<Vec<Element>> first
                                 let element_type = if is_decimal_element {
                                     // Get the inner type T from Vec<T> or Option<Vec<T>>
@@ -1219,8 +1220,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     }
                                 }
                             }
-                        } // <-- ADDED missing closing brace for `if is_fhir_element`
-                        else { // Not an FHIR element type
+                        } else { // Not an FHIR element type
                             let field_is_flattened = is_flattened(field);
                             if field_is_flattened {
                                 // If the field was flattened in the temp struct,
@@ -1235,6 +1235,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             }
                         };
+                        // Assign the generated logic to the final constructor_attribute variable
+                        let constructor_attribute = field_constructor_logic;
 
                         temp_struct_attributes.push(temp_struct_attribute);
                         constructor_attributes.push(constructor_attribute);
