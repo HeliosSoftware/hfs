@@ -1092,15 +1092,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let construction_logic = quote! {
                                     // Construct the DecimalElement struct itself
                                     crate::DecimalElement { // Assuming DecimalElement is in crate root
-                                        // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal>
-                                        value: temp_struct.#field_name_ident.map(|dec| {
-                                            // Use PreciseDecimal::new or appropriate constructor
-                                            // TODO: Need crate::PreciseDecimal::new - requires adding crate::PreciseDecimal
-                                            // For now, let's assume a direct conversion or placeholder
-                                            // This needs the actual PreciseDecimal constructor logic from fhir crate
-                                            crate::PreciseDecimal::from_decimal(dec) // Placeholder - replace with actual constructor
-                                                // .expect("Failed to create PreciseDecimal from deserialized value") // Add error handling
-                                        }),
+                                        // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> using .into()
+                                        value: temp_struct.#field_name_ident.map(|dec| dec.into()),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                     }

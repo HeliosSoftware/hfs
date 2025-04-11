@@ -52,6 +52,20 @@ impl PreciseDecimal {
     }
 }
 
+// Implement From<Decimal> to allow easy conversion, deriving the string representation.
+impl From<Decimal> for PreciseDecimal {
+    fn from(value: Decimal) -> Self {
+        // Convert the Decimal to string to store as original_string.
+        // This mimics the behavior when deserializing a raw JSON number.
+        let original_string = value.to_string();
+        Self {
+            value,
+            original_string,
+        }
+    }
+}
+
+
 impl Serialize for PreciseDecimal {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
