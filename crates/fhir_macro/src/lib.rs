@@ -253,6 +253,22 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
     (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
+// Keep this in sync with generate_primitive_type in fhir_gen/src/lib.rs
+fn extract_inner_element_type(type_name: &str) -> &str {
+    match type_name {
+        "Boolean" => "bool",
+        "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
+        "Decimal" => "rust_decimal::Decimal", // Use the actual Decimal type
+        "Integer64" => "std::primitive::i64",
+        "String" | "Code" | "Base64Binary" | "Canonical" | "Id" | "Oid" | "Uri" | "Url"
+        | "Uuid" | "Markdown" | "Xhtml" | "Date" | "DateTime" | "Instant" | "Time" => {
+            "std::string::String"
+        }
+        _ => "std::string::String", // Default or consider panic/error
+    }
+}
+
+
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
@@ -1035,49 +1051,85 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let extension_helper = if is_option {
                             quote! { Option<IdAndExtensionHelper> }
                         } else {
+                            quote! { Option<IdAndExtensionHelper> }
+                        } else {
                             quote! { IdAndExtensionHelper }
                         };
 
+                        // Determine the type for the primitive value field in the temp struct
+                        let temp_primitive_type_quote = if is_fhir_element {
+                            let inner_ty_opt = inner_ty; // Use the Option<&Type> from get_element_info
+                            let inner_ty = inner_ty_opt.expect("Element type expected but not found");
+                            if is_decimal_element {
+                                // DecimalElement's value is Option<rust_decimal::Decimal>
+                                quote! { Option<rust_decimal::Decimal> }
+                            } else {
+                                // Element<V, E>'s value is Option<V>
+                                // Need to get V from inner_ty (which could be Element<V,E> or an alias)
+                                if let Type::Path(type_path) = inner_ty {
+                                     if let Some(last_segment) = type_path.path.segments.last() {
+                                         if last_segment.ident == "Element" {
+                                             if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                                                 if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
+                                                     quote! { Option<#inner_v_type> } // Use Option<V>
+                                                 } else {
+                                                     panic!("Element missing generic argument V");
+                                                 }
+                                             } else {
+                                                  panic!("Element missing angle bracketed arguments");
+                                             }
+                                         } else {
+                                             // It's an alias like 'Code'. We need the primitive type it wraps.
+                                             // Use the helper function added in step 1.
+                                             let alias_name = last_segment.ident.to_string();
+                                             let primitive_type_str = extract_inner_element_type(&alias_name);
+                                             // Parse the primitive type string back into a Type
+                                             let primitive_type_ident : Type = syn::parse_str(primitive_type_str)
+                                                 .expect(&format!("Failed to parse primitive type string: {}", primitive_type_str));
+                                             quote! { Option<#primitive_type_ident> }
+                                         }
+                                     } else {
+                                         panic!("Could not get last segment of Element type path");
+                                     }
+                                } else {
+                                     panic!("Element type is not a Type::Path");
+                                }
+                            }
+                        } else {
+                            // Not an element, use the original type
+                            quote! { #field_ty }
+                        };
+
+                        // Determine the type for the extension helper field in the temp struct
+                        let temp_extension_type = quote! { Option<IdAndExtensionHelper> }; // Always optional in temp struct
+
                         // Create the string literal for the underscore field name
-                        let underscore_field_name_literal =
-                            format!("_{}", effective_field_name_str);
+                        let underscore_field_name_literal = format!("_{}", effective_field_name_str);
 
-                        // Conditionally add skip_serializing_if attribute
-                        let skip_if_none_attr = if is_option {
-                            quote! { #[serde(skip_serializing_if = "Option::is_none")] }
-                        } else {
-                            quote! {}
-                        };
-
-                        let attr_type = if is_fhir_element {
-                            Some(inner_ty.unwrap())
-                        } else {
-                            Some(field_ty)
-                        };
-
-                        // Base attribute for the regular field
+                        // Base attribute for the regular field (primitive value)
                         let base_attribute = quote! {
-                            #skip_if_none_attr
-                            #[serde(rename = #effective_field_name_str)]
-                            #field_name_ident: #attr_type,
+                            // Use default for Option types in the temp struct
+                            #[serde(default, rename = #effective_field_name_str)]
+                            #field_name_ident: #temp_primitive_type_quote, // Use the determined Option<V> or original type
                         };
 
                         // Conditionally add the underscore field attribute if it's an element type
                         let underscore_attribute = if is_fhir_element {
                             quote! {
-                                #skip_if_none_attr
-                                #[serde(rename = #underscore_field_name_literal)]
-                                #field_name_ident_ext: #extension_helper,
+                                // Use default for Option types in the temp struct
+                                #[serde(default, rename = #underscore_field_name_literal)]
+                                #field_name_ident_ext: #temp_extension_type,
                             }
                         } else {
                             quote! {} // Empty if not an element
                         };
 
-                        // Combine the attributes
+                        // Combine the attributes for the temp struct
                         let temp_struct_attribute = quote! {
                             #base_attribute
                             #underscore_attribute
                         };
+
 
                         let constructor_attribute = if is_fhir_element {
                             if is_vec {
@@ -1098,13 +1150,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     #field_name_ident: None,
                                 }
                             } else {
-                                // Handles Element
+                                // Handles Element (non-option, non-vec) - This is the case causing the error
                                 quote! {
-                                    #field_name_ident : #field_ty {
-                                                            value: temp_struct.#field_name_ident,
-                                                            id: temp_struct.#field_name_ident_ext.id,
-                                                            extension: temp_struct.#field_name_ident_ext.extension,
-                                                        },
+                                    #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
+                                        value: temp_struct.#field_name_ident, // Assign the Option<V> from temp struct
+                                        // Extract id and extension safely from the Option<IdAndExtensionHelper>
+                                        id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
+                                        extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                    },
                                 }
                             }
                         } else {
