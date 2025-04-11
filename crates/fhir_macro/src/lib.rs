@@ -1162,8 +1162,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 // Construct DecimalElement
                                                 // Explicitly match Option and use ::from() for conversion
                                                 let precise_decimal_value = match prim_val_opt {
-                                                    // Remove explicit type annotation, rely on ::from()
-                                                    Some(dec) => Some(crate::PreciseDecimal::from(dec)),
+                                                    // Re-add explicit type annotation inside Some arm
+                                                    Some(dec_val) => {
+                                                        let dec: rust_decimal::Decimal = dec_val;
+                                                        Some(crate::PreciseDecimal::from(dec))
+                                                    },
                                                     None => None,
                                                 };
                                                 result_vec.push(#element_type { // element_type is DecimalElement<E>
