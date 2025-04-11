@@ -267,7 +267,6 @@ fn extract_inner_element_type(type_name: &str) -> &str {
     }
 }
 
-
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
         Data::Struct(ref data) => {
@@ -976,28 +975,6 @@ mod tests {
     }
 }
 
-fn extract_inner_type(ty: &Type) -> &Type {
-    // Check if we're dealing with a Path type (like Element<V, E> or String)
-    if let Type::Path(type_path) = ty {
-        let path = &type_path.path;
-
-        // Get the last segment (Element or String in our case)
-        if let Some(last_segment) = path.segments.last() {
-            // If we have an Element directly
-            if last_segment.ident == "Element" {
-                // Extract the first generic argument (V)
-                if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                    if let Some(GenericArgument::Type(inner_type)) = generics.args.first() {
-                        return inner_type;
-                    }
-                }
-            }
-        }
-    }
-    panic!("Element doesn't have an inner type!")
-}
-
-
 // Add impl_generics and where_clause as parameters
 fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     let struct_name = format_ident!("Temp{}", name);
@@ -1026,7 +1003,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Determine the type for the primitive value field in the temp struct
                         let temp_primitive_type_quote = if is_fhir_element {
                             let inner_ty_opt = inner_ty; // Use the Option<&Type> from get_element_info
-                            let inner_ty = inner_ty_opt.expect("Element type expected but not found");
+                            let inner_ty =
+                                inner_ty_opt.expect("Element type expected but not found");
                             if is_decimal_element {
                                 // DecimalElement's value is Option<rust_decimal::Decimal>
                                 quote! { Option<rust_decimal::Decimal> }
@@ -1034,32 +1012,42 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Element<V, E>'s value is Option<V>
                                 // Need to get V from inner_ty (which could be Element<V,E> or an alias)
                                 if let Type::Path(type_path) = inner_ty {
-                                     if let Some(last_segment) = type_path.path.segments.last() {
-                                         if last_segment.ident == "Element" {
-                                             if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                                                 if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
-                                                     quote! { Option<#inner_v_type> } // Use Option<V>
-                                                 } else {
-                                                     panic!("Element missing generic argument V");
-                                                 }
-                                             } else {
-                                                  panic!("Element missing angle bracketed arguments");
-                                             }
-                                         } else {
-                                             // It's an alias like 'Code'. We need the primitive type it wraps.
-                                             // Use the helper function added in step 1.
-                                             let alias_name = last_segment.ident.to_string();
-                                             let primitive_type_str = extract_inner_element_type(&alias_name);
-                                             // Parse the primitive type string back into a Type
-                                             let primitive_type_ident : Type = syn::parse_str(primitive_type_str)
-                                                 .expect(&format!("Failed to parse primitive type string: {}", primitive_type_str));
-                                             quote! { Option<#primitive_type_ident> }
-                                         }
-                                     } else {
-                                         panic!("Could not get last segment of Element type path");
-                                     }
+                                    if let Some(last_segment) = type_path.path.segments.last() {
+                                        if last_segment.ident == "Element" {
+                                            if let PathArguments::AngleBracketed(generics) =
+                                                &last_segment.arguments
+                                            {
+                                                if let Some(GenericArgument::Type(inner_v_type)) =
+                                                    generics.args.first()
+                                                {
+                                                    quote! { Option<#inner_v_type> } // Use Option<V>
+                                                } else {
+                                                    panic!("Element missing generic argument V");
+                                                }
+                                            } else {
+                                                panic!("Element missing angle bracketed arguments");
+                                            }
+                                        } else {
+                                            // It's an alias like 'Code'. We need the primitive type it wraps.
+                                            // Use the helper function added in step 1.
+                                            let alias_name = last_segment.ident.to_string();
+                                            let primitive_type_str =
+                                                extract_inner_element_type(&alias_name);
+                                            // Parse the primitive type string back into a Type
+                                            let primitive_type_ident: Type = syn::parse_str(
+                                                primitive_type_str,
+                                            )
+                                            .expect(&format!(
+                                                "Failed to parse primitive type string: {}",
+                                                primitive_type_str
+                                            ));
+                                            quote! { Option<#primitive_type_ident> }
+                                        }
+                                    } else {
+                                        panic!("Could not get last segment of Element type path");
+                                    }
                                 } else {
-                                     panic!("Element type is not a Type::Path");
+                                    panic!("Element type is not a Type::Path");
                                 }
                             }
                         } else {
@@ -1071,7 +1059,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let temp_extension_type = quote! { Option<IdAndExtensionHelper> }; // Always optional in temp struct
 
                         // Create the string literal for the underscore field name
-                        let underscore_field_name_literal = format!("_{}", effective_field_name_str);
+                        let underscore_field_name_literal =
+                            format!("_{}", effective_field_name_str);
 
                         // Base attribute for the regular field (primitive value)
                         let base_attribute = quote! {
@@ -1096,7 +1085,6 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             #base_attribute
                             #underscore_attribute
                         };
-
 
                         let constructor_attribute = if is_fhir_element {
                             if is_vec {
