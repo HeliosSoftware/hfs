@@ -1253,10 +1253,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             } else {
                                 // Handles Element<V, E> (non-option, non-vec)
                                 quote! {
-                                    #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
-                                        value: temp_struct.#field_name_ident, // Assign the Option<V> from temp struct
-                                        id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
-                                        extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                    #field_name_ident: {
+                                        // Use intermediate binding to potentially help type inference
+                                        let temp_val = temp_struct.#field_name_ident;
+                                        let temp_id = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone());
+                                        let temp_ext = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone());
+                                        #field_ty { // Use the original Element type here (e.g., Code)
+                                            value: temp_val, // Assign the Option<V> from temp struct
+                                            id: temp_id,
+                                            extension: temp_ext,
+                                        }
                                     },
                                 }
                             }
