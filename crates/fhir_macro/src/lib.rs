@@ -976,6 +976,46 @@ mod tests {
         // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
         assert!(serialize_impl_str.contains("serialize_entry"));
     }
+
+    #[test]
+    fn test_is_renamed() {
+        let stream = quote! {
+            struct TestStruct {
+                #[fhir_serde(rename = "customName")]
+                field_a: String,
+                field_b: i32,
+                #[fhir_serde(flatten)] // Should not be considered renamed
+                field_c: String,
+            }
+        };
+        let input: DeriveInput = syn::parse2(stream).unwrap();
+        if let Data::Struct(data) = input.data {
+            if let Fields::Named(fields) = data.fields {
+                let field_a = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_a")
+                    .unwrap();
+                let field_b = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_b")
+                    .unwrap();
+                let field_c = fields
+                    .named
+                    .iter()
+                    .find(|f| f.ident.as_ref().unwrap() == "field_c")
+                    .unwrap();
+                assert!(is_renamed(field_a));
+                assert!(!is_renamed(field_b));
+                assert!(!is_renamed(field_c)); // Flatten is not rename
+            } else {
+                panic!("Expected named fields");
+            }
+        } else {
+            panic!("Expected struct");
+        }
+    }
 }
 
 // Add impl_generics and where_clause as parameters
