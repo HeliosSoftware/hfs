@@ -59,28 +59,6 @@ fn is_flattened(field: &syn::Field) -> bool {
     false
 }
 
-// Helper function to check if a field has #[fhir_serde(rename = "...")]
-fn is_renamed(field: &syn::Field) -> bool {
-    for attr in &field.attrs {
-        if attr.path().is_ident("fhir_serde") {
-            if let Ok(list) =
-                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
-            {
-                for meta in list {
-                    // Check for Meta::NameValue where the path is "rename"
-                    if let Meta::NameValue(nv) = meta {
-                        if nv.path.is_ident("rename") {
-                            // Found #[fhir_serde(rename = "...")]
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 #[proc_macro_derive(FhirSerde, attributes(fhir_serde))] // Add attributes(fhirserde) here
 pub fn fhir_serde_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -980,46 +958,6 @@ mod tests {
         // Check that regular serialization uses serialize_entry when flattening is active (due to serialize_map)
         assert!(serialize_impl_str.contains("serialize_entry"));
     }
-
-    #[test]
-    fn test_is_renamed() {
-        let stream = quote! {
-            struct TestStruct {
-                #[fhir_serde(rename = "customName")]
-                field_a: String,
-                field_b: i32,
-                #[fhir_serde(flatten)] // Should not be considered renamed
-                field_c: String,
-            }
-        };
-        let input: DeriveInput = syn::parse2(stream).unwrap();
-        if let Data::Struct(data) = input.data {
-            if let Fields::Named(fields) = data.fields {
-                let field_a = fields
-                    .named
-                    .iter()
-                    .find(|f| f.ident.as_ref().unwrap() == "field_a")
-                    .unwrap();
-                let field_b = fields
-                    .named
-                    .iter()
-                    .find(|f| f.ident.as_ref().unwrap() == "field_b")
-                    .unwrap();
-                let field_c = fields
-                    .named
-                    .iter()
-                    .find(|f| f.ident.as_ref().unwrap() == "field_c")
-                    .unwrap();
-                assert!(is_renamed(field_a));
-                assert!(!is_renamed(field_b));
-                assert!(!is_renamed(field_c)); // Flatten is not rename
-            } else {
-                panic!("Expected named fields");
-            }
-        } else {
-            panic!("Expected struct");
-        }
-    }
 }
 
 // Add impl_generics and where_clause as parameters
@@ -1038,11 +976,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let underscore_field_name_ident = format_ident!("_{}", field_name_ident);
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
-                        let underscore_field_name_str =
+                        let _underscore_field_name_str =
                             format_ident!("_{}", effective_field_name_str);
 
                         // Destructure all 5 return values, ignoring the inner_ty for now if not needed
-                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty) =
+                        let (_is_element, _is_decimal_element, is_option, _is_vec, _inner_ty) =
                             get_element_info(field_ty);
 
                         let extension_helper = if is_option {
@@ -1051,19 +989,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             quote! { IdAndExtensionHelper }
                         };
 
-                        let temp_struct_attribute = if is_renamed(field) {
-                            quote! {
-                                //#[serde(rename = "#effective_field_name_str")]
-                                #[serde(rename = "SOMETHING")]
-                                #field_name_ident: #field_ty,
-                                //#[serde(rename = "#underscore_field_name_str")]
-                                #underscore_field_name_ident: #extension_helper,
-                            }
-                        } else {
-                            quote! {
-                                #field_name_ident: #field_ty,
-                                #underscore_field_name_ident: #extension_helper,
-                            }
+                        // Create the string literal for the underscore field name
+                        let underscore_field_name_literal =
+                            format!("_{}", effective_field_name_str);
+
+                        // Always apply serde rename attributes using the effective names
+                        let temp_struct_attribute = quote! {
+                            #[serde(rename = #effective_field_name_str)]
+                            #field_name_ident: #field_ty,
+                            #[serde(rename = #underscore_field_name_literal)]
+                            #underscore_field_name_ident: #extension_helper,
                         };
 
                         let constructor_attribute = if is_option {
@@ -1095,14 +1030,22 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         }
     };
 
+    let temp_struct = quote! {
+        #[derive(Deserialize, Debug)]
+        struct #struct_name {
+            #(#temp_struct_attributes)*
+        }
+    };
+
     quote! {
 
         #id_extension_helper_def
 
-        #[derive(Deserialize)]
-        struct #struct_name {
-            #(#temp_struct_attributes)*
-        }
+        #temp_struct
+
+         // Perform the actual deserialization into the temporary struct
+        let temp_struct = #struct_name::deserialize(deserializer)?;
+
 
         Ok(#name{#(#constructor_attributes)*})
 
