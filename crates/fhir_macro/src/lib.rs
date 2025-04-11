@@ -1139,8 +1139,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
-                                            let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<rust_decimal::Decimal>
-                                            let ext_helper_opt = extensions.get(i).cloned().flatten();
+                                            let prim_val_opt = primitives.get(i).cloned(); // Remove .flatten()
+                                            let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 let precise_decimal_value = match prim_val_opt {
                                                     Some(dec_val) => {
@@ -1174,8 +1174,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
-                                            let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<V>
-                                            let ext_helper_opt = extensions.get(i).cloned().flatten();
+                                            let prim_val_opt = primitives.get(i).cloned(); // Remove .flatten()
+                                            let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 result_vec.push(#element_type {
                                                     value: prim_val_opt, // Assign Option<V> directly
