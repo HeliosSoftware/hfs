@@ -1219,7 +1219,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     }
                                 }
                             }
-                        } else { // Not an FHIR element type
+                         else { // Not an FHIR element type
                             let field_is_flattened = is_flattened(field);
                             if field_is_flattened {
                                 // If the field was flattened in the temp struct,
