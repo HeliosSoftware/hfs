@@ -1118,86 +1118,72 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let constructor_attribute = if is_fhir_element {
                             if is_vec {
                                 // Handle Vec<Element> or Option<Vec<Element>> first
-                                let element_type = if is_decimal_element {
-                                    // Get the inner type T from Vec<T> or Option<Vec<T>>
-                                    let vec_inner_type = if is_option {
-                                        get_option_inner_type(field_ty)
-                                    } else {
-                                        Some(field_ty)
-                                    }
-                                    .and_then(get_vec_inner_type)
-                                    .expect("Vec inner type not found for DecimalElement");
-                                    quote! { #vec_inner_type } // Should resolve to DecimalElement<E>
-                                } else {
-                                    // Get the inner type T from Vec<T> or Option<Vec<T>>
-                                    let vec_inner_type = if is_option {
-                                        get_option_inner_type(field_ty)
-                                    } else {
-                                        Some(field_ty)
-                                    }
-                                    .and_then(get_vec_inner_type)
-                                    .expect("Vec inner type not found for Element");
-                                    quote! { #vec_inner_type } // Should resolve to Element<V, E>
-                                };
-
-                                // Explicitly capture the boolean value for use inside the quote! block
-                                let is_decimal_element_for_vec = is_decimal_element;
-
-                                let construction_logic = quote! { { // Add opening brace for block expression
-                                    // Combine primitive and extension arrays from temp_struct
-                                    // Use field_name_ident for accessing temp_struct fields
-                                    let primitives = temp_struct.#field_name_ident.unwrap_or_default();
-                                    let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
-                                    let len = primitives.len().max(extensions.len()); // Assume lengths match or are padded correctly by serde
-                                    let mut result_vec = Vec::with_capacity(len);
-
-                                    for i in 0..len {
-                                        let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<Primitive>
-                                        let ext_helper_opt = extensions.get(i).cloned().flatten(); // Option<IdAndExtensionHelper>
-
-                                        // Only create an element if either part exists
-                                        if prim_val_opt.is_some() || ext_helper_opt.is_some() {
-                                            // Construct and push the element directly within the correct branch
-                                            if #is_decimal_element_for_vec { // Use the captured variable
-                                                // Construct DecimalElement
-                                                // Explicitly match Option and use ::from() for conversion
+                                // Generate different construction logic based on whether it's decimal
+                                let construction_logic = if is_decimal_element {
+                                    // Logic specifically for Vec<DecimalElement> or Option<Vec<DecimalElement>>
+                                    let element_type = { // Determine DecimalElement<E> type
+                                        let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
+                                            .and_then(get_vec_inner_type)
+                                            .expect("Vec inner type not found for DecimalElement");
+                                        quote! { #vec_inner_type }
+                                    };
+                                    quote! { { // Block expression starts
+                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default();
+                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
+                                        let len = primitives.len().max(extensions.len());
+                                        let mut result_vec = Vec::with_capacity(len);
+                                        for i in 0..len {
+                                            let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<rust_decimal::Decimal>
+                                            let ext_helper_opt = extensions.get(i).cloned().flatten();
+                                            if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 let precise_decimal_value = match prim_val_opt {
-                                                    // Re-add explicit type annotation inside Some arm
                                                     Some(dec_val) => {
+                                                        // This explicit typing is needed here
                                                         let dec: rust_decimal::Decimal = dec_val;
                                                         Some(crate::PreciseDecimal::from(dec))
                                                     },
                                                     None => None,
                                                 };
-                                                result_vec.push(#element_type { // element_type is DecimalElement<E>
-                                                    value: precise_decimal_value, // Assign Option<PreciseDecimal>
+                                                result_vec.push(#element_type {
+                                                    value: precise_decimal_value,
                                                     id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
                                                     extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
                                                 });
-                                            } else {
-                                                // Construct Element<V, E>
-                                                result_vec.push(#element_type { // element_type is Element<V, E>
+                                            }
+                                            // Note: Skipping adding element if both parts are null/None
+                                        }
+                                        result_vec
+                                    } } // Block expression ends
+                                } else {
+                                    // Logic specifically for Vec<Element<V, E>> or Option<Vec<Element<V, E>>> (non-decimal)
+                                    let element_type = { // Determine Element<V, E> type
+                                        let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
+                                            .and_then(get_vec_inner_type)
+                                            .expect("Vec inner type not found for Element");
+                                        quote! { #vec_inner_type }
+                                    };
+                                    quote! { { // Block expression starts
+                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default();
+                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
+                                        let len = primitives.len().max(extensions.len());
+                                        let mut result_vec = Vec::with_capacity(len);
+                                        for i in 0..len {
+                                            let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<V>
+                                            let ext_helper_opt = extensions.get(i).cloned().flatten();
+                                            if prim_val_opt.is_some() || ext_helper_opt.is_some() {
+                                                result_vec.push(#element_type {
                                                     value: prim_val_opt, // Assign Option<V> directly
                                                     id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
                                                     extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
                                                 });
                                             }
-                                        } else {
-                                            // If both primitive and extension are null/None, FHIR spec requires pushing null/default.
-                                            // For Vec<Option<Element>>, we should skip. For Vec<Element>, push default.
-                                            // Let's assume Vec<Element> requires default, Vec<Option<Element>> skips.
-                                            // Need to check if the inner vec type is Option.
-                                            // This logic might need refinement based on FHIR spec interpretation & tests.
-                                            // For now, let's push default if the field is Vec<T> and skip if Option<Vec<T>>
-                                            // This requires checking the original field_ty again, which is complex here.
-                                            // Simpler approach: Always push default if both parts are None.
-                                            // result_vec.push(#element_type::default());
-                                            // Safest approach for now: Skip adding element if both parts are null/None.
+                                            // Note: Skipping adding element if both parts are null/None
                                         }
-                                    }
-                                    result_vec
-                                } }; // Add closing brace for block expression
+                                        result_vec
+                                    } } // Block expression ends
+                                }; // End of outer if/else determining construction_logic
 
+                                // Assign the correct construction_logic based on is_option
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<Vec<Element>>
                                     quote! {
