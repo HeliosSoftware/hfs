@@ -1000,15 +1000,30 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             quote! {}
                         };
 
-                        // Always apply serde rename attributes using the effective names
-                        let temp_struct_attribute = quote! {
+                        // Base attribute for the regular field
+                        let base_attribute = quote! {
                             #skip_if_none_attr
                             #[serde(rename = #effective_field_name_str)]
                             #field_name_ident: #field_ty,
-                            #skip_if_none_attr
-                            #[serde(rename = #underscore_field_name_literal)]
-                            #underscore_field_name_ident: #extension_helper,
                         };
+
+                        // Conditionally add the underscore field attribute if it's an element type
+                        let underscore_attribute = if _is_element || _is_decimal_element {
+                            quote! {
+                                #skip_if_none_attr
+                                #[serde(rename = #underscore_field_name_literal)]
+                                #underscore_field_name_ident: #extension_helper,
+                            }
+                        } else {
+                            quote! {} // Empty if not an element
+                        };
+
+                        // Combine the attributes
+                        let temp_struct_attribute = quote! {
+                            #base_attribute
+                            #underscore_attribute
+                        };
+
 
                         let constructor_attribute = if is_option {
                             quote! {
