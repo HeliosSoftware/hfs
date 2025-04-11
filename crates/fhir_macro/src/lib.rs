@@ -1023,15 +1023,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
     }
 
     let id_extension_helper_def = quote! {
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize)]
         struct IdAndExtensionHelper {
+            #[serde(skip_serializing_if = "Option::is_none")]
             id: Option<std::string::String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             extension: Option<Vec<Extension>>,
         }
     };
 
     let temp_struct = quote! {
-        #[derive(Deserialize, Debug)]
+        #[derive(Deserialize)]
         struct #struct_name {
             #(#temp_struct_attributes)*
         }
