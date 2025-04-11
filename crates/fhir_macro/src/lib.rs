@@ -1232,34 +1232,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else if is_option {
                                 // Handle single Option<Element> (already checked !is_vec)
-                                // Handles Option<Element<V, E>>
-                                // Determine the expected primitive type V for Element<V, E> or alias
-                                let expected_primitive_type = if let Type::Path(type_path) = inner_ty.expect("Inner type expected for Option<Element>") {
-                                    if let Some(last_segment) = type_path.path.segments.last() {
-                                        if last_segment.ident == "Element" {
-                                            if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                                                if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
-                                                    inner_v_type.to_token_stream()
-                                                } else { panic!("Element missing generic argument V"); }
-                                            } else { panic!("Element missing angle bracketed arguments"); }
-                                        } else { // Alias
-                                            let alias_name = last_segment.ident.to_string();
-                                            let primitive_type_str = extract_inner_element_type(&alias_name);
-                                            let primitive_type_parsed: Type = syn::parse_str(primitive_type_str).expect("Failed to parse primitive type string");
-                                            primitive_type_parsed.to_token_stream()
-                                        }
-                                    } else { panic!("Could not get last segment"); }
-                                } else { panic!("Not a Type::Path"); };
-
-                                // Construct Some(Element { ... }) only if value or extension exists
+                                // Revert to simpler logic without explicit type annotation for value
                                 // Get the inner type T from Option<T> to construct Element<V, E>
                                 let inner_element_type = get_option_inner_type(field_ty)
                                     .expect("Option inner type not found");
                                 quote! {
                                     #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
                                         Some(#inner_element_type { // Use the unwrapped Element type
-                                            // Explicitly type the value from temp_struct *inside* the quote block
-                                            value: { let v: Option<#expected_primitive_type> = temp_struct.#field_name_ident; v },
+                                            value: temp_struct.#field_name_ident, // Assign directly
                                             id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                             extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                         })
