@@ -1172,6 +1172,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         value: temp_struct.#field_name_ident.map(|dec| dec.into()),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                    } // <-- Added missing brace here
                                 };
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<DecimalElement>
