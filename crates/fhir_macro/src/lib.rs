@@ -1003,11 +1003,12 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Determine the type for the primitive value field in the temp struct
                         let temp_primitive_type_quote = if is_fhir_element {
                             let inner_ty_opt = inner_ty; // Use the Option<&Type> from get_element_info
-                            let inner_ty =
-                                inner_ty_opt.expect("Element type expected but not found");
-                            if is_decimal_element {
+                            let inner_ty = inner_ty_opt.expect("Element type expected but not found");
+
+                            // Determine the base primitive type (e.g., bool, String, rust_decimal::Decimal)
+                            let primitive_type_ident = if is_decimal_element {
                                 // DecimalElement's value is Option<rust_decimal::Decimal>
-                                quote! { Option<rust_decimal::Decimal> }
+                                quote! { rust_decimal::Decimal }
                             } else {
                                 // Element<V, E>'s value is Option<V>
                                 // Need to get V from inner_ty (which could be Element<V,E> or an alias)
@@ -1047,8 +1048,21 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         panic!("Could not get last segment of Element type path");
                                     }
                                 } else {
-                                    panic!("Element type is not a Type::Path");
+                                             panic!("Could not get last segment of Element type path");
+                                         }
+                                    } else {
+                                         panic!("Element type is not a Type::Path");
+                                    }
                                 }
+                            };
+
+                            // Adjust the quote based on whether it's a vector
+                            if is_vec {
+                                // For Vec<Element> or Option<Vec<Element>>, temp type is Option<Vec<Option<Primitive>>>
+                                quote! { Option<Vec<Option<#primitive_type_ident>>> }
+                            } else {
+                                // For Element or Option<Element>, temp type is Option<Primitive>
+                                quote! { Option<#primitive_type_ident> }
                             }
                         } else {
                             // Not an element, use the original type
@@ -1056,7 +1070,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         };
 
                         // Determine the type for the extension helper field in the temp struct
-                        let temp_extension_type = quote! { Option<IdAndExtensionHelper> }; // Always optional in temp struct
+                        let temp_extension_type = if is_fhir_element {
+                             if is_vec {
+                                 // For Vec<Element> or Option<Vec<Element>>, temp type is Option<Vec<Option<IdAndExtensionHelper>>>
+                                 quote! { Option<Vec<Option<IdAndExtensionHelper>>> }
+                             } else {
+                                 // For Element or Option<Element>, temp type is Option<IdAndExtensionHelper>
+                                 quote! { Option<IdAndExtensionHelper> }
+                             }
+                         } else {
+                             // Not an element, no extension helper needed
+                             quote! { () } // Use unit type as placeholder, won't be generated anyway
+                         };
 
                         // Create the string literal for the underscore field name
                         let underscore_field_name_literal =
@@ -1087,8 +1112,75 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         };
 
                         let constructor_attribute = if is_fhir_element {
-                             if is_decimal_element {
-                                // Handle DecimalElement and Option<DecimalElement>
+                            if is_vec { // Handle Vec<Element> or Option<Vec<Element>> first
+                                let element_type = if is_decimal_element {
+                                    // Get the inner type T from Vec<T> or Option<Vec<T>>
+                                    let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
+                                        .and_then(get_vec_inner_type)
+                                        .expect("Vec inner type not found for DecimalElement");
+                                    quote! { #vec_inner_type } // Should resolve to DecimalElement<E>
+                                } else {
+                                    // Get the inner type T from Vec<T> or Option<Vec<T>>
+                                     let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
+                                        .and_then(get_vec_inner_type)
+                                        .expect("Vec inner type not found for Element");
+                                    quote! { #vec_inner_type } // Should resolve to Element<V, E>
+                                };
+
+                                let construction_logic = quote! {
+                                    // Combine primitive and extension arrays from temp_struct
+                                    // Use field_name_ident for accessing temp_struct fields
+                                    let primitives = temp_struct.#field_name_ident.unwrap_or_default();
+                                    let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
+                                    let len = primitives.len().max(extensions.len()); // Assume lengths match or are padded correctly by serde
+                                    let mut result_vec = Vec::with_capacity(len);
+
+                                    for i in 0..len {
+                                        let prim_val_opt = primitives.get(i).cloned().flatten(); // Option<Primitive>
+                                        let ext_helper_opt = extensions.get(i).cloned().flatten(); // Option<IdAndExtensionHelper>
+
+                                        // Only create an element if either part exists
+                                        if prim_val_opt.is_some() || ext_helper_opt.is_some() {
+                                            let element_value = if is_decimal_element {
+                                                // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal>
+                                                prim_val_opt.map(|dec| dec.into())
+                                            } else {
+                                                prim_val_opt // Use Option<V> directly
+                                            };
+
+                                            result_vec.push(#element_type {
+                                                value: element_value,
+                                                id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
+                                                extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
+                                            });
+                                        } else {
+                                            // If both primitive and extension are null/None, FHIR spec requires pushing null/default.
+                                            // For Vec<Option<Element>>, we should skip. For Vec<Element>, push default.
+                                            // Let's assume Vec<Element> requires default, Vec<Option<Element>> skips.
+                                            // Need to check if the inner vec type is Option.
+                                            // This logic might need refinement based on FHIR spec interpretation & tests.
+                                            // For now, let's push default if the field is Vec<T> and skip if Option<Vec<T>>
+                                            // This requires checking the original field_ty again, which is complex here.
+                                            // Simpler approach: Always push default if both parts are None.
+                                            // result_vec.push(#element_type::default());
+                                            // Safest approach for now: Skip adding element if both parts are null/None.
+                                        }
+                                    }
+                                    result_vec
+                                };
+
+                                if is_option {
+                                    // Wrap in Some() if the original field was Option<Vec<Element>>
+                                    quote! {
+                                        #field_name_ident: Some(#construction_logic),
+                                    }
+                                } else {
+                                    // Direct Vec<Element> field assignment
+                                    quote! {
+                                        #field_name_ident: #construction_logic,
+                                    }
+                                }
+                            } else if is_decimal_element { // Handle single DecimalElement or Option<DecimalElement>
                                 let construction_logic = quote! {
                                     // Construct the DecimalElement struct itself
                                     crate::DecimalElement { // Assuming DecimalElement is in crate root
@@ -1096,7 +1188,6 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         value: temp_struct.#field_name_ident.map(|dec| dec.into()),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                    }
                                 };
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<DecimalElement>
@@ -1114,16 +1205,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         #field_name_ident: #construction_logic,
                                     }
                                 }
-                            } else { // Handle regular Element<V, E>
-                                if is_vec {
-                                    // TODO: Handle Vec<Element> and Option<Vec<Element>> deserialization properly
-                                    // This part needs careful implementation to map primitive and extension arrays back
-                                     if is_option {
-                                         quote! { #field_name_ident: None, } // Placeholder for Option<Vec<Element>>
-                                     } else {
-                                         quote! { #field_name_ident: Vec::new(), } // Placeholder for Vec<Element>
-                                     }
-                                } else if is_option {
+                            } else if is_option { // Handle single Option<Element> (already checked !is_vec)
                                     // Handles Option<Element<V, E>>
                                     // Construct Some(Element { ... }) only if value or extension exists
                                     // Get the inner type T from Option<T> to construct Element<V, E>
