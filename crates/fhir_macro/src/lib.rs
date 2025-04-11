@@ -1157,20 +1157,23 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                                         // Only create an element if either part exists
                                         if prim_val_opt.is_some() || ext_helper_opt.is_some() {
-                                            // Use the captured boolean value here
-                                            let element_value = if #is_decimal_element_for_vec {
-                                                // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> explicitly
-                                                // Add type annotation to dec to guide inference
-                                                prim_val_opt.map(|dec: rust_decimal::Decimal| <crate::PreciseDecimal>::from(dec))
+                                            // Construct and push the element directly within the correct branch
+                                            if #is_decimal_element_for_vec {
+                                                // Construct DecimalElement
+                                                let precise_decimal_value = prim_val_opt.map(|dec: rust_decimal::Decimal| <crate::PreciseDecimal>::from(dec));
+                                                result_vec.push(#element_type { // element_type is DecimalElement<E>
+                                                    value: precise_decimal_value, // Assign Option<PreciseDecimal>
+                                                    id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
+                                                    extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
+                                                });
                                             } else {
-                                                prim_val_opt // Use Option<V> directly
-                                            };
-
-                                            result_vec.push(#element_type {
-                                                value: element_value,
-                                                id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
-                                                extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
-                                            });
+                                                // Construct Element<V, E>
+                                                result_vec.push(#element_type { // element_type is Element<V, E>
+                                                    value: prim_val_opt, // Assign Option<V> directly
+                                                    id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
+                                                    extension: ext_helper_opt.as_ref().and_then(|h| h.extension.clone()),
+                                                });
+                                            }
                                         } else {
                                             // If both primitive and extension are null/None, FHIR spec requires pushing null/default.
                                             // For Vec<Option<Element>>, we should skip. For Vec<Element>, push default.
