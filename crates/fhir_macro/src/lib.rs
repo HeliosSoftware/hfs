@@ -1113,7 +1113,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     quote! { #vec_inner_type } // Should resolve to Element<V, E>
                                 };
 
-                                let construction_logic = quote! {
+                                let construction_logic = quote! { { // Add opening brace for block expression
                                     // Combine primitive and extension arrays from temp_struct
                                     // Use field_name_ident for accessing temp_struct fields
                                     let primitives = temp_struct.#field_name_ident.unwrap_or_default();
@@ -1153,7 +1153,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         }
                                     }
                                     result_vec
-                                };
+                                } }; // Add closing brace for block expression
 
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<Vec<Element>>
