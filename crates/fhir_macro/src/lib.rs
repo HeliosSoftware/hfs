@@ -1056,11 +1056,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                             // Adjust the quote based on whether it's a vector
                             if is_vec {
-                                // For Vec<Element> or Option<Vec<Element>>, temp type is Option<Vec<Option<Primitive>>>
-                                quote! { Option<Vec<Option<#primitive_type_ident>>> }
+                                // Temp type should be Option<Vec<Primitive>> regardless of original Option<Vec<T>> or Vec<T>
+                                // Serde handles missing array as None with #[serde(default)]
+                                quote! { Option<Vec<#primitive_type_ident>> } // No Option inside Vec
                             } else {
-                                // For Element or Option<Element>, temp type is Option<Primitive>
-                                quote! { Option<#primitive_type_ident> }
+                                // If original field was Option<T>, temp type is Option<Primitive>
+                                // If original field was T, temp type is Primitive
+                                if is_option {
+                                     quote! { Option<#primitive_type_ident> }
+                                } else {
+                                     quote! { #primitive_type_ident } // No Option for non-optional fields
+                                }
                             }
                         } else {
                             // Not an element, use the original type
