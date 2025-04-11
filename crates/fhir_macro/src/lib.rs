@@ -1159,8 +1159,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                             // Use the captured boolean value here
                                             let element_value = if #is_decimal_element_for_vec {
-                                                // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal>
-                                                prim_val_opt.map(|dec| dec.into())
+                                                // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> explicitly
+                                                prim_val_opt.map(|dec| <crate::PreciseDecimal>::from(dec))
                                             } else {
                                                 prim_val_opt // Use Option<V> directly
                                             };
@@ -1202,11 +1202,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let construction_logic = quote! {
                                     // Construct the DecimalElement struct itself
                                     crate::DecimalElement { // Assuming DecimalElement is in crate root
-                                        // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> using .into()
-                                        value: temp_struct.#field_name_ident.map(|dec| dec.into()),
+                                        // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> explicitly
+                                        value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                    } // <-- Added missing brace here
+                                    }
                                 };
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<DecimalElement>
