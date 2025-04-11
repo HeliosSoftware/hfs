@@ -2,6 +2,7 @@ extern crate proc_macro;
 
 use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
+use proc_macro2::extra;
 use quote::{format_ident, quote}; // Add format_ident here
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
@@ -960,6 +961,52 @@ mod tests {
     }
 }
 
+fn extract_inner_type(ty: &Type) -> &Type {
+    // Check if we're dealing with a Path type (like Element<V, E> or String)
+    if let Type::Path(type_path) = ty {
+        let path = &type_path.path;
+
+        // Get the last segment (Element or String in our case)
+        if let Some(last_segment) = path.segments.last() {
+            // If we have an Element directly
+            if last_segment.ident == "Element" {
+                // Extract the first generic argument (V)
+                if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                    if let Some(GenericArgument::Type(inner_type)) = generics.args.first() {
+                        return inner_type;
+                    }
+                }
+            }
+        }
+    }
+    panic!("Element doesn't have an inner type!")
+}
+
+// Keep this in sync with generate_primitive_type in fhir_gen/src/lib.rs
+fn extract_inner_element_type(type_name: &str) -> &str {
+    match type_name {
+        "Boolean" => "bool",
+        "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
+        "Decimal" => "std::primitive::f64",
+        "PreciseDecimal" => "std::primitive::f64", // SLM TODO - eventually remove PreciseDecimal
+        "Integer64" => "std::primitive::i64",
+        "String" => "std::string::String",
+        "Code" => "std::string::String",
+        "Base64Binary" => "std::string::String",
+        "Canonical" => "std::string::String",
+        "Id" => "std::string::String",
+        "Oid" => "std::string::String",
+        "Uri" => "std::string::String",
+        "Url" => "std::string::String",
+        "Uuid" => "std::string::String",
+        "Markdown" => "std::string::String",
+        "Xhtml" => "std::string::String",
+        "Date" => "std::string::String",
+        "DateTime" | "Instant" | "Time" => "std::string::String",
+        _ => "std::string::String",
+    }
+}
+
 // Add impl_generics and where_clause as parameters
 fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     let struct_name = format_ident!("Temp{}", name);
@@ -973,15 +1020,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 Fields::Named(ref fields) => {
                     for field in fields.named.iter() {
                         let field_name_ident = field.ident.as_ref().unwrap(); // Keep original ident for access
-                        let underscore_field_name_ident = format_ident!("_{}", field_name_ident);
+                        let field_name_ident_ext = format_ident!("{}_ext", field_name_ident);
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
                         let _underscore_field_name_str =
                             format_ident!("_{}", effective_field_name_str);
 
                         // Destructure all 5 return values, ignoring the inner_ty for now if not needed
-                        let (_is_element, _is_decimal_element, is_option, _is_vec, _inner_ty) =
+                        let (is_element, is_decimal_element, is_option, is_vec, inner_ty) =
                             get_element_info(field_ty);
+
+                        let is_fhir_element = is_element || is_decimal_element;
 
                         let extension_helper = if is_option {
                             quote! { Option<IdAndExtensionHelper> }
@@ -1000,19 +1049,25 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             quote! {}
                         };
 
+                        let attr_type = if is_fhir_element {
+                            Some(inner_ty.unwrap())
+                        } else {
+                            Some(field_ty)
+                        };
+
                         // Base attribute for the regular field
                         let base_attribute = quote! {
                             #skip_if_none_attr
                             #[serde(rename = #effective_field_name_str)]
-                            #field_name_ident: #field_ty,
+                            #field_name_ident: #attr_type,
                         };
 
                         // Conditionally add the underscore field attribute if it's an element type
-                        let underscore_attribute = if _is_element || _is_decimal_element {
+                        let underscore_attribute = if is_fhir_element {
                             quote! {
                                 #skip_if_none_attr
                                 #[serde(rename = #underscore_field_name_literal)]
-                                #underscore_field_name_ident: #extension_helper,
+                                #field_name_ident_ext: #extension_helper,
                             }
                         } else {
                             quote! {} // Empty if not an element
@@ -1024,14 +1079,37 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             #underscore_attribute
                         };
 
-
-                        let constructor_attribute = if is_option {
-                            quote! {
-                                #field_name_ident: None,
+                        let constructor_attribute = if is_fhir_element {
+                            if is_vec {
+                                if is_option {
+                                    // Handles Option<Vec<Element>>
+                                    quote! {
+                                        #field_name_ident: None,
+                                    }
+                                } else {
+                                    // Handles Option<Vec<Element>>
+                                    quote! {
+                                        #field_name_ident: None,
+                                    }
+                                }
+                            } else if is_option {
+                                // Handles Option<Element>
+                                quote! {
+                                    #field_name_ident: None,
+                                }
+                            } else {
+                                // Handles Element
+                                quote! {
+                                    #field_name_ident : #field_ty {
+                                                            value: temp_struct.#field_name_ident,
+                                                            id: temp_struct.#field_name_ident_ext.id,
+                                                            extension: temp_struct.#field_name_ident_ext.extension,
+                                                        },
+                                }
                             }
                         } else {
                             quote! {
-                                #field_name_ident : #field_ty::default(),
+                                #field_name_ident: temp_struct.#field_name_ident,
                             }
                         };
 

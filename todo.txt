@@ -1,3 +1,4 @@
+- Support fhir_serde flatten
 - Need to remove unnecessary parameter on get_element_info
 - Search for SLM TODO - need to change the others I think
 - Remember to remove Default on all structs - needed for initial draft implementation of fhir_macro

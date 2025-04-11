@@ -282,6 +282,7 @@ fn structure_definition_to_rust(
     output
 }
 
+// Keep this in sync with extract_inner_element_type in fhir_macro/src/lib.rs
 fn generate_primitive_type(sd: &StructureDefinition) -> String {
     let type_name = &sd.name;
     let mut output = String::new();
