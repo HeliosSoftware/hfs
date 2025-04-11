@@ -1203,18 +1203,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else if is_decimal_element {
                                 // Handle single DecimalElement or Option<DecimalElement>
-                                let construction_logic = quote! { { // Add opening brace for block expression
-                                    // Construct the DecimalElement struct itself
-                                    crate::DecimalElement { // Assuming DecimalElement is in crate root
-                                        // Access temp_struct field directly in map, remove intermediate variable
-                                        value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)),
-                                        id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
-                                        extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                    }
-                                } }; // Add closing brace for block expression
                                 if is_option {
-                                    // Wrap in Some() if the original field was Option<DecimalElement>
-                                    // Only construct Some if either the value or extension part exists
+                                    // Logic for Option<DecimalElement>
+                                    let construction_logic = quote! { { // Block expression
+                                        crate::DecimalElement {
+                                            // temp_struct field is Option<Decimal>, map it
+                                            value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)),
+                                            id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
+                                            extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                        }
+                                    } }; // End block expression
+                                    // Wrap in Some() only if value or extension exists
                                     quote! {
                                          #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
                                              Some(#construction_logic)
@@ -1223,9 +1222,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                          },
                                     }
                                 } else {
-                                    // Direct DecimalElement field assignment
+                                    // Logic for non-optional DecimalElement
                                     quote! {
-                                        #field_name_ident: #construction_logic,
+                                        #field_name_ident: { // Block expression
+                                            crate::DecimalElement {
+                                                // temp_struct field is Decimal, convert and wrap in Some()
+                                                value: Some(<crate::PreciseDecimal>::from(temp_struct.#field_name_ident)),
+                                                id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
+                                                extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                            }
+                                        }, // End block expression
                                     }
                                 }
                             } else if is_option {
