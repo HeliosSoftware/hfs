@@ -16520,11 +16520,11 @@ pub struct VisionPrescriptionLensSpecification {
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
 pub struct VisionPrescriptionLensSpecificationPrism {
-    //pub id: Option<String>,
-    //pub extension: Option<Vec<Extension>>,
-    //#[fhir_serde(rename = "modifierExtension")]
-    //pub modifier_extension: Option<Vec<Extension>>,
-    //pub amount: Decimal,
+    pub id: Option<String>,
+    pub extension: Option<Vec<Extension>>,
+    #[fhir_serde(rename = "modifierExtension")]
+    pub modifier_extension: Option<Vec<Extension>>,
+    pub amount: Decimal, // Uncommented
     pub base: Code,
 }
 
