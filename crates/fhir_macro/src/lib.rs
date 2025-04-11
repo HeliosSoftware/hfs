@@ -2,7 +2,7 @@ extern crate proc_macro;
 
 use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens}; // Add ToTokens here
+use quote::{format_ident, quote};
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
     TypePath, parse_macro_input, punctuated::Punctuated, token,
@@ -1063,9 +1063,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // If original field was Option<T>, temp type is Option<Primitive>
                                 // If original field was T, temp type is Primitive
                                 if is_option {
-                                     quote! { Option<#primitive_type_ident> }
+                                    quote! { Option<#primitive_type_ident> }
                                 } else {
-                                     quote! { #primitive_type_ident } // No Option for non-optional fields
+                                    quote! { #primitive_type_ident } // No Option for non-optional fields
                                 }
                             }
                         } else {
@@ -1127,10 +1127,15 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Generate different construction logic based on whether it's decimal
                                 let construction_logic = if is_decimal_element {
                                     // Logic specifically for Vec<DecimalElement> or Option<Vec<DecimalElement>>
-                                    let element_type = { // Determine DecimalElement<E> type
-                                        let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
-                                            .and_then(get_vec_inner_type)
-                                            .expect("Vec inner type not found for DecimalElement");
+                                    let element_type = {
+                                        // Determine DecimalElement<E> type
+                                        let vec_inner_type = if is_option {
+                                            get_option_inner_type(field_ty)
+                                        } else {
+                                            Some(field_ty)
+                                        }
+                                        .and_then(get_vec_inner_type)
+                                        .expect("Vec inner type not found for DecimalElement");
                                         quote! { #vec_inner_type }
                                     };
                                     quote! { { // Block expression starts
@@ -1162,10 +1167,15 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     } } // Block expression ends
                                 } else {
                                     // Logic specifically for Vec<Element<V, E>> or Option<Vec<Element<V, E>>> (non-decimal)
-                                    let element_type = { // Determine Element<V, E> type
-                                        let vec_inner_type = if is_option { get_option_inner_type(field_ty) } else { Some(field_ty) }
-                                            .and_then(get_vec_inner_type)
-                                            .expect("Vec inner type not found for Element");
+                                    let element_type = {
+                                        // Determine Element<V, E> type
+                                        let vec_inner_type = if is_option {
+                                            get_option_inner_type(field_ty)
+                                        } else {
+                                            Some(field_ty)
+                                        }
+                                        .and_then(get_vec_inner_type)
+                                        .expect("Vec inner type not found for Element");
                                         quote! { #vec_inner_type }
                                     };
                                     quote! { { // Block expression starts
