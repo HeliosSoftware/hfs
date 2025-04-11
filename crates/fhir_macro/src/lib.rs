@@ -1090,7 +1090,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         };
 
                         // Combine the attributes for the temp struct
+                        let flatten_attr = if is_flattened(field) { quote! { #[serde(flatten)] } } else { quote! {} };
                         let temp_struct_attribute = quote! {
+                            #flatten_attr // Add flatten attribute if needed
                             #base_attribute
                             #underscore_attribute
                         };
@@ -1218,8 +1220,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             }
                         } else { // Not an FHIR element type
-                            quote! {
-                                #field_name_ident: temp_struct.#field_name_ident,
+                            let field_is_flattened = is_flattened(field);
+                            if field_is_flattened {
+                                // If the field was flattened in the temp struct,
+                                // assume the necessary values are present for the target struct's
+                                // construction (which might also use flatten implicitly or explicitly).
+                                // We don't generate a direct assignment for the flattened field itself.
+                                quote! {}
+                            } else {
+                                // Standard assignment for non-flattened, non-FHIR element fields
+                                quote! {
+                                    #field_name_ident: temp_struct.#field_name_ident,
+                                }
                             }
                         };
 
