@@ -181,8 +181,8 @@ fn get_box_inner_type(ty: &Type) -> Option<&Type> {
 }
 
 // Helper to check if a Type is Element<V, E> or DecimalElement<E>, potentially via a known alias.
-// Returns (IsElement, IsDecimalElement, IsOption, IsVec)
-fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool) {
+// Returns (IsElement, IsDecimalElement, IsOption, IsVec, Option<InnerType>)
+fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) {
     // List of known FHIR primitive type aliases that wrap Element or DecimalElement
     // Note: This list might need adjustment based on the specific FHIR version/implementation details.
     // IMPORTANT: Do not include base Rust types like "String", "bool", "i32" here.
@@ -263,12 +263,13 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool) {
                     is_decimal_element,
                     is_option,
                     is_vec,
+                    Some(current_ty), // Return the identified inner type
                 );
             }
         }
     }
 
-    (false, false, is_option, is_vec) // Not an Element or DecimalElement type we handle specially
+    (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
 }
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
