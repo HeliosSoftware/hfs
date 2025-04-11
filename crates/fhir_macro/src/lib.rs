@@ -1260,12 +1260,34 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Handles Element<V, E> (non-option, non-vec)
                                 quote! {
                                     #field_name_ident: {
-                                        // Use intermediate binding to potentially help type inference
-                                        let temp_val = temp_struct.#field_name_ident;
+                                        // Determine the expected primitive type V for Element<V, E> or alias
+                                        let expected_primitive_type = if let Type::Path(type_path) = &#field_ty {
+                                            if let Some(last_segment) = type_path.path.segments.last() {
+                                                if last_segment.ident == "Element" {
+                                                    // Extract V from Element<V, E>
+                                                    if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                                                        if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
+                                                            quote! { #inner_v_type }
+                                                        } else { panic!("Element missing generic argument V"); }
+                                                    } else { panic!("Element missing angle bracketed arguments"); }
+                                                } else { // It's an alias like 'Code'
+                                                    let alias_name = last_segment.ident.to_string();
+                                                    let primitive_type_str = extract_inner_element_type(&alias_name);
+                                                    // Parse the primitive type string back into a Type for quoting
+                                                    let primitive_type_parsed: Type = syn::parse_str(primitive_type_str)
+                                                        .expect(&format!("Failed to parse primitive type string: {}", primitive_type_str));
+                                                    quote! { #primitive_type_parsed }
+                                                }
+                                            } else { panic!("Could not get last segment of Element type path"); }
+                                        } else { panic!("Element type is not a Type::Path"); };
+
+                                        // Use intermediate binding with explicit type annotation
+                                        let temp_val: Option<#expected_primitive_type> = temp_struct.#field_name_ident;
                                         let temp_id = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone());
                                         let temp_ext = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone());
+
                                         #field_ty { // Use the original Element type here (e.g., Code)
-                                            value: temp_val, // Assign the Option<V> from temp struct
+                                            value: temp_val, // Assign the explicitly typed Option<V>
                                             id: temp_id,
                                             extension: temp_ext,
                                         }
