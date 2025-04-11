@@ -1258,45 +1258,48 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else {
                                 // Handles Element<V, E> (non-option, non-vec)
-                                quote! {
-                                    #field_name_ident: {
-                                        // Determine the expected primitive type V for Element<V, E> or alias
-                                        // This needs to be done outside the final quote! block
-                                        let expected_primitive_type_token_stream = if let Type::Path(type_path) = &#field_ty {
-                                            if let Some(last_segment) = type_path.path.segments.last() {
-                                                if last_segment.ident == "Element" {
-                                                    // Extract V from Element<V, E>
-                                                    if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                                                        if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
-                                                            // inner_v_type is already a &Type, quote it directly
-                                                            quote! { #inner_v_type }
-                                                        } else { panic!("Element missing generic argument V"); }
-                                                    } else { panic!("Element missing angle bracketed arguments"); }
-                                                } else { // It's an alias like 'Code'
-                                                    let alias_name = last_segment.ident.to_string();
-                                                    let primitive_type_str = extract_inner_element_type(&alias_name);
-                                                    // Parse the primitive type string back into a Type for quoting
-                                                    let primitive_type_parsed: Type = syn::parse_str(primitive_type_str)
-                                                        .expect(&format!("Failed to parse primitive type string: {}", primitive_type_str));
-                                                    // primitive_type_parsed is a Type, quote it directly
-                                                    quote! { #primitive_type_parsed }
-                                                }
-                                            } else { panic!("Could not get last segment of Element type path"); }
-                                        } else { panic!("Element type is not a Type::Path"); };
+                                { // Start a block to define expected_primitive_type before quote!
+                                    // Determine the expected primitive type V for Element<V, E> or alias
+                                    // Capture the type as TokenStream within the correct scope
+                                    let expected_primitive_type = if let Type::Path(type_path) = &#field_ty {
+                                        if let Some(last_segment) = type_path.path.segments.last() {
+                                            if last_segment.ident == "Element" {
+                                                // Extract V from Element<V, E>
+                                                if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                                                    if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
+                                                        // inner_v_type is already a &Type
+                                                        inner_v_type.to_token_stream() // Convert to TokenStream
+                                                    } else { panic!("Element missing generic argument V"); }
+                                                } else { panic!("Element missing angle bracketed arguments"); }
+                                            } else { // It's an alias like 'Code'
+                                                let alias_name = last_segment.ident.to_string();
+                                                let primitive_type_str = extract_inner_element_type(&alias_name);
+                                                // Parse the primitive type string back into a Type
+                                                let primitive_type_parsed: Type = syn::parse_str(primitive_type_str)
+                                                    .expect(&format!("Failed to parse primitive type string: {}", primitive_type_str));
+                                                // Convert the parsed Type to TokenStream
+                                                primitive_type_parsed.to_token_stream()
+                                            }
+                                        } else { panic!("Could not get last segment of Element type path"); }
+                                    } else { panic!("Element type is not a Type::Path"); };
 
-                                        // Use intermediate binding with explicit type annotation
-                                        // Interpolate the determined type token stream here
-                                        let temp_val: Option<#expected_primitive_type_token_stream> = temp_struct.#field_name_ident;
-                                        let temp_id = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone());
-                                        let temp_ext = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone());
+                                    // Now generate the constructor logic using the determined type
+                                    quote! {
+                                        #field_name_ident: { // Add opening brace for block expression
+                                            // Use intermediate binding with explicit type annotation *inside* quote!
+                                            // Interpolate the determined type token stream here
+                                            let temp_val: Option<#expected_primitive_type> = temp_struct.#field_name_ident;
+                                            let temp_id = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone());
+                                            let temp_ext = temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone());
 
-                                        #field_ty { // Use the original Element type here (e.g., Code)
-                                            value: temp_val, // Assign the explicitly typed Option<V>
-                                            id: temp_id,
-                                            extension: temp_ext,
-                                        }
-                                    },
-                                }
+                                            #field_ty { // Use the original Element type here (e.g., Code)
+                                                value: temp_val, // Assign the explicitly typed Option<V>
+                                                id: temp_id,
+                                                extension: temp_ext,
+                                            }
+                                        } } // Add closing brace for block expression
+                                    }
+                                } // End of the block defining expected_primitive_type
                             }
                         } else {
                             // Not an FHIR element type
