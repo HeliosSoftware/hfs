@@ -1295,9 +1295,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         // Helper struct for deserializing the id/extension part from _fieldName
         #[derive(Clone, Deserialize, Default)] // Add Default derive
         struct IdAndExtensionHelper {
-            #[serde(default)] // Use default for Option<String>
+            #[serde(skip_serializing_if = "Option::is_none")] // Change from default
             id: Option<std::string::String>,
-            #[serde(default)] // Use default for Option<Vec<Extension>>
+            #[serde(skip_serializing_if = "Option::is_none")] // Change from default
             extension: Option<Vec<Extension>>,
         }
     };
