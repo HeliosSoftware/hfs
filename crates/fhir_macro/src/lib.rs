@@ -2,7 +2,6 @@ extern crate proc_macro;
 
 use heck::ToLowerCamelCase;
 use proc_macro::TokenStream;
-use proc_macro2::extra;
 use quote::{format_ident, quote}; // Add format_ident here
 use syn::{
     Data, DeriveInput, Fields, GenericArgument, Ident, Lit, Meta, Path, PathArguments, Type,
@@ -998,30 +997,6 @@ fn extract_inner_type(ty: &Type) -> &Type {
     panic!("Element doesn't have an inner type!")
 }
 
-// Keep this in sync with generate_primitive_type in fhir_gen/src/lib.rs
-fn extract_inner_element_type(type_name: &str) -> &str {
-    match type_name {
-        "Boolean" => "bool",
-        "Integer" | "PositiveInt" | "UnsignedInt" => "std::primitive::i32",
-        "Decimal" => "std::primitive::f64",
-        "PreciseDecimal" => "std::primitive::f64", // SLM TODO - eventually remove PreciseDecimal
-        "Integer64" => "std::primitive::i64",
-        "String" => "std::string::String",
-        "Code" => "std::string::String",
-        "Base64Binary" => "std::string::String",
-        "Canonical" => "std::string::String",
-        "Id" => "std::string::String",
-        "Oid" => "std::string::String",
-        "Uri" => "std::string::String",
-        "Url" => "std::string::String",
-        "Uuid" => "std::string::String",
-        "Markdown" => "std::string::String",
-        "Xhtml" => "std::string::String",
-        "Date" => "std::string::String",
-        "DateTime" | "Instant" | "Time" => "std::string::String",
-        _ => "std::string::String",
-    }
-}
 
 // Add impl_generics and where_clause as parameters
 fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
@@ -1047,14 +1022,6 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             get_element_info(field_ty);
 
                         let is_fhir_element = is_element || is_decimal_element;
-
-                        let extension_helper = if is_option {
-                            quote! { Option<IdAndExtensionHelper> }
-                        } else {
-                            quote! { Option<IdAndExtensionHelper> }
-                        } else {
-                            quote! { IdAndExtensionHelper }
-                        };
 
                         // Determine the type for the primitive value field in the temp struct
                         let temp_primitive_type_quote = if is_fhir_element {
