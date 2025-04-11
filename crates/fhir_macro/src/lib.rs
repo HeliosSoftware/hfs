@@ -1207,13 +1207,13 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else if is_decimal_element {
                                 // Handle single DecimalElement or Option<DecimalElement>
-                                // Explicitly type the intermediate Option value
-                                let temp_decimal_option: Option<rust_decimal::Decimal> = temp_struct.#field_name_ident;
                                 let construction_logic = quote! {
+                                    // Explicitly type the intermediate Option value *inside* the quote block
+                                    let temp_decimal_option: Option<rust_decimal::Decimal> = temp_struct.#field_name_ident;
                                     // Construct the DecimalElement struct itself
                                     crate::DecimalElement { // Assuming DecimalElement is in crate root
                                         // Use the explicitly typed intermediate variable
-                                        value: #temp_decimal_option.map(|dec| <crate::PreciseDecimal>::from(dec)),
+                                        value: temp_decimal_option.map(|dec| <crate::PreciseDecimal>::from(dec)),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                     }
