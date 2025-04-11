@@ -1039,7 +1039,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let underscore_field_name_str =
                             format_ident!("_{}", effective_field_name_str);
 
-                        let (is_element, is_decimal_element, is_option, is_vec) =
+                        // Destructure all 5 return values, ignoring the inner_ty for now if not needed
+                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty) =
                             get_element_info(field_ty);
 
                         let extension_helper = if is_option {
