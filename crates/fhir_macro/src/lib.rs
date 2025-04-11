@@ -67,8 +67,10 @@ fn is_renamed(field: &syn::Field) -> bool {
                 attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
             {
                 for meta in list {
-                    if let Meta::Path(path) = meta {
-                        if path.is_ident("renamed") {
+                    // Check for Meta::NameValue where the path is "rename"
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("rename") {
+                            // Found #[fhir_serde(rename = "...")]
                             return true;
                         }
                     }
