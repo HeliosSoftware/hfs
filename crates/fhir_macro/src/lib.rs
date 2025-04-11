@@ -1160,7 +1160,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             // Use the captured boolean value here
                                             let element_value = if #is_decimal_element_for_vec {
                                                 // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal> explicitly
-                                                prim_val_opt.map(|dec| <crate::PreciseDecimal>::from(dec))
+                                                // Add type annotation to dec to guide inference
+                                                prim_val_opt.map(|dec: rust_decimal::Decimal| <crate::PreciseDecimal>::from(dec))
                                             } else {
                                                 prim_val_opt // Use Option<V> directly
                                             };
