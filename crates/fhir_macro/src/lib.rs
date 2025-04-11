@@ -1207,7 +1207,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else if is_decimal_element {
                                 // Handle single DecimalElement or Option<DecimalElement>
-                                let construction_logic = quote! {
+                                let construction_logic = quote! { { // Add opening brace for block expression
                                     // Explicitly type the intermediate Option value *inside* the quote block
                                     let temp_decimal_option: Option<rust_decimal::Decimal> = temp_struct.#field_name_ident;
                                     // Construct the DecimalElement struct itself
@@ -1217,7 +1217,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                     }
-                                };
+                                } }; // Add closing brace for block expression
                                 if is_option {
                                     // Wrap in Some() if the original field was Option<DecimalElement>
                                     // Only construct Some if either the value or extension part exists
