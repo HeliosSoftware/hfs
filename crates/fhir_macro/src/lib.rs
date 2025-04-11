@@ -992,7 +992,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Create the string literal for the underscore field name
                         let underscore_field_name_literal =
                             format!("_{}", effective_field_name_str);
-
+                        // AI! In addition to the serde rename on both attributes below, I also want to add
+                        // '#[serde(skip_serializing_if = "Option::is_none")]' but only if
+                        // is_option is true
                         // Always apply serde rename attributes using the effective names
                         let temp_struct_attribute = quote! {
                             #[serde(rename = #effective_field_name_str)]
