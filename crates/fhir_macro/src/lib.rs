@@ -1115,6 +1115,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     quote! { #vec_inner_type } // Should resolve to Element<V, E>
                                 };
 
+                                // Explicitly capture the boolean value for use inside the quote! block
+                                let is_decimal_element_for_vec = is_decimal_element;
+
                                 let construction_logic = quote! { { // Add opening brace for block expression
                                     // Combine primitive and extension arrays from temp_struct
                                     // Use field_name_ident for accessing temp_struct fields
@@ -1129,7 +1132,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                                         // Only create an element if either part exists
                                         if prim_val_opt.is_some() || ext_helper_opt.is_some() {
-                                            let element_value = if is_decimal_element {
+                                            // Use the captured boolean value here
+                                            let element_value = if #is_decimal_element_for_vec {
                                                 // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal>
                                                 prim_val_opt.map(|dec| dec.into())
                                             } else {
@@ -1249,11 +1253,12 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
     }
 
     let id_extension_helper_def = quote! {
-        #[derive(Deserialize)]
+        // Helper struct for deserializing the id/extension part from _fieldName
+        #[derive(Deserialize, Default)] // Add Default derive
         struct IdAndExtensionHelper {
-            #[serde(skip_serializing_if = "Option::is_none")]
+            #[serde(default)] // Use default for Option<String>
             id: Option<std::string::String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
+            #[serde(default)] // Use default for Option<Vec<Extension>>
             extension: Option<Vec<Extension>>,
         }
     };
