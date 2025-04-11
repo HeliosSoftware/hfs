@@ -1160,8 +1160,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             // Construct and push the element directly within the correct branch
                                             if #is_decimal_element_for_vec {
                                                 // Construct DecimalElement
-                                                // Revert to using .into() for conversion
-                                                let precise_decimal_value = prim_val_opt.map(|dec| dec.into());
+                                                // Use explicit ::from() with intermediate typed variable
+                                                let precise_decimal_value = prim_val_opt.map(|dec| {
+                                                    let decimal_val: rust_decimal::Decimal = dec; // Explicit type
+                                                    <crate::PreciseDecimal>::from(decimal_val)
+                                                });
                                                 result_vec.push(#element_type { // element_type is DecimalElement<E>
                                                     value: precise_decimal_value, // Assign Option<PreciseDecimal>
                                                     id: ext_helper_opt.as_ref().and_then(|h| h.id.clone()),
