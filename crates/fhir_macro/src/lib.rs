@@ -1140,9 +1140,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     quote! { #vec_inner_type } // Should resolve to Element<V, E>
                                 };
 
-                                // Explicitly capture the boolean value for use inside the quote! block
-                                let is_decimal_element_for_vec = is_decimal_element;
-
+                                // Use is_decimal_element directly inside the quote! block
                                 let construction_logic = quote! { { // Add opening brace for block expression
                                     // Combine primitive and extension arrays from temp_struct
                                     // Use field_name_ident for accessing temp_struct fields
@@ -1158,7 +1156,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         // Only create an element if either part exists
                                         if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                             // Construct and push the element directly within the correct branch
-                                            if #is_decimal_element_for_vec {
+                                            if is_decimal_element { // Use is_decimal_element directly
                                                 // Construct DecimalElement
                                                 // Explicitly match Option and convert inner value
                                                 let precise_decimal_value = match prim_val_opt {
