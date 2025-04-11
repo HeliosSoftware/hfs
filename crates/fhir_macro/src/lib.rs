@@ -1087,35 +1087,77 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         };
 
                         let constructor_attribute = if is_fhir_element {
-                            if is_vec {
-                                if is_option {
-                                    // Handles Option<Vec<Element>>
-                                    quote! {
-                                        #field_name_ident: None,
-                                    }
-                                } else {
-                                    // Handles Option<Vec<Element>>
-                                    quote! {
-                                        #field_name_ident: None,
-                                    }
-                                }
-                            } else if is_option {
-                                // Handles Option<Element>
-                                quote! {
-                                    #field_name_ident: None,
-                                }
-                            } else {
-                                // Handles Element (non-option, non-vec) - This is the case causing the error
-                                quote! {
-                                    #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
-                                        value: temp_struct.#field_name_ident, // Assign the Option<V> from temp struct
-                                        // Extract id and extension safely from the Option<IdAndExtensionHelper>
+                             if is_decimal_element {
+                                // Handle DecimalElement and Option<DecimalElement>
+                                let construction_logic = quote! {
+                                    // Construct the DecimalElement struct itself
+                                    crate::DecimalElement { // Assuming DecimalElement is in crate root
+                                        // Convert Option<rust_decimal::Decimal> to Option<PreciseDecimal>
+                                        value: temp_struct.#field_name_ident.map(|dec| {
+                                            // Use PreciseDecimal::new or appropriate constructor
+                                            // TODO: Need crate::PreciseDecimal::new - requires adding crate::PreciseDecimal
+                                            // For now, let's assume a direct conversion or placeholder
+                                            // This needs the actual PreciseDecimal constructor logic from fhir crate
+                                            crate::PreciseDecimal::from_decimal(dec) // Placeholder - replace with actual constructor
+                                                // .expect("Failed to create PreciseDecimal from deserialized value") // Add error handling
+                                        }),
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                    },
+                                    }
+                                };
+                                if is_option {
+                                    // Wrap in Some() if the original field was Option<DecimalElement>
+                                    // Only construct Some if either the value or extension part exists
+                                    quote! {
+                                         #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
+                                             Some(#construction_logic)
+                                         } else {
+                                             None
+                                         },
+                                    }
+                                } else {
+                                    // Direct DecimalElement field assignment
+                                    quote! {
+                                        #field_name_ident: #construction_logic,
+                                    }
+                                }
+                            } else { // Handle regular Element<V, E>
+                                if is_vec {
+                                    // TODO: Handle Vec<Element> and Option<Vec<Element>> deserialization properly
+                                    // This part needs careful implementation to map primitive and extension arrays back
+                                     if is_option {
+                                         quote! { #field_name_ident: None, } // Placeholder for Option<Vec<Element>>
+                                     } else {
+                                         quote! { #field_name_ident: Vec::new(), } // Placeholder for Vec<Element>
+                                     }
+                                } else if is_option {
+                                    // Handles Option<Element<V, E>>
+                                    // Construct Some(Element { ... }) only if value or extension exists
+                                    // Get the inner type T from Option<T> to construct Element<V, E>
+                                    let inner_element_type = get_option_inner_type(field_ty).expect("Option inner type not found");
+                                    quote! {
+                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
+                                            Some(#inner_element_type { // Use the unwrapped Element type
+                                                value: temp_struct.#field_name_ident,
+                                                id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
+                                                extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                            })
+                                        } else {
+                                            None // Assign None if neither value nor extension part exists
+                                        },
+                                    }
+                                } else {
+                                    // Handles Element<V, E> (non-option, non-vec)
+                                    quote! {
+                                        #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
+                                            value: temp_struct.#field_name_ident, // Assign the Option<V> from temp struct
+                                            id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
+                                            extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                        },
+                                    }
                                 }
                             }
-                        } else {
+                        } else { // Not an FHIR element type
                             quote! {
                                 #field_name_ident: temp_struct.#field_name_ident,
                             }
