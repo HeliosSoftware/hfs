@@ -282,11 +282,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_ty = &field.ty;
                         let effective_field_name_str = get_effective_field_name(field);
                         let underscore_field_name_str = format!("_{}", effective_field_name_str);
-                        // Destructure all 5 return values, ignoring the inner_ty for now if not needed
+
+                        // Destructure all 5 return values from get_element_info
+                        // We need is_element, is_decimal_element, is_option, is_vec here
                         let (is_element, is_decimal_element, is_option, is_vec, _inner_ty) =
                             get_element_info(field_ty);
 
-                        // Only treat as FHIR element if it looks like one AND handling is NOT skipped
+                        // Determine if it's an FHIR element type we need to handle specially
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Use field_name_ident for accessing the struct field
