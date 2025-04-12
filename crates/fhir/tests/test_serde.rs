@@ -1148,18 +1148,6 @@ fn test_flatten_serialization() {
 
 #[test]
 fn test_fhir_serde_deserialize() {
-    // Helper to create default extension for comparison
-    let default_extension = || Extension {
-        id: None,
-        extension: None,
-        url: "http://example.com/ext".to_string().into(), // Convert String to Url
-        value: Some(ExtensionValue::String(String {
-            id: None,
-            extension: None,
-            value: Some("ext-val".to_string()),
-        })),
-    };
-
     let decimal = Decimal::new(dec!(123.45));
 
     // Case 1: Only primitive value for birthDate1

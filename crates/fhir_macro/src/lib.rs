@@ -1201,12 +1201,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                                 // Assign the correct construction_logic based on is_option
                                 if is_option {
-                                    // Wrap in Some() if the original field was Option<Vec<Element>>
+                                    // For Option<Vec<Element>>, only construct Some if input fields were present
                                     quote! {
-                                        #field_name_ident: Some(#construction_logic),
+                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
+                                            Some(#construction_logic)
+                                        } else {
+                                            None
+                                        },
                                     }
                                 } else {
-                                    // Direct Vec<Element> field assignment
+                                    // Direct Vec<Element> field assignment (always construct the Vec)
                                     quote! {
                                         #field_name_ident: #construction_logic,
                                     }
