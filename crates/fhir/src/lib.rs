@@ -679,6 +679,34 @@ pub struct DecimalElement<E> {
     pub value: Option<PreciseDecimal>,
 }
 
+// Add this impl block for DecimalElement
+impl<E> DecimalElement<E> {
+    /// Creates a new DecimalElement with the given value, setting id and extension to None.
+    /// The original string representation is derived automatically from the Decimal value.
+    ///
+    /// # Example
+    /// ```
+    /// # use fhir::r4::Decimal; // Assuming Decimal is DecimalElement<Extension>
+    /// # use rust_decimal_macros::dec;
+    /// let decimal_value = dec!(123.45);
+    /// let fhir_decimal = Decimal::new(decimal_value);
+    /// assert_eq!(fhir_decimal.value.as_ref().map(|pd| pd.value()), Some(decimal_value));
+    /// assert_eq!(fhir_decimal.value.map(|pd| pd.original_string().to_string()), Some("123.45".to_string()));
+    /// assert!(fhir_decimal.id.is_none());
+    /// assert!(fhir_decimal.extension.is_none());
+    /// ```
+    pub fn new(value: Decimal) -> Self {
+        // Use the From<Decimal> impl for PreciseDecimal to create it,
+        // which automatically handles storing the original string representation.
+        let precise_value = PreciseDecimal::from(value);
+        Self {
+            id: None,
+            extension: None, // Assuming E is typically Vec<Extension> or similar, default should be None
+            value: Some(precise_value),
+        }
+    }
+}
+
 // Custom Deserialize for DecimalElement<E> using the visitor
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
