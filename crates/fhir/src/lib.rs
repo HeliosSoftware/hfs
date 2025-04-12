@@ -65,7 +65,6 @@ impl From<Decimal> for PreciseDecimal {
     }
 }
 
-
 impl Serialize for PreciseDecimal {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -679,7 +678,6 @@ pub struct DecimalElement<E> {
     pub value: Option<PreciseDecimal>,
 }
 
-// Add this impl block for DecimalElement
 impl<E> DecimalElement<E> {
     /// Creates a new DecimalElement with the given value, setting id and extension to None.
     /// The original string representation is derived automatically from the Decimal value.
