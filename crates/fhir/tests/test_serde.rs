@@ -1292,89 +1292,85 @@ fn test_fhir_serde_deserialize() {
     };
     let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
     assert_eq!(s4, expected4);
+
+    // Case 5: Primitive value is null, but extension exists
+    let json5 = r#"{"name1":"Test5","_birthDate1":{"id":"bd-null"},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
+    let expected5 = FhirSerdeTestStruct {
+        name1: "Test5".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: Some("bd-null".to_string()),
+            extension: None,
+            value: None, // Value is None because input was null
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: None,
+    };
+    let s5: FhirSerdeTestStruct = serde_json::from_str(json5).unwrap();
+    assert_eq!(s5, expected5);
+
+    //  No Case 6 or 7
+
+    // Case 8: Duplicate primitive field (should error)
+    let json8 = r#"{"birthDate1":"1970-03-30", "birthDate1":"1971-04-01"}"#;
+    let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
+    assert!(res8.is_err());
+    assert!(
+        res8.unwrap_err()
+            .to_string()
+            .contains("duplicate field `birthDate1`")
+    );
+
+    // No Case 9
+
+    // Case 10: Deserialize Decimal (primitive and extension)
+    let json10 = r#"{"name1":"Test10","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"_decimal1":{"id":"dec-id"},"decimal2":98.7,"money1":{"value":123.45}}"#;
+    let expected10 = FhirSerdeTestStruct {
+        name1: "Test10".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: Some("bd-null".to_string()),
+            extension: None,
+            value: None, // Value is None because input was null
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: Decimal {
+            id: Some("dec-id".to_string()),
+            extension: None,
+            // Deserialization preserves original string rep
+            value: Some(PreciseDecimal::new(dec!(123.45), "123.45".to_string())),
+        },
+        decimal2: Some(Decimal {
+            id: None,
+            extension: None,
+            value: Some(PreciseDecimal::new(dec!(98.7), "98.7".to_string())),
+        }),
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: None,
+    };
+    let s10: FhirSerdeTestStruct = serde_json::from_str(json10).unwrap();
+    assert_eq!(s10, expected10);
+
     /*
-        // Case 5: Empty object (plus required fields)
-        let json5 = r#"{"name1":"Test5"}"#;
-        let expected5 = FhirSerdeTestStruct {
-            name1: "Test5".to_string().into(),
-            ..Default::default()
-        };
-        let s5: FhirSerdeTestStruct = serde_json::from_str(json5).unwrap();
-        assert_eq!(s5, expected5);
-
-        // Case 6: Primitive value is null, but extension exists
-        let json6 = r#"{"name1":"Test6","_birthDate1":{"id":"bd-null"}}"#;
-        let expected6 = FhirSerdeTestStruct {
-            name1: "Test6".to_string().into(),
-            birth_date1: Date {
-                id: Some("bd-null".to_string()),
-                extension: None,
-                value: None, // Value is None because input was null
-            },
-            ..Default::default()
-        };
-        let s6: FhirSerdeTestStruct = serde_json::from_str(json6).unwrap();
-        assert_eq!(s6, expected6);
-
-        // Case 7: Primitive value exists, but extension is null (should ignore null extension object)
-        let json7 = r#"{"name1":"Test7","birthDate1":"1999-09-09"}"#;
-        let expected7 = FhirSerdeTestStruct {
-            name1: "Test7".to_string().into(),
-            birth_date1: Date {
-                id: None,
-                extension: None,
-                value: Some("1999-09-09".to_string()),
-            },
-            ..Default::default()
-        };
-        let s7: FhirSerdeTestStruct = serde_json::from_str(json7).unwrap();
-        assert_eq!(s7, expected7);
-
-        // Case 8: Duplicate primitive field (should error)
-        let json8 = r#"{"birthDate1":"1970-03-30", "birthDate1":"1971-04-01"}"#;
-        let res8: Result<FhirSerdeTestStruct, _> = serde_json::from_str(json8);
-        assert!(res8.is_err());
-        assert!(
-            res8.unwrap_err()
-                .to_string()
-                .contains("duplicate field `birthDate1`")
-        );
-
-        // Case 9: Duplicate extension field (should use the last one according to JSON parsing rules)
-        let json9 = r#"{"name1":"Test9","_birthDate1":{"id":"a"}, "_birthDate1":{"id":"b"}}"#;
-        let expected9 = FhirSerdeTestStruct {
-            name1: "Test9".to_string().into(),
-            birth_date1: Date {
-                id: Some("b".to_string()), // Last value wins
-                extension: None,
-                value: None,
-            },
-            ..Default::default()
-        };
-        let s9: FhirSerdeTestStruct = serde_json::from_str(json9).unwrap();
-        assert_eq!(s9, expected9);
-
-        // Case 10: Deserialize Decimal (primitive and extension)
-        let json10 =
-            r#"{"name1":"Test10","decimal1":123.45,"_decimal1":{"id":"dec-id"},"decimal2":98.7}"#;
-        let expected10 = FhirSerdeTestStruct {
-            name1: "Test10".to_string().into(),
-            decimal1: Decimal {
-                id: Some("dec-id".to_string()),
-                extension: None,
-                // Deserialization preserves original string rep
-                value: Some(PreciseDecimal::new(dec!(123.45), "123.45".to_string())),
-            },
-            decimal2: Some(Decimal {
-                id: None,
-                extension: None,
-                value: Some(PreciseDecimal::new(dec!(98.7), "98.7".to_string())),
-            }),
-            ..Default::default()
-        };
-        let s10: FhirSerdeTestStruct = serde_json::from_str(json10).unwrap();
-        assert_eq!(s10, expected10);
-
         // Case 11: Deserialize Money (always object)
         let json11 = r#"{"name1":"Test11","money1":{"id":"money-id","value":100.50,"currency":"USD"},"money2":{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}],"value":200}}"#;
         let expected11 = FhirSerdeTestStruct {
