@@ -1267,10 +1267,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else {
                                 // Handles Element<V, E> (non-option, non-vec)
-                                // Assign the Option<Primitive> from temp_struct directly
+                                // Wrap the primitive from temp_struct in Some()
                                 quote! {
                                     #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
-                                        value: temp_struct.#field_name_ident, // Assign Option<Primitive> directly
+                                        value: Some(temp_struct.#field_name_ident), // Wrap primitive in Some()
                                         id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                         extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                     },
