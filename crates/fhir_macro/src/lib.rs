@@ -1241,8 +1241,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     quote! {
                                         #field_name_ident: { // Block expression
                                             crate::DecimalElement {
-                                                // temp_struct field is Decimal, convert and wrap in Some()
-                                                value: Some(<crate::PreciseDecimal>::from(temp_struct.#field_name_ident)),
+                                                // temp_struct field is Option<Decimal>, map it
+                                                value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)), // Use map here
                                                 id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                                 extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                             }
