@@ -1177,28 +1177,41 @@ fn test_fhir_serde_deserialize() {
     let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
     assert_eq!(s1, expected1);
     /*
-        // Case 2: Only extension for birthDate1
-        let json2 = r#"{"name1":"Test2","_birthDate1":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]}}"#;
-        let expected2 = FhirSerdeTestStruct {
-            name1: "Test2".to_string().into(),
-            birth_date1: Date {
-                id: Some("bd-id".to_string()),
-                extension: Some(vec![Extension {
+    // Case 2: Only extension for birthDate1
+    let json2 = r#"{"name1":"Test2","_birthDate1":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}}"#;
+    let expected2 = FhirSerdeTestStruct {
+        name1: "Test2".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: Some("bd-id".to_string()),
+            extension: Some(vec![Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/note".to_string().into(), // Convert String to Url
+                value: Some(ExtensionValue::String(String {
                     id: None,
                     extension: None,
-                    url: "http://example.com/note".to_string().into(), // Convert String to Url
-                    value: Some(ExtensionValue::String(String {
-                        id: None,
-                        extension: None,
-                        value: Some("some note".to_string()),
-                    })),
-                }]),
-                value: None,
-            },
-            ..Default::default()
-        };
-        let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
-        assert_eq!(s2, expected2);
+                    value: Some("some note".to_string()),
+                })),
+            }]),
+            value: None,
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: None,
+    };
+    let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
+    assert_eq!(s2, expected2);
 
         // Case 3: Both primitive value and extension for birthDate1 and isActive1
         let json3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive1":true,"_isActive1":{"id":"active-id"}}"#;
