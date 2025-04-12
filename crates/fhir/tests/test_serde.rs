@@ -1212,74 +1212,87 @@ fn test_fhir_serde_deserialize() {
     };
     let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
     assert_eq!(s2, expected2);
+
+    // Case 3: Both primitive value and extension for birthDate1 and isActive1
+    let json3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive1":true,"_isActive1":{"id":"active-id"},"decimal1":123.45,"money1":{"value":123.45}}"#;
+    let expected3 = FhirSerdeTestStruct {
+        name1: "Test3".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: Some("bd-id-3".to_string()),
+            extension: Some(vec![Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/test".to_string().into(), // Convert String to Url
+                value: Some(ExtensionValue::String(String {
+                    id: None,
+                    extension: None,
+                    value: Some("some-ext-val".to_string()),
+                })),
+            }]),
+            value: Some("1970-03-30".to_string()),
+        },
+        birth_date2: None,
+        is_active1: Boolean {
+            id: Some("active-id".to_string()), // Merged from _isActive1
+            extension: None,                   // Merged from _isActive1
+            value: Some(true),                 // From isActive1
+        },
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: None,
+    };
+    let s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap();
+    assert_eq!(s3, expected3);
+
+    // Case 4: isActive1 has only extension
+    let json4 = r#"{"name1":"Test4","birthDate1":"1970-03-30","_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]},"decimal1":123.45,"money1":{"value":123.45}}"#;
+    let expected4 = FhirSerdeTestStruct {
+        name1: "Test4".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: None,
+            extension: None,
+            value: Some("1970-03-30".to_string()),
+        },
+        birth_date2: None,
+        is_active1: Boolean {
+            id: None,
+            extension: Some(vec![Extension {
+                id: None,
+                extension: None,
+                url: "http://example.com/flag".to_string().into(), // Convert String to Url
+                value: Some(ExtensionValue::Boolean(Boolean {
+                    id: None,
+                    extension: None,
+                    value: Some(true),
+                })),
+            }]),
+            value: None, // isActive1 primitive is missing/null
+        },
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: None,
+    };
+    let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
+    assert_eq!(s4, expected4);
     /*
-        // Case 3: Both primitive value and extension for birthDate1 and isActive1
-        let json3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive1":true,"_isActive1":{"id":"active-id"}}"#;
-        let expected3 = FhirSerdeTestStruct {
-            name1: "Test3".to_string().into(),
-            birth_date1: Date {
-                id: Some("bd-id-3".to_string()),
-                extension: Some(vec![Extension {
-                    id: None,
-                    extension: None,
-                    url: "http://example.com/test".to_string().into(), // Convert String to Url
-                    value: Some(ExtensionValue::String(String {
-                        id: None,
-                        extension: None,
-                        value: Some("some-ext-val".to_string()),
-                    })),
-                }]),
-                value: Some("1970-03-30".to_string()),
-            },
-            is_active1: Boolean {
-                id: Some("active-id".to_string()), // Merged from _isActive1
-                extension: None,                   // Merged from _isActive1
-                value: Some(true),                 // From isActive1
-            },
-            ..Default::default()
-        };
-        let s3: FhirSerdeTestStruct = serde_json::from_str(json3).unwrap();
-        assert_eq!(s3, expected3);
-
-        // Case 4: birthDate1 is null, isActive1 has only extension
-        let json4 = r#"{"name1":"Test4","birthDate1":null,"isActive1":null,"decimal1":null,"money1":{},"name2":null,"birth_date2":null,"is_active2":null,"decimal2":null,"money2":null,"given":null,"_isActive1":{"extension":[{"url":"http://example.com/flag","valueBoolean":true}]}}"#;
-        let expected4 = FhirSerdeTestStruct {
-            name1: "Test4".to_string().into(),
-            birth_date1: Date {
-                id: None,
-                extension: None,
-                value: None,
-            },
-            is_active1: Boolean {
-                id: None,
-                extension: Some(vec![Extension {
-                    id: None,
-                    extension: None,
-                    url: "http://example.com/flag".to_string().into(), // Convert String to Url
-                    value: Some(ExtensionValue::Boolean(Boolean {
-                        id: None,
-                        extension: None,
-                        value: Some(true),
-                    })),
-                }]),
-                value: None, // isActive1 primitive is missing/null
-            },
-            decimal1: Decimal {
-                id: None,
-                extension: None,
-                value: None,
-            },
-            money1: Money {
-                id: None,
-                extension: None,
-                value: None,
-                currency: None,
-            },
-            ..Default::default()
-        };
-        let s4: FhirSerdeTestStruct = serde_json::from_str(json4).unwrap();
-        assert_eq!(s4, expected4);
-
         // Case 5: Empty object (plus required fields)
         let json5 = r#"{"name1":"Test5"}"#;
         let expected5 = FhirSerdeTestStruct {
