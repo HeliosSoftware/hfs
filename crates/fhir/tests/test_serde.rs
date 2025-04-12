@@ -1176,9 +1176,9 @@ fn test_fhir_serde_deserialize() {
     };
     let s1: FhirSerdeTestStruct = serde_json::from_str(json1).unwrap();
     assert_eq!(s1, expected1);
-    /*
+
     // Case 2: Only extension for birthDate1
-    let json2 = r#"{"name1":"Test2","_birthDate1":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}}"#;
+    let json2 = r#"{"name1":"Test2","_birthDate1":{"id":"bd-id","extension":[{"url":"http://example.com/note","valueString":"some note"}]},"isActive1":true,"decimal1":123.45,"money1":{"value":123.45}}"#;
     let expected2 = FhirSerdeTestStruct {
         name1: "Test2".to_string().into(),
         name2: None,
@@ -1212,7 +1212,7 @@ fn test_fhir_serde_deserialize() {
     };
     let s2: FhirSerdeTestStruct = serde_json::from_str(json2).unwrap();
     assert_eq!(s2, expected2);
-
+    /*
         // Case 3: Both primitive value and extension for birthDate1 and isActive1
         let json3 = r#"{"name1":"Test3","birthDate1":"1970-03-30","_birthDate1":{"id":"bd-id-3","extension":[{"url":"http://example.com/test","valueString":"some-ext-val"}]},"isActive1":true,"_isActive1":{"id":"active-id"}}"#;
         let expected3 = FhirSerdeTestStruct {
