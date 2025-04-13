@@ -4,7 +4,7 @@ use serde::{
     de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-use serde_json::value::RawValue;
+// Removed unused RawValue import
 use std::marker::PhantomData;
 
 // Store both the parsed value and the original string representation
@@ -70,9 +70,8 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Serialize the inner rust_decimal::Decimal value directly.
-        // This uses rust_decimal's default serialization, which might normalize.
-        self.value.serialize(serializer)
+        // Serialize the inner rust_decimal::Decimal value directly using the Serialize trait.
+        serde::Serialize::serialize(&self.value, serializer)
     }
 }
 
@@ -83,7 +82,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     where
         D: Deserializer<'de>,
     {
-        // Deserialize directly into rust_decimal::Decimal
+        // Deserialize directly into rust_decimal::Decimal using the Deserialize trait
         let decimal_value = Decimal::deserialize(deserializer)?;
         // Convert to PreciseDecimal using From, which derives original_string
         Ok(PreciseDecimal::from(decimal_value))
