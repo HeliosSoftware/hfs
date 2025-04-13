@@ -806,52 +806,8 @@ where
     where
         D: Deserializer<'de>,
     {
-        // Try deserializing as a primitive PreciseDecimal first
-        let result = PreciseDecimal::deserialize(deserializer);
-
-        match result {
-            Ok(precise_decimal) => {
-                // Successfully deserialized as primitive, wrap it
-                Ok(DecimalElement {
-                    value: Some(precise_decimal),
-                    ..Default::default() // id and extension are None
-                })
-            }
-            Err(e) => {
-                // Failed as primitive, could be an object or null.
-                // Need a new deserializer instance as the previous one might be consumed/invalid.
-                // This is tricky. Let's stick with deserialize_any for now,
-                // but maybe the visitor logic needs refinement.
-                // Reverting this part and focusing on the visitor again.
-                // The issue might be in how deserialize_any handles the visitor dispatch.
-
-                // Let's retry the original approach with the visitor,
-                // ensuring the visitor handles primitives correctly.
-                // The previous fix to the visitor's visit_* methods should have worked.
-                // Perhaps the error propagation from PreciseDecimal::deserialize is the issue.
-
-                // Revert to the simpler visitor call, assuming the visitor is correct.
-                 struct DeserializerClone<'a, D: Deserializer<'de>>(D, PhantomData<&'a ()>);
-                 // This cloning is complex and likely not the right way.
-
-                 // Let's assume the failure means it MUST be an object or null,
-                 // and try deserializing specifically as a map or unit.
-                 // This requires a more tailored visitor.
-
-                 // --- Reverting to the original visitor approach ---
-                 // Re-create the deserializer from the error if possible? No standard way.
-                 // The original approach MUST work if the visitor is correct.
-                 // Let's re-verify the DecimalElementVisitor's primitive handlers.
-
-                 // The DecimalElementVisitor's primitive handlers seem correct now.
-                 // Let's stick to the original plan of using deserialize_any.
-                 // The failure in the test suggests the visitor isn't being called correctly
-                 // for primitive inputs, or the result is being lost.
-                 deserializer.deserialize_any(DecimalElementVisitor(PhantomData))
-                 // If this fails, the error 'e' from the PreciseDecimal attempt might be more informative,
-                 // but we can't easily reuse the deserializer.
-                 // Let's return the visitor error directly.
-                 // .map_err(|_visitor_err| e) // This might hide the real error
+        // Use the custom visitor directly
+        deserializer.deserialize_any(DecimalElementVisitor(PhantomData))
     }
 }
 
