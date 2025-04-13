@@ -1154,13 +1154,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             let prim_val_opt = primitives.get(i).cloned().flatten();
                                             let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
+                                                // Deserialize the Option<serde_json::Value> into Option<PreciseDecimal>
                                                 let precise_decimal_value = match prim_val_opt {
-                                                    Some(dec_val) => {
-                                                        // This explicit typing is needed here
-                                                        let dec: rust_decimal::Decimal = dec_val;
-                                                        Some(crate::PreciseDecimal::from(dec))
+                                                    Some(json_val) if !json_val.is_null() => {
+                                                        match crate::PreciseDecimal::deserialize(json_val) {
+                                                            Ok(pd) => Some(pd),
+                                                            Err(_e) => {
+                                                                // eprintln!("WARN: Failed to deserialize PreciseDecimal in vec for field '{}': {}", stringify!(#field_name_ident), e);
+                                                                None // Treat deserialization error as None
+                                                            }
+                                                        }
                                                     },
-                                                    None => None,
+                                                    _ => None, // Treat None or JSON null as None
                                                 };
                                                 result_vec.push(#element_type {
                                                     value: precise_decimal_value,
