@@ -1139,8 +1139,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         quote! { #vec_inner_type }
                                     };
                                     quote! { { // Block expression starts
-                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default();
-                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
+                                        // Handle Option for primitives and extensions
+                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default(); // Vec<Option<Primitive>>
+                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default(); // Vec<Option<IdAndExtensionHelper>>
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
@@ -1180,8 +1181,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         quote! { #vec_inner_type }
                                     };
                                     quote! { { // Block expression starts
-                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default();
-                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default();
+                                        // Handle Option for primitives and extensions
+                                        let primitives = temp_struct.#field_name_ident.unwrap_or_default(); // Vec<Option<Primitive>>
+                                        let extensions = temp_struct.#field_name_ident_ext.unwrap_or_default(); // Vec<Option<IdAndExtensionHelper>>
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
@@ -1203,14 +1205,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                                 // Assign the correct construction_logic based on is_option
                                 if is_option {
-                                    // For Option<Vec<Element>>, only construct Some if the primitive array was present
+                                    // For Option<Vec<Element>>, construct Some if either primitive or extension array was present
                                     quote! {
-                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() { // Check only primitive field
+                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
                                             Some(#construction_logic)
                                         } else {
-                                            // If primitive array is missing, but extension array exists,
-                                            // the field itself should be None according to FHIR JSON rules.
-                                            // The extensions from _event are effectively orphaned in this case.
                                             None
                                         },
                                     }
