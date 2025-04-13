@@ -4,7 +4,7 @@ use serde::{
     de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-use serde_json::value::RawValue; // Add back RawValue import
+// Removed unused RawValue import
 use std::marker::PhantomData;
 
 // Store both the parsed value and the original string representation
@@ -189,7 +189,7 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
                 s.parse::<Decimal>()
                     .map(|value| PreciseDecimal {
                         value,
-                        original_string: s, // Store inner string content
+                        original_string: s.clone(), // Clone s here
                     })
                     .map_err(|e| {
                         de::Error::custom(format!(
@@ -204,7 +204,7 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
                 s.parse::<Decimal>()
                     .map(|value| PreciseDecimal {
                         value,
-                        original_string: s, // Store raw segment string
+                        original_string: s.clone(), // Clone s here
                     })
                     .map_err(|e| {
                         de::Error::custom(format!(
