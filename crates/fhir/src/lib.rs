@@ -4,7 +4,7 @@ use serde::{
     de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-// Removed unused RawValue import
+use serde_json::value::RawValue; // Add back RawValue import
 use std::marker::PhantomData;
 
 // Store both the parsed value and the original string representation
