@@ -4,7 +4,7 @@ use serde::{
     de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-use serde_json::value::RawValue; // Add back RawValue import
+// Removed unused RawValue import
 use std::marker::PhantomData;
 
 // Store both the parsed value and the original string representation
@@ -180,10 +180,12 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
         // Try to deserialize as RawValue first
         let raw_value = match <&serde_json::value::RawValue>::deserialize(deserializer) {
             Ok(rv) => rv,
-            Err(e) => {
-                // If RawValue fails, let deserialize_any try other methods by propagating the error.
-                // Serde's deserialize_any should handle this and attempt visit_str, visit_f64 etc.
-                return Err(e);
+            Err(_e) => {
+                // If RawValue fails, it might be because we are deserializing from Value
+                // or the input wasn't directly deserializable as RawValue.
+                // Signal an error specific to this path, allowing deserialize_any
+                // to try other visit methods like visit_f64 or visit_str.
+                return Err(de::Error::invalid_type(de::Unexpected::Other("non-raw json value for newtype"), &self));
             }
         };
         let original_json_segment = raw_value.get();
