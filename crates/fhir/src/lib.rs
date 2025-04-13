@@ -316,9 +316,11 @@ where
         let original_string = v;
         original_string.parse::<Decimal>()
             .map(|value| DecimalElement {
-                value: Some(PreciseDecimal { value, original_string }),
+                // Clone original_string here before moving it into PreciseDecimal
+                value: Some(PreciseDecimal { value, original_string: original_string.clone() }),
                 ..Default::default()
             })
+            // Now original_string is still available to be borrowed here
             .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", original_string, e)))
     }
      fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
