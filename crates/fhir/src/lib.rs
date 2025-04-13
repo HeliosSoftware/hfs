@@ -83,7 +83,8 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
         D: Deserializer<'de>,
     {
         // Deserialize directly into rust_decimal::Decimal using the Deserialize trait explicitly
-        let decimal_value = serde::Deserialize::deserialize(deserializer)?;
+        // Add type annotation to help inference
+        let decimal_value: Decimal = serde::Deserialize::deserialize(deserializer)?;
         // Convert to PreciseDecimal using From, which derives original_string
         Ok(PreciseDecimal::from(decimal_value))
     }
