@@ -105,7 +105,7 @@ impl<'de> Visitor<'de> for PreciseDecimalValueVisitor {
     fn visit_string<E>(self, v: String) -> Result<Self::Value, E> where E: de::Error {
         let original_string = v; // Keep original string
         original_string.parse::<Decimal>()
-            .map(|value| PreciseDecimal { value, original_string })
+            .map(|value| PreciseDecimal { value, original_string: original_string.clone() }) // Clone here
             .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", original_string, e)))
     }
 
