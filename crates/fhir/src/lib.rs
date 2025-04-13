@@ -266,39 +266,68 @@ where
         formatter.write_str("a decimal number, string, object, or null")
     }
 
-    // Handle primitive types by attempting to deserialize PreciseDecimal and wrapping it
+    // Handle primitive types by directly constructing PreciseDecimal and wrapping it
     fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> where Er: de::Error {
         Err(de::Error::invalid_type(de::Unexpected::Bool(v), &self))
     }
     fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::I64Deserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        let s = v.to_string();
+        s.parse::<Decimal>()
+            .map(|value| DecimalElement {
+                value: Some(PreciseDecimal { value, original_string: s }),
+                ..Default::default()
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from i64 '{}': {}", v, e)))
     }
     fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::U64Deserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        let s = v.to_string();
+        s.parse::<Decimal>()
+            .map(|value| DecimalElement {
+                value: Some(PreciseDecimal { value, original_string: s }),
+                ..Default::default()
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from u64 '{}': {}", v, e)))
     }
     fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::F64Deserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        // Use serde_json::Number to try and preserve original string format better than f64::to_string
+        match serde_json::Number::from_f64(v) {
+            Some(n) => {
+                let s = n.to_string();
+                s.parse::<Decimal>()
+                    .map(|value| DecimalElement {
+                        value: Some(PreciseDecimal { value, original_string: s }),
+                        ..Default::default()
+                    })
+                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from f64 '{}' (string '{}'): {}", v, n, e)))
+            }
+            None => Err(de::Error::custom(format!("Invalid f64 value: {}", v))),
+        }
     }
     fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::StrDeserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        v.parse::<Decimal>()
+            .map(|value| DecimalElement {
+                value: Some(PreciseDecimal { value, original_string: v.to_string() }),
+                ..Default::default()
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", v, e)))
     }
     fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::StringDeserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        // Avoid clone if possible by parsing v directly
+        let original_string = v;
+        original_string.parse::<Decimal>()
+            .map(|value| DecimalElement {
+                value: Some(PreciseDecimal { value, original_string }),
+                ..Default::default()
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", original_string, e)))
     }
      fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
-        PreciseDecimal::deserialize(de::value::BorrowedStrDeserializer::new(v))
-            .map(|pd| DecimalElement { value: Some(pd), ..Default::default() })
-            .map_err(|e| e) // Propagate error
+        v.parse::<Decimal>()
+            .map(|value| DecimalElement {
+                value: Some(PreciseDecimal { value, original_string: v.to_string() }),
+                ..Default::default()
+            })
+            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from borrowed string '{}': {}", v, e)))
     }
     fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
          Err(de::Error::invalid_type(de::Unexpected::Bytes(v), &self))
