@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
             }
             serde_json::Value::String(s) => {
                  s.parse::<Decimal>()
-                    .map(|dec| PreciseDecimal::new(dec, s)) // Use new to store string
+                    .map(|dec| PreciseDecimal::new(dec, s.clone())) // Clone s here
                     .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", s, e)))
             }
             // Handle case where PreciseDecimal might be nested inside an object like {"value": 123.45}
