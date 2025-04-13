@@ -1015,8 +1015,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                             // Determine the base primitive type (e.g., bool, String, rust_decimal::Decimal)
                             let primitive_type_ident = if is_decimal_element {
-                                // DecimalElement wraps PreciseDecimal, but the temp struct uses rust_decimal::Decimal
-                                quote! { rust_decimal::Decimal }
+                                // For DecimalElement, use serde_json::Value in temp struct to preserve original string
+                                quote! { serde_json::Value }
                             } else {
                                 // is_element is true here
                                 if let Type::Path(type_path) = inner_ty {
@@ -1154,13 +1154,18 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             let prim_val_opt = primitives.get(i).cloned().flatten();
                                             let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
+                                                // Deserialize the Option<serde_json::Value> into Option<PreciseDecimal>
                                                 let precise_decimal_value = match prim_val_opt {
-                                                    Some(dec_val) => {
-                                                        // This explicit typing is needed here
-                                                        let dec: rust_decimal::Decimal = dec_val;
-                                                        Some(crate::PreciseDecimal::from(dec))
+                                                    Some(json_val) if !json_val.is_null() => {
+                                                        match crate::PreciseDecimal::deserialize(json_val) {
+                                                            Ok(pd) => Some(pd),
+                                                            Err(_e) => {
+                                                                // eprintln!("WARN: Failed to deserialize PreciseDecimal in vec for field '{}': {}", stringify!(#field_name_ident), e);
+                                                                None // Treat deserialization error as None
+                                                            }
+                                                        }
                                                     },
-                                                    None => None,
+                                                    _ => None, // Treat None or JSON null as None
                                                 };
                                                 result_vec.push(#element_type {
                                                     value: precise_decimal_value,
@@ -1228,14 +1233,31 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Handle single DecimalElement or Option<DecimalElement>
                                 if is_option {
                                     // Logic for Option<DecimalElement>
-                                    let construction_logic = quote! { { // Block expression
+                                    let construction_logic = quote! { { // Block expression starts
+                                        // Deserialize PreciseDecimal from Option<serde_json::Value>
+                                        let precise_decimal_value = match temp_struct.#field_name_ident {
+                                            // Check for Some(Value) that isn't JSON null
+                                            Some(json_val) if !json_val.is_null() => {
+                                                // Attempt deserialization using PreciseDecimal's custom logic
+                                                match crate::PreciseDecimal::deserialize(json_val) {
+                                                    Ok(pd) => Some(pd),
+                                                    Err(_e) => {
+                                                        // Error during PreciseDecimal deserialization, treat as None
+                                                        // eprintln!("WARN: Failed to deserialize PreciseDecimal for field '{}': {}", stringify!(#field_name_ident), e);
+                                                        None
+                                                    }
+                                                }
+                                            },
+                                            // Treat None or Some(Null) as None for the value
+                                            _ => None,
+                                        };
+                                        // Construct the DecimalElement
                                         crate::DecimalElement {
-                                            // temp_struct field is Option<Decimal>, map it
-                                            value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)),
+                                            value: precise_decimal_value,
                                             id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                             extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                         }
-                                    } }; // End block expression
+                                    } }; // Block expression ends
                                     // Wrap in Some() only if value or extension exists
                                     quote! {
                                          #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
@@ -1247,14 +1269,31 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 } else {
                                     // Logic for non-optional DecimalElement
                                     quote! {
-                                        #field_name_ident: { // Block expression
+                                        #field_name_ident: { // Block expression starts
+                                            // Deserialize PreciseDecimal from Option<serde_json::Value>
+                                            let precise_decimal_value = match temp_struct.#field_name_ident {
+                                                // Check for Some(Value) that isn't JSON null
+                                                Some(json_val) if !json_val.is_null() => {
+                                                    // Attempt deserialization using PreciseDecimal's custom logic
+                                                    match crate::PreciseDecimal::deserialize(json_val) {
+                                                        Ok(pd) => Some(pd),
+                                                        Err(_e) => {
+                                                            // Error during PreciseDecimal deserialization, treat as None
+                                                            // eprintln!("WARN: Failed to deserialize PreciseDecimal for field '{}': {}", stringify!(#field_name_ident), e);
+                                                            None
+                                                        }
+                                                    }
+                                                },
+                                                 // Treat None or Some(Null) as None for the value
+                                                _ => None,
+                                            };
+                                            // Construct the DecimalElement
                                             crate::DecimalElement {
-                                                // temp_struct field is Option<Decimal>, map it
-                                                value: temp_struct.#field_name_ident.map(|dec| <crate::PreciseDecimal>::from(dec)), // Use map here
+                                                value: precise_decimal_value,
                                                 id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                                 extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
                                             }
-                                        }, // End block expression
+                                        }, // Block expression ends
                                     }
                                 }
                             } else if is_option {
