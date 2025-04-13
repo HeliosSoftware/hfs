@@ -4,7 +4,7 @@ use serde::{
     de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-use serde_json::value::RawValue; // Add back RawValue import
+// Removed unused RawValue import
 use std::marker::PhantomData;
 
 // Store both the parsed value and the original string representation
@@ -123,15 +123,17 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     _ => Err(de::Error::invalid_type(de::Unexpected::Map, &"a map with a 'value' field containing a number or string"))
                  }
             }
+            // Handle remaining unexpected types
             other => Err(de::Error::invalid_type(
                 match other {
                     serde_json::Value::Null => de::Unexpected::Unit,
                     serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
                     serde_json::Value::Array(_) => de::Unexpected::Seq,
-                    // Map case handled above, but include for completeness
-                    serde_json::Value::Object(_) => de::Unexpected::Map,
+                    // Number, String, Object are handled by outer match arms
+                    // Use Unexpected::Other for anything else unexpected
+                     _ => de::Unexpected::Other("unexpected JSON type for PreciseDecimal"),
                 },
-                &"a number, string, or object with a 'value' field",
+                &"a number, string, or object with a 'value' field", // Keep expected types clear
             )),
         }
     }
