@@ -1056,9 +1056,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                             // Adjust the quote based on whether it's a vector
                             if is_vec {
-                                // Temp type should be Option<Vec<Primitive>> regardless of original Option<Vec<T>> or Vec<T>
-                                // Serde handles missing array as None with #[serde(default)]
-                                quote! { Option<Vec<#primitive_type_ident>> } // No Option inside Vec
+                                // Temp type should be Option<Vec<Option<Primitive>>> to handle nulls inside the array
+                                quote! { Option<Vec<Option<#primitive_type_ident>>> } // Add Option inside Vec
                             } else {
                                 // If original field was Option<T>, temp type is Option<Primitive>
                                 // If original field was T, temp type is Primitive
@@ -1145,7 +1144,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
-                                            let prim_val_opt = primitives.get(i).cloned(); // Remove .flatten()
+                                            // Get Option<Primitive> by flattening the Option<Option<Primitive>> from the vec
+                                            let prim_val_opt = primitives.get(i).cloned().flatten();
                                             let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 let precise_decimal_value = match prim_val_opt {
@@ -1185,7 +1185,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         let len = primitives.len().max(extensions.len());
                                         let mut result_vec = Vec::with_capacity(len);
                                         for i in 0..len {
-                                            let prim_val_opt = primitives.get(i).cloned(); // Remove .flatten()
+                                            // Get Option<Primitive> by flattening the Option<Option<Primitive>> from the vec
+                                            let prim_val_opt = primitives.get(i).cloned().flatten();
                                             let ext_helper_opt = extensions.get(i).cloned().flatten(); // Keep flatten here
                                             if prim_val_opt.is_some() || ext_helper_opt.is_some() {
                                                 result_vec.push(#element_type {
