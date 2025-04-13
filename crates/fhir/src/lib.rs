@@ -70,117 +70,13 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Use RawValue to serialize the original string directly as a JSON number.
-        // This ensures the exact string format (including trailing zeros) is preserved.
-        // Note: This assumes the original_string is a valid JSON number representation.
-        // Check if original_string lost precision (e.g., "100" when value is 100.0)
-        let string_to_serialize = if !self.original_string.contains('.') && self.value.scale() > 0 {
-            // original_string looks like an integer, but value has decimal places.
-            // Use value.to_string() which preserves scale.
-            self.value.to_string()
-        } else {
-            // Otherwise, trust the original_string
-            self.original_string.clone()
-        };
-
-        match RawValue::from_string(string_to_serialize.clone()) { // Clone here for error message
-            Ok(raw_value) => raw_value.serialize(serializer),
-            Err(e) => Err(serde::ser::Error::custom(format!(
-                "Failed to create RawValue from PreciseDecimal string '{}': {}",
-                self.original_string, e
-            ))),
-        }
+        // Serialize the inner rust_decimal::Decimal value directly.
+        // This uses rust_decimal's default serialization, which might normalize.
+        self.value.serialize(serializer)
     }
 }
 
-// Visitor for PreciseDecimal deserialization
-struct PreciseDecimalVisitor;
-
-impl<'de> Visitor<'de> for PreciseDecimalVisitor {
-    type Value = PreciseDecimal;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a JSON number or string representing a decimal")
-    }
-
-    // Handle direct string input (e.g., "3.00" from a JSON string "\"3.00\"")
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        v.parse::<Decimal>()
-            .map(|value| PreciseDecimal {
-                value,
-                original_string: v.to_string(), // Store the exact string parsed
-            })
-            .map_err(|e| {
-                de::Error::custom(format!(
-                    "Failed to parse decimal from string '{}': {}",
-                    v, e
-                ))
-            })
-    }
-
-    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_str(v)
-    }
-
-    // Handle number input (e.g., 3.00 from JSON number 3.00) - might normalize
-    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        // Converting f64 to string might normalize (e.g., 3.00 -> "3.0")
-        // We store the potentially normalized string here as a fallback.
-        // The visit_newtype_struct path is preferred for preserving original format.
-        let s = v.to_string();
-        s.parse::<Decimal>()
-            .map(|value| PreciseDecimal {
-                value,
-                original_string: s.clone(),
-            })
-            .map_err(|e| {
-                de::Error::custom(format!("Failed to parse decimal from f64 '{}': {}", v, e))
-            })
-    }
-
-    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        let s = v.to_string();
-        s.parse::<Decimal>()
-            .map(|value| PreciseDecimal {
-                value,
-                original_string: s.clone(),
-            })
-            .map_err(|e| {
-                de::Error::custom(format!("Failed to parse decimal from i64 '{}': {}", v, e))
-            })
-    }
-
-    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        let s = v.to_string();
-        s.parse::<Decimal>()
-            .map(|value| PreciseDecimal {
-                value,
-                original_string: s.clone(),
-            })
-            .map_err(|e| {
-                de::Error::custom(format!("Failed to parse decimal from u64 '{}': {}", v, e))
-            })
-    }
-
-    // NOTE: Removing visit_newtype_struct to simplify and rely solely on
-    // visit_str, visit_f64 etc. This might lose original formatting in some
-    // cases previously handled by RawValue, but aims for robust basic parsing.
-}
+// Removed PreciseDecimalVisitor
 
 impl<'de> Deserialize<'de> for PreciseDecimal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
