@@ -253,7 +253,7 @@ struct DecimalElementVisitor<E>(PhantomData<E>);
 
 impl<'de, E> Visitor<'de> for DecimalElementVisitor<E>
 where
-    E: Deserialize<'de>,
+    E: Deserialize<'de> + Default, // Add Default bound here
 {
     type Value = DecimalElement<E>;
 
