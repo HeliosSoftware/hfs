@@ -435,8 +435,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             }
                                         }
 
-                                        // Serialize primitive array using the correct method (entry or field)
-                                        #serialize_call(&#effective_field_name_str, &primitive_array)?;
+                                        // Check if the primitive array contains any non-null values
+                                        let should_serialize_primitive_array = primitive_array.iter().any(|v| !v.is_null());
+
+                                        // Serialize primitive array only if it has non-null values
+                                        if should_serialize_primitive_array {
+                                            #serialize_call(&#effective_field_name_str, &primitive_array)?;
+                                        }
 
                                         // Serialize extension array if needed, using the correct method
                                         if has_extensions {
