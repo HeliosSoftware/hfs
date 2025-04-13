@@ -185,15 +185,10 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
         // Try to deserialize as RawValue first
         let raw_value = match <&RawValue>::deserialize(deserializer) {
             Ok(rv) => rv,
-            Err(_e) => {
-                // If RawValue fails, it might be because we are deserializing from Value
-                // or the input wasn't directly deserializable as RawValue (e.g., a plain string).
-                // We cannot proceed with RawValue logic, so signal an error specific
-                // to this path, allowing deserialize_any to try other visit methods.
-                // Using Unexpected::Other signals that this specific path failed,
-                // but other paths might succeed.
-                // Pass self (the visitor) to invalid_type.
-                return Err(de::Error::invalid_type(de::Unexpected::Other("non-raw json value"), &self));
+            Err(e) => {
+                // If RawValue fails, let deserialize_any try other methods by propagating the error.
+                // Serde's deserialize_any should handle this and attempt visit_str, visit_f64 etc.
+                return Err(e);
             }
         };
         let original_json_segment = raw_value.get();
