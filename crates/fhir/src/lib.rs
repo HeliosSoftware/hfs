@@ -187,10 +187,10 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
     where
         D: Deserializer<'de>,
     {
-        // Use deserialize_any with the visitor. This allows flexibility in handling
-        // different underlying deserializers (e.g., direct from JSON text vs. from Value).
-        // It prioritizes visit_newtype_struct for RawValue handling when possible.
-        deserializer.deserialize_any(PreciseDecimalVisitor)
+        // Deserialize directly into rust_decimal::Decimal
+        let decimal_value = Decimal::deserialize(deserializer)?;
+        // Convert to PreciseDecimal using From, which derives original_string
+        Ok(PreciseDecimal::from(decimal_value))
     }
 }
 

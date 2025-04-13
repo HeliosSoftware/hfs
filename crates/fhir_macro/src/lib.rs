@@ -1015,8 +1015,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                             // Determine the base primitive type (e.g., bool, String, rust_decimal::Decimal)
                             let primitive_type_ident = if is_decimal_element {
-                                // For DecimalElement, use serde_json::Value in temp struct to preserve original string
-                                quote! { serde_json::Value }
+                                // DecimalElement wraps PreciseDecimal, but the temp struct uses rust_decimal::Decimal
+                                quote! { rust_decimal::Decimal }
                             } else {
                                 // is_element is true here
                                 if let Type::Path(type_path) = inner_ty {
