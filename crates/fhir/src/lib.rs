@@ -821,7 +821,7 @@ impl<E> DecimalElement<E> {
 // Custom Deserialize for DecimalElement<E> using the visitor
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
-    E: Deserialize<'de>,
+    E: Deserialize<'de> + Default, // Add Default bound here as well
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
