@@ -70,8 +70,15 @@ impl Serialize for PreciseDecimal {
     where
         S: Serializer,
     {
-        // Serialize the inner rust_decimal::Decimal value directly using the Serialize trait.
-        serde::Serialize::serialize(&self.value, serializer)
+        // Use RawValue to serialize the original string directly as a JSON number.
+        // This ensures the exact string format (including trailing zeros) is preserved.
+        match serde_json::value::RawValue::from_string(self.original_string.clone()) {
+            Ok(raw_value) => raw_value.serialize(serializer),
+            Err(e) => Err(serde::ser::Error::custom(format!(
+                "Failed to create RawValue from PreciseDecimal original_string '{}': {}",
+                self.original_string, e
+            ))),
+        }
     }
 }
 
