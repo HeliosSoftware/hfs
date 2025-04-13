@@ -1157,13 +1157,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 // Deserialize the Option<serde_json::Value> into Option<PreciseDecimal>
                                                 let precise_decimal_value = match prim_val_opt {
                                                     Some(json_val) if !json_val.is_null() => {
-                                                        match crate::PreciseDecimal::deserialize(json_val) {
-                                                            Ok(pd) => Some(pd),
-                                                            Err(_e) => {
-                                                                // eprintln!("WARN: Failed to deserialize PreciseDecimal in vec for field '{}': {}", stringify!(#field_name_ident), e);
-                                                                None // Treat deserialization error as None
-                                                            }
-                                                        }
+                                                        // Use ? to propagate error
+                                                        crate::PreciseDecimal::deserialize(json_val).map(Some)?
                                                     },
                                                     _ => None, // Treat None or JSON null as None
                                                 };
@@ -1175,7 +1170,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             }
                                             // Note: Skipping adding element if both parts are null/None
                                         }
-                                        result_vec
+                                        Ok(result_vec) // Wrap the final vec in Ok
                                     } } // Block expression ends
                                 } else {
                                     // Logic specifically for Vec<Element<V, E>> or Option<Vec<Element<V, E>>> (non-decimal)
@@ -1218,7 +1213,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     // For Option<Vec<Element>>, construct Some if either primitive or extension array was present
                                     quote! {
                                         #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
-                                            Some(#construction_logic)
+                                            // Use ? to propagate error from construction_logic
+                                            Some(#construction_logic?)
                                         } else {
                                             None
                                         },
@@ -1226,74 +1222,61 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 } else {
                                     // Direct Vec<Element> field assignment (always construct the Vec)
                                     quote! {
-                                        #field_name_ident: #construction_logic,
+                                        // Use ? to propagate error from construction_logic
+                                        #field_name_ident: #construction_logic?,
                                     }
                                 }
                             } else if is_decimal_element {
                                 // Handle single DecimalElement or Option<DecimalElement>
                                 if is_option {
                                     // Logic for Option<DecimalElement>
+                                    // This block now needs to return Result<DecimalElement<E>, D::Error>
                                     let construction_logic = quote! { { // Block expression starts
                                         // Deserialize PreciseDecimal from Option<serde_json::Value>
                                         let precise_decimal_value = match temp_struct.#field_name_ident {
-                                            // Check for Some(Value) that isn't JSON null
                                             Some(json_val) if !json_val.is_null() => {
-                                                // Attempt deserialization using PreciseDecimal's custom logic
-                                                match crate::PreciseDecimal::deserialize(json_val) {
-                                                    Ok(pd) => Some(pd),
-                                                    Err(_e) => {
-                                                        // Error during PreciseDecimal deserialization, treat as None
-                                                        // eprintln!("WARN: Failed to deserialize PreciseDecimal for field '{}': {}", stringify!(#field_name_ident), e);
-                                                        None
-                                                    }
-                                                }
+                                                // Attempt deserialization, propagate error with ?
+                                                crate::PreciseDecimal::deserialize(json_val).map(Some)?
                                             },
-                                            // Treat None or Some(Null) as None for the value
-                                            _ => None,
+                                            _ => None, // Treat None or JSON null as None
                                         };
                                         // Construct the DecimalElement
-                                        crate::DecimalElement {
+                                        Ok(crate::DecimalElement {
                                             value: precise_decimal_value,
                                             id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                             extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                        }
+                                        })
                                     } }; // Block expression ends
-                                    // Wrap in Some() only if value or extension exists
+                                    // Wrap in Some(Ok(...)) or Ok(None)
                                     quote! {
                                          #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
-                                             Some(#construction_logic)
+                                             // Call the construction logic which returns Result<DecimalElement, Error>
+                                             // Map Ok(element) to Some(element) and propagate Err
+                                             Some(#construction_logic?) // Use ? to propagate error
                                          } else {
-                                             None
+                                             None // If neither field present, result is None
                                          },
                                     }
                                 } else {
                                     // Logic for non-optional DecimalElement
+                                    // This block also needs to return Result<DecimalElement<E>, D::Error>
                                     quote! {
                                         #field_name_ident: { // Block expression starts
                                             // Deserialize PreciseDecimal from Option<serde_json::Value>
                                             let precise_decimal_value = match temp_struct.#field_name_ident {
-                                                // Check for Some(Value) that isn't JSON null
                                                 Some(json_val) if !json_val.is_null() => {
-                                                    // Attempt deserialization using PreciseDecimal's custom logic
-                                                    match crate::PreciseDecimal::deserialize(json_val) {
-                                                        Ok(pd) => Some(pd),
-                                                        Err(_e) => {
-                                                            // Error during PreciseDecimal deserialization, treat as None
-                                                            // eprintln!("WARN: Failed to deserialize PreciseDecimal for field '{}': {}", stringify!(#field_name_ident), e);
-                                                            None
-                                                        }
-                                                    }
+                                                    // Attempt deserialization, propagate error with ?
+                                                    crate::PreciseDecimal::deserialize(json_val).map(Some)?
                                                 },
-                                                 // Treat None or Some(Null) as None for the value
-                                                _ => None,
+                                                _ => None, // Treat None or JSON null as None
                                             };
                                             // Construct the DecimalElement
-                                            crate::DecimalElement {
+                                            Ok(crate::DecimalElement {
                                                 value: precise_decimal_value,
                                                 id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
                                                 extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
-                                            }
-                                        }, // Block expression ends
+                                            })
+                                        }?, // Use ? to propagate error from the block
                                     }
                                 }
                             } else if is_option {
