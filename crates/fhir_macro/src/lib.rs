@@ -1203,11 +1203,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                                 // Assign the correct construction_logic based on is_option
                                 if is_option {
-                                    // For Option<Vec<Element>>, only construct Some if input fields were present
+                                    // For Option<Vec<Element>>, only construct Some if the primitive array was present
                                     quote! {
-                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() || temp_struct.#field_name_ident_ext.is_some() {
+                                        #field_name_ident: if temp_struct.#field_name_ident.is_some() { // Check only primitive field
                                             Some(#construction_logic)
                                         } else {
+                                            // If primitive array is missing, but extension array exists,
+                                            // the field itself should be None according to FHIR JSON rules.
+                                            // The extensions from _event are effectively orphaned in this case.
                                             None
                                         },
                                     }
