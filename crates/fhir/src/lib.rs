@@ -82,8 +82,21 @@ impl Serialize for PreciseDecimal {
     }
 }
 
-// Removed PreciseDecimalValueVisitor and PreciseDecimal::deserialize
-// Deserialization is now handled within DecimalElement::deserialize
+// Removed PreciseDecimalValueVisitor
+
+// Restore Deserialize implementation for PreciseDecimal
+impl<'de> Deserialize<'de> for PreciseDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize directly into rust_decimal::Decimal using the Deserialize trait explicitly
+        // Add type annotation to help inference
+        let decimal_value: Decimal = serde::Deserialize::deserialize(deserializer)?;
+        // Convert to PreciseDecimal using From, which derives original_string
+        Ok(PreciseDecimal::from(decimal_value))
+    }
+}
 
 // --- End PreciseDecimal ---
 
