@@ -88,123 +88,69 @@ impl Serialize for PreciseDecimal {
             ))),
         }
     }
-}
+// Removed PreciseDecimalVisitor and its impl block
 
-// --- Visitor for PreciseDecimal Deserialization ---
-struct PreciseDecimalVisitor;
-
-impl<'de> Visitor<'de> for PreciseDecimalVisitor {
-    type Value = PreciseDecimal;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a number or string that can represent a decimal")
-    }
-
-    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        // Use v.to_string() as the original string representation from f64
-        // Note: This might differ from the exact JSON source (e.g., "1E-22" vs "1e-22")
-        // but is the best we can do when receiving an f64.
-        self.parse_and_construct(v.to_string())
-    }
-
-    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.parse_and_construct(v.to_string())
-    }
-
-    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.parse_and_construct(v.to_string())
-    }
-
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        // Use the provided string slice directly
-        self.parse_and_construct(v.to_string())
-    }
-
-    fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        // Use the provided string directly
-        self.parse_and_construct(v)
-    }
-
-     fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-    {
-        // Use the provided borrowed string slice directly
-        self.parse_and_construct(v.to_string())
-    }
-
-    // Handle cases where PreciseDecimal might be nested inside an object like {"value": 123.45}
-    // This requires deserializing the inner value first to get its string representation.
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: MapAccess<'de>,
-    {
-        let mut value_str: Option<String> = None;
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "value" {
-                if value_str.is_some() {
-                    return Err(de::Error::duplicate_field("value"));
-                }
-                // Deserialize the value field flexibly (could be number or string)
-                // We need the string representation. Deserialize as Value first.
-                let temp_value: serde_json::Value = map.next_value()?;
-                match temp_value {
-                    serde_json::Value::Number(n) => value_str = Some(n.to_string()),
-                    serde_json::Value::String(s) => value_str = Some(s),
-                     serde_json::Value::Null => {
-                        // If value is explicitly null in the object, treat as error.
-                         return Err(de::Error::invalid_value(de::Unexpected::Unit, &"a number or string for decimal value"));
-                    }
-                    _ => return Err(de::Error::invalid_type(de::Unexpected::Other("unexpected type in value field"), &"a number or string"))
-                }
-            } else {
-                // Ignore other fields
-                let _ = map.next_value::<de::IgnoredAny>()?;
-            }
-        }
-
-        match value_str {
-            Some(s) => self.parse_and_construct(s),
-            None => Err(de::Error::missing_field("value")),
-        }
-    }
-}
-
-// Implement helper methods directly on the visitor struct
-impl PreciseDecimalVisitor {
-    // Helper to perform the parse and construction, taking the original string
-    fn parse_and_construct<E>(&self, s: String) -> Result<PreciseDecimal, E>
-    where
-        E: de::Error,
-    {
-        let parsed_value = s.parse::<Decimal>().ok();
-        Ok(PreciseDecimal::from_parts(parsed_value, s))
-    }
-}
-
-// Deserialize implementation for PreciseDecimal using the visitor
+// Deserialize implementation for PreciseDecimal using intermediate Value
 impl<'de> Deserialize<'de> for PreciseDecimal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Use the visitor to handle different primitive types directly
-        deserializer.deserialize_any(PreciseDecimalVisitor)
+        // Deserialize into an intermediate serde_json::Value first
+        // This allows capturing the original string representation accurately.
+        let json_value = serde_json::Value::deserialize(deserializer)?;
+
+        // Helper function to attempt parsing and create PreciseDecimal
+        let try_parse = |s: String| -> Result<PreciseDecimal, D::Error> {
+            // Attempt to parse the string into a Decimal
+            let parsed_value = s.parse::<Decimal>().ok();
+            // Store the original string regardless of parsing success.
+            // Store Some(decimal) if parse succeeded, None otherwise.
+            Ok(PreciseDecimal::from_parts(parsed_value, s))
+        };
+
+        match json_value {
+            serde_json::Value::Number(n) => {
+                // Use the number's string representation directly
+                try_parse(n.to_string())
+            }
+            serde_json::Value::String(s) => {
+                // Use the string directly
+                try_parse(s)
+            }
+            // Handle case where PreciseDecimal might be nested inside an object like {"value": 123.45}
+            // This can happen when deserializing from a Value passed by the macro
+            serde_json::Value::Object(map) => {
+                 match map.get("value") {
+                    Some(serde_json::Value::Number(n)) => {
+                        // Use nested number's string representation
+                        try_parse(n.to_string())
+                    }
+                    Some(serde_json::Value::String(s)) => {
+                         // Use nested string directly (clone needed as s is borrowed)
+                        try_parse(s.clone())
+                    }
+                    // Handle null value field if necessary, otherwise error
+                    Some(serde_json::Value::Null) => {
+                        // Decide how to handle {"value": null}. Treat as missing/None?
+                        // For now, let's error, as FHIR doesn't typically represent null decimals this way.
+                         Err(de::Error::invalid_value(de::Unexpected::Unit, &"a number or string for decimal value")) // Use Unit for null
+                    }
+                    None => Err(de::Error::missing_field("value")), // Missing "value" field
+                    _ => Err(de::Error::invalid_type(de::Unexpected::Map, &"a map with a 'value' field containing a number or string"))
+                 }
+            }
+            // Handle remaining unexpected types
+            other => Err(de::Error::invalid_type(
+                match other {
+                    serde_json::Value::Null => de::Unexpected::Unit, // Or Unexpected::Option if mapping null to None
+                    serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
+                    serde_json::Value::Array(_) => de::Unexpected::Seq,
+                     _ => de::Unexpected::Other("unexpected JSON type for PreciseDecimal"),
+                },
+                &"a number, string, or object with a 'value' field",
+            )),
+        }
     }
 }
 
