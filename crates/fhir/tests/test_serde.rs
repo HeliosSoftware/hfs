@@ -1053,7 +1053,7 @@ fn test_fhir_serde_serialize() {
     };
     let json10 = serde_json::to_string(&s10).unwrap();
     // Expected: `given` array with nulls, `_given` array with objects
-    let expected10 = r#"{"name1":"Test10","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":[null,null],"_given":[{"id":"g1"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
+    let expected10 = r#"{"name1":"Test10","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"_given":[{"id":"g1"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
     assert_eq!(json10, expected10);
 
     // Case 11: Test Vec<String> with null value in primitive array and corresponding extension
@@ -1428,7 +1428,7 @@ fn test_fhir_serde_deserialize() {
     };
     let s11: FhirSerdeTestStruct = serde_json::from_str(json11).unwrap();
     assert_eq!(s11, expected11);
-    /*
+
     // Case 12: Deserialize Vec<String> (primitive and extension)
     let json12 = r#"{"name1":"Test12","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":["Peter","James",null,"Smith"],"_given":[null,{"id":"given-id-2"},{"extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]},{"id":"given-id-4","extension":[{"url":"http://example.com/ext","valueString":"ext-val"}]}]}"#;
     let expected12 = FhirSerdeTestStruct {
@@ -1477,55 +1477,105 @@ fn test_fhir_serde_deserialize() {
     let s12: FhirSerdeTestStruct = serde_json::from_str(json12).unwrap();
     assert_eq!(s12, expected12);
 
-        // Case 13: Deserialize Vec<String> with mismatched lengths (should handle gracefully)
-        // FHIR spec allows for missing attributes, so we should handle this case
-        let json13 = r#"{"name1":"Test13","given":["Peter"],"_given":[null, {"id":"extra-id"}]}"#;
-        let expected13 = FhirSerdeTestStruct {
-            name1: "Test13".to_string().into(),
-            given: Some(vec![
-                String {
-                    id: None,
-                    extension: None,
-                    value: Some("Peter".to_string()),
-                },
-                // Second element from _given with no corresponding primitive
-                String {
-                    id: Some("extra-id".to_string()),
-                    extension: None,
-                    value: None,
-                },
-            ]),
-            ..Default::default()
-        };
-        let s13: FhirSerdeTestStruct = serde_json::from_str(json13).unwrap();
-        assert_eq!(s13, expected13);
-
-        // Case 14: Deserialize Vec<String> with null primitive but non-null extension element
-        let json14 = r#"{"name1":"Test14","given":[null],"_given":[{"id":"g-null"}]}"#;
-        let expected14 = FhirSerdeTestStruct {
-            name1: "Test14".to_string().into(),
-            given: Some(vec![String {
-                id: Some("g-null".to_string()),
-                extension: None,
-                value: None,
-            }]),
-            ..Default::default()
-        };
-        let s14: FhirSerdeTestStruct = serde_json::from_str(json14).unwrap();
-        assert_eq!(s14, expected14);
-
-        // Case 15: Deserialize Vec<String> with primitive value but null extension element (should be ok)
-        let json15 = r#"{"name1":"Test15","given":["Value"]}"#;
-        let expected15 = FhirSerdeTestStruct {
-            name1: "Test15".to_string().into(),
-            given: Some(vec![String {
+    // Case 13: Deserialize Vec<String> with mismatched lengths (should handle gracefully)
+    // FHIR spec allows for missing attributes, so we should handle this case
+    let json13 = r#"{"name1":"Test13","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":["Peter"],"_given":[null, {"id":"extra-id"}]}"#;
+    let expected13 = FhirSerdeTestStruct {
+        name1: "Test13".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: None,
+            extension: None,
+            value: Some("1970-03-30".to_string()),
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: Some(vec![
+            String {
                 id: None,
                 extension: None,
-                value: Some("Value".to_string()),
-            }]),
-            ..Default::default()
-        };
-        let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
-        assert_eq!(s15, expected15);
-    */
+                value: Some("Peter".to_string()),
+            },
+            // Second element from _given with no corresponding primitive
+            String {
+                id: Some("extra-id".to_string()),
+                extension: None,
+                value: None,
+            },
+        ]),
+    };
+    let s13: FhirSerdeTestStruct = serde_json::from_str(json13).unwrap();
+    assert_eq!(s13, expected13);
+
+    // Case 14: Deserialize Vec<String> with null primitive but non-null extension element
+    let json14 = r#"{"name1":"Test14","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"_given":[{"id":"g-null"}]}"#;
+    let expected14 = FhirSerdeTestStruct {
+        name1: "Test14".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: None,
+            extension: None,
+            value: Some("1970-03-30".to_string()),
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: Some(vec![String {
+            id: Some("g-null".to_string()),
+            extension: None,
+            value: None,
+        }]),
+    };
+    let s14: FhirSerdeTestStruct = serde_json::from_str(json14).unwrap();
+    assert_eq!(s14, expected14);
+
+    // Case 15: Deserialize Vec<String> with primitive value but null extension element (should be ok)
+    let json15 = r#"{"name1":"Test15","birthDate1":"1970-03-30","isActive1":true,"decimal1":123.45,"money1":{"value":123.45},"given":["Value"]}"#;
+    let expected15 = FhirSerdeTestStruct {
+        name1: "Test15".to_string().into(),
+        name2: None,
+        birth_date1: Date {
+            id: None,
+            extension: None,
+            value: Some("1970-03-30".to_string()),
+        },
+        birth_date2: None,
+        is_active1: true.into(),
+        is_active2: None,
+        decimal1: decimal.clone(),
+        decimal2: None,
+        money1: Money {
+            id: None,
+            extension: None,
+            value: Some(decimal.clone()),
+            currency: None,
+        },
+        money2: None,
+        given: Some(vec![String {
+            id: None,
+            extension: None,
+            value: Some("Value".to_string()),
+        }]),
+    };
+    let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
+    assert_eq!(s15, expected15);
 }
