@@ -628,9 +628,10 @@ where
         match json_value {
             // Handle primitive JSON Number
             serde_json::Value::Number(n) => {
-                // Deserialize PreciseDecimal from the number
-                let pd = PreciseDecimal::deserialize(serde_json::Value::Number(n))
-                    .map_err(de::Error::custom)?; // Propagate PreciseDecimal error
+                // Directly parse the number string to create PreciseDecimal
+                let s = n.to_string();
+                let parsed_value = s.parse::<Decimal>().ok();
+                let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
@@ -639,9 +640,10 @@ where
             }
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
-                // Deserialize PreciseDecimal from the string
-                 let pd = PreciseDecimal::deserialize(serde_json::Value::String(s))
-                    .map_err(de::Error::custom)?; // Propagate PreciseDecimal error
+                // Directly parse the string to create PreciseDecimal
+                // Note: We take ownership of s here.
+                let parsed_value = s.parse::<Decimal>().ok();
+                let pd = PreciseDecimal::from_parts(parsed_value, s);
                  Ok(DecimalElement {
                     id: None,
                     extension: None,
