@@ -1,0 +1,112 @@
+      {
+        "resourceType": "CodeSystem",
+        "id": "v2-0291",
+        "meta": {
+          "profile": [
+            "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+          ]
+        },
+        "language": "en",
+        "url": "http://terminology.hl7.org/CodeSystem/v2-0291",
+        "identifier": [
+          {
+            "system": "urn:ietf:rfc:3986",
+            "value": "urn:oid:2.16.840.1.113883.18.181"
+          }
+        ],
+        "version": "2.9",
+        "name": "v2.0291",
+        "title": "v2 Subtype of Referenced Data",
+        "status": "active",
+        "experimental": false,
+        "publisher": "HL7, Inc",
+        "contact": [
+          {
+            "telecom": [
+              {
+                "system": "url",
+                "value": "http://hl7.org"
+              }
+            ]
+          }
+        ],
+        "description": "FHIR Value set/code system definition for HL7 v2 table 0291 ( Subtype of Referenced Data)",
+        "content": "complete",
+        "property": [
+          {
+            "code": "status",
+            "uri": "http://hl7.org/fhir/concept-properties#status",
+            "description": "A property that indicates the status of the concept. One of active, experimental, deprecated, retired",
+            "type": "code"
+          },
+          {
+            "code": "deprecationDate",
+            "uri": "http://hl7.org/fhir/concept-properties#deprecationDate",
+            "description": "The date at which a concept was deprecated. Concepts that are deprecated but not inactive can still be used, but their use is discouraged",
+            "type": "dateTime"
+          }
+        ],
+        "concept": [
+          {
+            "code": "...",
+            "display": "Source RFC 2046",
+            "designation": [
+              {
+                "language": "nl",
+                "use": {
+                  "system": "http://terminology.hl7.org/CodeSystem/designation-usage",
+                  "code": "display"
+                },
+                "value": "Bron RFC 2046"
+              }
+            ],
+            "property": [
+              {
+                "code": "status",
+                "valueCode": "deprecated"
+              },
+              {
+                "code": "deprecationDate",
+                "valueDateTime": "2015-09"
+              }
+            ]
+          },
+          {
+            "extension": [
+              {
+                "url": "http://hl7.org/fhir/StructureDefinition/codesystem-concept-comments",
+                "valueString": "Retained for backwards compatibility only as of v2.6 and CDA R 2. Preferred value is text/xml.",
+                "_valueString": {
+                  "extension": [
+                    {
+                      "extension": [
+                        {
+                          "url": "lang",
+                          "valueCode": "nl"
+                        },
+                        {
+                          "url": "content",
+                          "valueString": "Alleen voor backward compatibiliteit vanaf v2.6 en CDAr2. Voorkeurswaarde is text/xml."
+                        }
+                      ],
+                      "url": "http://hl7.org/fhir/StructureDefinition/translation"
+                    }
+                  ]
+                }
+              }
+            ],
+            "code": "x-hl7-cda-level-one",
+            "display": "HL7 Clinical Document Architecture Level One document",
+            "designation": [
+              {
+                "language": "nl",
+                "use": {
+                  "system": "http://terminology.hl7.org/CodeSystem/designation-usage",
+                  "code": "display"
+                },
+                "value": "HL7 Clinical Document Architecture Level One document"
+              }
+            ]
+          }
+        ]
+      }
