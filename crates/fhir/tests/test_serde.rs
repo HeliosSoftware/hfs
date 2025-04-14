@@ -1579,3 +1579,62 @@ fn test_fhir_serde_deserialize() {
     let s15: FhirSerdeTestStruct = serde_json::from_str(json15).unwrap();
     assert_eq!(s15, expected15);
 }
+
+#[test]
+fn test_fhir_serde_deserialize_extension_with_primitive_extension() {
+    // This test replicates the structure found in slm-codesystem.json
+    // where an Extension has a value[x] (valueString) which itself has an extension (_valueString).
+    let json_input = r#"
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/codesystem-concept-comments",
+      "valueString": "Retained for backwards compatibility only as of v2.6 and CDA R 2. Preferred value is text/xml.",
+      "_valueString": {
+        "extension": [
+          {
+            "extension": [
+              {
+                "url": "lang",
+                "valueCode": "nl"
+              },
+              {
+                "url": "content",
+                "valueString": "Alleen voor backward compatibiliteit vanaf v2.6 en CDAr2. Voorkeurswaarde is text/xml."
+              }
+            ],
+            "url": "http://hl7.org/fhir/StructureDefinition/translation"
+          }
+        ]
+      }
+    }
+    "#;
+
+    // Parse the input JSON string into a serde_json::Value for comparison later
+    let original_value: serde_json::Value =
+        serde_json::from_str(json_input).expect("Parsing original JSON failed");
+
+    // Deserialize the JSON string into the Extension struct
+    let extension_struct: Extension =
+        serde_json::from_str(json_input).expect("Deserialization into Extension struct failed");
+
+    // Serialize the Extension struct back into a serde_json::Value
+    let reserialized_value =
+        serde_json::to_value(&extension_struct).expect("Serialization back to JSON value failed");
+
+    // Assert that the reserialized JSON value is identical to the original JSON value
+    assert_eq!(
+        original_value, reserialized_value,
+        "Roundtrip failed for Extension with primitive extension.\nOriginal JSON: {}\nReserialized JSON: {}",
+        serde_json::to_string_pretty(&original_value).unwrap(),
+        serde_json::to_string_pretty(&reserialized_value).unwrap()
+    );
+
+    // Explicitly check that the _valueString field exists in the reserialized value
+    assert!(
+        reserialized_value.get("_valueString").is_some(),
+        "_valueString field is missing after roundtrip"
+    );
+    assert_eq!(
+        reserialized_value["_valueString"], original_value["_valueString"],
+        "_valueString content mismatch"
+    );
+}
