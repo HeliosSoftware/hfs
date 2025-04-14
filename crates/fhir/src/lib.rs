@@ -636,11 +636,10 @@ where
             // Handle primitive JSON Number
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
-                let s = n.to_string();
-                eprintln!("[DEBUG] n.to_string() result: '{}'", s); // DEBUG
+                let s = n.to_string(); // Note: n.to_string() might normalize exponent case (e.g., 'E' -> 'e')
                 // Parse the original string directly.
                 let parsed_value = s.parse::<Decimal>().ok();
-                // Store the ORIGINAL string `s`.
+                // Store the ORIGINAL string `s` (as returned by n.to_string()).
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
                     id: None,
