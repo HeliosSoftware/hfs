@@ -136,7 +136,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     Some(serde_json::Value::Null) => {
                         // Decide how to handle {"value": null}. Treat as missing/None?
                         // For now, let's error, as FHIR doesn't typically represent null decimals this way.
-                         Err(de::Error::invalid_value(de::Unexpected::Null, &"a number or string for decimal value"))
+                         Err(de::Error::invalid_value(de::Unexpected::Unit, &"a number or string for decimal value")) // Use Unit for null
                     }
                     None => Err(de::Error::missing_field("value")), // Missing "value" field
                     _ => Err(de::Error::invalid_type(de::Unexpected::Map, &"a map with a 'value' field containing a number or string"))
