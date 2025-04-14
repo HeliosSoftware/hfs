@@ -7,16 +7,18 @@ use serde::{
 // Removed unused RawValue import
 use std::marker::PhantomData;
 
-// Store both the parsed value and the original string representation
+// Store the original string representation and optionally the parsed Decimal value.
 #[derive(Debug, Clone)]
 pub struct PreciseDecimal {
-    value: Decimal,
+    // Store None if the original string couldn't be parsed into Decimal (e.g., out of range)
+    value: Option<Decimal>,
     original_string: String,
 }
 
-// Implement comparison based on the numerical value only
+// Implement comparison based on the numerical value (Option<Decimal>)
 impl PartialEq for PreciseDecimal {
     fn eq(&self, other: &Self) -> bool {
+        // Compare the Option<Decimal> values. None == None is true.
         self.value == other.value
     }
 }
@@ -24,29 +26,35 @@ impl Eq for PreciseDecimal {}
 
 impl PartialOrd for PreciseDecimal {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Compare the Option<Decimal> values. None is considered less than Some(_).
         self.value.partial_cmp(&other.value)
     }
 }
 
 impl Ord for PreciseDecimal {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Compare the Option<Decimal> values. None is considered less than Some(_).
         self.value.cmp(&other.value)
     }
 }
 
-// Provide methods to access the inner value if needed, instead of Deref/DerefMut
+// Provide methods to access the inner value if needed
 impl PreciseDecimal {
-    /// Creates a new PreciseDecimal, storing the value and its original string representation.
-    pub fn new(value: Decimal, original_string: String) -> Self {
+    /// Creates a new PreciseDecimal from its parts.
+    /// Use this when you have both the parsed value (or know it failed) and the original string.
+    pub fn from_parts(value: Option<Decimal>, original_string: String) -> Self {
         Self {
             value,
             original_string,
         }
     }
 
-    pub fn value(&self) -> Decimal {
+    /// Returns the parsed Decimal value, if parsing was successful.
+    pub fn value(&self) -> Option<Decimal> {
         self.value
     }
+
+    /// Returns the original string representation.
     pub fn original_string(&self) -> &str {
         &self.original_string
     }
@@ -56,10 +64,10 @@ impl PreciseDecimal {
 impl From<Decimal> for PreciseDecimal {
     fn from(value: Decimal) -> Self {
         // Convert the Decimal to string to store as original_string.
-        // This mimics the behavior when deserializing a raw JSON number.
         let original_string = value.to_string();
+        // When creating from a valid Decimal, the value is Some(value).
         Self {
-            value,
+            value: Some(value),
             original_string,
         }
     }
@@ -93,33 +101,41 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
         // Deserialize into an intermediate serde_json::Value first
         let json_value = serde_json::Value::deserialize(deserializer)?;
 
+        // Helper function to attempt parsing and create PreciseDecimal
+        let try_parse = |s: String| -> Result<PreciseDecimal, D::Error> {
+            // Attempt to parse the string into a Decimal
+            let parsed_value = s.parse::<Decimal>();
+            // Store the original string regardless of parsing success.
+            // Store Some(decimal) if parse succeeded, None otherwise.
+            // Do not return error on parse failure.
+            Ok(PreciseDecimal::from_parts(parsed_value.ok(), s))
+        };
+
         match json_value {
             serde_json::Value::Number(n) => {
-                let s = n.to_string();
-                s.parse::<Decimal>()
-                    .map(|dec| PreciseDecimal::new(dec, s)) // Use new to store string
-                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from number '{}': {}", n, e)))
+                // Convert number to string and attempt parse
+                try_parse(n.to_string())
             }
             serde_json::Value::String(s) => {
-                 s.parse::<Decimal>()
-                    .map(|dec| PreciseDecimal::new(dec, s.clone())) // Clone s here
-                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", s, e)))
+                // Attempt parse directly from string
+                try_parse(s)
             }
             // Handle case where PreciseDecimal might be nested inside an object like {"value": 123.45}
             // This can happen when deserializing from a Value passed by the macro
             serde_json::Value::Object(map) => {
                  match map.get("value") {
                     Some(serde_json::Value::Number(n)) => {
-                        let s = n.to_string();
-                        s.parse::<Decimal>()
-                            .map(|dec| PreciseDecimal::new(dec, s))
-                            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from nested number '{}': {}", n, e)))
+                        // Convert nested number to string and attempt parse
+                        try_parse(n.to_string())
                     }
                     Some(serde_json::Value::String(s)) => {
-                         s.parse::<Decimal>()
-                            .map(|dec| PreciseDecimal::new(dec, s.clone())) // Clone s as it's borrowed
-                            .map_err(|e| de::Error::custom(format!("Failed to parse decimal from nested string '{}': {}", s, e)))
+                         // Attempt parse directly from nested string (clone needed as s is borrowed)
+                        try_parse(s.clone())
                     }
+                    // If "value" field is null or missing, treat as null/empty PreciseDecimal?
+                    // Let's return an error for unexpected structure within the object.
+                    // If the intent is to allow {"value": null}, that needs specific handling.
+                    // Current FHIR JSON doesn't typically represent null primitives this way.
                     _ => Err(de::Error::invalid_type(de::Unexpected::Map, &"a map with a 'value' field containing a number or string"))
                  }
             }
@@ -632,20 +648,24 @@ where
                         "value" => {
                             if value.is_some() { return Err(de::Error::duplicate_field("value")); }
                             // Directly parse the Value (v) into PreciseDecimal here, avoiding recursive deserialize
-                             match v {
+                            // Directly parse the Value (v) into PreciseDecimal here
+                            match v {
                                 serde_json::Value::Number(n) => {
-                                    let s = n.to_string(); // Get string from Number
-                                    let dec_val = s.parse::<Decimal>().map_err(|e| de::Error::custom(format!("Failed to parse decimal from number '{}': {}", s, e)))?;
-                                    // Store original string from number
-                                    value = Some(PreciseDecimal::new(dec_val, s));
+                                    let s = n.to_string();
+                                    // Attempt parse, store Some(dec) or None
+                                    let parsed_value = s.parse::<Decimal>().ok();
+                                    // Store original string and optional parsed value
+                                    value = Some(PreciseDecimal::from_parts(parsed_value, s));
                                 }
-                                serde_json::Value::String(s) => {
-                                    let dec_val = s.parse::<Decimal>().map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", s, e)))?;
-                                     // Store original string
-                                    value = Some(PreciseDecimal::new(dec_val, s));
+                                serde_json::Value::String(s_val) => {
+                                    // Attempt parse, store Some(dec) or None
+                                    let parsed_value = s_val.parse::<Decimal>().ok();
+                                    // Store original string and optional parsed value
+                                    value = Some(PreciseDecimal::from_parts(parsed_value, s_val));
                                 }
                                 serde_json::Value::Null => {
-                                    value = None; // Explicitly handle null value field
+                                    // If the "value" field itself is null, the PreciseDecimal is None
+                                    value = None;
                                 }
                                 _ => return Err(de::Error::invalid_type(de::Unexpected::Other("unexpected type for decimal value field"), &"a number or string")),
                             }
@@ -656,27 +676,28 @@ where
                 }
                 Ok(DecimalElement { id, extension, value })
             }
-            // Handle primitive JSON Number
+            // Handle primitive JSON Number (bare number like 123.45)
             serde_json::Value::Number(n) => {
                 let s = n.to_string();
-                let decimal_value = s.parse::<Decimal>().map_err(|e| {
-                    de::Error::custom(format!("Failed to parse decimal from number '{}': {}", s, e))
-                })?;
+                // Attempt parse, store Some(dec) or None
+                let parsed_value = s.parse::<Decimal>().ok();
                 Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(PreciseDecimal::from(decimal_value)), // Use From<Decimal>
+                    // Store original string and optional parsed value
+                    value: Some(PreciseDecimal::from_parts(parsed_value, s)),
                 })
             }
-            // Handle primitive JSON String
+            // Handle primitive JSON String (bare string like "123.45")
             serde_json::Value::String(s) => {
-                 s.parse::<Decimal>()
-                    .map(|value| DecimalElement {
-                        id: None,
-                        extension: None,
-                        value: Some(PreciseDecimal::from(value)), // Use From<Decimal>
-                     })
-                    .map_err(|e| de::Error::custom(format!("Failed to parse decimal from string '{}': {}", s, e)))
+                // Attempt parse, store Some(dec) or None
+                let parsed_value = s.parse::<Decimal>().ok();
+                 Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    // Store original string and optional parsed value
+                    value: Some(PreciseDecimal::from_parts(parsed_value, s)),
+                 })
             }
             // Handle JSON Null
             serde_json::Value::Null => Ok(DecimalElement::default()), // Default has value: None
