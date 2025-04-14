@@ -632,26 +632,23 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string();
-                eprintln!("[DEBUG] Deserializing Number: s='{}'", s); // DEBUG
-                let parsed_value = s.parse::<Decimal>().ok();
-                eprintln!("[DEBUG] Parsed value: {:?}", parsed_value); // DEBUG
+                // Attempt parsing after converting to lowercase, just in case.
+                let parsed_value = s.to_lowercase().parse::<Decimal>().ok();
+                // IMPORTANT: Store the ORIGINAL string `s`, not the lowercased one.
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
-                eprintln!("[DEBUG] Created PreciseDecimal: {:?}", pd); // DEBUG
-                let result = Ok(DecimalElement {
+                Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(pd), // Ensure Some() is used here
-                });
-                 // Check if the value field in the result is Some
-                eprintln!("[DEBUG] Returning DecimalElement has value? {:?}", result.as_ref().map(|de| de.value.is_some()).unwrap_or(false)); // DEBUG
-                result
+                    value: Some(pd),
+                })
             }
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
                 // Directly parse the string to create PreciseDecimal
-                // Note: We take ownership of s here.
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
+                // Attempt parsing after converting to lowercase.
+                let parsed_value = s.to_lowercase().parse::<Decimal>().ok();
+                // IMPORTANT: Store the ORIGINAL string `s`.
+                let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
                  Ok(DecimalElement {
                     id: None,
                     extension: None,
