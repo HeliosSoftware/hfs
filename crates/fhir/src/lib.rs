@@ -111,8 +111,12 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                 let s = n.to_string();
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                // Attempt to parse the modified string into a Decimal
-                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                // Use from_scientific if 'e' is present, otherwise parse
+                let parsed_value = if s_for_parsing.contains('e') {
+                    Decimal::from_scientific(&s_for_parsing).ok()
+                } else {
+                    s_for_parsing.parse::<Decimal>().ok()
+                };
                 // Store the ORIGINAL string `s` regardless of parsing success.
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
@@ -120,8 +124,12 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                 // Use the string directly
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                // Attempt to parse the modified string into a Decimal
-                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                 // Use from_scientific if 'e' is present, otherwise parse
+                let parsed_value = if s_for_parsing.contains('e') {
+                    Decimal::from_scientific(&s_for_parsing).ok()
+                } else {
+                    s_for_parsing.parse::<Decimal>().ok()
+                };
                 // Store the ORIGINAL string `s` regardless of parsing success.
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
@@ -134,7 +142,12 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                         let s = n.to_string();
                         // Replace 'E' with 'e' for parsing
                         let s_for_parsing = s.replace('E', "e");
-                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                         // Use from_scientific if 'e' is present, otherwise parse
+                        let parsed_value = if s_for_parsing.contains('e') {
+                            Decimal::from_scientific(&s_for_parsing).ok()
+                        } else {
+                            s_for_parsing.parse::<Decimal>().ok()
+                        };
                         Ok(PreciseDecimal::from_parts(parsed_value, s))
                     }
                     Some(serde_json::Value::String(s)) => {
@@ -142,7 +155,12 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                         let s_clone = s.clone(); // Clone s for PreciseDecimal
                         // Replace 'E' with 'e' for parsing
                         let s_for_parsing = s_clone.replace('E', "e");
-                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                         // Use from_scientific if 'e' is present, otherwise parse
+                        let parsed_value = if s_for_parsing.contains('e') {
+                            Decimal::from_scientific(&s_for_parsing).ok()
+                        } else {
+                            s_for_parsing.parse::<Decimal>().ok()
+                        };
                         Ok(PreciseDecimal::from_parts(parsed_value, s_clone))
                     }
                     // Handle null value field if necessary, otherwise error
@@ -647,8 +665,12 @@ where
                 let s = n.to_string(); // Note: n.to_string() might normalize exponent case (e.g., 'E' -> 'e')
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                // Parse the modified string.
-                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                 // Use from_scientific if 'e' is present, otherwise parse
+                let parsed_value = if s_for_parsing.contains('e') {
+                    Decimal::from_scientific(&s_for_parsing).ok()
+                } else {
+                    s_for_parsing.parse::<Decimal>().ok()
+                };
                 // Store the ORIGINAL string `s` (as returned by n.to_string()).
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
@@ -662,8 +684,12 @@ where
                 // Directly parse the string to create PreciseDecimal
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                // Parse the modified string.
-                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                 // Use from_scientific if 'e' is present, otherwise parse
+                let parsed_value = if s_for_parsing.contains('e') {
+                    Decimal::from_scientific(&s_for_parsing).ok()
+                } else {
+                    s_for_parsing.parse::<Decimal>().ok()
+                };
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
                  Ok(DecimalElement {
