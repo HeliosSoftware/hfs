@@ -16,8 +16,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.4", features = ["derive"] }
 fhir_macro = { path = "../fhir_macro" }
 time = "0.3.41"
-# Add serde-float feature
-rust_decimal = { version = "1.37.1", features = ["serde-with-arbitrary-precision", "macros", "serde-float"] }
+# Add serde-float and scientific features
+rust_decimal = { version = "1.37.1", features = ["serde-with-arbitrary-precision", "macros", "serde-float", "scientific"] }
 
 [dev-dependencies]
 rust_decimal_macros = "1.37.1"
