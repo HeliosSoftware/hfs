@@ -632,9 +632,9 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string();
-                // Attempt parsing after converting to lowercase, just in case.
-                let parsed_value = s.to_lowercase().parse::<Decimal>().ok();
-                // IMPORTANT: Store the ORIGINAL string `s`, not the lowercased one.
+                // Parse the original string directly.
+                let parsed_value = s.parse::<Decimal>().ok();
+                // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
                     id: None,
@@ -645,9 +645,9 @@ where
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
                 // Directly parse the string to create PreciseDecimal
-                // Attempt parsing after converting to lowercase.
-                let parsed_value = s.to_lowercase().parse::<Decimal>().ok();
-                // IMPORTANT: Store the ORIGINAL string `s`.
+                // Parse the original string directly.
+                let parsed_value = s.parse::<Decimal>().ok();
+                // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
                  Ok(DecimalElement {
                     id: None,
