@@ -88,7 +88,7 @@ impl Serialize for PreciseDecimal {
             ))),
         }
     }
-} // <-- Add missing closing brace here
+}
 
 // Removed PreciseDecimalVisitor and its impl block
 
@@ -689,48 +689,34 @@ where
                 Err(de::Error::invalid_type(de::Unexpected::Bool(v), &self))
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
-                // Directly construct PreciseDecimal from primitive
-                let s = v.to_string();
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::I64Deserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Directly construct PreciseDecimal from primitive
-                let s = v.to_string();
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::U64Deserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Directly construct PreciseDecimal from primitive
-                 // Use a robust f64-to-string conversion if necessary, but serde_json's number handling is usually good.
-                 // Let's rely on the standard to_string for now.
-                let s = v.to_string();
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::F64Deserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Directly construct PreciseDecimal from primitive
-                let s = v.to_string(); // Clone the string slice
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::StrDeserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
             fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Directly construct PreciseDecimal from primitive
-                let s = v; // Take ownership
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::StringDeserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
              fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Directly construct PreciseDecimal from primitive
-                let s = v.to_string(); // Clone the borrowed string slice
-                let parsed_value = s.parse::<Decimal>().ok();
-                let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement { id: None, extension: None, value: Some(pd) })
+                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
+                PreciseDecimal::deserialize(de::value::BorrowedStrDeserializer::new(v))
+                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
             }
             // Decimal cannot come from bytes
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
