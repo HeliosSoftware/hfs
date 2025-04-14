@@ -632,28 +632,43 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string();
+                eprintln!("[DEBUG] Deserializing Number: s='{}'", s); // DEBUG
                 // Parse the original string directly using FromStr explicitly.
-                let parsed_value = std::str::FromStr::from_str(&s).ok();
+                let parse_result = std::str::FromStr::from_str(&s);
+                eprintln!("[DEBUG] FromStr result: {:?}", parse_result); // DEBUG
+                let parsed_value = parse_result.ok();
+                eprintln!("[DEBUG] Parsed value (.ok()): {:?}", parsed_value); // DEBUG
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement {
+                 eprintln!("[DEBUG] Created PreciseDecimal: {:?}", pd); // DEBUG
+                let result = Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(pd),
-                })
+                    value: Some(pd), // Ensure Some() is used here
+                });
+                 // Check if the value field in the result is Some
+                eprintln!("[DEBUG] Returning DecimalElement has value? {:?}", result.as_ref().map(|de| de.value.is_some()).unwrap_or(false)); // DEBUG
+                result
             }
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
                 // Directly parse the string to create PreciseDecimal
+                eprintln!("[DEBUG] Deserializing String: s='{}'", s); // DEBUG
                 // Parse the original string directly using FromStr explicitly.
-                let parsed_value = std::str::FromStr::from_str(&s).ok();
+                let parse_result = std::str::FromStr::from_str(&s);
+                 eprintln!("[DEBUG] FromStr result: {:?}", parse_result); // DEBUG
+                let parsed_value = parse_result.ok();
+                 eprintln!("[DEBUG] Parsed value (.ok()): {:?}", parsed_value); // DEBUG
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
-                 Ok(DecimalElement {
+                 eprintln!("[DEBUG] Created PreciseDecimal: {:?}", pd); // DEBUG
+                 let result = Ok(DecimalElement {
                     id: None,
                     extension: None,
                     value: Some(pd),
-                 })
+                 });
+                 eprintln!("[DEBUG] Returning DecimalElement has value? {:?}", result.as_ref().map(|de| de.value.is_some()).unwrap_or(false)); // DEBUG
+                 result
             }
             // Handle JSON object: deserialize fields individually
             serde_json::Value::Object(map) => {
