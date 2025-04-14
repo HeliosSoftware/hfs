@@ -109,15 +109,19 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
             serde_json::Value::Number(n) => {
                 // Use the number's string representation directly
                 let s = n.to_string();
-                // Attempt to parse the original string into a Decimal
-                let parsed_value = s.parse::<Decimal>().ok();
+                // Replace 'E' with 'e' for parsing
+                let s_for_parsing = s.replace('E', "e");
+                // Attempt to parse the modified string into a Decimal
+                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s` regardless of parsing success.
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
             serde_json::Value::String(s) => {
                 // Use the string directly
-                // Attempt to parse the original string into a Decimal
-                let parsed_value = s.parse::<Decimal>().ok();
+                // Replace 'E' with 'e' for parsing
+                let s_for_parsing = s.replace('E', "e");
+                // Attempt to parse the modified string into a Decimal
+                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s` regardless of parsing success.
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
@@ -128,13 +132,17 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     Some(serde_json::Value::Number(n)) => {
                         // Use nested number's string representation
                         let s = n.to_string();
-                        let parsed_value = s.parse::<Decimal>().ok();
+                        // Replace 'E' with 'e' for parsing
+                        let s_for_parsing = s.replace('E', "e");
+                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                         Ok(PreciseDecimal::from_parts(parsed_value, s))
                     }
                     Some(serde_json::Value::String(s)) => {
                          // Use nested string directly (clone needed as s is borrowed)
                         let s_clone = s.clone(); // Clone s for PreciseDecimal
-                        let parsed_value = s_clone.parse::<Decimal>().ok();
+                        // Replace 'E' with 'e' for parsing
+                        let s_for_parsing = s_clone.replace('E', "e");
+                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                         Ok(PreciseDecimal::from_parts(parsed_value, s_clone))
                     }
                     // Handle null value field if necessary, otherwise error
@@ -637,8 +645,10 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string(); // Note: n.to_string() might normalize exponent case (e.g., 'E' -> 'e')
-                // Parse the original string directly.
-                let parsed_value = s.parse::<Decimal>().ok();
+                // Replace 'E' with 'e' for parsing
+                let s_for_parsing = s.replace('E', "e");
+                // Parse the modified string.
+                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s` (as returned by n.to_string()).
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
@@ -650,8 +660,10 @@ where
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
                 // Directly parse the string to create PreciseDecimal
-                // Parse the original string directly.
-                let parsed_value = s.parse::<Decimal>().ok();
+                // Replace 'E' with 'e' for parsing
+                let s_for_parsing = s.replace('E', "e");
+                // Parse the modified string.
+                let parsed_value = s_for_parsing.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
                  Ok(DecimalElement {
