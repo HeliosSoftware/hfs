@@ -156,54 +156,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
 
 // --- End PreciseDecimal ---
 
-// --- Visitor for DecimalElement Object Deserialization ---
-struct DecimalElementObjectVisitor<E>(PhantomData<E>);
-
-impl<'de, E> Visitor<'de> for DecimalElementObjectVisitor<E>
-where
-    E: Deserialize<'de>,
-{
-    type Value = DecimalElement<E>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a DecimalElement object")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut id: Option<String> = None;
-        let mut extension: Option<Vec<E>> = None;
-        // Use PreciseDecimal::deserialize for the value field
-        let mut value: Option<PreciseDecimal> = None;
-
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                "id" => {
-                    if id.is_some() { return Err(de::Error::duplicate_field("id")); }
-                    id = Some(map.next_value()?);
-                }
-                "extension" => {
-                    if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
-                    extension = Some(map.next_value()?);
-                }
-                "value" => {
-                    if value.is_some() { return Err(de::Error::duplicate_field("value")); }
-                    // Deserialize directly into Option<PreciseDecimal> using its impl
-                    // Important: Use map.next_value_seed(option_seed) if value itself could be null in JSON
-                    // Assuming "value": null means the field is absent or PreciseDecimal should be None
-                    // Let PreciseDecimal::deserialize handle null if needed within its logic
-                    value = Some(map.next_value()?);
-                }
-                _ => { let _ = map.next_value::<de::IgnoredAny>()?; }
-            }
-        }
-
-        Ok(DecimalElement { id, extension, value })
-    }
-}
-
+// Removed DecimalElementObjectVisitor
 
 #[cfg(feature = "R4")]
 pub mod r4;
@@ -660,106 +613,87 @@ impl<E> DecimalElement<E> {
     }
 }
 
-// Custom Deserialize for DecimalElement<E> using the visitor pattern
+// Custom Deserialize for DecimalElement<E> using intermediate Value
 impl<'de, E> Deserialize<'de> for DecimalElement<E>
 where
-    E: Deserialize<'de> + Default, // Keep Default bound for visit_none/visit_unit
+    E: Deserialize<'de> + Default,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        struct AnyDecimalElementVisitor<E>(PhantomData<E>);
+        // Deserialize into an intermediate serde_json::Value first
+        let json_value = serde_json::Value::deserialize(deserializer)?;
 
-        impl<'de, E> Visitor<'de> for AnyDecimalElementVisitor<E>
-        where
-            E: Deserialize<'de> + Default,
-        {
-            type Value = DecimalElement<E>;
+        match json_value {
+            // Handle primitive JSON Number
+            serde_json::Value::Number(n) => {
+                // Deserialize PreciseDecimal from the number
+                let pd = PreciseDecimal::deserialize(serde_json::Value::Number(n))
+                    .map_err(de::Error::custom)?; // Propagate PreciseDecimal error
+                Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: Some(pd),
+                })
+            }
+            // Handle primitive JSON String
+            serde_json::Value::String(s) => {
+                // Deserialize PreciseDecimal from the string
+                 let pd = PreciseDecimal::deserialize(serde_json::Value::String(s))
+                    .map_err(de::Error::custom)?; // Propagate PreciseDecimal error
+                 Ok(DecimalElement {
+                    id: None,
+                    extension: None,
+                    value: Some(pd),
+                 })
+            }
+            // Handle JSON object: deserialize fields individually
+            serde_json::Value::Object(map) => {
+                let mut id: Option<String> = None;
+                let mut extension: Option<Vec<E>> = None;
+                let mut value: Option<PreciseDecimal> = None;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a decimal number, string, object, or null")
+                for (k, v) in map {
+                    match k.as_str() {
+                        "id" => {
+                            if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                            // Deserialize id directly from its Value
+                            id = Deserialize::deserialize(v).map_err(de::Error::custom)?;
+                        }
+                        "extension" => {
+                            if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
+                             // Deserialize extension directly from its Value
+                            extension = Deserialize::deserialize(v).map_err(de::Error::custom)?;
+                        }
+                        "value" => {
+                            if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                            // Deserialize value using PreciseDecimal::deserialize from its Value
+                            // Handle null explicitly within the value field
+                            if v.is_null() {
+                                value = None;
+                            } else {
+                                value = Some(PreciseDecimal::deserialize(v).map_err(de::Error::custom)?);
+                            }
+                        }
+                        // Ignore any unknown fields encountered
+                        _ => {} // Simply ignore unknown fields
+                    }
+                }
+                Ok(DecimalElement { id, extension, value })
             }
-
-            // Handle primitive types by deserializing PreciseDecimal and wrapping it
-            fn visit_bool<Er>(self, v: bool) -> Result<Self::Value, Er> where Er: de::Error {
-                // Decimal cannot come from bool
-                Err(de::Error::invalid_type(de::Unexpected::Bool(v), &self))
-            }
-            fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
-                // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::I64Deserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-            fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::U64Deserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-            fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::F64Deserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-            fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::StrDeserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-            fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::StringDeserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
-                 // Delegate to PreciseDecimal::deserialize which handles intermediate Value
-                PreciseDecimal::deserialize(de::value::BorrowedStrDeserializer::new(v))
-                    .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-            }
-            // Decimal cannot come from bytes
-            fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
-                 Err(de::Error::invalid_type(de::Unexpected::Bytes(v), &self))
-            }
-            fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er> where Er: de::Error {
-                 Err(de::Error::invalid_type(de::Unexpected::Bytes(&v), &self))
-            }
-
-            // Handle null
-            fn visit_none<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
-                Ok(DecimalElement::default()) // Default has value: None
-            }
-            fn visit_unit<Er>(self) -> Result<Self::Value, Er> where Er: de::Error {
-                Ok(DecimalElement::default())
-            }
-
-            // Handle Option<T> by visiting Some
-            fn visit_some<De>(self, deserializer: De) -> Result<Self::Value, De::Error>
-            where
-                De: Deserializer<'de>,
-            {
-                deserializer.deserialize_any(self)
-            }
-
-            // Handle object
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                // Deserialize the map using DecimalElementObjectVisitor
-                let map_deserializer = de::value::MapAccessDeserializer::new(map);
-                map_deserializer.deserialize_map(DecimalElementObjectVisitor(PhantomData))
-            }
-
-            // We don't expect sequences for a single DecimalElement
-            fn visit_seq<A>(self, _seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: de::SeqAccess<'de>,
-            {
-                Err(de::Error::invalid_type(de::Unexpected::Seq, &self))
-            }
+            // Handle JSON Null for the whole element
+            serde_json::Value::Null => Ok(DecimalElement::default()), // Default has value: None
+            // Handle other unexpected types
+            other => Err(de::Error::invalid_type(
+                match other {
+                    serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
+                    serde_json::Value::Array(_) => de::Unexpected::Seq,
+                    _ => de::Unexpected::Other("unexpected JSON type for DecimalElement"),
+                },
+                &"a decimal number, string, object, or null",
+            )),
         }
-
-        deserializer.deserialize_any(AnyDecimalElementVisitor(PhantomData))
     }
 }
 
