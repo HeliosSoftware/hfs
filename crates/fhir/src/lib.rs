@@ -739,34 +739,34 @@ where
                 Err(de::Error::invalid_type(de::Unexpected::Bool(v), &self))
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::I64Deserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v.to_string())
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e) // Propagate error
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::U64Deserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v.to_string())
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e)
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::F64Deserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v.to_string())
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e)
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::StrDeserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v.to_string())
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e)
             }
             fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::StringDeserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v)
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e)
             }
              fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er> where Er: de::Error {
-                PreciseDecimal::deserialize(de::value::BorrowedStrDeserializer::new(v))
+                // Directly use parse_and_construct logic
+                PreciseDecimalVisitor.parse_and_construct(v.to_string())
                     .map(|pd| DecimalElement { id: None, extension: None, value: Some(pd) })
-                    .map_err(|e| e)
             }
             // Decimal cannot come from bytes
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er> where Er: de::Error {
