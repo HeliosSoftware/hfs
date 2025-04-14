@@ -100,15 +100,6 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
         formatter.write_str("a number or string that can represent a decimal")
     }
 
-    // Helper to perform the parse and construction, taking the original string
-    fn parse_and_construct<E>(&self, s: String) -> Result<PreciseDecimal, E>
-    where
-        E: de::Error,
-    {
-        let parsed_value = s.parse::<Decimal>().ok();
-        Ok(PreciseDecimal::from_parts(parsed_value, s))
-    }
-
     fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
     where
         E: de::Error,
@@ -191,6 +182,18 @@ impl<'de> Visitor<'de> for PreciseDecimalVisitor {
             Some(s) => self.parse_and_construct(s),
             None => Err(de::Error::missing_field("value")),
         }
+    }
+}
+
+// Implement helper methods directly on the visitor struct
+impl PreciseDecimalVisitor {
+    // Helper to perform the parse and construction, taking the original string
+    fn parse_and_construct<E>(&self, s: String) -> Result<PreciseDecimal, E>
+    where
+        E: de::Error,
+    {
+        let parsed_value = s.parse::<Decimal>().ok();
+        Ok(PreciseDecimal::from_parts(parsed_value, s))
     }
 }
 
