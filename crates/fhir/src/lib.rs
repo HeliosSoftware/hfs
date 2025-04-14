@@ -131,11 +131,19 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                  match map.get("value") {
                     Some(serde_json::Value::Number(n)) => {
                         // Use nested number's string representation
-                        try_parse(n.to_string())
+                        // Replace 'E' with 'e' for parsing, but keep original 's'
+                        let s = n.to_string();
+                        let s_for_parsing = s.replace('E', "e");
+                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                        Ok(PreciseDecimal::from_parts(parsed_value, s))
                     }
                     Some(serde_json::Value::String(s)) => {
                          // Use nested string directly (clone needed as s is borrowed)
-                        try_parse(s.clone())
+                         // Replace 'E' with 'e' for parsing, but keep original 's'
+                        let s_clone = s.clone(); // Clone s for PreciseDecimal
+                        let s_for_parsing = s_clone.replace('E', "e");
+                        let parsed_value = s_for_parsing.parse::<Decimal>().ok();
+                        Ok(PreciseDecimal::from_parts(parsed_value, s_clone))
                     }
                     // Handle null value field if necessary, otherwise error
                     Some(serde_json::Value::Null) => {
