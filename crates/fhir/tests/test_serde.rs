@@ -54,18 +54,10 @@ fn test_decimal_out_of_range() {
                 )
             });
 
-        // Check that the original string was preserved, allowing for case normalization of 'E'/'e' by serde_json::Number::to_string()
-        let expected_stored_string = if json_input.contains('E') {
-            // If input has 'E', serde_json::Number::to_string() gives lowercase 'e'.
-            // This assumes the input is treated as a JSON number by serde_json::from_str.
-            // If the input was a JSON string like "\"1E-22\"", this wouldn't apply.
-            json_input.replace('E', "e")
-        } else {
-            json_input.to_string() // Otherwise, expect the exact input
-        };
+        // Check that the original string was preserved exactly
         assert_eq!(
             element.value.as_ref().map(|pd| pd.original_string()),
-            Some(expected_stored_string.as_str()), // Compare with potentially lowercased string
+            Some(json_input), // Expect the exact original input string
             "Stored original string mismatch for input: {}",
             json_input
         );
