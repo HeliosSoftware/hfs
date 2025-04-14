@@ -104,8 +104,8 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
 
         // Helper function to attempt parsing and create PreciseDecimal
         let try_parse = |s: String| -> Result<PreciseDecimal, D::Error> {
-            // Attempt to parse the string into a Decimal using FromStr explicitly
-            let parsed_value = std::str::FromStr::from_str(&s).ok();
+            // Attempt to parse the string into a Decimal
+            let parsed_value = s.parse::<Decimal>().ok();
             // Store the original string regardless of parsing success.
             // Store Some(decimal) if parse succeeded, None otherwise.
             Ok(PreciseDecimal::from_parts(parsed_value, s))
@@ -632,8 +632,8 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string();
-                // Parse the original string directly using FromStr explicitly.
-                let parsed_value = std::str::FromStr::from_str(&s).ok();
+                // Parse the original string directly.
+                let parsed_value = s.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
                 Ok(DecimalElement {
@@ -645,8 +645,8 @@ where
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
                 // Directly parse the string to create PreciseDecimal
-                // Parse the original string directly using FromStr explicitly.
-                let parsed_value = std::str::FromStr::from_str(&s).ok();
+                // Parse the original string directly.
+                let parsed_value = s.parse::<Decimal>().ok();
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
                  Ok(DecimalElement {
