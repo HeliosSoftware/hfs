@@ -630,13 +630,19 @@ where
             serde_json::Value::Number(n) => {
                 // Directly parse the number string to create PreciseDecimal
                 let s = n.to_string();
+                eprintln!("[DEBUG] Deserializing Number: s='{}'", s); // DEBUG
                 let parsed_value = s.parse::<Decimal>().ok();
+                eprintln!("[DEBUG] Parsed value: {:?}", parsed_value); // DEBUG
                 let pd = PreciseDecimal::from_parts(parsed_value, s);
-                Ok(DecimalElement {
+                eprintln!("[DEBUG] Created PreciseDecimal: {:?}", pd); // DEBUG
+                let result = Ok(DecimalElement {
                     id: None,
                     extension: None,
-                    value: Some(pd),
-                })
+                    value: Some(pd), // Ensure Some() is used here
+                });
+                 // Check if the value field in the result is Some
+                eprintln!("[DEBUG] Returning DecimalElement has value? {:?}", result.as_ref().map(|de| de.value.is_some()).unwrap_or(false)); // DEBUG
+                result
             }
             // Handle primitive JSON String
             serde_json::Value::String(s) => {
