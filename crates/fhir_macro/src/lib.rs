@@ -1194,26 +1194,22 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     let value_part = value_idx
                                         .map(|idx| values[idx].clone())
                                         .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                    
-                                    // Deserialize the main value
-                                    let mut element: #field_ty = serde::Deserialize::deserialize(value_part)
-                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
-                                    
-                                    // If we have an extension part, merge it with the element
+
+                                    // Deserialize the extension part if present
+                                    let extension_idx = keys.iter().position(|k| k == #underscore_variant_key);
+                                    let extension_value = extension_idx.map(|idx| values[idx].clone());
+                                    let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
                                     if let Some(ext_value) = extension_value {
-                                        // Deserialize the extension part into a helper struct
-                                        #[derive(serde::Deserialize)]
-                                        struct IdAndExtensionHelper {
-                                            #[serde(default)]
-                                            id: Option<std::string::String>,
-                                            #[serde(default)]
-                                            extension: Option<Vec<Extension>>,
-                                        }
-                                        
-                                        let ext_helper: IdAndExtensionHelper = serde::Deserialize::deserialize(ext_value)
-                                            .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #underscore_variant_key, e)))?;
-                                        
-                                        // Merge the extension data into the element
+                                        ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
+                                            .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key, e)))?);
+                                    }
+
+                                    // Deserialize the primitive value directly into the Element type
+                                    let mut element: #field_ty = serde::Deserialize::deserialize(value_part)
+                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?;
+
+                                    // Merge the extension data if it exists
+                                    if let Some(ext_helper) = ext_helper_opt {
                                         if ext_helper.id.is_some() {
                                             element.id = ext_helper.id;
                                         }
@@ -1221,7 +1217,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             element.extension = ext_helper.extension;
                                         }
                                     }
-                                    
+
                                     Ok(#name::#variant_name(element))
                                 }
                             });
@@ -1249,9 +1245,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let value = value_idx
                                     .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                let inner = serde::Deserialize::deserialize(value)
-                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner))
+                                // Deserialize directly into the inner type for non-element variants
+                                let inner_value = serde::Deserialize::deserialize(value)
+                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
+                                Ok(#name::#variant_name(inner_value))
                             }
                         });
                     },
@@ -1263,9 +1260,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let value = value_idx
                                     .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                let inner = serde::Deserialize::deserialize(value)
-                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner))
+                                // Deserialize directly into the inner type for non-element variants
+                                let inner_value = serde::Deserialize::deserialize(value)
+                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
+                                Ok(#name::#variant_name(inner_value))
                             }
                         });
                     },
