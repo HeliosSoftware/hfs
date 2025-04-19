@@ -1301,25 +1301,26 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             keys.push(key);
                             values.push(value);
                         }
-                        
+
                         // Find which variant we're deserializing
-                        let variant_key_idx = keys.iter().position(|k| {
-                            #(
-                                if k == #variant_names || (k.starts_with('_') && k.len() > 1 && &k[1..] == #variant_names) {
+                        let variant_key_idx = keys.iter().position(|k: &String| { // Explicit type for k
+                            #( // Loop over variant_names (String literals)
+                                // Compare k with the base name and the underscore-prefixed name
+                                if k == #variant_names || k == &format!("_{}", #variant_names) {
                                     return true;
                                 }
                             )*
                             false
                         });
-                        
+
                         let variant_key = match variant_key_idx {
                             Some(idx) => {
-                                let k = &keys[idx];
-                                // If it starts with underscore, use the non-underscore version
-                                if k.starts_with('_') && k.len() > 1 {
+                                let k = &keys[idx]; // k is &String
+                                // If it starts with underscore, strip the underscore
+                                if k.starts_with('_') {
                                     k[1..].to_string()
                                 } else {
-                                    k.clone()
+                                    k.clone() // k is &String, clone it into an owned String
                                 }
                             },
                             None => return Err(serde::de::Error::custom(format!(
