@@ -1222,7 +1222,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                 let inner_value = serde::Deserialize::deserialize(value)
                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner_value.into())) // Use .into()
+                                Ok(#name::#variant_name(inner_value)) // Removed .into()
                             }
                             // --- End Regular Newtype Variant Construction ---
                         }
