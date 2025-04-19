@@ -1186,9 +1186,12 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             let underscore_variant_key_str = format!("_{}", variant_key); // For error messages
 
                             quote! {
+                                // Check if extension part exists *before* potentially moving it
+                                let has_extension_part = extension_part.is_some();
+
                                 // Deserialize the extension part if present
                                 let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
-                                if let Some(ext_value) = extension_part { // Use stored extension_part
+                                if let Some(ext_value) = extension_part { // Move happens here
                                     ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key_str, e)))?);
                                 }
