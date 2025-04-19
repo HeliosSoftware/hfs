@@ -1310,7 +1310,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let base_name = #variant_names; // e.g., "authorString"
                                 let underscore_name = format!("_{}", base_name); // e.g., "_authorString"
 
-                                if key_str == base_name {
+                                if key_str.as_str() == base_name { // Compare as &str
                                     if value_part.is_some() {
                                         return Err(serde::de::Error::duplicate_field(base_name));
                                     }
@@ -1325,7 +1325,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     }
                                     processed_keys.insert(key_str.clone());
                                     key_matched = true;
-                                } else if key_str == underscore_name {
+                                } else if key_str.as_str() == underscore_name { // Compare as &str
                                     if extension_part.is_some() {
                                         return Err(serde::de::Error::duplicate_field(&underscore_name));
                                     }
