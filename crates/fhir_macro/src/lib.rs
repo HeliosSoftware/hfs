@@ -1305,7 +1305,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Find which variant we're deserializing
                         let variant_key_idx = keys.iter().position(|k| {
                             #(
-                                if k == #variant_names || (k.starts_with('_') && &k[1..] == #variant_names) {
+                                if k == #variant_names || (k.starts_with('_') && k.len() > 1 && &k[1..] == #variant_names) {
                                     return true;
                                 }
                             )*
@@ -1316,7 +1316,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             Some(idx) => {
                                 let k = &keys[idx];
                                 // If it starts with underscore, use the non-underscore version
-                                if k.starts_with('_') {
+                                if k.starts_with('_') && k.len() > 1 {
                                     k[1..].to_string()
                                 } else {
                                     k.clone()
