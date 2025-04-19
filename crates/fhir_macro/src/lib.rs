@@ -1185,6 +1185,33 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             // --- Element/DecimalElement Variant Construction ---
                             let underscore_variant_key_str = format!("_{}", variant_key); // For error messages
 
+                            // Determine the primitive type V or PreciseDecimal for the value field
+                            let primitive_type_for_element = if is_decimal_element {
+                                quote! { crate::PreciseDecimal }
+                            } else {
+                                // Extract V from Element<V, E> or the alias's underlying primitive
+                                let element_or_alias_type = get_element_info(field_ty).4.expect("Element type expected but not found");
+                                if let Type::Path(type_path) = element_or_alias_type {
+                                     if let Some(last_segment) = type_path.path.segments.last() {
+                                         if last_segment.ident == "Element" {
+                                             // Direct Element<V, E>
+                                             if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
+                                                 if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
+                                                     quote! { #inner_v_type }
+                                                 } else { panic!("Element missing generic argument V"); }
+                                             } else { panic!("Element missing angle bracketed arguments"); }
+                                         } else {
+                                             // Alias
+                                             let alias_name = last_segment.ident.to_string();
+                                             let primitive_type_str = extract_inner_element_type(&alias_name);
+                                             let primitive_type_parsed: Type = syn::parse_str(primitive_type_str).expect("Failed to parse primitive type string");
+                                             quote! { #primitive_type_parsed }
+                                         }
+                                     } else { panic!("Could not get last segment of Element type path"); }
+                                 } else { panic!("Element type is not a Type::Path"); }
+                            };
+
+
                             quote! {
                                 // Check if parts exist *before* potentially moving them
                                 let has_value_part = value_part.is_some();
