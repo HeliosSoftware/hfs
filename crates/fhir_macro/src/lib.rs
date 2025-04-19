@@ -1679,12 +1679,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 }
                             } else {
                                 // Handles Element<V, E> (non-option, non-vec)
-                                // Assign the Option<Primitive> from temp_struct directly
+                                // Construct element explicitly
                                 quote! {
-                                    #field_name_ident: #field_ty { // Use the original Element type here (e.g., Code)
-                                        value: temp_struct.#field_name_ident, // Assign Option<Primitive> directly
-                                        id: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.id.clone()),
-                                        extension: temp_struct.#field_name_ident_ext.as_ref().and_then(|h| h.extension.clone()),
+                                    #field_name_ident: {
+                                        let mut element = #field_ty::default(); // Create default element (e.g., Code::default())
+                                        element.value = temp_struct.#field_name_ident; // Assign Option<Primitive>
+                                        // Assign id/extension from helper if present
+                                        if let Some(helper) = temp_struct.#field_name_ident_ext {
+                                            element.id = helper.id;
+                                            element.extension = helper.extension;
+                                        }
+                                        element // Return the constructed element
                                     },
                                 }
                             }
