@@ -1407,10 +1407,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 }
 
                                                 // Deserialize the primitive value directly into the Element type if value_part exists
-                                                let mut element: #field_ty = match value_part { // Use stored value_part
+                                                let mut element = match value_part { // Use stored value_part
                                                     Some(prim_value) => serde::Deserialize::deserialize(prim_value)
                                                          .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_names, e)))?,
-                                                    None => #field_ty::default(), // If no value part, start with default
+                                                    None => Default::default(), // If no value part, start with default
                                                 };
 
 
@@ -1429,7 +1429,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 }
 
 
-                                                Ok(#name::#variant_name(element))
+                                                Ok(#name::from_str(#variant_names).unwrap()(element))
                                                 // --- End Element/DecimalElement Variant Construction ---
                                             } else {
                                                 // --- Regular Newtype Variant Construction ---
