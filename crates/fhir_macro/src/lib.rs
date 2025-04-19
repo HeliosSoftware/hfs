@@ -350,7 +350,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             // Regular newtype variant
                             match_arms.push(quote! {
                                 Self::#variant_name(ref value) => {
-                                    state.serialize_field(#variant_key, value)?;
+                                    state.serialize_entry(#variant_key, value)?;
                                     Ok(())
                                 }
                             });
@@ -360,7 +360,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Tuple variant with multiple fields
                         match_arms.push(quote! {
                             Self::#variant_name(ref value) => {
-                                state.serialize_field(#variant_key, value)?;
+                                state.serialize_entry(#variant_key, value)?;
                                 Ok(())
                             }
                         });
@@ -369,7 +369,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Struct variant
                         match_arms.push(quote! {
                             Self::#variant_name { .. } => {
-                                state.serialize_field(#variant_key, self)?;
+                                state.serialize_entry(#variant_key, self)?;
                                 Ok(())
                             }
                         });
@@ -378,7 +378,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         // Unit variant
                         match_arms.push(quote! {
                             Self::#variant_name => {
-                                state.serialize_field(#variant_key, &())?;
+                                state.serialize_entry(#variant_key, &())?;
                                 Ok(())
                             }
                         });
