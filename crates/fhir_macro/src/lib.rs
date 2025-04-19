@@ -1276,8 +1276,23 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 }
             }
             
+            // Define the helper struct needed for enum deserialization
+            let id_extension_helper_def = quote! {
+                // Helper struct for deserializing the id/extension part from _fieldName
+                #[derive(Clone, Deserialize, Default)] // Add Default derive
+                struct IdAndExtensionHelper {
+                    #[serde(skip_serializing_if = "Option::is_none")] // Change from default
+                    id: Option<std::string::String>,
+                    #[serde(skip_serializing_if = "Option::is_none")] // Change from default
+                    extension: Option<Vec<Extension>>,
+                }
+            };
+
             // Generate the enum deserialization implementation
             return quote! {
+                // Define the helper struct at the top level of the deserialize function
+                #id_extension_helper_def
+
                 // Define a visitor for the enum
                 struct EnumVisitor;
                 
