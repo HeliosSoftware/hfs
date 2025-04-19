@@ -1710,9 +1710,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
     };
 
     quote! {
-
+        // Define the helper struct at the top level of the deserialize function
         #id_extension_helper_def
 
+        // Define the temporary struct for deserialization
         #temp_struct
 
          // Perform the actual deserialization into the temporary struct
