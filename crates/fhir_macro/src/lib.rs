@@ -312,9 +312,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         if is_element || is_decimal_element {
                             // For Element types, we need special handling for the _fieldName pattern
                             let underscore_variant_key = format!("_{}", variant_key);
-                            
+
                             match_arms.push(quote! {
-                                Self::#variant_name(ref value) => {
+                                // Removed 'ref' from pattern
+                                Self::#variant_name(value) => {
                                     // Check if the element has id or extension that needs to be serialized
                                     let has_extension = value.id.is_some() || value.extension.is_some();
                                     
@@ -1334,7 +1335,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     key_matched = true;
                                 } else if key_str.as_str() == underscore_name.as_str() { // Compare &str == &str
                                     if extension_part.is_some() {
-                                        return Err(serde::de::Error::duplicate_field(&underscore_name));
+                                        // Use key_str.as_str() which has a valid lifetime here
+                                        return Err(serde::de::Error::duplicate_field(key_str.as_str()));
                                     }
                                     extension_part = Some(current_value.clone()); // Store the extension value
                                     // If we already found a key based on the base version, ensure it matches
