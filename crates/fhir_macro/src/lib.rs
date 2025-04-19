@@ -269,6 +269,140 @@ fn extract_inner_element_type(type_name: &str) -> &str {
 
 fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStream {
     match *data {
+        Data::Enum(ref data) => {
+            // Handle enum serialization
+            let mut match_arms = Vec::new();
+            
+            for variant in &data.variants {
+                let variant_name = &variant.ident;
+                
+                // Get the rename attribute if present
+                let mut rename = None;
+                for attr in &variant.attrs {
+                    if attr.path().is_ident("fhir_serde") {
+                        if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                            for meta in list {
+                                if let Meta::NameValue(nv) = meta {
+                                    if nv.path.is_ident("rename") {
+                                        if let syn::Expr::Lit(expr_lit) = nv.value {
+                                            if let Lit::Str(lit_str) = expr_lit.lit {
+                                                rename = Some(lit_str.value());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Use the rename value or the variant name as a string
+                let variant_key = rename.unwrap_or_else(|| variant_name.to_string());
+                
+                // Handle different variant field types
+                match &variant.fields {
+                    Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                        // Newtype variant (e.g., String(String))
+                        let field = fields.unnamed.first().unwrap();
+                        let field_ty = &field.ty;
+                        
+                        // Check if this is a primitive type that might have extensions
+                        let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
+                        
+                        if is_element || is_decimal_element {
+                            // For Element types, we need special handling for the _fieldName pattern
+                            let underscore_variant_key = format!("_{}", variant_key);
+                            
+                            match_arms.push(quote! {
+                                Self::#variant_name(ref value) => {
+                                    // Check if the element has id or extension that needs to be serialized
+                                    let has_extension = value.id.is_some() || value.extension.is_some();
+                                    
+                                    // Serialize the primitive value
+                                    if value.value.is_some() {
+                                        // Use serialize_field for the value
+                                        state.serialize_field(#variant_key, &value.value)?;
+                                    }
+                                    
+                                    // Serialize the extension part if present
+                                    if has_extension {
+                                        #[derive(serde::Serialize)]
+                                        struct IdAndExtensionHelper<'a> {
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            id: &'a Option<std::string::String>,
+                                            #[serde(skip_serializing_if = "Option::is_none")]
+                                            extension: &'a Option<Vec<Extension>>,
+                                        }
+                                        
+                                        let extension_part = IdAndExtensionHelper {
+                                            id: &value.id,
+                                            extension: &value.extension,
+                                        };
+                                        
+                                        // Use serialize_field for the extension part
+                                        state.serialize_field(#underscore_variant_key, &extension_part)?;
+                                    }
+                                    
+                                    Ok(())
+                                }
+                            });
+                        } else {
+                            // Regular newtype variant
+                            match_arms.push(quote! {
+                                Self::#variant_name(ref value) => {
+                                    state.serialize_field(#variant_key, value)?;
+                                    Ok(())
+                                }
+                            });
+                        }
+                    },
+                    Fields::Unnamed(_) => {
+                        // Tuple variant with multiple fields
+                        match_arms.push(quote! {
+                            Self::#variant_name(ref value) => {
+                                state.serialize_field(#variant_key, value)?;
+                                Ok(())
+                            }
+                        });
+                    },
+                    Fields::Named(fields) => {
+                        // Struct variant
+                        match_arms.push(quote! {
+                            Self::#variant_name { .. } => {
+                                state.serialize_field(#variant_key, self)?;
+                                Ok(())
+                            }
+                        });
+                    },
+                    Fields::Unit => {
+                        // Unit variant
+                        match_arms.push(quote! {
+                            Self::#variant_name => {
+                                state.serialize_field(#variant_key, &())?;
+                                Ok(())
+                            }
+                        });
+                    },
+                }
+            }
+            
+            // Generate the enum serialization implementation
+            quote! {
+                // Count the number of fields to serialize (always 1 for an enum variant)
+                let count = 1;
+                
+                // Create a serialization state
+                let mut state = serializer.serialize_map(Some(count))?;
+                
+                // Match on self to determine which variant to serialize
+                match self {
+                    #(#match_arms)*
+                }
+                
+                // End the map serialization
+                state.end()
+            }
+        },
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
@@ -990,6 +1124,204 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
     let mut constructor_attributes = Vec::new();
 
     match *data {
+        Data::Enum(ref data) => {
+            // For enums, we need to deserialize from a map with a single key-value pair
+            // where the key is the variant name and the value is the variant data
+            
+            // Generate a visitor for the enum
+            let enum_name = name.to_string();
+            let variants = &data.variants;
+            
+            let mut variant_matches = Vec::new();
+            let mut variant_names = Vec::new();
+            
+            for variant in variants {
+                let variant_name = &variant.ident;
+                let variant_name_str = variant_name.to_string();
+                
+                // Get the rename attribute if present
+                let mut rename = None;
+                for attr in &variant.attrs {
+                    if attr.path().is_ident("fhir_serde") {
+                        if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                            for meta in list {
+                                if let Meta::NameValue(nv) = meta {
+                                    if nv.path.is_ident("rename") {
+                                        if let syn::Expr::Lit(expr_lit) = nv.value {
+                                            if let Lit::Str(lit_str) = expr_lit.lit {
+                                                rename = Some(lit_str.value());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Use the rename value or the variant name as a string
+                let variant_key = rename.unwrap_or_else(|| variant_name_str.clone());
+                let underscore_variant_key = format!("_{}", variant_key);
+                
+                variant_names.push(variant_key.clone());
+                
+                // Handle different variant field types
+                match &variant.fields {
+                    Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                        // Newtype variant (e.g., String(String))
+                        let field = fields.unnamed.first().unwrap();
+                        let field_ty = &field.ty;
+                        
+                        // Check if this is a primitive type that might have extensions
+                        let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
+                        
+                        if is_element || is_decimal_element {
+                            // For Element types, we need special handling for the _fieldName pattern
+                            variant_matches.push(quote! {
+                                #variant_key => {
+                                    // Check if we also have an extension part (_fieldName)
+                                    let extension_value = map.remove(#underscore_variant_key);
+                                    
+                                    // Deserialize the value part
+                                    let value_part = map.remove(#variant_key)
+                                        .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                                    
+                                    // Deserialize the main value
+                                    let mut element: #field_ty = serde::Deserialize::deserialize(value_part)
+                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
+                                    
+                                    // If we have an extension part, merge it with the element
+                                    if let Some(ext_value) = extension_value {
+                                        // Deserialize the extension part into a helper struct
+                                        #[derive(serde::Deserialize)]
+                                        struct IdAndExtensionHelper {
+                                            #[serde(default)]
+                                            id: Option<std::string::String>,
+                                            #[serde(default)]
+                                            extension: Option<Vec<Extension>>,
+                                        }
+                                        
+                                        let ext_helper: IdAndExtensionHelper = serde::Deserialize::deserialize(ext_value)
+                                            .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #underscore_variant_key, e)))?;
+                                        
+                                        // Merge the extension data into the element
+                                        if ext_helper.id.is_some() {
+                                            element.id = ext_helper.id;
+                                        }
+                                        if ext_helper.extension.is_some() {
+                                            element.extension = ext_helper.extension;
+                                        }
+                                    }
+                                    
+                                    Ok(#name::#variant_name(element))
+                                }
+                            });
+                        } else {
+                            // Regular newtype variant
+                            variant_matches.push(quote! {
+                                #variant_key => {
+                                    let value = map.remove(#variant_key)
+                                        .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                                    let inner: #field_ty = serde::Deserialize::deserialize(value)
+                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
+                                    Ok(#name::#variant_name(inner))
+                                }
+                            });
+                        }
+                    },
+                    Fields::Unnamed(_) => {
+                        // Tuple variant with multiple fields
+                        variant_matches.push(quote! {
+                            #variant_key => {
+                                let value = map.remove(#variant_key)
+                                    .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                                let inner = serde::Deserialize::deserialize(value)
+                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
+                                Ok(#name::#variant_name(inner))
+                            }
+                        });
+                    },
+                    Fields::Named(_) => {
+                        // Struct variant
+                        variant_matches.push(quote! {
+                            #variant_key => {
+                                let value = map.remove(#variant_key)
+                                    .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                                let inner = serde::Deserialize::deserialize(value)
+                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
+                                Ok(#name::#variant_name(inner))
+                            }
+                        });
+                    },
+                    Fields::Unit => {
+                        // Unit variant
+                        variant_matches.push(quote! {
+                            #variant_key => Ok(#name::#variant_name)
+                        });
+                    },
+                }
+            }
+            
+            // Generate the enum deserialization implementation
+            return quote! {
+                // Define a visitor for the enum
+                struct EnumVisitor;
+                
+                impl<'de> serde::de::Visitor<'de> for EnumVisitor {
+                    type Value = #name;
+                    
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        formatter.write_str(concat!("a ", #enum_name, " enum"))
+                    }
+                    
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: serde::de::MapAccess<'de>,
+                    {
+                        // Convert the MapAccess to a HashMap for easier handling
+                        let mut values = std::collections::HashMap::new();
+                        
+                        while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                            values.insert(key, value);
+                        }
+                        
+                        // Find which variant we're deserializing
+                        let variant_key = values.keys().find(|k| {
+                            let k_str = k.as_str();
+                            #(
+                                if k_str == #variant_names || k_str.starts_with("_") && k_str[1..] == #variant_names {
+                                    return true;
+                                }
+                            )*
+                            false
+                        });
+                        
+                        let variant_key = match variant_key {
+                            Some(k) => {
+                                // If it starts with underscore, use the non-underscore version
+                                if k.starts_with("_") {
+                                    k[1..].to_string()
+                                } else {
+                                    k.clone()
+                                }
+                            },
+                            None => return Err(serde::de::Error::custom(format!(
+                                "expected one of the variant keys: {:?}", [#(#variant_names),*]
+                            ))),
+                        };
+                        
+                        // Match on the variant key to deserialize the correct variant
+                        match variant_key.as_str() {
+                            #(#variant_matches)*
+                            _ => Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*])),
+                        }
+                    }
+                }
+                
+                // Use the visitor to deserialize the enum
+                deserializer.deserialize_map(EnumVisitor)
+            };
+        },
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
