@@ -1213,7 +1213,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                      element.value = None;
                                 }
 
-                                Ok(#name::#variant_name(element.into())) // Use .into()
+                                Ok(#name::#variant_name(element)) // Removed .into()
                             }
                             // --- End Element/DecimalElement Variant Construction ---
                         } else {
