@@ -1302,36 +1302,50 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             values.push(value);
                         }
 
-                        // Find which variant we're deserializing
-                        let variant_key_idx = keys.iter().position(|k: &String| { // Explicit type for k
-                            #( // Loop over variant_names (String literals)
-                                // Compare k with the base name and the underscore-prefixed name
-                                if k == #variant_names || k == &format!("_{}", #variant_names) {
-                                    return true;
+                        // Find the base variant key directly by checking keys against expected names
+                        let mut found_variant_key: Option<String> = None;
+                        for k in keys.iter() { // k is &String
+                             #( // Loop over variant_names (&'static str, e.g., "authorReference", "authorString")
+                                // Check if k matches the base name
+                                if k == #variant_names {
+                                    found_variant_key = Some(#variant_names.to_string());
+                                    break;
+                                }
+                                // Check if k matches the underscore-prefixed name
+                                let underscore_name = format!("_{}", #variant_names); // e.g., "_authorString"
+                                if k == &underscore_name { // Compare &String with &String
+                                    found_variant_key = Some(#variant_names.to_string()); // Store the base name, e.g., "authorString"
+                                    break;
                                 }
                             )*
-                            false
-                        });
+                            // Exit outer loop once a match is found
+                            if found_variant_key.is_some() {
+                                break;
+                            }
+                        }
 
-                        let variant_key = match variant_key_idx {
-                            Some(idx) => {
-                                let k = &keys[idx]; // k is &String
-                                // If it starts with underscore, strip the underscore
-                                if k.starts_with('_') {
-                                    k[1..].to_string()
-                                } else {
-                                    k.clone() // k is &String, clone it into an owned String
-                                }
-                            },
-                            None => return Err(serde::de::Error::custom(format!(
-                                "expected one of the variant keys: {:?}", [#(#variant_names),*]
-                            ))),
+                        // Ensure a variant key was found
+                        let variant_key = match found_variant_key {
+                            Some(key) => key, // key is the base name (String), e.g., "authorString"
+                            None => {
+                                // Construct a more informative error message including the keys found
+                                let available_keys = keys.join(", ");
+                                return Err(serde::de::Error::custom(format!(
+                                    "Expected one of the variant keys {:?} (or their underscore-prefixed versions) but found keys: [{}]",
+                                    [#(#variant_names),*],
+                                    available_keys
+                                )));
+                            }
                         };
-                        
-                        // Match on the variant key to deserialize the correct variant
-                        match variant_key.as_str() {
-                            #(#variant_matches)*
-                            _ => Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*])),
+
+                        // Match on the determined base variant key string to deserialize the correct variant
+                        match variant_key.as_str() { // Use the base name string, e.g. "authorString"
+                            #(#variant_matches)* // Patterns like "authorString" => { ... }
+                            _ => {
+                                // This case should theoretically not be reached if found_variant_key logic is correct,
+                                // but kept for robustness.
+                                Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*]))
+                            }
                         }
                     }
                 }
