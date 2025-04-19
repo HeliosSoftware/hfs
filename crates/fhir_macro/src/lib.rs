@@ -1436,7 +1436,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                                 let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
                                                 let inner_value = serde::Deserialize::deserialize(value)
                                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_names, e)))?;
-                                                Ok(#name::#variant_name(inner_value))
+                                                Ok(#name::variant_name(inner_value)) // Use variant_name directly
                                                 // --- End Regular Newtype Variant Construction ---
                                             }
                                         }
@@ -1445,16 +1445,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                              let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
                                              let inner_value = serde::Deserialize::deserialize(value)
                                                  .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_names, e)))?;
-                                             Ok(#name::#variant_name(inner_value)) // Assuming tuple variants deserialize from single value
+                                             Ok(#name::variant_name(inner_value)) // Use variant_name directly
                                         },
                                         Fields::Named(_) => { /* ... deserialize struct from value_part ... */
                                              let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
                                              let inner_value = serde::Deserialize::deserialize(value)
                                                  .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_names, e)))?;
-                                             Ok(#name::#variant_name(inner_value)) // Assuming struct variants deserialize from single value
+                                             Ok(#name::variant_name(inner_value)) // Use variant_name directly
                                         },
                                         Fields::Unit => { /* ... construct unit variant ... */
-                                             Ok(#name::#variant_name)
+                                             Ok(#name::variant_name) // Use variant_name directly
                                         },
                                     }
                                 }
