@@ -1307,59 +1307,160 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     where
                         A: serde::de::MapAccess<'de>,
                     {
-                        // Collect all keys and values into vectors instead of using HashMap
-                        let mut keys = Vec::new();
-                        let mut values = Vec::new();
-                        
-                        while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                            keys.push(key);
-                            values.push(value);
-                        }
-
-                        // Find the base variant key directly by checking keys against expected names
                         let mut found_variant_key: Option<String> = None;
-                        for k in keys.iter() { // k is &String
-                             #( // Loop over variant_names (&'static str, e.g., "authorReference", "authorString")
-                                // Check if k matches the base name - convert both to &str for comparison
-                                if k.as_str() == #variant_names {
-                                    found_variant_key = Some(#variant_names.to_string());
-                                    break;
-                                }
-                                // Check if k matches the underscore-prefixed name
-                                let underscore_name = format!("_{}", #variant_names); // e.g., "_authorString"
-                                if k.as_str() == underscore_name { // Compare &str with &str
-                                    found_variant_key = Some(#variant_names.to_string()); // Store the base name, e.g., "authorString"
-                                    break;
+                        let mut value_part: Option<serde_json::Value> = None;
+                        let mut extension_part: Option<serde_json::Value> = None;
+                        let mut processed_keys = std::collections::HashSet::new(); // Track processed keys
+
+                        // Iterate through map entries directly
+                        while let Some((key_str, current_value)) = map.next_entry::<String, serde_json::Value>()? {
+                            let mut key_matched = false;
+                            #( // Loop over variant_names (&'static str)
+                                let base_name = #variant_names; // e.g., "authorString"
+                                let underscore_name = format!("_{}", base_name); // e.g., "_authorString"
+
+                                if key_str == base_name {
+                                    if value_part.is_some() {
+                                        return Err(serde::de::Error::duplicate_field(base_name));
+                                    }
+                                    value_part = Some(current_value.clone()); // Store the value
+                                    // If we already found a key based on the underscore version, ensure it matches
+                                    if let Some(ref existing_key) = found_variant_key {
+                                        if existing_key != base_name {
+                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, base_name)));
+                                        }
+                                    } else {
+                                        found_variant_key = Some(base_name.to_string());
+                                    }
+                                    processed_keys.insert(key_str.clone());
+                                    key_matched = true;
+                                } else if key_str == underscore_name {
+                                    if extension_part.is_some() {
+                                        return Err(serde::de::Error::duplicate_field(&underscore_name));
+                                    }
+                                    extension_part = Some(current_value.clone()); // Store the extension value
+                                    // If we already found a key based on the base version, ensure it matches
+                                     if let Some(ref existing_key) = found_variant_key {
+                                        if existing_key != base_name {
+                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, underscore_name)));
+                                        }
+                                    } else {
+                                        found_variant_key = Some(base_name.to_string()); // Store the BASE name
+                                    }
+                                    processed_keys.insert(key_str.clone());
+                                    key_matched = true;
                                 }
                             )*
-                            // Exit outer loop once a match is found
-                            if found_variant_key.is_some() {
-                                break;
-                            }
+                            // If the key didn't match any expected variant key (base or underscore), ignore it?
+                            // Or error? Let's ignore for now, assuming other fields might be present.
+                            // if !key_matched {
+                            //     // Handle unexpected fields if necessary
+                            // }
                         }
 
                         // Ensure a variant key was found
                         let variant_key = match found_variant_key {
-                            Some(key) => key, // key is the base name (String), e.g., "authorString"
+                            Some(key) => key, // key is the base name (String)
                             None => {
-                                // Construct a more informative error message including the keys found
-                                let available_keys = keys.join(", ");
+                                // No matching key found at all
                                 return Err(serde::de::Error::custom(format!(
-                                    "Expected one of the variant keys {:?} (or their underscore-prefixed versions) but found keys: [{}]",
-                                    [#(#variant_names),*],
-                                    available_keys
+                                    "Expected one of the variant keys {:?} (or their underscore-prefixed versions) but found none",
+                                    [#(#variant_names),*]
                                 )));
                             }
                         };
 
-                        // Match on the determined base variant key string to deserialize the correct variant
-                        match variant_key.as_str() { // Use the base name string, e.g. "authorString"
-                            #(#variant_matches)* // Patterns like "authorString" => { ... }
-                            _ => {
-                                // This case should theoretically not be reached if found_variant_key logic is correct,
-                                // but kept for robustness.
-                                Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*]))
-                            }
+                        // --- Construct the variant based on found_variant_key, value_part, extension_part ---
+                        match variant_key.as_str() {
+                            #( // Loop over variant_names again to generate match arms
+                                #variant_names => {
+                                    // Get the corresponding variant definition info (field_ty, is_element, etc.)
+                                    // This requires matching the variant_key back to the original variant definition.
+                                    // We need to regenerate the logic for each variant within the match arm.
+
+                                    // Find the specific variant corresponding to #variant_names
+                                    let target_variant = variants.iter().find(|v| {
+                                        let mut rename = None;
+                                        // Extract rename logic... (duplicate code, consider refactoring)
+                                        for attr in &v.attrs { /* ... find rename ... */ }
+                                        let effective_name = rename.unwrap_or_else(|| v.ident.to_string());
+                                        effective_name == #variant_names
+                                    }).expect("Variant not found during match arm generation"); // Should not happen
+
+                                    // Extract info for this specific variant
+                                    let variant_name = &target_variant.ident;
+                                    match &target_variant.fields {
+                                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                                            let field = fields.unnamed.first().unwrap();
+                                            let field_ty = &field.ty;
+                                            let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
+
+                                            if is_element || is_decimal_element {
+                                                // --- Element/DecimalElement Variant Construction ---
+                                                let underscore_variant_key_str = format!("_{}", #variant_names); // For error messages
+
+                                                // Deserialize the extension part if present
+                                                let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
+                                                if let Some(ext_value) = extension_part { // Use stored extension_part
+                                                    ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
+                                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", underscore_variant_key_str, e)))?);
+                                                }
+
+                                                // Deserialize the primitive value directly into the Element type if value_part exists
+                                                let mut element: #field_ty = match value_part { // Use stored value_part
+                                                    Some(prim_value) => serde::Deserialize::deserialize(prim_value)
+                                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_names, e)))?,
+                                                    None => #field_ty::default(), // If no value part, start with default
+                                                };
+
+
+                                                // Merge the extension data if it exists
+                                                if let Some(ext_helper) = ext_helper_opt {
+                                                    if ext_helper.id.is_some() {
+                                                        element.id = ext_helper.id;
+                                                    }
+                                                    if ext_helper.extension.is_some() {
+                                                        element.extension = ext_helper.extension;
+                                                    }
+                                                }
+                                                // Ensure value is None if only extension was present
+                                                if value_part.is_none() && extension_part.is_some() {
+                                                     element.value = None;
+                                                }
+
+
+                                                Ok(#name::#variant_name(element))
+                                                // --- End Element/DecimalElement Variant Construction ---
+                                            } else {
+                                                // --- Regular Newtype Variant Construction ---
+                                                let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
+                                                let inner_value = serde::Deserialize::deserialize(value)
+                                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_names, e)))?;
+                                                Ok(#name::#variant_name(inner_value))
+                                                // --- End Regular Newtype Variant Construction ---
+                                            }
+                                        }
+                                        // Handle other field types (Tuple, Named, Unit) as before, using value_part
+                                        Fields::Unnamed(_) => { /* ... deserialize tuple from value_part ... */
+                                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
+                                             let inner_value = serde::Deserialize::deserialize(value)
+                                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_names, e)))?;
+                                             Ok(#name::#variant_name(inner_value)) // Assuming tuple variants deserialize from single value
+                                        },
+                                        Fields::Named(_) => { /* ... deserialize struct from value_part ... */
+                                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
+                                             let inner_value = serde::Deserialize::deserialize(value)
+                                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_names, e)))?;
+                                             Ok(#name::#variant_name(inner_value)) // Assuming struct variants deserialize from single value
+                                        },
+                                        Fields::Unit => { /* ... construct unit variant ... */
+                                             Ok(#name::#variant_name)
+                                        },
+                                    }
+                                }
+                            )*
+                            // Fallback for unknown variant key (should not be reached if logic above is correct)
+                            _ => Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*])),
                         }
                     }
                 }
