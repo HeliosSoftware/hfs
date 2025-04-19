@@ -1224,13 +1224,20 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key_str, e)))?);
                                 }
 
-                                // Deserialize the primitive value directly into the Element type if value_part exists
-                                // Use Default::default() which works for Element<V,E> and DecimalElement<E>
-                                let mut element: #field_ty = match value_part { // Use stored value_part
-                                    Some(prim_value) => serde::Deserialize::deserialize(prim_value)
-                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?,
-                                    None => Default::default(), // If no value part, start with default
+                                // Deserialize the value part if present, consuming value_part
+                                let deserialized_value_opt = if let Some(prim_value) = value_part { // Move of value_part happens here
+                                    // Use #primitive_type_for_element determined outside
+                                    Some(<#primitive_type_for_element>::deserialize(prim_value)
+                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?)
+                                } else {
+                                    None::<#primitive_type_for_element> // Explicit type needed for None
                                 };
+
+                                // Construct the element using deserialized parts
+                                let mut element: #field_ty = Default::default(); // Start with default
+
+                                // Assign deserialized value
+                                element.value = deserialized_value_opt; // Assign the Option<V> or Option<PreciseDecimal>
 
                                 // Merge the extension data if it exists
                                 if let Some(ext_helper) = ext_helper_opt {
@@ -1241,12 +1248,10 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         element.extension = ext_helper.extension;
                                     }
                                 }
-                                // Ensure value is None if only extension was present (use the flag)
-                                if value_part.is_none() && has_extension_part {
-                                     element.value = None;
-                                }
+                                // Note: The check `if !has_value_part && has_extension_part { element.value = None; }`
+                                // is now redundant because element.value is already None if !has_value_part.
 
-                                Ok(#name::#variant_name(element)) // Removed .into()
+                                Ok(#name::#variant_name(element))
                             }
                             // --- End Element/DecimalElement Variant Construction ---
                         } else {
