@@ -363,7 +363,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             }
                         });
                     },
-                    Fields::Named(fields) => {
+                    Fields::Named(_fields) => {
                         // Struct variant
                         match_arms.push(quote! {
                             Self::#variant_name { .. } => {
@@ -803,7 +803,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
             }
         }
-        Data::Enum(_) | Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
+        Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
     }
 }
 
@@ -1674,7 +1674,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 Fields::Unit => panic!("Unit structs not supported by FhirSerde"),
             }
         }
-        Data::Enum(_) | Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
+        Data::Union(_) => panic!("Enums and Unions not supported by FhirSerde"),
     }
 
     let id_extension_helper_def = quote! {
