@@ -1138,13 +1138,13 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
             let enum_name = name.to_string();
             let variants = &data.variants;
             
-            let mut variant_matches = Vec::new();
-            let mut variant_names = Vec::new();
-            
+            let mut variant_matches = Vec::new(); // Stores the generated match arms
+            let mut variant_names = Vec::new(); // Stores the string names for error messages/expecting
+
             for variant in variants {
-                let variant_name = &variant.ident;
+                let variant_name = &variant.ident; // The Ident (e.g., String)
                 let variant_name_str = variant_name.to_string();
-                
+
                 // Get the rename attribute if present
                 let mut rename = None;
                 for attr in &variant.attrs {
@@ -1156,6 +1156,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         if let syn::Expr::Lit(expr_lit) = nv.value {
                                             if let Lit::Str(lit_str) = expr_lit.lit {
                                                 rename = Some(lit_str.value());
+                                                break;
                                             }
                                         }
                                     }
@@ -1163,119 +1164,103 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             }
                         }
                     }
+                    if rename.is_some() { break; }
                 }
-                
-                // Use the rename value or the variant name as a string
+
+                // Use the rename value or the variant name as a string for the JSON key
                 let variant_key = rename.unwrap_or_else(|| variant_name_str.clone());
-                let underscore_variant_key = format!("_{}", variant_key);
-                
-                variant_names.push(variant_key.clone());
-                
-                // Handle different variant field types
-                match &variant.fields {
+                variant_names.push(variant_key.clone()); // Keep track of expected keys
+
+                // Generate the specific deserialization logic for this variant
+                let deserialization_logic = match &variant.fields {
                     Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                         // Newtype variant (e.g., String(String))
                         let field = fields.unnamed.first().unwrap();
                         let field_ty = &field.ty;
-                        
-                        // Check if this is a primitive type that might have extensions
                         let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
-                        
+
                         if is_element || is_decimal_element {
-                            // For Element types, we need special handling for the _fieldName pattern
-                            variant_matches.push(quote! {
-                                #variant_key => {
-                                    // Check if we also have an extension part (_fieldName)
-                                    let extension_idx = keys.iter().position(|k| k == #underscore_variant_key);
-                                    let extension_value = extension_idx.map(|idx| values[idx].clone());
-                                    
-                                    // Deserialize the value part
-                                    let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
-                                    let value_part = value_idx
-                                        .map(|idx| values[idx].clone())
-                                        .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                            // --- Element/DecimalElement Variant Construction ---
+                            let underscore_variant_key_str = format!("_{}", variant_key); // For error messages
 
-                                    // Deserialize the extension part if present
-                                    let extension_idx = keys.iter().position(|k| k.as_str() == #underscore_variant_key);
-                                    let extension_value = extension_idx.map(|idx| values[idx].clone());
-                                    let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
-                                    if let Some(ext_value) = extension_value {
-                                        ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
-                                            .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key, e)))?);
-                                    }
-
-                                    // Deserialize the primitive value directly into the Element type
-                                    let mut element: #field_ty = serde::Deserialize::deserialize(value_part)
-                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?;
-
-                                    // Merge the extension data if it exists
-                                    if let Some(ext_helper) = ext_helper_opt {
-                                        if ext_helper.id.is_some() {
-                                            element.id = ext_helper.id;
-                                        }
-                                        if ext_helper.extension.is_some() {
-                                            element.extension = ext_helper.extension;
-                                        }
-                                    }
-
-                                    Ok(#name::#variant_name(element))
+                            quote! {
+                                // Deserialize the extension part if present
+                                let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
+                                if let Some(ext_value) = extension_part { // Use stored extension_part
+                                    ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
+                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", #underscore_variant_key_str, e)))?);
                                 }
-                            });
-                        } else {
-                            // Regular newtype variant
-                            variant_matches.push(quote! {
-                                #variant_key => {
-                                    let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
-                                    let value = value_idx
-                                        .map(|idx| values[idx].clone())
-                                        .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                    // Deserialize directly into the inner type for non-element variants
-                                    let inner_value = serde::Deserialize::deserialize(value)
-                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
-                                    Ok(#name::#variant_name(inner_value))
+
+                                // Deserialize the primitive value directly into the Element type if value_part exists
+                                // Use Default::default() which works for Element<V,E> and DecimalElement<E>
+                                let mut element: #field_ty = match value_part { // Use stored value_part
+                                    Some(prim_value) => serde::Deserialize::deserialize(prim_value)
+                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_key, e)))?,
+                                    None => Default::default(), // If no value part, start with default
+                                };
+
+                                // Merge the extension data if it exists
+                                if let Some(ext_helper) = ext_helper_opt {
+                                    if ext_helper.id.is_some() {
+                                        element.id = ext_helper.id;
+                                    }
+                                    if ext_helper.extension.is_some() {
+                                        element.extension = ext_helper.extension;
+                                    }
                                 }
-                            });
-                        }
-                    },
-                    Fields::Unnamed(_) => {
-                        // Tuple variant with multiple fields
-                        variant_matches.push(quote! {
-                            #variant_key => {
-                                let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
-                                let value = value_idx
-                                    .map(|idx| values[idx].clone())
-                                    .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                // Deserialize directly into the inner type for non-element variants
-                                let inner_value = serde::Deserialize::deserialize(value)
-                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner_value))
+                                // Ensure value is None if only extension was present
+                                if value_part.is_none() && extension_part.is_some() {
+                                     element.value = None;
+                                }
+
+                                Ok(#name::#variant_name(element)) // Use the variant_name Ident
                             }
-                        });
+                            // --- End Element/DecimalElement Variant Construction ---
+                        } else {
+                            // --- Regular Newtype Variant Construction ---
+                            quote! {
+                                let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                                let inner_value = serde::Deserialize::deserialize(value)
+                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
+                                Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                            }
+                            // --- End Regular Newtype Variant Construction ---
+                        }
+                    }
+                    Fields::Unnamed(_) => {
+                        // Tuple variant
+                         quote! {
+                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                             let inner_value = serde::Deserialize::deserialize(value)
+                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
+                             Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                         }
                     },
                     Fields::Named(_) => {
                         // Struct variant
-                        variant_matches.push(quote! {
-                            #variant_key => {
-                                let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
-                                let value = value_idx
-                                    .map(|idx| values[idx].clone())
-                                    .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                                // Deserialize directly into the inner type for non-element variants
-                                let inner_value = serde::Deserialize::deserialize(value)
-                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner_value))
-                            }
-                        });
+                         quote! {
+                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                             let inner_value = serde::Deserialize::deserialize(value)
+                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
+                             Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                         }
                     },
                     Fields::Unit => {
                         // Unit variant
-                        variant_matches.push(quote! {
-                            #variant_key => Ok(#name::#variant_name)
-                        });
+                         quote! {
+                             Ok(#name::#variant_name) // Use variant_name directly
+                         }
                     },
-                }
-            }
-            
+                }; // End match variant.fields
+
+                // Push the complete match arm
+                variant_matches.push(quote! {
+                    #variant_key => { // Use the string key as the match pattern
+                        #deserialization_logic // Embed the generated logic block
+                    }
+                });
+            } // End loop over variants
+
             // Define the helper struct needed for enum deserialization
             let id_extension_helper_def = quote! {
                 // Helper struct for deserializing the id/extension part from _fieldName
@@ -1294,17 +1279,15 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 use serde::{Deserialize, de::{self, Visitor, MapAccess}};
                 use serde_json; // Needed for Value
                 use std::collections::HashSet; // Needed for processed_keys
-                use syn; // Import syn crate for syn::Variant
+                // NOTE: Removed `use syn;` as it's not needed at runtime
 
                 // Define the helper struct at the top level of the impl block
                 #id_extension_helper_def
 
-                // Define a visitor for the enum, holding a reference to the variants
-                struct EnumVisitor<'a> {
-                    variants: &'a [syn::Variant], // Store reference to variants
-                }
+                // Define a visitor for the enum (no longer needs variants reference)
+                struct EnumVisitor; // Removed lifetime and variants field
 
-                impl<'de, 'a> serde::de::Visitor<'de> for EnumVisitor<'a> { // Add lifetime 'a
+                impl<'de> serde::de::Visitor<'de> for EnumVisitor { // Removed lifetime 'a
                     type Value = #name;
 
                     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -1380,119 +1363,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
                         // --- Construct the variant based on found_variant_key, value_part, extension_part ---
                         match variant_key.as_str() {
-                            #( // Loop over variant_names again to generate match arms
-                                #variant_names => {
-                                    // Get the corresponding variant definition info (field_ty, is_element, etc.)
-                                    // This requires matching the variant_key back to the original variant definition.
-                                    // We need to regenerate the logic for each variant within the match arm.
+                            // Use the pre-generated match arms
+                            #(#variant_matches)*
 
-                                    // Find the specific variant corresponding to #variant_names using the stored reference
-                                    let target_variant = self.variants.iter().find(|v| { // Use self.variants
-                                        let mut rename = None;
-                                        // Extract rename logic... (duplicate code, consider refactoring)
-                                        for attr in &v.attrs {
-                                             if attr.path().is_ident("fhir_serde") {
-                                                if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
-                                                    for meta in list {
-                                                        if let Meta::NameValue(nv) = meta {
-                                                            if nv.path.is_ident("rename") {
-                                                                if let syn::Expr::Lit(expr_lit) = nv.value {
-                                                                    if let Lit::Str(lit_str) = expr_lit.lit {
-                                                                        rename = Some(lit_str.value());
-                                                                        break; // Found rename, exit inner loop
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            if rename.is_some() { break; } // Exit outer loop if rename found
-                                        }
-                                        let effective_name = rename.unwrap_or_else(|| v.ident.to_string());
-                                        effective_name == #variant_names
-                                    }).expect("Variant not found during match arm generation"); // Should not happen
-
-                                    // Extract info for this specific variant
-                                    let variant_name = &target_variant.ident;
-                                    match &target_variant.fields {
-                                        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                                            let field = fields.unnamed.first().unwrap();
-                                            let field_ty = &field.ty;
-                                            let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
-
-                                            if is_element || is_decimal_element {
-                                                // --- Element/DecimalElement Variant Construction ---
-                                                let underscore_variant_key_str = format!("_{}", #variant_names); // For error messages
-
-                                                // Deserialize the extension part if present
-                                                let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
-                                                if let Some(ext_value) = extension_part { // Use stored extension_part
-                                                    ext_helper_opt = Some(serde::Deserialize::deserialize(ext_value)
-                                                        .map_err(|e| serde::de::Error::custom(format!("Error deserializing extension {}: {}", underscore_variant_key_str, e)))?);
-                                                }
-
-                                                // Deserialize the primitive value directly into the Element type if value_part exists
-                                                let mut element = match value_part { // Use stored value_part
-                                                    Some(prim_value) => serde::Deserialize::deserialize(prim_value)
-                                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing primitive {}: {}", #variant_names, e)))?,
-                                                    None => Default::default(), // If no value part, start with default
-                                                };
-
-
-                                                // Merge the extension data if it exists
-                                                if let Some(ext_helper) = ext_helper_opt {
-                                                    if ext_helper.id.is_some() {
-                                                        element.id = ext_helper.id;
-                                                    }
-                                                    if ext_helper.extension.is_some() {
-                                                        element.extension = ext_helper.extension;
-                                                    }
-                                                }
-                                                // Ensure value is None if only extension was present
-                                                if value_part.is_none() && extension_part.is_some() {
-                                                     element.value = None;
-                                                }
-
-
-                                                Ok(#name::from_str(#variant_names).unwrap()(element))
-                                                // --- End Element/DecimalElement Variant Construction ---
-                                            } else {
-                                                // --- Regular Newtype Variant Construction ---
-                                                let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
-                                                let inner_value = serde::Deserialize::deserialize(value)
-                                                    .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_names, e)))?;
-                                                Ok(#name::variant_name(inner_value)) // Use variant_name directly
-                                                // --- End Regular Newtype Variant Construction ---
-                                            }
-                                        }
-                                        // Handle other field types (Tuple, Named, Unit) as before, using value_part
-                                        Fields::Unnamed(_) => { /* ... deserialize tuple from value_part ... */
-                                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
-                                             let inner_value = serde::Deserialize::deserialize(value)
-                                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_names, e)))?;
-                                             Ok(#name::variant_name(inner_value)) // Use variant_name directly
-                                        },
-                                        Fields::Named(_) => { /* ... deserialize struct from value_part ... */
-                                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_names))?;
-                                             let inner_value = serde::Deserialize::deserialize(value)
-                                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_names, e)))?;
-                                             Ok(#name::variant_name(inner_value)) // Use variant_name directly
-                                        },
-                                        Fields::Unit => { /* ... construct unit variant ... */
-                                             Ok(#name::variant_name) // Use variant_name directly
-                                        },
-                                    }
-                                }
-                            )*
                             // Fallback for unknown variant key (should not be reached if logic above is correct)
                             _ => Err(serde::de::Error::unknown_variant(&variant_key, &[#(#variant_names),*])),
                         }
                     }
                 }
 
-                // Use the visitor to deserialize the enum, passing the variants reference
-                deserializer.deserialize_map(EnumVisitor { variants }) // Pass variants here
+                // Use the visitor to deserialize the enum (no longer needs variants)
+                deserializer.deserialize_map(EnumVisitor) // Removed variants passing
             };
         },
         Data::Struct(ref data) => {
