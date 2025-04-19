@@ -124,7 +124,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                 // Use the string directly
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                 // Use from_scientific if 'e' is present, otherwise parse
+                // Use from_scientific if 'e' is present, otherwise parse
                 let parsed_value = if s_for_parsing.contains('e') {
                     Decimal::from_scientific(&s_for_parsing).ok()
                 } else {
@@ -136,13 +136,13 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
             // Handle case where PreciseDecimal might be nested inside an object like {"value": 123.45}
             // This can happen when deserializing from a Value passed by the macro
             serde_json::Value::Object(map) => {
-                 match map.get("value") {
+                match map.get("value") {
                     Some(serde_json::Value::Number(n)) => {
                         // Use nested number's string representation
                         let s = n.to_string();
                         // Replace 'E' with 'e' for parsing
                         let s_for_parsing = s.replace('E', "e");
-                         // Use from_scientific if 'e' is present, otherwise parse
+                        // Use from_scientific if 'e' is present, otherwise parse
                         let parsed_value = if s_for_parsing.contains('e') {
                             Decimal::from_scientific(&s_for_parsing).ok()
                         } else {
@@ -151,11 +151,11 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                         Ok(PreciseDecimal::from_parts(parsed_value, s))
                     }
                     Some(serde_json::Value::String(s)) => {
-                         // Use nested string directly (clone needed as s is borrowed)
+                        // Use nested string directly (clone needed as s is borrowed)
                         let s_clone = s.clone(); // Clone s for PreciseDecimal
                         // Replace 'E' with 'e' for parsing
                         let s_for_parsing = s_clone.replace('E', "e");
-                         // Use from_scientific if 'e' is present, otherwise parse
+                        // Use from_scientific if 'e' is present, otherwise parse
                         let parsed_value = if s_for_parsing.contains('e') {
                             Decimal::from_scientific(&s_for_parsing).ok()
                         } else {
@@ -167,11 +167,17 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     Some(serde_json::Value::Null) => {
                         // Decide how to handle {"value": null}. Treat as missing/None?
                         // For now, let's error, as FHIR doesn't typically represent null decimals this way.
-                         Err(de::Error::invalid_value(de::Unexpected::Unit, &"a number or string for decimal value")) // Use Unit for null
+                        Err(de::Error::invalid_value(
+                            de::Unexpected::Unit,
+                            &"a number or string for decimal value",
+                        )) // Use Unit for null
                     }
                     None => Err(de::Error::missing_field("value")), // Missing "value" field
-                    _ => Err(de::Error::invalid_type(de::Unexpected::Map, &"a map with a 'value' field containing a number or string"))
-                 }
+                    _ => Err(de::Error::invalid_type(
+                        de::Unexpected::Map,
+                        &"a map with a 'value' field containing a number or string",
+                    )),
+                }
             }
             // Handle remaining unexpected types
             other => Err(de::Error::invalid_type(
@@ -179,7 +185,7 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                     serde_json::Value::Null => de::Unexpected::Unit, // Or Unexpected::Option if mapping null to None
                     serde_json::Value::Bool(b) => de::Unexpected::Bool(b),
                     serde_json::Value::Array(_) => de::Unexpected::Seq,
-                     _ => de::Unexpected::Other("unexpected JSON type for PreciseDecimal"),
+                    _ => de::Unexpected::Other("unexpected JSON type for PreciseDecimal"),
                 },
                 &"a number, string, or object with a 'value' field",
             )),
@@ -629,7 +635,7 @@ impl<E> DecimalElement<E> {
     /// # use rust_decimal_macros::dec;
     /// let decimal_value = dec!(123.45);
     /// let fhir_decimal = Decimal::new(decimal_value);
-    /// assert_eq!(fhir_decimal.value.as_ref().map(|pd| pd.value()), Some(decimal_value));
+    /// assert_eq!(fhir_decimal.value.as_ref().map(|pd| pd.value()), Some(Some(decimal_value)));
     /// assert_eq!(fhir_decimal.value.map(|pd| pd.original_string().to_string()), Some("123.45".to_string()));
     /// assert!(fhir_decimal.id.is_none());
     /// assert!(fhir_decimal.extension.is_none());
@@ -665,7 +671,7 @@ where
                 let s = n.to_string(); // Note: n.to_string() might normalize exponent case (e.g., 'E' -> 'e')
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                 // Use from_scientific if 'e' is present, otherwise parse
+                // Use from_scientific if 'e' is present, otherwise parse
                 let parsed_value = if s_for_parsing.contains('e') {
                     Decimal::from_scientific(&s_for_parsing).ok()
                 } else {
@@ -684,7 +690,7 @@ where
                 // Directly parse the string to create PreciseDecimal
                 // Replace 'E' with 'e' for parsing
                 let s_for_parsing = s.replace('E', "e");
-                 // Use from_scientific if 'e' is present, otherwise parse
+                // Use from_scientific if 'e' is present, otherwise parse
                 let parsed_value = if s_for_parsing.contains('e') {
                     Decimal::from_scientific(&s_for_parsing).ok()
                 } else {
@@ -692,11 +698,11 @@ where
                 };
                 // Store the ORIGINAL string `s`.
                 let pd = PreciseDecimal::from_parts(parsed_value, s); // s is owned, no clone needed
-                 Ok(DecimalElement {
+                Ok(DecimalElement {
                     id: None,
                     extension: None,
                     value: Some(pd),
-                 })
+                })
             }
             // Handle JSON object: deserialize fields individually
             serde_json::Value::Object(map) => {
@@ -707,30 +713,42 @@ where
                 for (k, v) in map {
                     match k.as_str() {
                         "id" => {
-                            if id.is_some() { return Err(de::Error::duplicate_field("id")); }
+                            if id.is_some() {
+                                return Err(de::Error::duplicate_field("id"));
+                            }
                             // Deserialize id directly from its Value
                             id = Deserialize::deserialize(v).map_err(de::Error::custom)?;
                         }
                         "extension" => {
-                            if extension.is_some() { return Err(de::Error::duplicate_field("extension")); }
-                             // Deserialize extension directly from its Value
+                            if extension.is_some() {
+                                return Err(de::Error::duplicate_field("extension"));
+                            }
+                            // Deserialize extension directly from its Value
                             extension = Deserialize::deserialize(v).map_err(de::Error::custom)?;
                         }
                         "value" => {
-                            if value.is_some() { return Err(de::Error::duplicate_field("value")); }
+                            if value.is_some() {
+                                return Err(de::Error::duplicate_field("value"));
+                            }
                             // Deserialize value using PreciseDecimal::deserialize from its Value
                             // Handle null explicitly within the value field
                             if v.is_null() {
                                 value = None;
                             } else {
-                                value = Some(PreciseDecimal::deserialize(v).map_err(de::Error::custom)?);
+                                value = Some(
+                                    PreciseDecimal::deserialize(v).map_err(de::Error::custom)?,
+                                );
                             }
                         }
                         // Ignore any unknown fields encountered
                         _ => {} // Simply ignore unknown fields
                     }
                 }
-                Ok(DecimalElement { id, extension, value })
+                Ok(DecimalElement {
+                    id,
+                    extension,
+                    value,
+                })
             }
             // Handle JSON Null for the whole element
             serde_json::Value::Null => Ok(DecimalElement::default()), // Default has value: None

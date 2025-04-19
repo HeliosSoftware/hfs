@@ -434,18 +434,10 @@ fn process_elements(
             ));
 
             // Generate enum derives - Add Clone, PartialEq, Eq to all enums
-            let enum_derives = vec![
-                "Debug",
-                "Serialize",
-                "Deserialize",
-                "Clone",
-                "PartialEq",
-                "Eq",
-            ];
+            let enum_derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde"];
             output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
 
             // Add other serde attributes and enum definition
-            output.push_str("#[serde(rename_all = \"camelCase\")]\n");
             output.push_str(&format!("pub enum {} {{\n", enum_name));
 
             if let Some(types) = &choice.r#type {
@@ -458,7 +450,10 @@ fn process_elements(
                         "    /// Variant accepting the {} type.\n",
                         type_code
                     ));
-                    output.push_str(&format!("    #[serde(rename = \"{}\")]\n", rename_value));
+                    output.push_str(&format!(
+                        "    #[fhir_serde(rename = \"{}\")]\n",
+                        rename_value
+                    ));
                     output.push_str(&format!("    {}({}),\n", type_code, type_code));
                 }
             }
