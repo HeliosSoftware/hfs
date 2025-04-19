@@ -1303,14 +1303,20 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let mut extension_part: Option<serde_json::Value> = None;
                         let mut processed_keys = std::collections::HashSet::new(); // Track processed keys
 
-                        // Iterate through map entries directly
-                        while let Some((key_str, current_value)) = map.next_entry::<String, serde_json::Value>()? {
+                        // Iterate through map entries directly, deserializing key as Value
+                        while let Some((key_value, current_value)) = map.next_entry::<serde_json::Value, serde_json::Value>()? {
+                            // Ensure the key is a string
+                            let key_str = match key_value {
+                                serde_json::Value::String(s) => s,
+                                _ => return Err(serde::de::Error::invalid_type(serde::de::Unexpected::Other("non-string key"), &"a string key")),
+                            };
+
                             let mut key_matched = false;
                             #( // Loop over variant_names (&'static str)
                                 let base_name = #variant_names; // e.g., "authorString"
                                 let underscore_name = format!("_{}", base_name); // e.g., "_authorString"
 
-                                if key_str.as_str() == base_name { // Compare as &str
+                                if key_str == base_name { // Compare the extracted &str
                                     if value_part.is_some() {
                                         return Err(serde::de::Error::duplicate_field(base_name));
                                     }
@@ -1323,9 +1329,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     } else {
                                         found_variant_key = Some(base_name.to_string());
                                     }
-                                    processed_keys.insert(key_str.clone());
+                                    processed_keys.insert(key_str.clone()); // Clone the String key
                                     key_matched = true;
-                                } else if key_str.as_str() == underscore_name { // Compare as &str
+                                } else if key_str == underscore_name { // Compare the extracted &str
                                     if extension_part.is_some() {
                                         return Err(serde::de::Error::duplicate_field(&underscore_name));
                                     }
