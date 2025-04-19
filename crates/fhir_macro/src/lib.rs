@@ -343,7 +343,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         state.serialize_entry(#underscore_variant_key, &extension_part)?;
                                     }
                                     
-                                    Ok(())
+                                    // Don't return Result here, just continue
                                 }
                             });
                         } else {
@@ -351,7 +351,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                             match_arms.push(quote! {
                                 Self::#variant_name(ref value) => {
                                     state.serialize_entry(#variant_key, value)?;
-                                    Ok(())
                                 }
                             });
                         }
@@ -361,7 +360,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         match_arms.push(quote! {
                             Self::#variant_name(ref value) => {
                                 state.serialize_entry(#variant_key, value)?;
-                                Ok(())
                             }
                         });
                     },
@@ -370,7 +368,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         match_arms.push(quote! {
                             Self::#variant_name { .. } => {
                                 state.serialize_entry(#variant_key, self)?;
-                                Ok(())
                             }
                         });
                     },
@@ -379,7 +376,6 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         match_arms.push(quote! {
                             Self::#variant_name => {
                                 state.serialize_entry(#variant_key, &())?;
-                                Ok(())
                             }
                         });
                     },
@@ -401,7 +397,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 match self {
                     #(#match_arms)*
                 }
-                
+                                
                 // End the map serialization
                 state.end()
             }
@@ -1190,10 +1186,13 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             variant_matches.push(quote! {
                                 #variant_key => {
                                     // Check if we also have an extension part (_fieldName)
-                                    let extension_value = map.remove(#underscore_variant_key);
+                                    let extension_idx = keys.iter().position(|k| k == #underscore_variant_key);
+                                    let extension_value = extension_idx.map(|idx| values[idx].clone());
                                     
                                     // Deserialize the value part
-                                    let value_part = map.remove(#variant_key)
+                                    let value_idx = keys.iter().position(|k| k == #variant_key);
+                                    let value_part = value_idx
+                                        .map(|idx| values[idx].clone())
                                         .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                     
                                     // Deserialize the main value
@@ -1230,7 +1229,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             // Regular newtype variant
                             variant_matches.push(quote! {
                                 #variant_key => {
-                                    let value = map.remove(#variant_key)
+                                    let value_idx = keys.iter().position(|k| k == #variant_key);
+                                    let value = value_idx
+                                        .map(|idx| values[idx].clone())
                                         .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                     let inner: #field_ty = serde::Deserialize::deserialize(value)
                                         .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
@@ -1243,7 +1244,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Tuple variant with multiple fields
                         variant_matches.push(quote! {
                             #variant_key => {
-                                let value = map.remove(#variant_key)
+                                let value_idx = keys.iter().position(|k| k == #variant_key);
+                                let value = value_idx
+                                    .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                 let inner = serde::Deserialize::deserialize(value)
                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
@@ -1255,7 +1258,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Struct variant
                         variant_matches.push(quote! {
                             #variant_key => {
-                                let value = map.remove(#variant_key)
+                                let value_idx = keys.iter().position(|k| k == #variant_key);
+                                let value = value_idx
+                                    .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                 let inner = serde::Deserialize::deserialize(value)
                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing {}: {}", #variant_key, e)))?;
@@ -1288,15 +1293,17 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     where
                         A: serde::de::MapAccess<'de>,
                     {
-                        // Convert the MapAccess to a HashMap for easier handling
-                        let mut values = std::collections::HashMap::new();
+                        // Collect all keys and values into vectors instead of using HashMap
+                        let mut keys = Vec::new();
+                        let mut values = Vec::new();
                         
                         while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
-                            values.insert(key, value);
+                            keys.push(key);
+                            values.push(value);
                         }
                         
                         // Find which variant we're deserializing
-                        let variant_key = values.keys().find(|k| {
+                        let variant_key_idx = keys.iter().position(|k| {
                             let k_str = k.as_str();
                             #(
                                 if k_str == #variant_names || k_str.starts_with("_") && k_str[1..] == #variant_names {
@@ -1306,8 +1313,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             false
                         });
                         
-                        let variant_key = match variant_key {
-                            Some(k) => {
+                        let variant_key = match variant_key_idx {
+                            Some(idx) => {
+                                let k = &keys[idx];
                                 // If it starts with underscore, use the non-underscore version
                                 if k.starts_with("_") {
                                     k[1..].to_string()
