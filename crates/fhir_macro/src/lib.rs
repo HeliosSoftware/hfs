@@ -1293,12 +1293,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 // Define the helper struct at the top level of the deserialize function
                 #id_extension_helper_def
 
-                // Define a visitor for the enum
-                struct EnumVisitor;
-                
-                impl<'de> serde::de::Visitor<'de> for EnumVisitor {
+                // Define a visitor for the enum, holding a reference to the variants
+                struct EnumVisitor<'a> {
+                    variants: &'a [syn::Variant], // Store reference to variants
+                }
+
+                impl<'de, 'a> serde::de::Visitor<'de> for EnumVisitor<'a> { // Add lifetime 'a
                     type Value = #name;
-                    
+
                     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                         formatter.write_str(concat!("a ", #enum_name, " enum"))
                     }
@@ -1378,11 +1380,29 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     // This requires matching the variant_key back to the original variant definition.
                                     // We need to regenerate the logic for each variant within the match arm.
 
-                                    // Find the specific variant corresponding to #variant_names
-                                    let target_variant = variants.iter().find(|v| {
+                                    // Find the specific variant corresponding to #variant_names using the stored reference
+                                    let target_variant = self.variants.iter().find(|v| { // Use self.variants
                                         let mut rename = None;
                                         // Extract rename logic... (duplicate code, consider refactoring)
-                                        for attr in &v.attrs { /* ... find rename ... */ }
+                                        for attr in &v.attrs {
+                                             if attr.path().is_ident("fhir_serde") {
+                                                if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                                                    for meta in list {
+                                                        if let Meta::NameValue(nv) = meta {
+                                                            if nv.path.is_ident("rename") {
+                                                                if let syn::Expr::Lit(expr_lit) = nv.value {
+                                                                    if let Lit::Str(lit_str) = expr_lit.lit {
+                                                                        rename = Some(lit_str.value());
+                                                                        break; // Found rename, exit inner loop
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if rename.is_some() { break; } // Exit outer loop if rename found
+                                        }
                                         let effective_name = rename.unwrap_or_else(|| v.ident.to_string());
                                         effective_name == #variant_names
                                     }).expect("Variant not found during match arm generation"); // Should not happen
@@ -1464,9 +1484,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         }
                     }
                 }
-                
-                // Use the visitor to deserialize the enum
-                deserializer.deserialize_map(EnumVisitor)
+
+                // Use the visitor to deserialize the enum, passing the variants reference
+                deserializer.deserialize_map(EnumVisitor { variants }) // Pass variants here
             };
         },
         Data::Struct(ref data) => {
