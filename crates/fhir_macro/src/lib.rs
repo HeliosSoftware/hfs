@@ -391,6 +391,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 // Count the number of fields to serialize (always 1 for an enum variant)
                 let count = 1;
                 
+                // Import SerializeMap trait to access serialize_entry method
+                use serde::ser::SerializeMap;
+                
                 // Create a serialization state
                 let mut state = serializer.serialize_map(Some(count))?;
                 
@@ -408,6 +411,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                 Fields::Named(ref fields) => {
                     // Check if any fields have the flatten attribute - define this at the top level
                     let has_flattened_fields = fields.named.iter().any(is_flattened);
+
+                    // Import SerializeMap trait if we have flattened fields
+                    let import_serialize_map = if has_flattened_fields {
+                        quote! { use serde::ser::SerializeMap; }
+                    } else {
+                        quote! { use serde::ser::SerializeStruct; }
+                    };
 
                     let mut field_serializers = Vec::new();
                     let mut field_counts = Vec::new();
@@ -776,7 +786,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         quote! {
                             let mut count = 0;
                             #(#field_counts)*
-                            use serde::ser::SerializeMap; // Import trait for map methods
+                            #import_serialize_map
                             let mut state = serializer.serialize_map(Some(count))?;
                             #(#field_serializers)*
                             state.end()
@@ -786,7 +796,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         quote! {
                             let mut count = 0;
                             #(#field_counts)*
-                            use serde::ser::SerializeStruct; // Import trait for struct methods
+                            #import_serialize_map
                             let mut state = serializer.serialize_struct(stringify!(#name), count)?;
                             #(#field_serializers)*
                             state.end()
