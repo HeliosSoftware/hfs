@@ -320,10 +320,10 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     
                                     // Serialize the primitive value
                                     if value.value.is_some() {
-                                        // Use serialize_field for the value
-                                        state.serialize_field(#variant_key, &value.value)?;
+                                        // Use serialize_entry for SerializeMap
+                                        state.serialize_entry(#variant_key, &value.value)?;
                                     }
-                                    
+                                        
                                     // Serialize the extension part if present
                                     if has_extension {
                                         #[derive(serde::Serialize)]
@@ -333,14 +333,14 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             extension: &'a Option<Vec<Extension>>,
                                         }
-                                        
+                                            
                                         let extension_part = IdAndExtensionHelper {
                                             id: &value.id,
                                             extension: &value.extension,
                                         };
-                                        
-                                        // Use serialize_field for the extension part
-                                        state.serialize_field(#underscore_variant_key, &extension_part)?;
+                                            
+                                        // Use serialize_entry for SerializeMap
+                                        state.serialize_entry(#underscore_variant_key, &extension_part)?;
                                     }
                                     
                                     Ok(())
