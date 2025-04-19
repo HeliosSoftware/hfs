@@ -1213,7 +1213,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                      element.value = None;
                                 }
 
-                                Ok(#name::#variant_name(element)) // Use the variant_name Ident
+                                Ok(#name::#variant_name(element.into())) // Use .into()
                             }
                             // --- End Element/DecimalElement Variant Construction ---
                         } else {
@@ -1222,7 +1222,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
                                 let inner_value = serde::Deserialize::deserialize(value)
                                     .map_err(|e| serde::de::Error::custom(format!("Error deserializing non-element variant {}: {}", #variant_key, e)))?;
-                                Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                                Ok(#name::#variant_name(inner_value.into())) // Use .into()
                             }
                             // --- End Regular Newtype Variant Construction ---
                         }
@@ -1324,7 +1324,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     // If we already found a key based on the underscore version, ensure it matches
                                     if let Some(ref existing_key) = found_variant_key {
                                         if existing_key != base_name {
-                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, base_name)));
+                                             // Use key_str.as_str() for formatting
+                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, key_str.as_str())));
                                         }
                                     } else {
                                         found_variant_key = Some(base_name.to_string());
@@ -1339,7 +1340,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     // If we already found a key based on the base version, ensure it matches
                                      if let Some(ref existing_key) = found_variant_key {
                                         if existing_key != base_name {
-                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, underscore_name)));
+                                             // Use key_str.as_str() for formatting
+                                             return Err(serde::de::Error::custom(format!("Mismatched keys found: {} and {}", existing_key, key_str.as_str())));
                                         }
                                     } else {
                                         found_variant_key = Some(base_name.to_string()); // Store the BASE name
