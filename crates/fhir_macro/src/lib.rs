@@ -1190,13 +1190,13 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     let extension_value = extension_idx.map(|idx| values[idx].clone());
                                     
                                     // Deserialize the value part
-                                    let value_idx = keys.iter().position(|k| k == #variant_key);
+                                    let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
                                     let value_part = value_idx
                                         .map(|idx| values[idx].clone())
                                         .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
 
                                     // Deserialize the extension part if present
-                                    let extension_idx = keys.iter().position(|k| k == #underscore_variant_key);
+                                    let extension_idx = keys.iter().position(|k| k.as_str() == #underscore_variant_key);
                                     let extension_value = extension_idx.map(|idx| values[idx].clone());
                                     let mut ext_helper_opt: Option<IdAndExtensionHelper> = None;
                                     if let Some(ext_value) = extension_value {
@@ -1225,7 +1225,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             // Regular newtype variant
                             variant_matches.push(quote! {
                                 #variant_key => {
-                                    let value_idx = keys.iter().position(|k| k == #variant_key);
+                                    let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
                                     let value = value_idx
                                         .map(|idx| values[idx].clone())
                                         .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
@@ -1241,7 +1241,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Tuple variant with multiple fields
                         variant_matches.push(quote! {
                             #variant_key => {
-                                let value_idx = keys.iter().position(|k| k == #variant_key);
+                                let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
                                 let value = value_idx
                                     .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
@@ -1256,7 +1256,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Struct variant
                         variant_matches.push(quote! {
                             #variant_key => {
-                                let value_idx = keys.iter().position(|k| k == #variant_key);
+                                let value_idx = keys.iter().position(|k| k.as_str() == #variant_key);
                                 let value = value_idx
                                     .map(|idx| values[idx].clone())
                                     .ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
@@ -1320,14 +1320,14 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let mut found_variant_key: Option<String> = None;
                         for k in keys.iter() { // k is &String
                              #( // Loop over variant_names (&'static str, e.g., "authorReference", "authorString")
-                                // Check if k matches the base name
-                                if k == #variant_names {
+                                // Check if k matches the base name - convert both to &str for comparison
+                                if k.as_str() == #variant_names {
                                     found_variant_key = Some(#variant_names.to_string());
                                     break;
                                 }
                                 // Check if k matches the underscore-prefixed name
                                 let underscore_name = format!("_{}", #variant_names); // e.g., "_authorString"
-                                if k == &underscore_name { // Compare &String with &String
+                                if k.as_str() == underscore_name { // Compare &str with &str
                                     found_variant_key = Some(#variant_names.to_string()); // Store the base name, e.g., "authorString"
                                     break;
                                 }
