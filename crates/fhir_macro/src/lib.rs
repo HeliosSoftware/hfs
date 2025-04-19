@@ -1186,7 +1186,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             let underscore_variant_key_str = format!("_{}", variant_key); // For error messages
 
                             quote! {
-                                // Check if extension part exists *before* potentially moving it
+                                // Check if parts exist *before* potentially moving them
+                                let has_value_part = value_part.is_some();
                                 let has_extension_part = extension_part.is_some();
 
                                 // Deserialize the extension part if present
