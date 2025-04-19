@@ -1290,6 +1290,12 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
             // Generate the enum deserialization implementation
             return quote! {
+                // Import necessary crates/modules for generated code
+                use serde::{Deserialize, de::{self, Visitor, MapAccess}};
+                use serde_json; // Needed for Value
+                use std::collections::HashSet; // Needed for processed_keys
+                use syn; // Import syn crate for syn::Variant
+
                 // Define the helper struct at the top level of the deserialize function
                 #id_extension_helper_def
 
