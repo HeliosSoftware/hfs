@@ -1213,8 +1213,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                         element.extension = ext_helper.extension;
                                     }
                                 }
-                                // Ensure value is None if only extension was present
-                                if value_part.is_none() && extension_part.is_some() {
+                                // Ensure value is None if only extension was present (use the flag)
+                                if value_part.is_none() && has_extension_part {
                                      element.value = None;
                                 }
 
