@@ -1298,7 +1298,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     where
                         A: serde::de::MapAccess<'de>,
                     {
-                        let mut found_variant_key: Option<String> = None;
+                        let mut found_variant_key: Option<std::string::String> = None;
                         let mut value_part: Option<serde_json::Value> = None;
                         let mut extension_part: Option<serde_json::Value> = None;
                         let mut processed_keys = std::collections::HashSet::new(); // Track processed keys
