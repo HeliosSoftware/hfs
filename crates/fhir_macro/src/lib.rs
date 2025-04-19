@@ -350,7 +350,8 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         } else {
                             // Regular newtype variant
                             match_arms.push(quote! {
-                                Self::#variant_name(ref value) => {
+                                // Removed 'ref' from pattern
+                                Self::#variant_name(value) => {
                                     state.serialize_entry(#variant_key, value)?;
                                 }
                             });
@@ -1335,8 +1336,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                     key_matched = true;
                                 } else if key_str.as_str() == underscore_name.as_str() { // Compare &str == &str
                                     if extension_part.is_some() {
-                                        // Use key_str.as_str() which has a valid lifetime here
-                                        return Err(serde::de::Error::duplicate_field(key_str.as_str()));
+                                        // Pass slice of owned String `key_str`
+                                        return Err(serde::de::Error::duplicate_field(&key_str));
                                     }
                                     extension_part = Some(current_value.clone()); // Store the extension value
                                     // If we already found a key based on the base version, ensure it matches
