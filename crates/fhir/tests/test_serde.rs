@@ -48,7 +48,7 @@ struct NotificationTestStruct {
 #[derive(Debug, PartialEq, FhirSerde)]
 struct NotificationEventStruct {
     #[fhir_serde(rename = "eventNumber")]
-    event_number: Option<r5::Integer64>, // Assuming R5 based on URL in example
+    event_number: r5::Integer64, // Assuming R5 based on URL in example
     focus: Option<r5::Reference>,
 }
 
@@ -71,11 +71,11 @@ fn test_deserialize_integer64_from_string() {
     let expected_struct = NotificationTestStruct {
         notification_event: Some(vec![
             NotificationEventStruct {
-                event_number: Some(r5::Integer64 { // Integer64 is Element<i64, Extension>
+                event_number: r5::Integer64 { // Integer64 is Element<i64, Extension>
                     id: None,
                     extension: None,
                     value: Some(2i64), // Expecting the string "2" to be parsed as i64
-                }),
+                },
                 focus: Some(r5::Reference {
                     id: None,
                     extension: None,
