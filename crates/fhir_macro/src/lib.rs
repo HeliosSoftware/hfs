@@ -331,7 +331,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let field_ty = &field.ty;
                         
                         // Check if this is a primitive type that might have extensions
-                        let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
+                        let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
                         
                         if is_element || is_decimal_element {
                             // For Element types, we need special handling for the _fieldName pattern
