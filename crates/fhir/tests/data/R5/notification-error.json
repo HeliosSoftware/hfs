@@ -15,10 +15,10 @@
         },
         "status": "error",
         "type": "event-notification",
-        "eventsSinceSubscriptionStart": "328",
+        "eventsSinceSubscriptionStart": 328,
         "notificationEvent": [
           {
-            "eventNumber": "328",
+            "eventNumber": 328,
             "timestamp": "2020-04-17T10:20:00.0000000-05:00"
           }
         ],

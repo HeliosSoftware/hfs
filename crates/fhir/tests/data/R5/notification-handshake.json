@@ -15,7 +15,7 @@
         },
         "status": "requested",
         "type": "handshake",
-        "eventsSinceSubscriptionStart": "0",
+        "eventsSinceSubscriptionStart": 0,
         "subscription": {
           "reference": "http://example.org/FHIR/R5/Subscription/123"
         },

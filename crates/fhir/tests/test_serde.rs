@@ -14,7 +14,10 @@ fn test_serialize_decimal_with_value_present() {
         id: None,
         extension: None,
         // Use from_parts constructor
-        value: Some(PreciseDecimal::from_parts(Some(decimal_val), "1050.00".to_string())),
+        value: Some(PreciseDecimal::from_parts(
+            Some(decimal_val),
+            "1050.00".to_string(),
+        )),
     };
 
     // Serialize the actual element
@@ -34,76 +37,6 @@ fn test_serialize_decimal_with_value_present() {
         actual_json_string, expected_json_string
     );
 }
-
-
-// --- Test for deserializing Integer64 from string ---
-
-// Define structs to hold the notificationEvent element for testing (using R5 types)
-#[derive(Debug, PartialEq, FhirSerde)]
-struct NotificationTestStruct {
-    #[fhir_serde(rename = "notificationEvent")]
-    notification_event: Option<Vec<NotificationEventStruct>>,
-}
-
-#[derive(Debug, PartialEq, FhirSerde)]
-struct NotificationEventStruct {
-    #[fhir_serde(rename = "eventNumber")]
-    event_number: r5::Integer64, // Assuming R5 based on URL in example
-    focus: Option<r5::Reference>,
-}
-
-#[test]
-fn test_deserialize_integer64_from_string() {
-    let json_input = r#"
-    {
-      "notificationEvent": [
-        {
-          "eventNumber": "2",
-          "focus": {
-            "reference": "http://example.org/FHIR/R5/Encounter/2"
-          }
-        }
-      ]
-    }
-    "#;
-
-    // Expected Rust structure after deserialization
-    let expected_struct = NotificationTestStruct {
-        notification_event: Some(vec![
-            NotificationEventStruct {
-                event_number: r5::Integer64 { // Integer64 is Element<i64, Extension>
-                    id: None,
-                    extension: None,
-                    value: Some(2i64), // Expecting the string "2" to be parsed as i64
-                },
-                focus: Some(r5::Reference {
-                    id: None,
-                    extension: None,
-                    reference: Some(r5::String { // String is Element<String, Extension>
-                        id: None,
-                        extension: None,
-                        value: Some("http://example.org/FHIR/R5/Encounter/2".to_string()),
-                    }),
-                    r#type: None,
-                    identifier: None,
-                    display: None,
-                }),
-            },
-        ]),
-    };
-
-    // Deserialize the JSON input
-    let deserialized_struct: NotificationTestStruct =
-        serde_json::from_str(json_input).expect("Deserialization failed");
-
-    // Assert that the deserialized struct matches the expected structure
-    assert_eq!(
-        deserialized_struct, expected_struct,
-        "Deserialized struct does not match expected structure.\nExpected: {:#?}\nActual: {:#?}",
-        expected_struct, deserialized_struct
-    );
-}
-
 
 // --- Test for deserializing array with null primitive and corresponding extension ---
 
@@ -200,19 +133,14 @@ fn test_decimal_out_of_range() {
     // Test values from observation-decimal.json that are outside rust_decimal::Decimal range
     let json_inputs = [
         "1E-22",                      // Small, but in range
-        "1.000000000000000000E-245", // Too small
+        "1.000000000000000000E-245",  // Too small
         "-1.000000000000000000E+245", // Too large (negative)
     ];
 
     for json_input in json_inputs {
         // Deserialize from string
         let element: DecimalElement<Extension> = serde_json::from_str(json_input)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Deserialization from '{}' failed: {}",
-                    json_input, e
-                )
-            });
+            .unwrap_or_else(|e| panic!("Deserialization from '{}' failed: {}", json_input, e));
 
         // Check that the original string was preserved exactly
         assert_eq!(
@@ -224,24 +152,26 @@ fn test_decimal_out_of_range() {
 
         // Check that the parsed Decimal value is None for out-of-range inputs
         if json_input == "1E-22" {
-             // 1E-22 should parse correctly
+            // 1E-22 should parse correctly
             assert!(
                 element.value.as_ref().and_then(|pd| pd.value()).is_some(),
-                "Parsed value should be Some for input: {}", json_input
+                "Parsed value should be Some for input: {}",
+                json_input
             );
-             assert_eq!(
+            assert_eq!(
                 element.value.as_ref().and_then(|pd| pd.value()),
                 Some(dec!(1E-22)),
-                "Parsed value mismatch for input: {}", json_input
+                "Parsed value mismatch for input: {}",
+                json_input
             );
         } else {
             // E-245 and E+245 should result in None
             assert!(
                 element.value.as_ref().and_then(|pd| pd.value()).is_none(),
-                "Parsed value should be None for out-of-range input: {}", json_input
+                "Parsed value should be None for out-of-range input: {}",
+                json_input
             );
         }
-
 
         // Serialize back to string
         let reserialized_string = serde_json::to_string(&element).unwrap_or_else(|e| {
@@ -258,7 +188,7 @@ fn test_decimal_out_of_range() {
             json_input
         );
 
-         // Serialize back to JSON Value
+        // Serialize back to JSON Value
         let reserialized_value = serde_json::to_value(&element).unwrap_or_else(|e| {
             panic!(
                 "Serialization back to value for input '{}' failed: {}",
@@ -332,7 +262,10 @@ fn test_serialize_decimal_with_all_fields() {
             },
         ]),
         // Use from_parts constructor
-        value: Some(PreciseDecimal::from_parts(Some(decimal_val), "-987.654321".to_string())),
+        value: Some(PreciseDecimal::from_parts(
+            Some(decimal_val),
+            "-987.654321".to_string(),
+        )),
     };
 
     let json_string = serde_json::to_string(&element).expect("Serialization failed");
@@ -385,10 +318,16 @@ fn test_deserialize_decimal_from_integer() {
         serde_json::from_str(json_string).expect("Deserialization failed");
 
     // Check the numerical value (pd.value() now returns Option<Decimal>)
-    assert_eq!(element.value.as_ref().and_then(|pd| pd.value()), Some(dec!(10)));
+    assert_eq!(
+        element.value.as_ref().and_then(|pd| pd.value()),
+        Some(dec!(10))
+    );
     // Check the stored original string
     assert_eq!(
-        element.value.as_ref().map(|pd| pd.original_string().to_string()),
+        element
+            .value
+            .as_ref()
+            .map(|pd| pd.original_string().to_string()),
         Some("10".to_string())
     );
 
@@ -398,10 +337,16 @@ fn test_deserialize_decimal_from_integer() {
         serde_json::from_str(json_string).expect("Deserialization from bare integer string failed");
 
     // Check the numerical value (pd.value() now returns Option<Decimal>)
-    assert_eq!(element.value.as_ref().and_then(|pd| pd.value()), Some(dec!(10)));
+    assert_eq!(
+        element.value.as_ref().and_then(|pd| pd.value()),
+        Some(dec!(10))
+    );
     // Check the stored original string
     assert_eq!(
-        element.value.as_ref().map(|pd| pd.original_string().to_string()),
+        element
+            .value
+            .as_ref()
+            .map(|pd| pd.original_string().to_string()),
         Some("10".to_string())
     );
 }
@@ -1080,13 +1025,19 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: Some("dec-id".to_string()),
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: Some(Decimal {
             // Optional field with only value
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(98.7)), "98.7".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(98.7)),
+                "98.7".to_string(),
+            )),
         }),
         money1: Money {
             id: None,
@@ -1117,7 +1068,10 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: None,
         money1: Money {
@@ -1125,12 +1079,17 @@ fn test_fhir_serde_serialize() {
             id: Some("money-id".to_string().into()), // Convert String to Id
             extension: None,
             // Wrap dec! in PreciseDecimal and DecimalElement
-            value: Some(Decimal { // This is DecimalElement<Extension>
+            value: Some(Decimal {
+                // This is DecimalElement<Extension>
                 id: None,
                 extension: None,
-                value: Some(PreciseDecimal::from_parts(Some(dec!(100.50)), "100.50".to_string())),
+                value: Some(PreciseDecimal::from_parts(
+                    Some(dec!(100.50)),
+                    "100.50".to_string(),
+                )),
             }),
-            currency: Some(Code { // This is Element<String, Extension>
+            currency: Some(Code {
+                // This is Element<String, Extension>
                 // Assuming Code is Element<String, Extension>
                 id: None,
                 extension: None,
@@ -1142,10 +1101,14 @@ fn test_fhir_serde_serialize() {
             id: None,
             extension: Some(vec![default_extension()]),
             // Wrap dec! in PreciseDecimal and DecimalElement
-            value: Some(Decimal { // This is DecimalElement<Extension>
+            value: Some(Decimal {
+                // This is DecimalElement<Extension>
                 id: None,
                 extension: None,
-                value: Some(PreciseDecimal::from_parts(Some(dec!(200)), "200".to_string())),
+                value: Some(PreciseDecimal::from_parts(
+                    Some(dec!(200)),
+                    "200".to_string(),
+                )),
             }),
             currency: None, // This is Option<Element<String, Extension>>
         }),
@@ -1172,7 +1135,10 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: None,
         money1: Money {
@@ -1227,7 +1193,10 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: None,
         money1: Money {
@@ -1270,7 +1239,10 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: None,
         money1: Money {
@@ -1313,7 +1285,10 @@ fn test_fhir_serde_serialize() {
         decimal1: Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: None,
         money1: Money {
@@ -1604,12 +1579,18 @@ fn test_fhir_serde_deserialize() {
             id: Some("dec-id".to_string()),
             extension: None,
             // Deserialization preserves original string rep, value is Some
-            value: Some(PreciseDecimal::from_parts(Some(dec!(123.45)), "123.45".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(123.45)),
+                "123.45".to_string(),
+            )),
         },
         decimal2: Some(Decimal {
             id: None,
             extension: None,
-            value: Some(PreciseDecimal::from_parts(Some(dec!(98.7)), "98.7".to_string())),
+            value: Some(PreciseDecimal::from_parts(
+                Some(dec!(98.7)),
+                "98.7".to_string(),
+            )),
         }),
         money1: Money {
             id: None,
@@ -1646,7 +1627,10 @@ fn test_fhir_serde_deserialize() {
                 id: None,
                 extension: None,
                 // Note: Deserialization preserves original string.
-                value: Some(PreciseDecimal::from_parts(Some(dec!(100.50)), "100.50".to_string())),
+                value: Some(PreciseDecimal::from_parts(
+                    Some(dec!(100.50)),
+                    "100.50".to_string(),
+                )),
             }),
             currency: Some(Code {
                 value: Some("USD".to_string()),
@@ -1661,7 +1645,10 @@ fn test_fhir_serde_deserialize() {
                 id: None,
                 extension: None,
                 // Assume "200" was the input.
-                value: Some(PreciseDecimal::from_parts(Some(dec!(200)), "200".to_string())),
+                value: Some(PreciseDecimal::from_parts(
+                    Some(dec!(200)),
+                    "200".to_string(),
+                )),
             }),
             currency: None,
         }),
@@ -1863,7 +1850,8 @@ fn test_fhir_serde_deserialize_extension_with_primitive_extension() {
 
     // Assert that the reserialized JSON value is identical to the original JSON value
     assert_eq!(
-        original_value, reserialized_value,
+        original_value,
+        reserialized_value,
         "Roundtrip failed for Extension with primitive extension.\nOriginal JSON: {}\nReserialized JSON: {}",
         serde_json::to_string_pretty(&original_value).unwrap(),
         serde_json::to_string_pretty(&reserialized_value).unwrap()

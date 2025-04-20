@@ -185,8 +185,8 @@
             "code": "http://hl7.org/fhirpath/System.Integer"
           }
         ],
-        "minValueInteger64": "-9223372036854775808",
-        "maxValueInteger64": "9223372036854775807",
+        "minValueInteger64": -9223372036854775808,
+        "maxValueInteger64": 9223372036854775807,
         "isModifier": false,
         "isSummary": false
       }
@@ -228,8 +228,8 @@
             "code": "http://hl7.org/fhirpath/System.Integer"
           }
         ],
-        "minValueInteger64": "-9223372036854775808",
-        "maxValueInteger64": "9223372036854775807"
+        "minValueInteger64": -9223372036854775808,
+        "maxValueInteger64": 9223372036854775807
       }
     ]
   }

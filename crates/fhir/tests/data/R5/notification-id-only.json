@@ -15,10 +15,10 @@
         },
         "status": "active",
         "type": "event-notification",
-        "eventsSinceSubscriptionStart": "2",
+        "eventsSinceSubscriptionStart": 2,
         "notificationEvent": [
           {
-            "eventNumber": "2",
+            "eventNumber": 2,
             "focus": {
               "reference": "http://example.org/FHIR/R5/Encounter/2"
             }

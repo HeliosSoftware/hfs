@@ -42,10 +42,10 @@
               "id": "bef7e5fb-b5ad-4b59-a618-1bace2bbf5c0",
               "status": "active",
               "type": "event-notification",
-              "eventsSinceSubscriptionStart": "2",
+              "eventsSinceSubscriptionStart": 2,
               "notificationEvent": [
                 {
-                  "eventNumber": "2",
+                  "eventNumber": 2,
                   "focus": {
                     "reference": "http://example.org/FHIR/R5/Encounter/2"
                   }

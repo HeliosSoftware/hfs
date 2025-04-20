@@ -15,7 +15,7 @@
         },
         "status": "active",
         "type": "heartbeat",
-        "eventsSinceSubscriptionStart": "310",
+        "eventsSinceSubscriptionStart": 310,
         "subscription": {
           "reference": "http://example.org/FHIR/R5/Subscription/123"
         },

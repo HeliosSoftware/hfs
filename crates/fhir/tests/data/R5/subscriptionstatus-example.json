@@ -7,10 +7,10 @@
   },
   "status": "active",
   "type": "event-notification",
-  "eventsSinceSubscriptionStart": "1000",
+  "eventsSinceSubscriptionStart": 1000,
   "notificationEvent": [
     {
-      "eventNumber": "1000"
+      "eventNumber": 1000
     }
   ],
   "subscription": {

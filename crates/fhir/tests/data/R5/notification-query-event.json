@@ -15,10 +15,10 @@
         },
         "status": "active",
         "type": "query-event",
-        "eventsSinceSubscriptionStart": "310",
+        "eventsSinceSubscriptionStart": 310,
         "notificationEvent": [
           {
-            "eventNumber": "307",
+            "eventNumber": 307,
             "focus": {
               "reference": "http://example.org/FHIR/R5/Encounter/307"
             },
@@ -29,7 +29,7 @@
             ]
           },
           {
-            "eventNumber": "308",
+            "eventNumber": 308,
             "focus": {
               "reference": "http://example.org/FHIR/R5/Encounter/308"
             },

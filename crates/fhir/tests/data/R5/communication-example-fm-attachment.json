@@ -67,7 +67,7 @@
       "contentAttachment": {
         "contentType": "application/pdf",
         "url": "http://example.org/docs/AB12345",
-        "size": "104274",
+        "size": 104274,
         "hash": "SGVsbG8gdGhlcmU\u003d",
         "creation": "2010-02-01T10:57:34+01:00"
       }

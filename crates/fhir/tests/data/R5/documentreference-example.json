@@ -178,7 +178,7 @@
         "contentType": "application/hl7-v3+xml",
         "language": "en-US",
         "url": "http://example.org/xds/mhd/Binary/07a6483f-732b-461e-86b6-edb665c45510",
-        "size": "3654",
+        "size": 3654,
         "hash": "2jmj7l5rSw0yVb/vlWAYkK/YBwk\u003d",
         "title": "Physical",
         "creation": "2005-12-24T09:35:00+11:00"

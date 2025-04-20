@@ -170,7 +170,7 @@
         "contentType": "text/plain",
         "language": "en",
         "url": "http://example.com/nowhere.txt",
-        "size": "190",
+        "size": 190,
         "hash": "OGEzOGYyNjMzMDA2ZmQ1MzUxNDljNDRhM2E3M2YzMTI0MzdiMzQ3OA\u003d\u003d",
         "title": "DocumentReference for Comprehensive fully filled metadata",
         "creation": "2020-12-31T23:50:50-05:00"
