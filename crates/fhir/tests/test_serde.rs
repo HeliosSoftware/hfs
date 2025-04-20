@@ -35,6 +35,96 @@ fn test_serialize_decimal_with_value_present() {
     );
 }
 
+// --- Test for deserializing array with null primitive and corresponding extension ---
+
+// Define a struct to hold the Timing element for testing
+#[derive(Debug, PartialEq, FhirSerde)]
+struct TimingTestStruct {
+    #[fhir_serde(rename = "timingTiming")]
+    timing_timing: Option<Timing>, // Use Option<Timing> to match the JSON structure
+}
+
+#[test]
+fn test_deserialize_timing_with_null_primitive_and_extension() {
+    let json_input = r#"
+    {
+      "timingTiming": {
+        "event": [
+          null
+        ],
+        "_event": [
+          {
+            "extension": [
+              {
+                "url": "http://hl7.org/fhir/StructureDefinition/cqf-expression",
+                "valueExpression": {
+                  "language": "text/cql",
+                  "expression": "Now()"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+    "#;
+
+    // Expected Rust structure after deserialization
+    let expected_struct = TimingTestStruct {
+        timing_timing: Some(Timing {
+            id: None,
+            extension: None,
+            modifier_extension: None,
+            event: Some(vec![
+                // The first element corresponds to the null primitive and its extension
+                DateTime {
+                    id: None,
+                    // The extension comes from the corresponding _event element
+                    extension: Some(vec![Extension {
+                        id: None,
+                        extension: None,
+                        url: "http://hl7.org/fhir/StructureDefinition/cqf-expression"
+                            .to_string()
+                            .into(),
+                        value: Some(ExtensionValue::Expression(Expression {
+                            id: None,
+                            extension: None,
+                            description: None,
+                            name: None,
+                            language: Code {
+                                id: None,
+                                extension: None,
+                                value: Some("text/cql".to_string()),
+                            },
+                            expression: Some(String {
+                                id: None,
+                                extension: None,
+                                value: Some("Now()".to_string()),
+                            }),
+                            reference: None,
+                        })),
+                    }]),
+                    // The value is None because the primitive in the 'event' array was null
+                    value: None,
+                },
+            ]),
+            repeat: None,
+            code: None,
+        }),
+    };
+
+    // Deserialize the JSON input
+    let deserialized_struct: TimingTestStruct =
+        serde_json::from_str(json_input).expect("Deserialization failed");
+
+    // Assert that the deserialized struct matches the expected structure
+    assert_eq!(
+        deserialized_struct, expected_struct,
+        "Deserialized struct does not match expected structure.\nExpected: {:#?}\nActual: {:#?}",
+        expected_struct, deserialized_struct
+    );
+}
+
 #[test]
 fn test_decimal_out_of_range() {
     // Test values from observation-decimal.json that are outside rust_decimal::Decimal range
