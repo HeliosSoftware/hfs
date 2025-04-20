@@ -35,6 +35,76 @@ fn test_serialize_decimal_with_value_present() {
     );
 }
 
+
+// --- Test for deserializing Integer64 from string ---
+
+// Define structs to hold the notificationEvent element for testing (using R5 types)
+#[derive(Debug, PartialEq, FhirSerde)]
+struct NotificationTestStruct {
+    #[fhir_serde(rename = "notificationEvent")]
+    notification_event: Option<Vec<NotificationEventStruct>>,
+}
+
+#[derive(Debug, PartialEq, FhirSerde)]
+struct NotificationEventStruct {
+    #[fhir_serde(rename = "eventNumber")]
+    event_number: Option<r5::Integer64>, // Assuming R5 based on URL in example
+    focus: Option<r5::Reference>,
+}
+
+#[test]
+fn test_deserialize_integer64_from_string() {
+    let json_input = r#"
+    {
+      "notificationEvent": [
+        {
+          "eventNumber": "2",
+          "focus": {
+            "reference": "http://example.org/FHIR/R5/Encounter/2"
+          }
+        }
+      ]
+    }
+    "#;
+
+    // Expected Rust structure after deserialization
+    let expected_struct = NotificationTestStruct {
+        notification_event: Some(vec![
+            NotificationEventStruct {
+                event_number: Some(r5::Integer64 { // Integer64 is Element<i64, Extension>
+                    id: None,
+                    extension: None,
+                    value: Some(2i64), // Expecting the string "2" to be parsed as i64
+                }),
+                focus: Some(r5::Reference {
+                    id: None,
+                    extension: None,
+                    reference: Some(r5::String { // String is Element<String, Extension>
+                        id: None,
+                        extension: None,
+                        value: Some("http://example.org/FHIR/R5/Encounter/2".to_string()),
+                    }),
+                    r#type: None,
+                    identifier: None,
+                    display: None,
+                }),
+            },
+        ]),
+    };
+
+    // Deserialize the JSON input
+    let deserialized_struct: NotificationTestStruct =
+        serde_json::from_str(json_input).expect("Deserialization failed");
+
+    // Assert that the deserialized struct matches the expected structure
+    assert_eq!(
+        deserialized_struct, expected_struct,
+        "Deserialized struct does not match expected structure.\nExpected: {:#?}\nActual: {:#?}",
+        expected_struct, deserialized_struct
+    );
+}
+
+
 // --- Test for deserializing array with null primitive and corresponding extension ---
 
 // Define a struct to hold the Timing element for testing
