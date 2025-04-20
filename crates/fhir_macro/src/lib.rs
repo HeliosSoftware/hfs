@@ -161,8 +161,8 @@ fn get_box_inner_type(ty: &Type) -> Option<&Type> {
 }
 
 // Helper to check if a Type is Element<V, E> or DecimalElement<E>, potentially via a known alias.
-// Returns (IsElement, IsDecimalElement, IsOption, IsVec, Option<InnerType>)
-fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) {
+// Returns (IsElement, IsDecimalElement, IsOption, IsVec)
+fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool) {
     // List of known FHIR primitive type aliases that wrap Element or DecimalElement
     // Note: This list might need adjustment based on the specific FHIR version/implementation details.
     // IMPORTANT: Do not include base Rust types like "String", "bool", "i32" here.
@@ -243,16 +243,40 @@ fn get_element_info(field_ty: &Type) -> (bool, bool, bool, bool, Option<&Type>) 
                     is_decimal_element,
                     is_option,
                     is_vec,
-                    Some(current_ty), // Return the identified inner type
                 );
             }
         }
     }
 
-    (false, false, is_option, is_vec, None) // Not an Element or DecimalElement type we handle specially
+    (false, false, is_option, is_vec) // Not an Element or DecimalElement type we handle specially
 }
 
 // Keep this in sync with generate_primitive_type in fhir_gen/src/lib.rs
+// Helper function to get the inner type T from Option<T>, Vec<T>, or Box<T>
+fn get_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(TypePath { path, .. }) = ty {
+        if let Some(segment) = path.segments.last() {
+            if segment.ident == "Option" || segment.ident == "Vec" || segment.ident == "Box" {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// Helper function to recursively unwrap Option, Vec, and Box to get the base type
+fn get_base_type(ty: &Type) -> &Type {
+    let mut current_ty = ty;
+    while let Some(inner) = get_inner_type(current_ty) {
+        current_ty = inner;
+    }
+    current_ty
+}
+
 fn extract_inner_element_type(type_name: &str) -> &str {
     match type_name {
         "Boolean" => "bool",
@@ -425,9 +449,9 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         let effective_field_name_str = get_effective_field_name(field);
                         let underscore_field_name_str = format!("_{}", effective_field_name_str);
 
-                        // Destructure all 5 return values from get_element_info
+                        // Destructure the 4 return values from get_element_info
                         // We need is_element, is_decimal_element, is_option, is_vec here
-                        let (is_element, is_decimal_element, is_option, is_vec, _inner_ty) =
+                        let (is_element, is_decimal_element, is_option, is_vec) =
                             get_element_info(field_ty);
 
                         // Determine if it's an FHIR element type we need to handle specially
@@ -812,215 +836,150 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quote::ToTokens;
-    use syn::{Type, parse_str}; // Import ToTokens trait
-
-    // Helper to compare Option<&Type> by converting to string
-    fn type_option_to_string(ty_opt: Option<&Type>) -> Option<String> {
-        ty_opt.map(|ty| ty.to_token_stream().to_string())
-    }
+    use syn::{Type, parse_str};
 
     #[test]
     fn test_get_element_info_option_element() {
         let ty: Type = parse_str("Option<Element<Markdown, Extension>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option);
         assert!(!is_vec);
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < Markdown , Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_decimal_element() {
         let ty: Type = parse_str("Option<DecimalElement<Extension>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(!is_element);
         assert!(is_decimal);
         assert!(is_option);
         assert!(!is_vec);
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("DecimalElement < Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_markdown() {
         let ty: Type = parse_str("Option<Markdown>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // It is an Option
         assert!(!is_vec);
-        // For aliases, inner_ty should be Some(alias_type)
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Markdown".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_vec_option_element() {
         let ty: Type = parse_str("Option<Vec<Option<Element<bool, Extension>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < bool , Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_vec_option_decimal_element() {
         let ty: Type = parse_str("Option<Vec<Option<DecimalElement<Extension>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(!is_element);
         assert!(is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("DecimalElement < Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_vec_markdown() {
         let ty: Type = parse_str("Option<Vec<Markdown>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
-        // For aliases, inner_ty should be Some(alias_type)
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Markdown".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_element() {
         let ty: Type = parse_str("Element<String, Extension>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < String , Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_decimal_element() {
         let ty: Type = parse_str("DecimalElement<Extension>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(!is_element);
         assert!(is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("DecimalElement < Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_markdown() {
         let ty: Type = parse_str("Markdown").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element); // Markdown should be identified as Element
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        // For aliases, inner_ty should be Some(alias_type)
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Markdown".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_vec_option_element() {
         // Less common, but test Vec<Option<Element>> without outer Option
         let ty: Type = parse_str("Vec<Option<Element<bool, Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option); // No outer Option
         assert!(is_vec); // Vec is present
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < bool , Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_vec_option_decimal_element() {
         let ty: Type = parse_str("Vec<Option<DecimalElement<Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(!is_element);
         assert!(is_decimal);
         assert!(!is_option); // No outer Option
         assert!(is_vec); // Vec is present
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("DecimalElement < Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_vec_string() {
         let ty: Type = parse_str("Vec<String>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         // String IS identified as Element because it's in KNOWN_ELEMENT_ALIASES
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(is_vec);
-        // For aliases, inner_ty should be Some(alias_type)
-        assert_eq!(type_option_to_string(inner_ty), Some("String".to_string()));
     }
 
     #[test]
     fn test_get_element_info_option_box_element() {
         // Test with Box wrapping
         let ty: Type = parse_str("Option<Box<Element<String, Extension>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option);
         assert!(!is_vec);
-        // The inner type returned should be the Element itself after unwrapping Box
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < String , Extension >".to_string())
-        );
     }
 
     #[test]
     fn test_get_element_info_option_vec_option_box_element() {
         // Test with Box inside Vec<Option<...>>
         let ty: Type = parse_str("Option<Vec<Option<Box<Element<bool, Extension>>>>>").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) = get_element_info(&ty);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(is_option); // Outer Option
         assert!(is_vec); // Vec is present
-        // The inner type returned should be the Element itself after unwrapping Box
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < bool , Extension >".to_string())
-        );
     }
 
     #[test]
@@ -1041,26 +1000,21 @@ mod tests {
 
         // Test with a path that *doesn't* end in Element/DecimalElement
         let ty_non_element_path: Type = parse_str("some::module::RegularStruct").unwrap();
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) =
+        let (is_element, is_decimal, is_option, is_vec) =
             get_element_info(&ty_non_element_path);
         assert!(!is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert!(inner_ty.is_none());
 
         // Test with a path that *does* end in Element (simulating alias)
         // We use the actual Element type parsed earlier for this simulation
-        let (is_element, is_decimal, is_option, is_vec, inner_ty) =
+        let (is_element, is_decimal, is_option, is_vec) =
             get_element_info(&ty_simulated_alias);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
         assert!(!is_vec);
-        assert_eq!(
-            type_option_to_string(inner_ty),
-            Some("Element < String , Extension >".to_string())
-        );
     }
 
     #[test]
@@ -1179,7 +1133,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         // Newtype variant (e.g., String(String))
                         let field = fields.unnamed.first().unwrap();
                         let field_ty = &field.ty;
-                        let (is_element, is_decimal_element, _, _, _) = get_element_info(field_ty);
+                        let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
 
                         if is_element || is_decimal_element {
                             // --- Element/DecimalElement Variant Construction ---
@@ -1190,8 +1144,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 quote! { crate::PreciseDecimal }
                             } else {
                                 // Extract V from Element<V, E> or the alias's underlying primitive
-                                let element_or_alias_type = get_element_info(field_ty).4.expect("Element type expected but not found");
-                                if let Type::Path(type_path) = element_or_alias_type {
+                                // Need to re-determine the base type here
+                                let base_type = get_base_type(field_ty);
+                                if let Type::Path(type_path) = base_type {
                                      if let Some(last_segment) = type_path.path.segments.last() {
                                          if last_segment.ident == "Element" {
                                              // Direct Element<V, E>
@@ -1434,17 +1389,16 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                         let _underscore_field_name_str =
                             format_ident!("_{}", effective_field_name_str);
 
-                        // Destructure all 5 return values, ignoring the inner_ty for now if not needed
-                        let (is_element, is_decimal_element, is_option, is_vec, inner_ty) =
+                        // Destructure the 4 return values
+                        let (is_element, is_decimal_element, is_option, is_vec) =
                             get_element_info(field_ty);
 
                         let is_fhir_element = is_element || is_decimal_element;
 
                         // Determine the type for the primitive value field in the temp struct
                         let temp_primitive_type_quote = if is_fhir_element {
-                            let inner_ty_opt = inner_ty; // Use the Option<&Type> from get_element_info
-                            let inner_ty =
-                                inner_ty_opt.expect("Element type expected but not found");
+                            // Need to re-determine the base type here
+                            let base_type = get_base_type(field_ty);
 
                             // Determine the base primitive type (e.g., bool, String, rust_decimal::Decimal)
                             let primitive_type_ident = if is_decimal_element {
@@ -1452,7 +1406,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 quote! { serde_json::Value }
                             } else {
                                 // is_element is true here
-                                if let Type::Path(type_path) = inner_ty {
+                                if let Type::Path(type_path) = base_type {
                                     if let Some(last_segment) = type_path.path.segments.last() {
                                         if last_segment.ident == "Element" {
                                             // Direct Element<V, E>
