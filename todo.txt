@@ -1,9 +1,5 @@
-- Need to remove unnecessary parameter on get_element_info
+- R6 tests need help - Integer64 issues in comparison because we download them each time, so might need an exclusion list for R6
 - Search for SLM TODO - need to change the others I think
-- Remember to remove Default on all structs - needed for initial draft implementation of fhir_macro
-- Thinking that what we have for PreciseDecimal is overkill and that rust_decimal should be able to handle the preservation of trailing zeros - e.g. 3.0000
-- Need to figure out how to support extensions on primitives (or any json _ attribute) and placement into the extension Vec.
-- Need to improve the deserialize/serialze/deserialze test - it's currently only checking ::Value
 - Need to add resourceType as an attribute to all resources
 - I can use a Custom Derive Macro, but I'm unsure what output it should have to send to the evaluator?
 - Change the form of the evaluator to:  expr:Expression, fhir_resources: Array(Resources), base:Expression, env_variables (HashMap(String, String), model (r4) ??, options (struct 
