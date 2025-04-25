@@ -147,14 +147,13 @@ fn test_parse_simple_expressions() {
 fn test_multiple_expressions_from_file() {
     // Get the path to the test file
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("resources/r4/tests-fhir-r4.xml");
+    path.push("tests/data/r4/tests-fhir-r4.xml");
 
     // Load the test file or use a fallback if it doesn't exist
     let mut file = match File::open(&path) {
         Ok(file) => file,
         Err(e) => {
-            println!("Warning: Could not open test file: {:?}.", e);
-            return;
+            panic!("Warning: Could not open test file: {:?}.", e);
         }
     };
     let mut contents = String::new();

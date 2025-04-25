@@ -113,7 +113,10 @@ fn test_variable_access() {
         let expr = parser().parse(input).unwrap();
         println!("Variable access parsed expression: {:?}", expr);
         let result = evaluate(&expr, &context);
-        println!("Variable access result: {:?}, Expected: {:?}", result, expected);
+        println!(
+            "Variable access result: {:?}, Expected: {:?}",
+            result, expected
+        );
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
@@ -146,7 +149,10 @@ fn test_string_operations() {
         let expr = parser().parse(input).unwrap();
         println!("String operation parsed expression: {:?}", expr);
         let result = evaluate(&expr, &context);
-        println!("String operation result: {:?}, Expected: {:?}", result, expected);
+        println!(
+            "String operation result: {:?}, Expected: {:?}",
+            result, expected
+        );
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
 }
@@ -155,33 +161,71 @@ fn test_string_operations() {
 fn test_functions() {
     // We'll set up the context without any resources
     let context = EvaluationContext::new_empty();
-    
+
     // Test collection functions
     let test_cases = vec![
         // Empty collection
-        ("{}".to_string(), "count()".to_string(), EvaluationResult::Integer(0)),
-        ("{}".to_string(), "empty()".to_string(), EvaluationResult::Boolean(true)),
-        ("{}".to_string(), "exists()".to_string(), EvaluationResult::Boolean(false)),
-        
+        (
+            "{}".to_string(),
+            "count()".to_string(),
+            EvaluationResult::Integer(0),
+        ),
+        (
+            "{}".to_string(),
+            "empty()".to_string(),
+            EvaluationResult::Boolean(true),
+        ),
+        (
+            "{}".to_string(),
+            "exists()".to_string(),
+            EvaluationResult::Boolean(false),
+        ),
         // Single item
-        ("'test'".to_string(), "count()".to_string(), EvaluationResult::Integer(1)),
-        ("'test'".to_string(), "empty()".to_string(), EvaluationResult::Boolean(false)),
-        ("'test'".to_string(), "exists()".to_string(), EvaluationResult::Boolean(true)),
-        
+        (
+            "'test'".to_string(),
+            "count()".to_string(),
+            EvaluationResult::Integer(1),
+        ),
+        (
+            "'test'".to_string(),
+            "empty()".to_string(),
+            EvaluationResult::Boolean(false),
+        ),
+        (
+            "'test'".to_string(),
+            "exists()".to_string(),
+            EvaluationResult::Boolean(true),
+        ),
         // String functions
-        ("'Hello'".to_string(), "count()".to_string(), EvaluationResult::Integer(1)),
-        ("'Hello'".to_string(), "length()".to_string(), EvaluationResult::Integer(5)),
-        ("'Hello, World!'".to_string(), "contains('World')".to_string(), EvaluationResult::Boolean(true)),
-        ("'Hello, World!'".to_string(), "contains('Goodbye')".to_string(), EvaluationResult::Boolean(false)),
+        (
+            "'Hello'".to_string(),
+            "count()".to_string(),
+            EvaluationResult::Integer(1),
+        ),
+        (
+            "'Hello'".to_string(),
+            "length()".to_string(),
+            EvaluationResult::Integer(5),
+        ),
+        (
+            "'Hello, World!'".to_string(),
+            "contains('World')".to_string(),
+            EvaluationResult::Boolean(true),
+        ),
+        (
+            "'Hello, World!'".to_string(),
+            "contains('Goodbye')".to_string(),
+            EvaluationResult::Boolean(false),
+        ),
     ];
-    
+
     for (base, func, expected) in test_cases {
         let full_expr = if base == "{}" {
             func.clone()
         } else {
             format!("{}.{}", base, func)
         };
-        
+
         println!("Testing expression: {}", full_expr);
         let expr = parser().parse(&*full_expr).unwrap();
         let result = evaluate(&expr, &context);
@@ -198,8 +242,10 @@ fn test_direct_string_operations() {
     let expr = parser().parse("'Hello, World!'.contains('World')").unwrap();
     let result = evaluate(&expr, &context);
     assert_eq!(result, EvaluationResult::Boolean(true));
-    
-    let expr = parser().parse("'Hello, World!'.contains('Goodbye')").unwrap();
+
+    let expr = parser()
+        .parse("'Hello, World!'.contains('Goodbye')")
+        .unwrap();
     let result = evaluate(&expr, &context);
     assert_eq!(result, EvaluationResult::Boolean(false));
 }
@@ -241,5 +287,5 @@ fn test_resource_access() {
     // Test accessing the resource type
     let expr = parser().parse("resourceType").unwrap();
     let result = evaluate(&expr, &context);
-    assert_eq!(result, EvaluationResult::String("R4Resource".to_string()));
+    assert_eq!(result, EvaluationResult::String("Account".to_string()));
 }
