@@ -14748,7 +14748,7 @@ pub struct VisionPrescriptionLensSpecification {
 }
 
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FhirPath)] // Added FhirPath
 #[serde(tag = "resourceType")]
 pub enum Resource {
     Account(Account),
