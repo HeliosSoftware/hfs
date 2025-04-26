@@ -197,9 +197,11 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
             // Match on the specific resource type inside the Box to access fields
-            match &**r { // Dereference Box -> Resource enum -> reference inner struct
+            match &**r {
+                // Dereference Box -> Resource enum -> reference inner struct
                 r4::Resource::Account(inner) => {
-                    if let Some(id_element) = &inner.id { // Access 'id' field directly
+                    if let Some(id_element) = &inner.id {
+                        // Access 'id' field directly
                         obj.insert("id".to_string(), id_element.into_evaluation_result());
                     }
                     // Add other fields from Account if needed
