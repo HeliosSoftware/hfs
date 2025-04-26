@@ -502,6 +502,7 @@ dependencies = [
 name = "fhir_macro"
 version = "0.1.0"
 dependencies = [
+ "fhirpath_support",
  "heck",
  "proc-macro2",
  "quote",

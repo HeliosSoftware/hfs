@@ -24,7 +24,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Create the version-specific output file with initial content
     std::fs::write(
         &version_path,
-        "use fhir_macro::FhirSerde;\nuse serde::{Serialize, Deserialize};\n
+        "use fhir_macro::{FhirSerde, FhirPath};\nuse serde::{Serialize, Deserialize};\n
 use crate::{Element, DecimalElement};\n\n",
     )?;
 
@@ -223,7 +223,7 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
     // Add Clone to the derives for the Resource enum
-    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]\n");
+    output.push_str("#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FhirPath)]\n");
     output.push_str("#[serde(tag = \"resourceType\")]\n");
     output.push_str("pub enum Resource {\n");
 
@@ -434,7 +434,7 @@ fn process_elements(
             ));
 
             // Generate enum derives - Add Clone, PartialEq, Eq to all enums
-            let enum_derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde"];
+            let enum_derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde", "FhirPath"];
             output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
 
             // Add other serde attributes and enum definition
@@ -461,7 +461,15 @@ fn process_elements(
         }
 
         // Generate struct derives - Add Clone, PartialEq, Eq to all structs
-        let derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde", "Default"];
+        let derives = vec![
+            "Debug",
+            "Clone",
+            "PartialEq",
+            "Eq",
+            "FhirSerde",
+            "FhirPath",
+            "Default",
+        ];
         output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
 
         // Add other serde attributes and struct definition
