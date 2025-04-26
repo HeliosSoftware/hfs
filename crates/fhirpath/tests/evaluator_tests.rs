@@ -1,7 +1,8 @@
 use chumsky::Parser;
 use fhir::FhirResource;
-use fhirpath::evaluator::{EvaluationContext, EvaluationResult, evaluate};
+use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
+use fhirpath_support::EvaluationResult;
 
 #[test]
 fn test_simple_literals() {
@@ -255,7 +256,7 @@ fn test_resource_access() {
     use fhir::r4;
     // Create a dummy R4 resource for testing
     let dummy_resource = r4::Resource::Account(r4::Account {
-        id: None,
+        id: Some("theid".to_string().into()), // Convert String to Id
         meta: None,
         implicit_rules: None,
         language: None,
@@ -285,7 +286,7 @@ fn test_resource_access() {
     resources.push(FhirResource::R4(Box::new(dummy_resource)));
     let context = EvaluationContext::new(resources);
     // Test accessing the resource type
-    let expr = parser().parse("resourceType").unwrap();
+    let expr = parser().parse("theid").unwrap();
     let result = evaluate(&expr, &context);
-    assert_eq!(result, EvaluationResult::String("Account".to_string()));
+    assert_eq!(result, EvaluationResult::String("theid".to_string()));
 }

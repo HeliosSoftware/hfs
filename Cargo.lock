@@ -476,6 +476,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fhir_macro",
+ "fhirpath_support",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -515,7 +516,15 @@ version = "0.1.0"
 dependencies = [
  "chumsky",
  "fhir",
+ "fhirpath_support",
  "roxmltree",
+]
+
+[[package]]
+name = "fhirpath_support"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
 ]
 
 [[package]]

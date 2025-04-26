@@ -1,15 +1,11 @@
-use fhirpath_support::EvaluationResult;
-use fhirpath_support::IntoEvaluationResult;
-use rust_decimal::Decimal;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
-use rust_decimal::prelude::ToPrimitive; // For decimal conversion
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{
-    de::{self, Deserializer, MapAccess, Visitor},
     Deserialize, Serialize,
+    de::{self, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
-// Removed unused RawValue import
 use std::marker::PhantomData;
 
 // Store the original string representation and optionally the parsed Decimal value.
@@ -868,97 +864,5 @@ where
             }
             None => EvaluationResult::Empty, // DecimalElement held None
         }
-    }
-}
-
-// --- Implementations for Rust Primitives (used within Elements) ---
-
-impl IntoEvaluationResult for String {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        // Could potentially parse FHIR date/time/instant strings here
-        // if needed for specific FHIRPath functions, but basic string
-        // is often sufficient for simple path navigation.
-        EvaluationResult::String(self.clone())
-    }
-}
-
-impl IntoEvaluationResult for bool {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Boolean(*self)
-    }
-}
-
-impl IntoEvaluationResult for i32 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        // Assuming i32 maps to FHIR integer types
-        EvaluationResult::Integer(*self as i64) // Convert to i64 for EvaluationResult
-    }
-}
-
-impl IntoEvaluationResult for i64 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Integer(*self)
-    }
-}
-
-// Add f64 if used directly (less common in FHIR primitives)
-impl IntoEvaluationResult for f64 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Number(*self)
-    }
-}
-
-// Add rust_decimal::Decimal if used directly (less common)
-impl IntoEvaluationResult for rust_decimal::Decimal {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        self.to_f64()
-            .map(EvaluationResult::Number)
-            .unwrap_or(EvaluationResult::Empty)
-    }
-}
-
-// --- Implementations for Option<T> and Vec<T> ---
-
-impl<T> IntoEvaluationResult for Option<T>
-where
-    T: IntoEvaluationResult,
-{
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        match self {
-            Some(value) => value.into_evaluation_result(), // Convert the inner value
-            None => EvaluationResult::Empty,
-        }
-    }
-}
-
-impl<T> IntoEvaluationResult for Vec<T>
-where
-    T: IntoEvaluationResult,
-{
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        let collection: Vec<EvaluationResult> = self
-            .iter()
-            .map(|item| item.into_evaluation_result()) // Convert each item
-            .collect();
-
-        // FHIRPath distinguishes empty collections from null/empty.
-        EvaluationResult::Collection(collection)
-        // If you wanted to treat empty Vec as Empty:
-        // if collection.is_empty() {
-        //     EvaluationResult::Empty
-        // } else {
-        //     EvaluationResult::Collection(collection)
-        // }
-    }
-}
-
-// --- Implementation for Box<T> ---
-impl<T> IntoEvaluationResult for Box<T>
-where
-    T: IntoEvaluationResult,
-{
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        // Dereference the Box and call the inner type's implementation
-        (**self).into_evaluation_result()
     }
 }

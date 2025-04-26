@@ -12,5 +12,6 @@ R6 = []
 
 [dependencies]
 fhir = { path = "../fhir" }
+fhirpath_support = { path = "../fhirpath_support" }
 chumsky = "0.9.3"
 roxmltree = "0.19.0"
