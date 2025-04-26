@@ -201,12 +201,6 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
         }
         #[cfg(feature = "R4B")]
         FhirResource::R4B(r) => {
-            let mut obj = HashMap::new();
-            obj.insert(
-                "resourceType".to_string(),
-                EvaluationResult::String("R4BResource".to_string()),
-            );
-            EvaluationResult::Object(obj)
             // Similar extraction for R4B
             let mut obj = HashMap::new();
              if let Some(id_element) = r.id() {
