@@ -185,95 +185,37 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     }
 }
 
-/// Converts a FHIR resource to an EvaluationResult
+/// Converts a FHIR resource to an EvaluationResult using the derived IntoEvaluationResult trait.
 fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
-    // This is a simplified conversion - in a real implementation,
-    // you would convert the resource to a proper object representation
-    // that can be navigated with FHIRPath.
-    // This needs to be significantly expanded for full FHIRPath support.
+    // Leverage the IntoEvaluationResult trait implemented by the #[derive(FhirPath)] macro
+    // on the inner rX::Resource enum.
     match resource {
         #[cfg(feature = "R4")]
         FhirResource::R4(r) => {
-            // Convert R4 resource to an object representation
-            let mut obj = HashMap::new();
-            // Match on the specific resource type inside the Box to access fields
-            match &**r {
-                // Dereference Box -> Resource enum -> reference inner struct
-                r4::Resource::Account(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        // Access 'id' field directly
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                    // Add other fields from Account if needed
-                }
-                r4::Resource::Patient(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                    // Add other fields from Patient if needed
-                }
-                // Add cases for other R4 resource types as needed...
-                _ => { /* Resource type not handled or doesn't have 'id' */ }
-            }
-            EvaluationResult::Object(obj)
+            // Dereference the Box to get the r4::Resource enum,
+            // then call the trait method derived by #[derive(FhirPath)].
+            // The derived implementation on the enum handles matching the specific variant
+            // and calling its corresponding derived implementation.
+            (*r).into_evaluation_result()
         }
         #[cfg(feature = "R4B")]
         FhirResource::R4B(r) => {
-            let mut obj = HashMap::new();
-            match &**r {
-                r4b::Resource::Account(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                r4b::Resource::Patient(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                // Add cases for other R4B resource types as needed...
-                _ => { /* Resource type not handled or doesn't have 'id' */ }
-            }
-            EvaluationResult::Object(obj)
+            // Same logic applies to R4B
+            (*r).into_evaluation_result()
         }
         #[cfg(feature = "R5")]
         FhirResource::R5(r) => {
-            let mut obj = HashMap::new();
-            match &**r {
-                r5::Resource::Account(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                r5::Resource::Patient(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                // Add cases for other R5 resource types as needed...
-                _ => { /* Resource type not handled or doesn't have 'id' */ }
-            }
-            EvaluationResult::Object(obj)
+            // Same logic applies to R5
+            (*r).into_evaluation_result()
         }
         #[cfg(feature = "R6")]
         FhirResource::R6(r) => {
-            let mut obj = HashMap::new();
-            match &**r {
-                r6::Resource::Account(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                r6::Resource::Patient(inner) => {
-                    if let Some(id_element) = &inner.id {
-                        obj.insert("id".to_string(), id_element.into_evaluation_result());
-                    }
-                }
-                // Add cases for other R6 resource types as needed...
-                _ => { /* Resource type not handled or doesn't have 'id' */ }
-            }
-            EvaluationResult::Object(obj)
+            // Same logic applies to R6
+            (*r).into_evaluation_result()
         }
+        // Note: If no features are enabled, this match might be empty.
+        // If the function is called in such a state, it would lead to a compile error,
+        // which is reasonable behavior.
     }
 }
 
