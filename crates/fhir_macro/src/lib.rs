@@ -1899,13 +1899,24 @@ fn generate_fhirpath_enum_impl(
         }
     });
 
+    // Handle the case where the enum has no variants
+    let body = if data.variants.is_empty() {
+        // An empty enum cannot be instantiated, so this method is technically unreachable.
+        // Return Empty as a safe default.
+        quote! { fhirpath_support::EvaluationResult::Empty }
+    } else {
+        // Generate the match statement for enums with variants
+        quote! {
+            match self {
+                #(#match_arms)*
+            }
+        }
+    };
 
     quote! {
         impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
             fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
-                 match self {
-                     #(#match_arms)*
-                 }
+                 #body // Use the generated body (either Empty or the match statement)
             }
         }
     }
