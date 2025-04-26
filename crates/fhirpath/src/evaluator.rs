@@ -1,6 +1,14 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+#[cfg(feature = "R4")]
+use fhir::r4::prelude::*; // Import R4 prelude for traits
+#[cfg(feature = "R4B")]
+use fhir::r4b::prelude::*; // Import R4B prelude for traits
+#[cfg(feature = "R5")]
+use fhir::r5::prelude::*; // Import R5 prelude for traits
+#[cfg(feature = "R6")]
+use fhir::r6::prelude::*; // Import R6 prelude for traits
 use fhir::FhirResource;
-use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Import IntoEvaluationResult
+use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use std::collections::HashMap;
 
 /// Context for evaluating FHIRPath expressions
