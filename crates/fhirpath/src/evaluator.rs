@@ -175,37 +175,11 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
     }
 }
 
-/// Converts a FHIR resource to an EvaluationResult using the derived IntoEvaluationResult trait.
+/// Converts a FHIR resource to an EvaluationResult by calling the trait method directly.
+#[inline] // Suggest inlining this simple function call
 fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
-    // Leverage the IntoEvaluationResult trait implemented by the #[derive(FhirPath)] macro
-    // on the inner rX::Resource enum.
-    match resource {
-        #[cfg(feature = "R4")]
-        FhirResource::R4(r) => {
-            // Dereference the Box to get the r4::Resource enum,
-            // then call the trait method derived by #[derive(FhirPath)].
-            // The derived implementation on the enum handles matching the specific variant
-            // and calling its corresponding derived implementation.
-            (*r).into_evaluation_result()
-        }
-        #[cfg(feature = "R4B")]
-        FhirResource::R4B(r) => {
-            // Same logic applies to R4B
-            (*r).into_evaluation_result()
-        }
-        #[cfg(feature = "R5")]
-        FhirResource::R5(r) => {
-            // Same logic applies to R5
-            (*r).into_evaluation_result()
-        }
-        #[cfg(feature = "R6")]
-        FhirResource::R6(r) => {
-            // Same logic applies to R6
-            (*r).into_evaluation_result()
-        } // Note: If no features are enabled, this match might be empty.
-          // If the function is called in such a state, it would lead to a compile error,
-          // which is reasonable behavior.
-    }
+    // Now that FhirResource implements IntoEvaluationResult, just call the method.
+    resource.into_evaluation_result()
 }
 
 /// Evaluates a literal value

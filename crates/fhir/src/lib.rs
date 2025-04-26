@@ -1,4 +1,5 @@
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Add this import
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{
@@ -863,6 +864,24 @@ where
                 }
             }
             None => EvaluationResult::Empty, // DecimalElement held None
+        }
+    }
+}
+
+// Implement the trait for the top-level enum
+impl IntoEvaluationResult for FhirResource {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        match self {
+            #[cfg(feature = "R4")]
+            FhirResource::R4(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r4::Resource>
+            #[cfg(feature = "R4B")]
+            FhirResource::R4B(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r4b::Resource>
+            #[cfg(feature = "R5")]
+            FhirResource::R5(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r5::Resource>
+            #[cfg(feature = "R6")]
+            FhirResource::R6(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r6::Resource>
+            // Note: If no features are enabled, this match might be empty or non-exhaustive.
+            // This is generally okay as the enum itself wouldn't be usable.
         }
     }
 }
