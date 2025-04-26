@@ -194,44 +194,81 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     match resource {
         #[cfg(feature = "R4")]
         FhirResource::R4(r) => {
-            let resource_enum: &r4::Resource = &*r; // Explicit type annotation
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
-            // Add resource properties to the object
-            // Example: Extract 'id' if present
-            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
-                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            // Match on the specific resource type inside the Box to access fields
+            match &**r { // Dereference Box -> Resource enum -> reference inner struct
+                r4::Resource::Account(inner) => {
+                    if let Some(id_element) = &inner.id { // Access 'id' field directly
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                    // Add other fields from Account if needed
+                }
+                r4::Resource::Patient(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                    // Add other fields from Patient if needed
+                }
+                // Add cases for other R4 resource types as needed...
+                _ => { /* Resource type not handled or doesn't have 'id' */ }
             }
-            // Add other fields as needed...
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R4B")]
         FhirResource::R4B(r) => {
-            let resource_enum: &r4b::Resource = &*r; // Explicit type annotation
-            // Similar extraction for R4B
             let mut obj = HashMap::new();
-            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
-                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            match &**r {
+                r4b::Resource::Account(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                r4b::Resource::Patient(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                // Add cases for other R4B resource types as needed...
+                _ => { /* Resource type not handled or doesn't have 'id' */ }
             }
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R5")]
         FhirResource::R5(r) => {
-            let resource_enum: &r5::Resource = &*r; // Explicit type annotation
-            // Similar extraction for R5
             let mut obj = HashMap::new();
-            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
-                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            match &**r {
+                r5::Resource::Account(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                r5::Resource::Patient(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                // Add cases for other R5 resource types as needed...
+                _ => { /* Resource type not handled or doesn't have 'id' */ }
             }
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R6")]
         FhirResource::R6(r) => {
-            let resource_enum: &r6::Resource = &*r; // Explicit type annotation
-            // Similar extraction for R6
             let mut obj = HashMap::new();
-            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
-                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            match &**r {
+                r6::Resource::Account(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                r6::Resource::Patient(inner) => {
+                    if let Some(id_element) = &inner.id {
+                        obj.insert("id".to_string(), id_element.into_evaluation_result());
+                    }
+                }
+                // Add cases for other R6 resource types as needed...
+                _ => { /* Resource type not handled or doesn't have 'id' */ }
             }
             EvaluationResult::Object(obj)
         }
