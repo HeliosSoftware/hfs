@@ -1,15 +1,17 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
-#[cfg(feature = "R4")]
-use fhir::r4::prelude::*; // Import R4 prelude for traits
-#[cfg(feature = "R4B")]
-use fhir::r4b::prelude::*; // Import R4B prelude for traits
-#[cfg(feature = "R5")]
-use fhir::r5::prelude::*; // Import R5 prelude for traits
-#[cfg(feature = "R6")]
-use fhir::r6::prelude::*; // Import R6 prelude for traits
+// Removed prelude imports as they caused E0432
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use std::collections::HashMap;
+// Import specific version modules needed for type annotations
+#[cfg(feature = "R4")]
+use fhir::r4;
+#[cfg(feature = "R4B")]
+use fhir::r4b;
+#[cfg(feature = "R5")]
+use fhir::r5;
+#[cfg(feature = "R6")]
+use fhir::r6;
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
@@ -192,12 +194,12 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     match resource {
         #[cfg(feature = "R4")]
         FhirResource::R4(r) => {
+            let resource_enum: &r4::Resource = &*r; // Explicit type annotation
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
             // Add resource properties to the object
             // Example: Extract 'id' if present
-            if let Some(id_element) = (*r).id() {
-                // Explicitly dereference r
+            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
             // Add other fields as needed...
@@ -205,30 +207,30 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
         }
         #[cfg(feature = "R4B")]
         FhirResource::R4B(r) => {
+            let resource_enum: &r4b::Resource = &*r; // Explicit type annotation
             // Similar extraction for R4B
             let mut obj = HashMap::new();
-            if let Some(id_element) = (*r).id() {
-                // Explicitly dereference r
+            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R5")]
         FhirResource::R5(r) => {
+            let resource_enum: &r5::Resource = &*r; // Explicit type annotation
             // Similar extraction for R5
             let mut obj = HashMap::new();
-            if let Some(id_element) = (*r).id() {
-                // Explicitly dereference r
+            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R6")]
         FhirResource::R6(r) => {
+            let resource_enum: &r6::Resource = &*r; // Explicit type annotation
             // Similar extraction for R6
             let mut obj = HashMap::new();
-            if let Some(id_element) = (*r).id() {
-                // Explicitly dereference r
+            if let Some(id_element) = resource_enum.id() { // Call on explicitly typed reference
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
             EvaluationResult::Object(obj)
