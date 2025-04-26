@@ -1,4 +1,10 @@
+use rust_decimal::prelude::ToPrimitive; // For decimal conversion
 use std::collections::HashMap;
+
+/// Trait to convert FHIR field values into EvaluationResult
+pub trait IntoEvaluationResult {
+    fn into_evaluation_result(&self) -> EvaluationResult;
+}
 
 /// Result of evaluating a FHIRPath expression
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +61,83 @@ impl EvaluationResult {
             }
             EvaluationResult::Object(_) => "[object]".to_string(),
         }
+    }
+}
+
+// --- Implementations for Rust Primitives ---
+
+impl IntoEvaluationResult for String {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::String(self.clone())
+    }
+}
+
+impl IntoEvaluationResult for bool {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Boolean(*self)
+    }
+}
+
+impl IntoEvaluationResult for i32 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Integer(*self as i64)
+    }
+}
+
+impl IntoEvaluationResult for i64 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Integer(*self)
+    }
+}
+
+impl IntoEvaluationResult for f64 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Number(*self)
+    }
+}
+
+// --- Implementation for rust_decimal ---
+impl IntoEvaluationResult for rust_decimal::Decimal {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        self.to_f64()
+            .map(EvaluationResult::Number)
+            .unwrap_or(EvaluationResult::Empty)
+    }
+}
+
+// --- Implementations for Option<T>, Vec<T>, Box<T> ---
+
+impl<T> IntoEvaluationResult for Option<T>
+where
+    T: IntoEvaluationResult,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        match self {
+            Some(value) => value.into_evaluation_result(),
+            None => EvaluationResult::Empty,
+        }
+    }
+}
+
+impl<T> IntoEvaluationResult for Vec<T>
+where
+    T: IntoEvaluationResult,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        let collection: Vec<EvaluationResult> = self
+            .iter()
+            .map(|item| item.into_evaluation_result())
+            .collect();
+        EvaluationResult::Collection(collection)
+    }
+}
+
+impl<T> IntoEvaluationResult for Box<T>
+where
+    T: IntoEvaluationResult + ?Sized, // Add ?Sized here
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        (**self).into_evaluation_result()
     }
 }
 
