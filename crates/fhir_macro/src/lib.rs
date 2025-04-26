@@ -1753,3 +1753,161 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 
     }
 }
+
+
+//=============================================================================
+// FhirPath Derive Macro
+//=============================================================================
+
+/// Derives the `fhirpath_support::IntoEvaluationResult` trait.
+#[proc_macro_derive(FhirPath, attributes(fhir_serde))] // Reuse fhir_serde attributes if needed
+pub fn fhir_path_derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let trait_impl = match &input.data {
+        Data::Struct(data) => generate_fhirpath_struct_impl(name, data, &impl_generics, &ty_generics, where_clause),
+        Data::Enum(data) => generate_fhirpath_enum_impl(name, data, &impl_generics, &ty_generics, where_clause),
+        Data::Union(_) => panic!("FhirPath derive macro does not support unions."),
+    };
+
+    TokenStream::from(trait_impl)
+}
+
+// Helper function to get the effective field name for FHIRPath access.
+// Respects #[fhir_serde(rename = "...")] attribute, otherwise defaults to the raw field identifier.
+fn get_fhirpath_field_name(field: &syn::Field) -> String {
+    for attr in &field.attrs {
+        if attr.path().is_ident("fhir_serde") {
+            if let Ok(list) =
+                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+            {
+                for meta in list {
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("rename") {
+                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                if let Lit::Str(lit_str) = expr_lit.lit {
+                                    return lit_str.value();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Default to the raw field identifier if no rename attribute found
+    field.ident.as_ref().unwrap().to_string()
+}
+
+
+fn generate_fhirpath_struct_impl(
+    name: &Ident,
+    data: &syn::DataStruct,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+) -> proc_macro2::TokenStream {
+    let fields = match &data.fields {
+        Fields::Named(fields) => &fields.named,
+        _ => panic!("FhirPath derive macro only supports structs with named fields."),
+    };
+
+    let field_conversions = fields.iter().map(|field| {
+        let field_name_ident = field.ident.as_ref().unwrap();
+        let field_key_str = get_fhirpath_field_name(field); // Use the specific FHIRPath naming helper
+
+        // Handle potential flattening - flattened fields are skipped for direct map insertion
+        if is_flattened(field) {
+             quote! {
+                // Flattened fields are handled differently - serialize the inner map
+                // Note: This requires the flattened field's type to also implement IntoEvaluationResult
+                // and return an Object variant.
+                 if let Some(inner_value) = &self.#field_name_ident {
+                    match inner_value.into_evaluation_result() {
+                        fhirpath_support::EvaluationResult::Object(inner_map) => {
+                            map.extend(inner_map);
+                        }
+                        // Decide how to handle non-object results from flattened fields.
+                        // Option 1: Ignore them silently.
+                        // Option 2: Panic or return an error.
+                        // Option 3: Insert a placeholder?
+                        // Let's ignore for now.
+                        _ => {}
+                    }
+                 }
+             }
+        } else {
+            quote! {
+                // For non-flattened fields, insert directly into the map
+                map.insert(#field_key_str.to_string(), self.#field_name_ident.into_evaluation_result());
+            }
+        }
+    });
+
+
+    quote! {
+        impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
+            fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
+                // Use fully qualified path for HashMap
+                let mut map = std::collections::HashMap::new();
+                #(#field_conversions)* // Expand the field conversion logic
+                fhirpath_support::EvaluationResult::Object(map)
+            }
+        }
+    }
+}
+
+
+fn generate_fhirpath_enum_impl(
+    name: &Ident,
+    data: &syn::DataEnum,
+    impl_generics: &syn::ImplGenerics,
+    ty_generics: &syn::TypeGenerics,
+    where_clause: Option<&syn::WhereClause>,
+) -> proc_macro2::TokenStream {
+
+    let match_arms = data.variants.iter().map(|variant| {
+        let variant_name = &variant.ident;
+        let variant_name_str = variant_name.to_string();
+
+        match &variant.fields {
+            Fields::Unit => {
+                // For unit variants, return the variant name as a string (like a code)
+                quote! {
+                    Self::#variant_name => fhirpath_support::EvaluationResult::String(#variant_name_str.to_string()),
+                }
+            }
+            Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                 // Newtype variant (e.g., String(String), Reference(Reference))
+                 // Call into_evaluation_result on the inner value.
+                 // Use 'ref value' to borrow the inner value.
+                 quote! {
+                     Self::#variant_name(ref value) => value.into_evaluation_result(),
+                 }
+            }
+            // For tuple or struct variants, the direct FHIRPath evaluation is less clear.
+            // Returning Empty seems like a reasonable default for now.
+            Fields::Unnamed(_) | Fields::Named(_) => {
+                 quote! {
+                     // Match all fields but ignore them for now
+                     Self::#variant_name { .. } => fhirpath_support::EvaluationResult::Empty,
+                 }
+            }
+        }
+    });
+
+
+    quote! {
+        impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
+            fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
+                 match self {
+                     #(#match_arms)*
+                 }
+            }
+        }
+    }
+}
+
