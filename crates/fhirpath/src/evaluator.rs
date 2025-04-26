@@ -188,14 +188,10 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
             let mut obj = HashMap::new();
             // Add resource properties to the object
             // Example: Extract 'id' if present
-            if let Some(id_element) = (*r).id() { // Explicitly dereference r
+            if let Some(id_element) = (*r).id() {
+                // Explicitly dereference r
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
-            // Add resourceType (you might want a more dynamic way to get this)
-            obj.insert(
-                "resourceType".to_string(),
-                EvaluationResult::String((*r).resource_type().to_string()), // Explicitly dereference r
-            );
             // Add other fields as needed...
             EvaluationResult::Object(obj)
         }
@@ -203,39 +199,30 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
         FhirResource::R4B(r) => {
             // Similar extraction for R4B
             let mut obj = HashMap::new();
-             if let Some(id_element) = (*r).id() { // Explicitly dereference r
+            if let Some(id_element) = (*r).id() {
+                // Explicitly dereference r
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
-            obj.insert(
-                "resourceType".to_string(),
-                 EvaluationResult::String((*r).resource_type().to_string()), // Explicitly dereference r
-            );
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R5")]
         FhirResource::R5(r) => {
             // Similar extraction for R5
             let mut obj = HashMap::new();
-             if let Some(id_element) = (*r).id() { // Explicitly dereference r
+            if let Some(id_element) = (*r).id() {
+                // Explicitly dereference r
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
-            obj.insert(
-                "resourceType".to_string(),
-                 EvaluationResult::String((*r).resource_type().to_string()), // Explicitly dereference r
-            );
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R6")]
         FhirResource::R6(r) => {
             // Similar extraction for R6
             let mut obj = HashMap::new();
-             if let Some(id_element) = (*r).id() { // Explicitly dereference r
+            if let Some(id_element) = (*r).id() {
+                // Explicitly dereference r
                 obj.insert("id".to_string(), id_element.into_evaluation_result());
             }
-            obj.insert(
-                "resourceType".to_string(),
-                 EvaluationResult::String((*r).resource_type().to_string()), // Explicitly dereference r
-            );
             EvaluationResult::Object(obj)
         }
     }
