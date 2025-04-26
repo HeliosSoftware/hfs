@@ -1,17 +1,7 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
-// Removed prelude imports as they caused E0432
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use std::collections::HashMap;
-// Import specific version modules needed for type annotations
-#[cfg(feature = "R4")]
-use fhir::r4;
-#[cfg(feature = "R4B")]
-use fhir::r4b;
-#[cfg(feature = "R5")]
-use fhir::r5;
-#[cfg(feature = "R6")]
-use fhir::r6;
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
@@ -212,10 +202,9 @@ fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
         FhirResource::R6(r) => {
             // Same logic applies to R6
             (*r).into_evaluation_result()
-        }
-        // Note: If no features are enabled, this match might be empty.
-        // If the function is called in such a state, it would lead to a compile error,
-        // which is reasonable behavior.
+        } // Note: If no features are enabled, this match might be empty.
+          // If the function is called in such a state, it would lead to a compile error,
+          // which is reasonable behavior.
     }
 }
 
