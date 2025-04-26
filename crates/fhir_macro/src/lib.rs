@@ -1881,13 +1881,13 @@ fn generate_fhirpath_enum_impl(
                 }
             }
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                 // Newtype variant (e.g., String(String), Reference(Reference))
-                 // Call into_evaluation_result on the inner value.
-                 // Use 'ref value' to borrow the inner value.
-                 quote! {
-                     Self::#variant_name(ref value) => value.into_evaluation_result(),
-                 }
-            }
+                // Newtype variant (e.g., String(String), Reference(Reference))
+                // Call into_evaluation_result on the inner value.
+                // No 'ref' needed; default binding mode handles borrowing.
+                quote! {
+                    Self::#variant_name(value) => value.into_evaluation_result(), // Removed 'ref'
+                }
+           }
             // For tuple or struct variants, the direct FHIRPath evaluation is less clear.
             // Returning Empty seems like a reasonable default for now.
             Fields::Unnamed(_) | Fields::Named(_) => {
