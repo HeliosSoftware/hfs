@@ -1,6 +1,6 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use fhir::FhirResource;
-use fhirpath_support::EvaluationResult;
+use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Import IntoEvaluationResult
 use std::collections::HashMap;
 
 /// Context for evaluating FHIRPath expressions
@@ -179,44 +179,68 @@ fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
 fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     // This is a simplified conversion - in a real implementation,
     // you would convert the resource to a proper object representation
-    // that can be navigated with FHIRPath
+    // that can be navigated with FHIRPath.
+    // This needs to be significantly expanded for full FHIRPath support.
     match resource {
         #[cfg(feature = "R4")]
-        FhirResource::R4(_r) => {
+        FhirResource::R4(r) => {
             // Convert R4 resource to an object representation
             let mut obj = HashMap::new();
             // Add resource properties to the object
-            // This is a placeholder - actual implementation would extract real properties
+            // Example: Extract 'id' if present
+            if let Some(id_element) = r.id() {
+                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            }
+            // Add resourceType (you might want a more dynamic way to get this)
             obj.insert(
                 "resourceType".to_string(),
-                EvaluationResult::String("R4Resource".to_string()),
+                EvaluationResult::String(r.resource_type().to_string()),
             );
+            // Add other fields as needed...
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R4B")]
-        FhirResource::R4B(_r) => {
+        FhirResource::R4B(r) => {
             let mut obj = HashMap::new();
             obj.insert(
                 "resourceType".to_string(),
                 EvaluationResult::String("R4BResource".to_string()),
             );
             EvaluationResult::Object(obj)
-        }
-        #[cfg(feature = "R5")]
-        FhirResource::R5(_r) => {
+            // Similar extraction for R4B
             let mut obj = HashMap::new();
+             if let Some(id_element) = r.id() {
+                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            }
             obj.insert(
                 "resourceType".to_string(),
-                EvaluationResult::String("R5Resource".to_string()),
+                 EvaluationResult::String(r.resource_type().to_string()),
+            );
+            EvaluationResult::Object(obj)
+        }
+        #[cfg(feature = "R5")]
+        FhirResource::R5(r) => {
+            // Similar extraction for R5
+            let mut obj = HashMap::new();
+             if let Some(id_element) = r.id() {
+                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            }
+            obj.insert(
+                "resourceType".to_string(),
+                 EvaluationResult::String(r.resource_type().to_string()),
             );
             EvaluationResult::Object(obj)
         }
         #[cfg(feature = "R6")]
-        FhirResource::R6(_r) => {
+        FhirResource::R6(r) => {
+            // Similar extraction for R6
             let mut obj = HashMap::new();
+             if let Some(id_element) = r.id() {
+                obj.insert("id".to_string(), id_element.into_evaluation_result());
+            }
             obj.insert(
                 "resourceType".to_string(),
-                EvaluationResult::String("R6Resource".to_string()),
+                 EvaluationResult::String(r.resource_type().to_string()),
             );
             EvaluationResult::Object(obj)
         }

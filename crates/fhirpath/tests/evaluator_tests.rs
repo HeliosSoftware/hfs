@@ -285,8 +285,8 @@ fn test_resource_access() {
     let mut resources = Vec::new();
     resources.push(FhirResource::R4(Box::new(dummy_resource)));
     let context = EvaluationContext::new(resources);
-    // Test accessing the resource type
-    let expr = parser().parse("theid").unwrap();
+    // Test accessing the resource id
+    let expr = parser().parse("id").unwrap(); // Use 'id' to access the field
     let result = evaluate(&expr, &context);
-    assert_eq!(result, EvaluationResult::String("theid".to_string()));
+    assert_eq!(result, EvaluationResult::String("theid".to_string())); // Expect the string value of the id
 }
