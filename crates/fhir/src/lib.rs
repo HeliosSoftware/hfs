@@ -1,9 +1,12 @@
 use fhirpath_support::EvaluationResult;
 use fhirpath_support::IntoEvaluationResult;
 use rust_decimal::Decimal;
+use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use rust_decimal::prelude::ToPrimitive; // For decimal conversion
+use rust_decimal::Decimal;
 use serde::{
-    Deserialize, Serialize,
     de::{self, Deserializer, MapAccess, Visitor},
+    Deserialize, Serialize,
     ser::{SerializeStruct, Serializer},
 };
 // Removed unused RawValue import
