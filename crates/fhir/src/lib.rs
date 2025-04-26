@@ -1,3 +1,5 @@
+use fhirpath_support::EvaluationResult;
+use fhirpath_support::IntoEvaluationResult;
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Serialize,
@@ -821,5 +823,139 @@ where
 
         // End the struct serialization
         state.end()
+    }
+}
+
+// For Element<V, E> - Extracts the primitive value
+impl<V, E> IntoEvaluationResult for Element<V, E>
+where
+    V: IntoEvaluationResult + Clone, // V must also be convertible
+    E: Clone,                        // Assuming Extension needs to be Cloneable if used elsewhere
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        match &self.value {
+            Some(v) => v.into_evaluation_result(), // Convert the inner value
+            None => EvaluationResult::Empty,
+        }
+    }
+}
+
+// For DecimalElement<E> - Handles PreciseDecimal specifically
+impl<E> IntoEvaluationResult for DecimalElement<E>
+where
+    E: Clone,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        match &self.value {
+            Some(precise_decimal) => {
+                // Extract the Option<rust_decimal::Decimal>
+                match precise_decimal.value() {
+                    Some(decimal_val) => {
+                        // Convert to f64 for EvaluationResult::Number
+                        // WARNING: Potential precision loss.
+                        // Consider adding a Decimal variant to EvaluationResult
+                        // if full precision is critical for FHIRPath operations.
+                        decimal_val
+                            .to_f64()
+                            .map(EvaluationResult::Number)
+                            .unwrap_or(EvaluationResult::Empty) // Handle conversion failure
+                    }
+                    None => EvaluationResult::Empty, // PreciseDecimal held None
+                }
+            }
+            None => EvaluationResult::Empty, // DecimalElement held None
+        }
+    }
+}
+
+// --- Implementations for Rust Primitives (used within Elements) ---
+
+impl IntoEvaluationResult for String {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        // Could potentially parse FHIR date/time/instant strings here
+        // if needed for specific FHIRPath functions, but basic string
+        // is often sufficient for simple path navigation.
+        EvaluationResult::String(self.clone())
+    }
+}
+
+impl IntoEvaluationResult for bool {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Boolean(*self)
+    }
+}
+
+impl IntoEvaluationResult for i32 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        // Assuming i32 maps to FHIR integer types
+        EvaluationResult::Integer(*self as i64) // Convert to i64 for EvaluationResult
+    }
+}
+
+impl IntoEvaluationResult for i64 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Integer(*self)
+    }
+}
+
+// Add f64 if used directly (less common in FHIR primitives)
+impl IntoEvaluationResult for f64 {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        EvaluationResult::Number(*self)
+    }
+}
+
+// Add rust_decimal::Decimal if used directly (less common)
+impl IntoEvaluationResult for rust_decimal::Decimal {
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        self.to_f64()
+            .map(EvaluationResult::Number)
+            .unwrap_or(EvaluationResult::Empty)
+    }
+}
+
+// --- Implementations for Option<T> and Vec<T> ---
+
+impl<T> IntoEvaluationResult for Option<T>
+where
+    T: IntoEvaluationResult,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        match self {
+            Some(value) => value.into_evaluation_result(), // Convert the inner value
+            None => EvaluationResult::Empty,
+        }
+    }
+}
+
+impl<T> IntoEvaluationResult for Vec<T>
+where
+    T: IntoEvaluationResult,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        let collection: Vec<EvaluationResult> = self
+            .iter()
+            .map(|item| item.into_evaluation_result()) // Convert each item
+            .collect();
+
+        // FHIRPath distinguishes empty collections from null/empty.
+        EvaluationResult::Collection(collection)
+        // If you wanted to treat empty Vec as Empty:
+        // if collection.is_empty() {
+        //     EvaluationResult::Empty
+        // } else {
+        //     EvaluationResult::Collection(collection)
+        // }
+    }
+}
+
+// --- Implementation for Box<T> ---
+impl<T> IntoEvaluationResult for Box<T>
+where
+    T: IntoEvaluationResult,
+{
+    fn into_evaluation_result(&self) -> EvaluationResult {
+        // Dereference the Box and call the inner type's implementation
+        (**self).into_evaluation_result()
     }
 }
