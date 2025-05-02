@@ -1,26 +1,34 @@
 # FHIRPath 
 
-This is an implementation of HL7's [FHIRPath Specification](https://hl7.org/fhirpath/2025Jan/) written in Rust.
+This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https://hl7.org/fhirpath/2025Jan/) written in Rust.
 
+## Table of Contents
+ - [About](#-about)
+ - [Implementation](#-implementation)
+ - [Performance](#-performance)
+ - [Features](#-features)
+
+
+## About
 FHIRPath is a path based navigation and extraction language, somewhat like XPath.
 
-## Where is FHIRPath Used? 
+### Where is FHIRPath Used? 
 FHIRPath is used extensively throughout the FHIR Specification, although, despite it's name, FHIRPath 
 is designed to be model-independent and works with data as an abstract model, allowing it to be used with any model.
 
-### Invariants
+#### Invariants
 
-### Search Parameters
+#### Search Parameters
 
-### View Definitions
+#### View Definitions
 
 ## Implementation
 
-This is an implemention of xx version,.
+Implementation notes go here...
 
 ## Performance
 
-Performance results go here
+Performance results go here...
 
 ## Features
 
@@ -45,14 +53,8 @@ Performance results go here
     *   [DateTime](https://hl7.org/fhirpath/2025Jan/#datetime): ✅ (Stored as String)
     *   [Quantity](https://hl7.org/fhirpath/2025Jan/#quantity): ✅ (Basic value/unit storage)
         *   [Time-valued Quantities](https://hl7.org/fhirpath/2025Jan/#time-valued-quantities): ✅ (Keywords parsed)
-    *   Empty Collection (`{}`): ✅
-*   [Paths](https://hl7.org/fhirpath/2025Jan/#path-selection): 🟡 (Basic member access implemented, full tree navigation pending)
-*   [Function Invocations](https://hl7.org/fhirpath/2025Jan/#function-invocations): ✅ (Syntax supported, specific functions below)
-*   [Operators](https://hl7.org/fhirpath/2025Jan/#operators): ✅ (Syntax supported, specific operators below)
-*   [Null and Empty Propagation](https://hl7.org/fhirpath/2025Jan/#null-and-empty): ✅
-*   [Singleton Evaluation](https://hl7.org/fhirpath/2025Jan/#singleton-evaluation-of-collections): ✅
     
-### Functions
+### [Functions](https://hl7.org/fhirpath/2025Jan/#functions)
     
 *   [Existence](https://hl7.org/fhirpath/2025Jan/#existence)
     *   [empty()](https://hl7.org/fhirpath/2025Jan/#empty--boolean): ✅
@@ -137,7 +139,7 @@ Performance results go here
     *   [precision()](https://hl7.org/fhirpath/2025Jan/#precision--integer) (STU): ❌
 *   [Date/DateTime/Time Component Extraction](https://hl7.org/fhirpath/2025Jan/#extract-datedatetimetime-components) (STU): ❌ (All)
     
-### 7. Operations
+### [Operations](https://hl7.org/fhirpath/2025Jan/#operations)
     
 *   [Equality](https://hl7.org/fhirpath/2025Jan/#equality)
     *   [`=` (Equals)](https://hl7.org/fhirpath/2025Jan/#-equals): ✅ (Basic types, collection order matters)
@@ -173,23 +175,26 @@ Performance results go here
 *   [Date/Time Arithmetic](https://hl7.org/fhirpath/2025Jan/#datetime-arithmetic): ❌
 *   [Operator Precedence](https://hl7.org/fhirpath/2025Jan/#operator-precedence): ✅
     
-### 8. Aggregates (STU)
+### [Aggregates](https://hl7.org/fhirpath/2025Jan/#aggregates)
     
-*   [aggregate()](https://hl7.org/fhirpath/2025Jan/#aggregateaggregator--expression--init--value--value): ❌
+*   [aggregate()](https://hl7.org/fhirpath/2025Jan/#aggregateaggregator--expression--init--value--value) (STU): ❌
+
+### [Lexical Elements](https://hl7.org/fhirpath/2025Jan/#lexical-elements)
+
+*   [Lexical Elements](https://hl7.org/fhirpath/2025Jan/#lexical-elements): ✅ (Handled by parser)
     
-### 10. Environment Variables
+### [Environment Variables](https://hl7.org/fhirpath/2025Jan/#environment-variables)
     
 *   [`%variable`](https://hl7.org/fhirpath/2025Jan/#environment-variables): ✅
 *   [`%context`](https://hl7.org/fhirpath/2025Jan/#environment-variables): ✅ (Basic implementation)
     
-### 11. Types and Reflection
+### [Types and Reflection](https://hl7.org/fhirpath/2025Jan/#types-and-reflection)
     
 *   [Models](https://hl7.org/fhirpath/2025Jan/#models): ✅ (Implicit System, FHIR namespaces assumed)
 *   [Reflection (`type()`)](https://hl7.org/fhirpath/2025Jan/#reflection) (STU): ❌
     
-### Other
+### [Type Safety and Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation)
     
-*   [Lexical Elements](https://hl7.org/fhirpath/2025Jan/#lexical-elements): ✅ (Handled by parser)
 *   [Type Safety / Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation): 🟡 (Runtime checks, errors signaled via Empty/panic)
     
     
