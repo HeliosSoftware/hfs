@@ -15,3 +15,7 @@ fhir = { path = "../fhir" }
 fhirpath_support = { path = "../fhirpath_support" }
 chumsky = "0.9.3"
 roxmltree = "0.19.0"
+chrono = { version = "0.4", features = ["serde"] } # For date/time parsing and functions
+rust_decimal = { version = "1.35", features = ["serde-with-float", "macros"] }
+rust_decimal_macros = "1.35"
+

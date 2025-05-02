@@ -2,12 +2,10 @@ use chumsky::Parser;
 use fhir::FhirResource;
 use fhir::r4;
 use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::{self, parser}; // Import parser module
-// Use the support crate's EvaluationResult
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
-use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Removed parser import from here
+use fhirpath::parser::parser;
+use fhirpath_support::EvaluationResult;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec; // For decimal literals in tests
+use rust_decimal_macros::dec;
 use std::str::FromStr;
 
 // Helper function to parse and evaluate
@@ -2626,38 +2624,6 @@ fn test_environment_variables() {
 
     // Test accessing %context explicitly
     // assert_eq!(eval("%context.id", &ctx_res), EvaluationResult::String("p1".to_string())); // Requires member access
-}
-
-// --- Helper Functions ---
-impl EvaluationResult {
-    // Helper to simplify getting integer value in tests
-    fn get_integer(&self) -> Option<i64> {
-        match self {
-            EvaluationResult::Integer(i) => Some(*i),
-            _ => None,
-        }
-    }
-    // Helper to simplify getting boolean value in tests
-    fn get_boolean(&self) -> Option<bool> {
-        match self {
-            EvaluationResult::Boolean(b) => Some(*b),
-            _ => None,
-        }
-    }
-    // Helper to simplify getting string value in tests
-    fn get_string(&self) -> Option<&str> {
-        match self {
-            EvaluationResult::String(s) => Some(s),
-            _ => None,
-        }
-    }
-    // Helper to simplify getting decimal value in tests
-    fn get_decimal(&self) -> Option<Decimal> {
-        match self {
-            EvaluationResult::Decimal(d) => Some(*d),
-            _ => None,
-        }
-    }
 }
 
 // --- Resource Access Tests ---
