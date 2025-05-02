@@ -1,5 +1,7 @@
 .DS_Store
 /target
+/node_modules
+yarn.lock
 .aider*
 crates/fhir_gen/resources/R6
 crates/fhir/tests/data/R6
