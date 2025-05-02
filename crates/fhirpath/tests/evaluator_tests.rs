@@ -8,13 +8,6 @@ use fhirpath_support::EvaluationResult;
 use rust_decimal_macros::dec;
 // Removed unused imports: Decimal, FromStr
 
-    let expr = parser().parse(input).unwrap_or_else(|e| {
-        panic!("Parser error for input '{}': {:?}", input, e);
-    });
-    // Pass the original context, evaluate will create the internal one with %context
-    evaluate(&expr, context)
-}
-
 // Helper to create a collection result
 fn collection(items: Vec<EvaluationResult>) -> EvaluationResult {
     EvaluationResult::Collection(items) // Removed normalize() call
