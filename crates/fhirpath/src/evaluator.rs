@@ -868,7 +868,7 @@ fn call_function(
                     }
                 }
                  // contains on single non-collection/non-string item
-                 EvaluationResult::Empty => EvaluationResult::Boolean(false), // Empty cannot contain anything
+                 EvaluationResult::Empty => EvaluationResult::Empty, // Spec: If input collection is empty, result is empty.
                  single_item => {
                      // Treat as single-item collection: check if the item equals the argument
                      // Check if arg is empty first
