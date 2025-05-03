@@ -718,6 +718,38 @@ fn call_function(
                  }
             }
         }
+        "distinct" => {
+            // Returns the collection with duplicates removed (based on equality)
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            if items.is_empty() {
+                return EvaluationResult::Empty;
+            }
+
+            let mut distinct_items = Vec::new();
+            for item in items {
+                // Check if the item (using '=') is already in distinct_items
+                let is_present = distinct_items
+                    .iter()
+                    .any(|existing| compare_equality(&item, "=", existing).to_boolean());
+                if !is_present {
+                    distinct_items.push(item);
+                }
+            }
+
+            // Return based on FHIRPath singleton evaluation
+            if distinct_items.is_empty() {
+                EvaluationResult::Empty
+            } else if distinct_items.len() == 1 {
+                distinct_items.into_iter().next().unwrap()
+            } else {
+                EvaluationResult::Collection(distinct_items)
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
