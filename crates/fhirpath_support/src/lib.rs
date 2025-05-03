@@ -1,4 +1,5 @@
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 /// Trait to convert FHIR field values into EvaluationResult
@@ -12,7 +13,7 @@ pub enum EvaluationResult {
     Empty,
     Boolean(bool),
     String(String),
-    Number(f64),
+    Decimal(Decimal),
     Integer(i64),
     Date(String),
     DateTime(String),
@@ -28,10 +29,10 @@ impl EvaluationResult {
             EvaluationResult::Empty => false,
             EvaluationResult::Boolean(b) => *b,
             EvaluationResult::String(s) => !s.is_empty(),
-            EvaluationResult::Number(n) => *n != 0.0,
+            EvaluationResult::Decimal(d) => !d.is_zero(),
             EvaluationResult::Integer(i) => *i != 0,
             EvaluationResult::Collection(c) => !c.is_empty(),
-            _ => true, // Other types are considered truthy
+            _ => true, // Other types (Date, DateTime, Time, Object) are considered truthy
         }
     }
 
@@ -41,7 +42,7 @@ impl EvaluationResult {
             EvaluationResult::Empty => "".to_string(),
             EvaluationResult::Boolean(b) => b.to_string(),
             EvaluationResult::String(s) => s.clone(),
-            EvaluationResult::Number(n) => n.to_string(),
+            EvaluationResult::Decimal(d) => d.to_string(),
             EvaluationResult::Integer(i) => i.to_string(),
             EvaluationResult::Date(d) => d.clone(),
             EvaluationResult::DateTime(dt) => dt.clone(),
@@ -90,18 +91,18 @@ impl IntoEvaluationResult for i64 {
     }
 }
 
-impl IntoEvaluationResult for f64 {
+impl IntoEvaluationResult for f64 { // Convert f64 to Decimal
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Number(*self)
+        Decimal::from_f64(*self)
+            .map(EvaluationResult::Decimal)
+            .unwrap_or(EvaluationResult::Empty) // Handle potential conversion errors (e.g., NaN, Infinity)
     }
 }
 
 // --- Implementation for rust_decimal ---
-impl IntoEvaluationResult for rust_decimal::Decimal {
+impl IntoEvaluationResult for Decimal {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        self.to_f64()
-            .map(EvaluationResult::Number)
-            .unwrap_or(EvaluationResult::Empty)
+        EvaluationResult::Decimal(*self)
     }
 }
 

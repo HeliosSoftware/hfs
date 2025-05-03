@@ -1,19 +1,22 @@
-use chumsky::Parser;
 use chumsky::error::Simple;
 use chumsky::prelude::*;
+use chumsky::Parser;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec; // For potential default values if needed
 use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     Boolean(bool),
     String(String),
-    Number(f64),
+    Number(Decimal), // Changed from f64 to Decimal
     LongNumber(i64),
     Date(String),
     DateTime(String, Option<(String, Option<String>)>),
     Time(String),
-    Quantity(f64, Option<Unit>),
+    Quantity(Decimal, Option<Unit>), // Changed from f64 to Decimal
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +107,7 @@ impl fmt::Display for Literal {
             Literal::Null => write!(f, "{{}}"),
             Literal::Boolean(b) => write!(f, "{}", b),
             Literal::String(s) => write!(f, "'{}'", s),
-            Literal::Number(n) => write!(f, "{}", n),
+            Literal::Number(d) => write!(f, "{}", d), // Use Decimal's Display
             Literal::LongNumber(n) => write!(f, "{}", n),
             Literal::Date(d) => write!(f, "@{}", d),
             Literal::DateTime(date, time_part) => {
@@ -118,8 +121,8 @@ impl fmt::Display for Literal {
                 Ok(())
             }
             Literal::Time(t) => write!(f, "@T{}", t),
-            Literal::Quantity(n, Some(u)) => write!(f, "{} '{}'", n, u),
-            Literal::Quantity(n, None) => write!(f, "{}", n),
+            Literal::Quantity(d, Some(u)) => write!(f, "{} '{}'", d, u), // Use Decimal's Display
+            Literal::Quantity(d, None) => write!(f, "{}", d), // Use Decimal's Display
         }
     }
 }
@@ -194,13 +197,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .or_not(),
         )
-        .map(|(i, d)| {
-            if let Some((_, d)) = d {
-                // Combine whole number and fractional part
-                let num_str = format!("{}.{}", i, d);
-                Literal::Number(num_str.parse::<f64>().unwrap())
+        .validate(|(i, d_opt), span, emit| {
+            let num_str = if let Some((_, d)) = d_opt {
+                format!("{}.{}", i, d)
             } else {
-                Literal::Number(i.parse::<f64>().unwrap())
+                i
+            };
+            match Decimal::from_str(&num_str) {
+                Ok(decimal) => Literal::Number(decimal),
+                Err(_) => {
+                    emit(Simple::custom(span, format!("Invalid number: {}", num_str)));
+                    Literal::Number(dec!(0)) // Default value on error
+                }
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -383,14 +391,21 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     .padded(); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
-    let quantity = number.then(unit).map(|(n, u)| {
-        if let Literal::Number(num) = n {
+    let quantity = number.then(unit).map(|(n_literal, u)| {
+        if let Literal::Number(num) = n_literal {
             Literal::Quantity(num, Some(u))
         } else {
-            // This shouldn't happen due to the parser structure
-            Literal::Quantity(0.0, Some(u))
+            // This case should ideally not be reachable if `number` always produces Literal::Number
+            // Provide a default Decimal value if it occurs.
+            emit_error("Expected Literal::Number in quantity parser, got other literal type.");
+            Literal::Quantity(dec!(0), Some(u))
         }
     });
+
+    // Helper function to emit errors (replace with actual logging/error handling if needed)
+    fn emit_error(message: &str) {
+        eprintln!("Parser Error: {}", message);
+    }
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
@@ -423,11 +438,19 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         Literal::Time(time_str)
                     }
                 }
-                // Other cases (shouldn't happen with proper parsing)
-                _ => Literal::Null,
-            }
-        })
-        .padded();
+                    // @T12:30 (without timezone)
+                    (None, Some(Some((time_str, None)))) => Literal::Time(time_str),
+                    // Invalid combinations or parsing errors
+                    _ => {
+                        // This case indicates an unexpected parsing result.
+                        // Log or handle this error appropriately.
+                        // Returning Null might mask issues. Consider a dedicated Error literal or panic.
+                        eprintln!("Warning: Unexpected combination in date/time parsing.");
+                        Literal::Null // Or handle as an error
+                    }
+                }
+            })
+            .padded();
 
     let literal = choice((
         null,

@@ -1,6 +1,9 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::collections::HashMap;
 
 /// Context for evaluating FHIRPath expressions
@@ -188,7 +191,7 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         Literal::Null => EvaluationResult::Empty,
         Literal::Boolean(b) => EvaluationResult::Boolean(*b),
         Literal::String(s) => EvaluationResult::String(s.clone()),
-        Literal::Number(n) => EvaluationResult::Number(*n),
+        Literal::Number(d) => EvaluationResult::Decimal(*d), // Use Decimal
         Literal::LongNumber(n) => EvaluationResult::Integer(*n),
         Literal::Date(d) => EvaluationResult::Date(d.clone()),
         Literal::DateTime(d, t) => {
@@ -200,9 +203,9 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         }
         Literal::Time(t) => EvaluationResult::Time(t.clone()),
         Literal::Quantity(n, _) => {
-            // For now, we ignore the unit and just return the number
+            // For now, we ignore the unit and just return the decimal value
             // In a full implementation, we would handle units properly
-            EvaluationResult::Number(*n)
+            EvaluationResult::Decimal(*d) // Use Decimal
         }
     }
 }
@@ -430,8 +433,8 @@ fn apply_polarity(op: char, value: &EvaluationResult) -> EvaluationResult {
         '-' => {
             // Negate numeric values
             match value {
-                EvaluationResult::Number(n) => EvaluationResult::Number(-n),
-                EvaluationResult::Integer(i) => EvaluationResult::Integer(-i),
+                EvaluationResult::Decimal(d) => EvaluationResult::Decimal(-*d),
+                EvaluationResult::Integer(i) => EvaluationResult::Integer(-*i),
                 _ => EvaluationResult::Empty,
             }
         }
@@ -445,87 +448,99 @@ fn apply_multiplicative(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
-    match (left, right) {
-        (EvaluationResult::Number(l), EvaluationResult::Number(r)) => match op {
-            "*" => EvaluationResult::Number(l * r),
+    // Promote Integer to Decimal for mixed operations
+    let (left_dec, right_dec) = match (left, right) {
+        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
+        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+            (Some(*l), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+            (Some(Decimal::from(*l)), Some(*r))
+        }
+        _ => (None, None),
+    };
+
+    if let (Some(l), Some(r)) = (left_dec, right_dec) {
+        match op {
+            "*" => EvaluationResult::Decimal(l * r),
             "/" => {
-                if *r == 0.0 {
+                if r.is_zero() {
                     EvaluationResult::Empty
                 } else {
-                    EvaluationResult::Number(l / r)
+                    // Decimal division preserves precision
+                    l.checked_div(r)
+                        .map(EvaluationResult::Decimal)
+                        .unwrap_or(EvaluationResult::Empty) // Handle potential overflow/errors
                 }
             }
             "div" => {
-                if *r == 0.0 {
+                if r.is_zero() {
                     EvaluationResult::Empty
                 } else {
-                    EvaluationResult::Integer((l / r).floor() as i64)
+                    // Integer division truncates towards zero
+                    l.checked_div(r)
+                        .map(|d| EvaluationResult::Integer(d.trunc().to_i64().unwrap_or(0))) // Convert truncated Decimal to i64
+                        .unwrap_or(EvaluationResult::Empty)
                 }
             }
             "mod" => {
-                if *r == 0.0 {
+                if r.is_zero() {
                     EvaluationResult::Empty
                 } else {
-                    EvaluationResult::Number(l % r)
+                    // Modulo operation for Decimals
+                    l.checked_rem(r)
+                        .map(EvaluationResult::Decimal)
+                        .unwrap_or(EvaluationResult::Empty)
                 }
             }
-            _ => EvaluationResult::Empty,
-        },
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => match op {
-            "*" => EvaluationResult::Integer(l * r),
-            "/" => {
-                if *r == 0 {
-                    EvaluationResult::Empty
-                } else {
-                    EvaluationResult::Number(*l as f64 / *r as f64)
-                }
-            }
-            "div" => {
-                if *r == 0 {
-                    EvaluationResult::Empty
-                } else {
-                    EvaluationResult::Integer(l / r)
-                }
-            }
-            "mod" => {
-                if *r == 0 {
-                    EvaluationResult::Empty
-                } else {
-                    EvaluationResult::Integer(l % r)
-                }
-            }
-            _ => EvaluationResult::Empty,
-        },
-        _ => EvaluationResult::Empty,
+            _ => EvaluationResult::Empty, // Unknown operator
+        }
+    } else {
+        // Operands are not compatible numeric types
+        EvaluationResult::Empty
     }
 }
 
 /// Applies an additive operator to two values
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
+    // Promote Integer to Decimal for mixed operations
+    let (left_num, right_num) = match (left, right) {
+        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
+        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+            (Some(*l), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+            (Some(Decimal::from(*l)), Some(*r))
+        }
+        _ => (None, None),
+    };
+
     match op {
-        "+" => match (left, right) {
-            (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-                EvaluationResult::Number(l + r)
-            }
-            (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                EvaluationResult::Integer(l + r)
-            }
-            (EvaluationResult::String(l), EvaluationResult::String(r)) => {
+        "+" => {
+            if let (Some(l), Some(r)) = (left_num, right_num) {
+                EvaluationResult::Decimal(l + r)
+            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right)
+            {
                 EvaluationResult::String(format!("{}{}", l, r))
+            } else {
+                EvaluationResult::Empty
             }
-            _ => EvaluationResult::Empty,
-        },
-        "-" => match (left, right) {
-            (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-                EvaluationResult::Number(l - r)
+        }
+        "-" => {
+            if let (Some(l), Some(r)) = (left_num, right_num) {
+                EvaluationResult::Decimal(l - r)
+            } else {
+                EvaluationResult::Empty
             }
-            (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                EvaluationResult::Integer(l - r)
-            }
-            _ => EvaluationResult::Empty,
-        },
+        }
         "&" => {
-            // String concatenation
+            // String concatenation - handles Empty correctly
             let left_str = left.to_string_value();
             let right_str = right.to_string_value();
             EvaluationResult::String(format!("{}{}", left_str, right_str))
@@ -551,7 +566,7 @@ fn apply_type_operation(
                 ("Boolean", EvaluationResult::Boolean(_)) => true,
                 ("String", EvaluationResult::String(_)) => true,
                 ("Integer", EvaluationResult::Integer(_)) => true,
-                ("Decimal", EvaluationResult::Number(_)) => true,
+                ("Decimal", EvaluationResult::Decimal(_)) => true, // Check for Decimal
                 ("Date", EvaluationResult::Date(_)) => true,
                 ("DateTime", EvaluationResult::DateTime(_)) => true,
                 ("Time", EvaluationResult::Time(_)) => true,
@@ -570,10 +585,12 @@ fn apply_type_operation(
             match (type_name.as_str(), value) {
                 // For now, we just return the value if it's already of the right type
                 // In a full implementation, we would attempt to convert between types
+                // In a full implementation, we would attempt to convert between types
+                // e.g., Integer to Decimal, String to Decimal, etc.
                 ("Boolean", EvaluationResult::Boolean(_)) => value.clone(),
                 ("String", EvaluationResult::String(_)) => value.clone(),
                 ("Integer", EvaluationResult::Integer(_)) => value.clone(),
-                ("Decimal", EvaluationResult::Number(_)) => value.clone(),
+                ("Decimal", EvaluationResult::Decimal(_)) => value.clone(), // Return if already Decimal
                 ("Date", EvaluationResult::Date(_)) => value.clone(),
                 ("DateTime", EvaluationResult::DateTime(_)) => value.clone(),
                 ("Time", EvaluationResult::Time(_)) => value.clone(),
@@ -615,30 +632,77 @@ fn compare_inequality(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
-    match (left, right) {
-        (EvaluationResult::Number(l), EvaluationResult::Number(r)) => {
-            let result = match op {
-                "<" => l < r,
-                "<=" => l <= r,
-                ">" => l > r,
-                ">=" => l >= r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
-        }
+    // Promote Integer to Decimal for mixed comparisons
+    let (left_num, right_num) = match (left, right) {
+        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
         (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-            let result = match op {
-                "<" => l < r,
-                "<=" => l <= r,
+            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+            (Some(*l), Some(Decimal::from(*r)))
+        }
+        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+            (Some(Decimal::from(*l)), Some(*r))
+        }
+        _ => (None, None),
+    };
+
+    if let (Some(l), Some(r)) = (left_num, right_num) {
+        let result = match op {
+            "<" => l < r,
+            "<=" => l <= r,
                 ">" => l > r,
                 ">=" => l >= r,
                 _ => false,
             };
-            EvaluationResult::Boolean(result)
+        EvaluationResult::Boolean(result)
+    } else {
+        // Handle non-numeric types
+        match (left, right) {
+            (EvaluationResult::String(l), EvaluationResult::String(r)) => {
+                let result = match op {
+                    "<" => l < r,
+                    "<=" => l <= r,
+                    ">" => l > r,
+                    ">=" => l >= r,
+                    _ => false,
+                };
+                EvaluationResult::Boolean(result)
+            }
+            (EvaluationResult::Date(l), EvaluationResult::Date(r)) => {
+                let result = match op {
+                    "<" => l < r,
+                    "<=" => l <= r,
+                    ">" => l > r,
+                    ">=" => l >= r,
+                    _ => false,
+                };
+                EvaluationResult::Boolean(result)
+            }
+            (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => {
+                let result = match op {
+                    "<" => l < r,
+                    "<=" => l <= r,
+                    ">" => l > r,
+                    ">=" => l >= r,
+                    _ => false,
+                };
+                EvaluationResult::Boolean(result)
+            }
+            (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
+                let result = match op {
+                    "<" => l < r,
+                    "<=" => l <= r,
+                    ">" => l > r,
+                    ">=" => l >= r,
+                    _ => false,
+                };
+                EvaluationResult::Boolean(result)
+            }
+            _ => EvaluationResult::Empty, // Incomparable types
         }
-        (EvaluationResult::String(l), EvaluationResult::String(r)) => {
-            let result = match op {
-                "<" => l < r,
+    }
+}
                 "<=" => l <= r,
                 ">" => l > r,
                 ">=" => l >= r,
@@ -690,11 +754,14 @@ fn compare_equality(
         "=" => {
             // Strict equality
             let result = match (left, right) {
-                (EvaluationResult::Empty, EvaluationResult::Empty) => true,
+                (EvaluationResult::Empty, EvaluationResult::Empty) => true, // Empty equals Empty
                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => l == r,
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => l == r,
-                (EvaluationResult::Number(l), EvaluationResult::Number(r)) => l == r,
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l == r,
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l == r,
+                // Mixed number/integer comparison
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => *l == Decimal::from(*r),
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => Decimal::from(*l) == *r,
                 (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l == r,
                 (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l == r,
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l == r,
@@ -705,11 +772,14 @@ fn compare_equality(
         "!=" => {
             // Strict inequality
             let result = match (left, right) {
-                (EvaluationResult::Empty, EvaluationResult::Empty) => false,
+                (EvaluationResult::Empty, EvaluationResult::Empty) => false, // Empty equals Empty
                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => l != r,
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => l != r,
-                (EvaluationResult::Number(l), EvaluationResult::Number(r)) => l != r,
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l != r,
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l != r,
+                // Mixed number/integer comparison
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => *l != Decimal::from(*r),
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => Decimal::from(*l) != *r,
                 (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l != r,
                 (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l != r,
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l != r,
