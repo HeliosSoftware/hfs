@@ -852,12 +852,8 @@ where
                     Some(decimal_val) => {
                         // Convert to f64 for EvaluationResult::Number
                         // WARNING: Potential precision loss.
-                        // Consider adding a Decimal variant to EvaluationResult
-                        // if full precision is critical for FHIRPath operations.
-                        decimal_val
-                            .to_f64()
-                            .map(EvaluationResult::Number)
-                            .unwrap_or(EvaluationResult::Empty) // Handle conversion failure
+                        // Directly use the Decimal value with EvaluationResult::Decimal
+                        EvaluationResult::Decimal(decimal_val)
                     }
                     None => EvaluationResult::Empty, // PreciseDecimal held None
                 }
