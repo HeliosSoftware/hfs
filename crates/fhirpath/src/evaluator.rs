@@ -2234,11 +2234,13 @@ fn apply_type_operation(
     match op {
         "is" => {
             // Check if the value is of the specified type
-            let type_name = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(name, _) => name,
+            // Correctly extract the base type name, ignoring the namespace if present
+            let base_type_name = match type_spec {
+                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
+                TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
             };
 
-            let is_type = match (type_name.as_str(), value) {
+            let is_type = match (base_type_name.as_str(), value) { // Compare using base_type_name
                 ("Boolean", EvaluationResult::Boolean(_)) => true,
                 ("String", EvaluationResult::String(_)) => true,
                 ("Integer", EvaluationResult::Integer(_)) => true,
@@ -2254,14 +2256,15 @@ fn apply_type_operation(
         }
         "as" => {
             // Cast the value to the specified type if possible
-            let type_name = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(name, _) => name,
+            // Correctly extract the base type name, ignoring the namespace if present
+            let base_type_name = match type_spec {
+                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
+                TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
             };
 
-            match (type_name.as_str(), value) {
-                // For now, we just return the value if it's already of the right type
-                // In a full implementation, we would attempt to convert between types
-                // In a full implementation, we would attempt to convert between types
+            match (base_type_name.as_str(), value) { // Use base_type_name
+                // Return the value if it's already of the right type.
+                // FHIRPath 'as' is primarily for checking/narrowing, not conversion like 'toX'.
                 // e.g., Integer to Decimal, String to Decimal, etc.
                 ("Boolean", EvaluationResult::Boolean(_)) => value.clone(),
                 ("String", EvaluationResult::String(_)) => value.clone(),
