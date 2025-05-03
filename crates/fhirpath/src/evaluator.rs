@@ -888,6 +888,32 @@ fn call_function(
 
             EvaluationResult::Boolean(true) // No duplicates found
         }
+        "toDecimal" => {
+            // Converts the input to Decimal according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Boolean(b) => EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO }),
+                EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)),
+                EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d),
+                EvaluationResult::String(s) => {
+                    // Try parsing as Decimal
+                    s.parse::<Decimal>()
+                        .map(EvaluationResult::Decimal)
+                        .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        // Recursively call toDecimal on the single item
+                        call_function("toDecimal", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty // Multi-item or empty collection -> Empty
+                    }
+                }
+                // Other types are not convertible
+                _ => EvaluationResult::Empty,
+            }
+        }
         "toInteger" => {
             // Converts the input to Integer according to FHIRPath rules
             match invocation_base {
