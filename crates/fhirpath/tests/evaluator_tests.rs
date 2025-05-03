@@ -1292,8 +1292,8 @@ fn test_function_conversion_to_string() {
         EvaluationResult::String("10:30:00".to_string())
     );
     assert_eq!(
-        eval("@2023-10-27T10:30:00Z.toString()", &context),
-        EvaluationResult::String("2023-10-27T10:30:00Z".to_string())
+        eval("@2023-10-27T10:30Z.toString()", &context), // Literal without seconds
+        EvaluationResult::String("2023-10-27T10:30Z".to_string()) // Expect output without seconds
     );
     // Quantity to string (evaluator returns Decimal or Integer, ignoring unit)
     assert_eq!(

@@ -1344,21 +1344,45 @@ fn call_function(
                 _ => EvaluationResult::Empty,
             }
         }
-        "toString" => {
-            // Converts the input to its string representation
+        "convertsToString" => {
+            // Checks if the input can be converted to String
             match invocation_base {
-                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 EvaluationResult::Collection(items) => {
-                    // toString on collection: Empty if 0 or >1 items, string of item if 1 item
+                    // Only single-item collections can be converted
                     if items.len() == 1 {
-                        // Recursively call toString on the single item
-                        call_function("toString", &items[0], &[])
+                        // Recursively call convertsToString on the single item
+                        call_function("convertsToString", &items[0], &[])
                     } else {
-                        EvaluationResult::Empty // Multi-item or empty collection -> Empty
+                        EvaluationResult::Boolean(false) // Multi-item collection cannot be converted
                     }
                 }
-                // For single items, use the existing helper
-                single_item => EvaluationResult::String(single_item.to_string_value()),
+                // Check convertibility for single items (most primitives can be)
+                EvaluationResult::Boolean(_) |
+                EvaluationResult::String(_) |
+                EvaluationResult::Integer(_) |
+                EvaluationResult::Decimal(_) |
+                EvaluationResult::Date(_) |
+                EvaluationResult::DateTime(_) |
+                EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
+                // Objects are not convertible to String via this function
+                EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
+            }
+        }
+        "toString" => {
+            // Converts the input to its string representation using the helper
+            // Handles single items, collections (returning Empty for multi-item), and Empty correctly.
+            let string_val = invocation_base.to_string_value();
+            // Check if the helper returned the collection representation "[...]" which means Empty for toString
+            if string_val.starts_with('[') && string_val.ends_with(']') && invocation_base.is_collection() && invocation_base.count() != 1 {
+                 EvaluationResult::Empty
+            } else if string_val.is_empty() && invocation_base != &EvaluationResult::String("".to_string()) {
+                 // If the string is empty, but the original wasn't an empty string, return Empty
+                 // This handles the case where to_string_value returns "" for Empty input.
+                 EvaluationResult::Empty
+            }
+             else {
+                 EvaluationResult::String(string_val)
             }
         }
         "length" => {
@@ -1372,8 +1396,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "toString" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal", "toString"].contains(&name) {
+             // Added "convertsToString" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal", "toString", "convertsToString"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty

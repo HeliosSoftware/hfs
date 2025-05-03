@@ -83,10 +83,11 @@ impl EvaluationResult {
             EvaluationResult::String(s) => s.clone(),
             EvaluationResult::Decimal(d) => d.to_string(),
             EvaluationResult::Integer(i) => i.to_string(),
-            EvaluationResult::Date(d) => d.clone(),
-            EvaluationResult::DateTime(dt) => dt.clone(),
-            EvaluationResult::Time(t) => t.clone(),
+            EvaluationResult::Date(d) => d.clone(), // Return stored string
+            EvaluationResult::DateTime(dt) => dt.clone(), // Return stored string
+            EvaluationResult::Time(t) => t.clone(), // Return stored string
             EvaluationResult::Collection(c) => {
+                // toString on collection: Empty if 0 or >1 items, string of item if 1 item
                 if c.len() == 1 {
                     c[0].to_string_value()
                 } else {
