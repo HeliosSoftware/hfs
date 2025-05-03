@@ -1698,8 +1698,13 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     // Check for invalid characters (e.g., whitespace within the unit)
     if unit.chars().skip(1).any(|c| c.is_whitespace()) { return false; }
 
-    // Assume valid if it passes basic checks (placeholder for real UCUM validation)
-    true
+    // Stricter check: Allow only alphanumeric, '.', '/', '{', '}', '[', ']', '(', ')', '%'
+    // This is still a simplification of full UCUM validation.
+    let is_potentially_ucum = unit.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '{' | '}' | '[' | ']' | '(' | ')' | '%')
+    });
+
+    is_potentially_ucum // Return true only if it's a time unit or passes the stricter UCUM check
 }
 
 

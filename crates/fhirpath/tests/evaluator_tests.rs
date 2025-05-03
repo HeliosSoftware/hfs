@@ -1640,7 +1640,7 @@ fn test_function_conversion_to_quantity() {
     );
     assert_eq!(
         eval("100 days.toQuantity()", &context),
-        EvaluationResult::Integer(100) // Parser returns Integer here
+        EvaluationResult::Decimal(dec!(100.0)) // Expect Decimal conversion
     );
 }
 
