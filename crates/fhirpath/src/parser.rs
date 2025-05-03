@@ -554,10 +554,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 )
                 .map(|(name, params)| Invocation::Function(name, params)),
         ))
-        .map(Term::Invocation) // Wrap identifier-based invocations in Term::Invocation
-        .or(literal.clone()) // Literals are terms
-        .or(external_constant.clone()) // External constants are terms
-        .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()).map(|e| Term::Parenthesized(Box::new(e)))) // Parenthesized expressions
+        .map(Term::Invocation) // Wrap invocation types into Term::Invocation
+        .or(literal.clone()) // Literals are already Term::Literal
+        .or(external_constant.clone()) // External constants are already Term::ExternalConstant
+        .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()).map(|e| Term::Parenthesized(Box::new(e)))) // Parenthesized expressions are Term::Parenthesized
+        // Now that all branches produce a Term, map the final result to Expression::Term
         .map(Expression::Term)
         .padded();
 
@@ -586,7 +587,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         ));
 
         let atom_with_postfix = atom.clone()
-            .then(postfix_op.repeated())
+            // Box the postfix_op parser before calling repeated()
+            .then(postfix_op.boxed().repeated())
             .foldl(|left, op_fn| op_fn(left));
 
         // Prefix operators (Polarity)
