@@ -2236,7 +2236,7 @@ fn apply_type_operation(
             // Check if the value is of the specified type
             // Correctly extract the base type name, ignoring the namespace if present
             let base_type_name = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
+                TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
                 TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
             };
 
@@ -2258,7 +2258,7 @@ fn apply_type_operation(
             // Cast the value to the specified type if possible
             // Correctly extract the base type name, ignoring the namespace if present
             let base_type_name = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
+                TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
                 TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
             };
 
