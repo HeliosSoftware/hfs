@@ -182,23 +182,24 @@ fn evaluate_term(
                 return current_item
                     .cloned()
                     .unwrap_or_else(|| -> EvaluationResult { // Explicitly type the closure return
-                        // If no specific item context, use the main context resource(s)
-                        if context.resources.is_empty() {
-                            EvaluationResult::Empty
-                        } else if context.resources.len() == 1 {
-                            // If only one resource, return it directly
-                            convert_resource_to_result(&context.resources[0])
-                        } else {
-                            // If multiple resources, return them as a collection
-                            EvaluationResult::Collection(
-                                context
-                                    .resources
-                                    .iter()
-                                    .map(convert_resource_to_result)
-                                    .collect(),
-                            )
-                        }
-                        // No need for intermediate 'result' variable now
+                        // Wrap the entire if/else block in parentheses to ensure it's treated as an expression
+                        (
+                            if context.resources.is_empty() {
+                                EvaluationResult::Empty
+                            } else if context.resources.len() == 1 {
+                                // If only one resource, return it directly
+                                convert_resource_to_result(&context.resources[0])
+                            } else {
+                                // If multiple resources, return them as a collection
+                                EvaluationResult::Collection(
+                                    context
+                                        .resources
+                                        .iter()
+                                        .map(convert_resource_to_result)
+                                        .collect(),
+                                )
+                            }
+                        )
                     });
             }
 
