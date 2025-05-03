@@ -407,16 +407,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     fn emit_error(message: &str) {
         eprintln!("Parser Error: {}", message);
     }
-            // Provide a default Decimal value if it occurs.
-            emit_error("Expected Literal::Number in quantity parser, got other literal type.");
-            Literal::Quantity(dec!(0), Some(u))
-        }
-    });
-
-    // Helper function to emit errors (replace with actual logging/error handling if needed)
-    fn emit_error(message: &str) {
-        eprintln!("Parser Error: {}", message);
-    }
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
@@ -829,9 +819,9 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
         .or(expr_with_operations);
 
-        polarity_expr.boxed()
+        polarity_expr.boxed() // Return the final parser definition from the closure
     });
 
-    // Return the parser
+    // Apply then_ignore(end()) to the fully defined recursive parser
     expr_parser.then_ignore(end())
 }
