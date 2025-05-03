@@ -925,6 +925,42 @@ fn call_function(
                 EvaluationResult::Collection(distinct_items)
             }
         }
+        "skip" => {
+            // Returns the collection with the first 'num' items removed
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Skip requires exactly one argument
+            }
+            let num_to_skip = match &args[0] {
+                EvaluationResult::Integer(i) => {
+                    if *i < 0 { 0 } else { *i as usize } // Treat negative skip as 0
+                },
+                // Add conversion from Decimal if it's an integer value
+                EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
+                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
+                },
+                _ => return EvaluationResult::Empty, // Invalid argument type
+            };
+
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            if num_to_skip >= items.len() {
+                EvaluationResult::Empty
+            } else {
+                let skipped_items = items[num_to_skip..].to_vec();
+                // Apply singleton evaluation rule
+                if skipped_items.is_empty() {
+                    EvaluationResult::Empty
+                } else if skipped_items.len() == 1 {
+                    skipped_items.into_iter().next().unwrap()
+                } else {
+                    EvaluationResult::Collection(skipped_items)
+                }
+            }
+        }
         "tail" => {
             // Returns the collection with all items except the first
             if let EvaluationResult::Collection(items) = invocation_base {
