@@ -113,10 +113,34 @@ impl Ord for EvaluationResult {
 // --- End Ord Implementation ---
 
 
-// Implement Hash for EvaluationResult to use it in HashSet for distinct/intersect
-// Note: Hashing floating-point numbers (Decimal) directly can be problematic due to precision.
-// We'll hash their string representation for stability. Hashing collections/objects might be complex.
-impl Hash for EvaluationResult {
+// --- Hash Implementation ---
+    }
+
+    /// Converts the result to Boolean specifically for logical operators (and, or, xor, implies).
+    /// Handles String conversion ('true'/'false' variants) -> Boolean.
+    /// Other types (including other strings and collections) result in Empty.
+    fn to_boolean_for_logic(&self) -> EvaluationResult {
+        match self {
+            EvaluationResult::Boolean(b) => EvaluationResult::Boolean(*b),
+            EvaluationResult::String(s) => match s.to_lowercase().as_str() {
+                "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
+                "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
+                _ => EvaluationResult::Empty, // Other strings evaluate to empty in boolean logic
+            },
+            // Other types evaluate to Empty for logical operators per spec section 5.2
+            EvaluationResult::Integer(_)
+            | EvaluationResult::Decimal(_)
+            | EvaluationResult::Date(_)
+            | EvaluationResult::DateTime(_)
+            | EvaluationResult::Time(_)
+            | EvaluationResult::Collection(_) // Collections evaluate to Empty in boolean logic context
+            | EvaluationResult::Object(_) => EvaluationResult::Empty,
+            EvaluationResult::Empty => EvaluationResult::Empty,
+        }
+    }
+}
+
+// --- Implementations for Rust Primitives ---
     fn hash<H: Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state); // Hash the enum variant first
         match self {
