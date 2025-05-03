@@ -581,18 +581,20 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             // Member/Function Invocation: '.' followed by an identifier or function call structure
             just('.').ignore_then(
                 choice((
-                    // Function call after dot
-                    identifier.clone()
-                        .then(
-                            expr.clone()
-                                .separated_by(just(',').padded())
+                    // Attempt to parse identifier followed by parentheses FIRST
+                    attempt( // Use attempt to allow backtracking if parentheses are not found
+                        identifier.clone()
+                            .then(
+                                expr.clone()
+                                    .separated_by(just(',').padded())
                                 .allow_trailing()
                                 .collect::<Vec<_>>()
                                 // Add padding to parentheses here
-                                .delimited_by(just('(').padded(), just(')').padded())
-                        )
-                        .map(|(name, params)| Invocation::Function(name, params)),
-                    // Simple member access after dot
+                                    .delimited_by(just('(').padded(), just(')').padded())
+                            )
+                            .map(|(name, params)| Invocation::Function(name, params))
+                    ),
+                    // If the above fails (no parentheses), parse as simple member access
                     identifier.clone().map(Invocation::Member),
                 ))
             )
