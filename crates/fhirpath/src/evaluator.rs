@@ -910,14 +910,12 @@ fn apply_multiplicative(
                 } else {
                     // Decimal division preserves precision
                     l.checked_div(r)
-                        .map(EvaluationResult::Decimal)
-                        .map(EvaluationResult::Decimal)
+                        .map(EvaluationResult::Decimal) // Keep only one map
                         .unwrap_or(EvaluationResult::Empty) // Handle potential overflow/errors
-                } else {
-                    EvaluationResult::Empty // Invalid types for division
                 }
+                // Removed the incorrect inner else block
             } else {
-                 EvaluationResult::Empty // Invalid types for division
+                 EvaluationResult::Empty // Invalid types for division (this else is correct)
             }
         }
         "div" | "mod" => {
