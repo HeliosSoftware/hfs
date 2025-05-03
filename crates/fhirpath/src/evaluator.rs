@@ -718,6 +718,29 @@ fn call_function(
                  }
             }
         }
+        "isDistinct" => {
+            // Returns true if all items in the collection are distinct (based on equality)
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            if items.len() <= 1 {
+                return EvaluationResult::Boolean(true); // Empty or single-item collections are distinct
+            }
+
+            for i in 0..items.len() {
+                for j in (i + 1)..items.len() {
+                    // Use compare_equality to check for duplicates
+                    if compare_equality(&items[i], "=", &items[j]).to_boolean() {
+                        return EvaluationResult::Boolean(false); // Found a duplicate
+                    }
+                }
+            }
+
+            EvaluationResult::Boolean(true) // No duplicates found
+        }
         "distinct" => {
             // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
