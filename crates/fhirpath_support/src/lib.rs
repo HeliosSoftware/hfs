@@ -1,6 +1,6 @@
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
-use std::collections::{HashMap, HashSet}; // Import HashSet
+use std::collections::HashMap; // Removed HashSet import
 use std::hash::{Hash, Hasher}; // Import Hash and Hasher
 
 /// Trait to convert FHIR field values into EvaluationResult

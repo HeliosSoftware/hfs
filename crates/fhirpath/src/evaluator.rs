@@ -4,7 +4,7 @@ use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 // Removed unused import: use rust_decimal_macros::dec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet}; // Import HashSet here
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
