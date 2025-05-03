@@ -586,15 +586,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     // Simple member access after dot
                     identifier.clone().map(Invocation::Member),
                 ))
-            ).map(|inv| |left| Expression::Invocation(Box::new(left), inv)),
+            )
+            .map(|inv| |left| Expression::Invocation(Box::new(left), inv))
+            .boxed(), // Box the first branch explicitly
             // Indexer
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
                 .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx)))
-                .boxed(), // Box this branch
-        )); // Remove .boxed() from after choice
+                .boxed(), // Box the second branch explicitly
+        )); // Choice now combines two BoxedParsers
 
         let atom_with_postfix = atom.clone()
-            // Use the choice parser directly (branches are already boxed)
+            // Now call repeated on the Choice parser whose branches are boxed
             .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
