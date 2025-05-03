@@ -4,7 +4,11 @@ use chumsky::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec; // For potential default values if needed
 use std::fmt;
+use std::fmt;
 use std::str::FromStr;
+
+// Type alias for the closure used in postfix operations
+type PostfixOpFn = Box<dyn Fn(Expression) -> Expression + Clone>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -587,17 +591,25 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                     identifier.clone().map(Invocation::Member),
                 ))
             )
-            .map(|inv| |left| Expression::Invocation(Box::new(left), inv))
-            .boxed(), // Box the first branch explicitly
+            .map(|inv| {
+                // Explicitly create and box the closure to match PostfixOpFn
+                let op_fn: PostfixOpFn = Box::new(move |left| Expression::Invocation(Box::new(left), inv.clone()));
+                op_fn
+            })
+            .boxed(), // Box the parser returning the closure
             // Indexer
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
-                .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx)))
-                .boxed(), // Box the second branch explicitly
-        )); // Don't box the choice result here yet
+                .map(|idx| {
+                    // Explicitly create and box the closure
+                    let op_fn: PostfixOpFn = Box::new(move |left| Expression::Indexer(Box::new(left), Box::new(idx.clone())));
+                    op_fn
+                })
+                .boxed(), // Box the parser returning the closure
+        )).boxed(); // Box the result of the choice combinator
 
         let atom_with_postfix = atom.clone()
-            // Box the postfix_op parser *before* calling repeated()
-            .then(postfix_op.boxed().repeated())
+            // Now call repeated on the boxed Choice parser
+            .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
         // Prefix operators (Polarity)
