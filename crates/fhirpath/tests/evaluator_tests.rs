@@ -3043,11 +3043,11 @@ fn test_environment_variables() {
         r4::Resource::Patient(patient.clone()), // Wrap in Resource enum
     ))]); // Pass resource vec
 
-    // %context should be set automatically by evaluate()
-    let context_var = ctx_res.get_variable_as_result("context"); // Use get_variable_as_result
-    // Remove .expect(), check the result directly
+    // Evaluate the %context variable using the eval function
+    let context_var_result = eval("%context", &ctx_res);
+    // Check that the result is not Empty
     assert!(
-        !matches!(context_var, EvaluationResult::Empty),
+        !matches!(context_var_result, EvaluationResult::Empty),
         "%context should be set"
     );
     assert!(matches!(context_var, EvaluationResult::Object(_)));
