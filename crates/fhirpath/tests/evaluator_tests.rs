@@ -488,11 +488,11 @@ fn test_function_filtering_select() {
     assert_eq!(
         eval("(1 | 2 | 3).select($this * 2)", &context),
         collection(vec![
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(4),
-            EvaluationResult::Integer(6)
+            EvaluationResult::Decimal(dec!(2.0)), // Result should be Decimal
+            EvaluationResult::Decimal(dec!(4.0)), // Result should be Decimal
+            EvaluationResult::Decimal(dec!(6.0))  // Result should be Decimal
         ])
-    ); // Corrected expected result
+    );
     // Test flattening
     assert_eq!(
         eval("( (1|2) | (3|4) ).select($this)", &context),
