@@ -182,24 +182,22 @@ fn evaluate_term(
                 return current_item
                     .cloned()
                     .unwrap_or_else(|| {
-                        // Assign the result of the if/else block to a variable inside the closure
-                        let result = if context.resources.is_empty() {
-                            EvaluationResult::Empty
+                        // Add explicit return statements for each branch within the closure
+                        if context.resources.is_empty() {
+                            return EvaluationResult::Empty;
                         } else if context.resources.len() == 1 {
                             // If only one resource, return it directly
-                            convert_resource_to_result(&context.resources[0])
+                            return convert_resource_to_result(&context.resources[0]);
                         } else {
                             // If multiple resources, return them as a collection
-                            EvaluationResult::Collection(
+                            return EvaluationResult::Collection(
                                 context
                                     .resources
                                     .iter()
                                     .map(convert_resource_to_result)
                                     .collect(),
-                            )
-                        };
-                        // Explicitly return the variable from the closure
-                        result
+                            );
+                        }
                     });
             }
 
