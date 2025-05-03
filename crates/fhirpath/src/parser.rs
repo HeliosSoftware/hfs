@@ -536,32 +536,37 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     recursive(|expr| {
         // Atom: the most basic elements like literals, identifiers, parenthesized expressions.
         let atom = choice((
-            literal.clone(),
-            external_constant.clone(),
-            // Function calls, member access, $this etc. are handled as invocations
-            identifier.clone().map(Invocation::Member),
-            just("$this").to(Invocation::This),
-            just("$index").to(Invocation::Index),
-            just("$total").to(Invocation::Total),
-            // Function calls need parameters parsed using the main expression parser
-            identifier.clone()
-                .then(
-                    expr.clone()
-                        .separated_by(just(',').padded())
-                        .allow_trailing() // Allow trailing comma
-                        .collect::<Vec<_>>()
-                        .delimited_by(just('('), just(')'))
-                )
-                .map(|(name, params)| Invocation::Function(name, params))
-                .map(Term::Invocation), // Map this branch to Term::Invocation
+            // Box each branch individually to ensure type uniformity for choice
+            literal.clone().map(Expression::Term).boxed(), // Map literal Term to Expression here
+            external_constant.clone().map(Expression::Term).boxed(), // Map external constant Term to Expression here
+            // Invocations (Member, Function, $this, $index, $total)
+            choice((
+                identifier.clone().map(Invocation::Member),
+                just("$this").to(Invocation::This),
+                just("$index").to(Invocation::Index),
+                just("$total").to(Invocation::Total),
+                identifier.clone()
+                    .then(
+                        expr.clone()
+                            .separated_by(just(',').padded())
+                            .allow_trailing()
+                            .collect::<Vec<_>>()
+                            .delimited_by(just('('), just(')'))
+                    )
+                    .map(|(name, params)| Invocation::Function(name, params)),
+            ))
+            .map(Term::Invocation) // Map invocation variants to Term
+            .map(Expression::Term) // Map Term to Expression
+            .boxed(), // Box the invocation branch
+            // Parenthesized expression
+            expr.clone()
+                .delimited_by(just('(').padded(), just(')').padded())
+                // No need for Term::Parenthesized, just return the inner Expression
+                // .map(|e| Term::Parenthesized(Box::new(e)))
+                // .map(Expression::Term)
+                .boxed(), // Box the parenthesized branch
         ))
-        // .map(Term::Invocation) // Removed map after choice
-        .or(literal.clone()) // Literals are already Term::Literal
-        .or(external_constant.clone()) // External constants are already Term::ExternalConstant
-        .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()).map(|e| Term::Parenthesized(Box::new(e)))) // Parenthesized expressions are Term::Parenthesized
-        // Now that all branches produce a Term, map the final result to Expression::Term
-        .map(Expression::Term)
-        .padded();
+        .padded(); // Apply padding after choice
 
         // Postfix operators: . (member/function invocation) and [] (indexer)
         let postfix_op = choice((
@@ -584,11 +589,12 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             ).map(|inv| |left| Expression::Invocation(Box::new(left), inv)),
             // Indexer
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
-                .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx))),
-        )).boxed(); // Box the result of the choice
+                .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx)))
+                .boxed(), // Box this branch
+        )); // Remove .boxed() from after choice
 
         let atom_with_postfix = atom.clone()
-            // Now use the boxed parser with repeated()
+            // Use the choice parser directly (branches are already boxed)
             .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
