@@ -1,9 +1,10 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
 use fhir::FhirResource;
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
+use chrono::{Local, Timelike}; // Import chrono for date/time functions
+use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use regex::Regex; // Import the regex crate
-use rust_decimal::prelude::*;
-use rust_decimal::Decimal;
 // Removed unused import: use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet}; // Import HashSet here
 
@@ -1798,11 +1799,35 @@ fn call_function(
                 _ => EvaluationResult::Empty,
             }
         }
+        "now" => {
+            // Returns the current DateTime
+            let now = Local::now();
+            // Format according to FHIRPath spec (ISO 8601 with timezone offset)
+            EvaluationResult::DateTime(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }
+        "today" => {
+            // Returns the current Date
+            let today = Local::now().date_naive();
+            // Format as YYYY-MM-DD
+            EvaluationResult::Date(today.format("%Y-%m-%d").to_string())
+        }
+        "timeOfDay" => {
+            // Returns the current Time
+            let now = Local::now();
+            // Format as HH:mm:ss.sss (using Millis for consistency with now())
+            EvaluationResult::Time(format!(
+                "{:02}:{:02}:{:02}.{:03}",
+                now.hour(),
+                now.minute(),
+                now.second(),
+                now.nanosecond() / 1_000_000 // Convert nanoseconds to milliseconds
+            ))
+        }
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added conversion functions to the list
+             // Added conversion functions and now/today/timeOfDay to the list
              let handled_functions = [
                  "where", "select", "exists", "all", "iif", "ofType",
                  "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger",
@@ -1813,10 +1838,10 @@ fn call_function(
                  "count", "empty", "first", "last", "not", "contains", "isDistinct",
                  "distinct", "skip", "tail", "take", "intersect", "exclude", "union", "combine",
                  "length", "indexOf", "substring", "startsWith", "endsWith", "upper", "lower",
-                 "replace", "matches", "replaceMatches", "toChars",
+                 "replace", "matches", "replaceMatches", "toChars", "now", "today", "timeOfDay",
              ];
              if !handled_functions.contains(&name) {
-                 eprintln!("Warning: Unsupported function called: {}", name);
+                 eprintln!("Warning: Unsupported function called: {}", name); // Keep this warning for truly unhandled functions
              }
              EvaluationResult::Empty
         }
