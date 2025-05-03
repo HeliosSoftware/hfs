@@ -703,46 +703,6 @@ fn compare_inequality(
         }
     }
 }
-                "<=" => l <= r,
-                ">" => l > r,
-                ">=" => l >= r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
-        }
-        (EvaluationResult::Date(l), EvaluationResult::Date(r)) => {
-            let result = match op {
-                "<" => l < r,
-                "<=" => l <= r,
-                ">" => l > r,
-                ">=" => l >= r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
-        }
-        (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => {
-            let result = match op {
-                "<" => l < r,
-                "<=" => l <= r,
-                ">" => l > r,
-                ">=" => l >= r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
-        }
-        (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
-            let result = match op {
-                "<" => l < r,
-                "<=" => l <= r,
-                ">" => l > r,
-                ">=" => l >= r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
-        }
-        _ => EvaluationResult::Empty,
-    }
-}
 
 /// Compares two values for equality
 fn compare_equality(

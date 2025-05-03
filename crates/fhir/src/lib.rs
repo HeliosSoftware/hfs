@@ -1,6 +1,6 @@
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Keep only one import
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
+// Removed unused import: use rust_decimal::prelude::ToPrimitive;
 use serde::{
     Deserialize, Serialize,
     de::{self, Deserializer, MapAccess, Visitor},
