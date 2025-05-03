@@ -888,6 +888,33 @@ fn call_function(
 
             EvaluationResult::Boolean(true) // No duplicates found
         }
+        "toInteger" => {
+            // Converts the input to Integer according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Boolean(b) => EvaluationResult::Integer(if *b { 1 } else { 0 }),
+                EvaluationResult::Integer(i) => EvaluationResult::Integer(*i),
+                EvaluationResult::String(s) => {
+                    // Try parsing as i64
+                    s.parse::<i64>()
+                        .map(EvaluationResult::Integer)
+                        .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
+                }
+                // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
+                EvaluationResult::Decimal(_) => EvaluationResult::Empty,
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        // Recursively call toInteger on the single item
+                        call_function("toInteger", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty // Multi-item or empty collection -> Empty
+                    }
+                }
+                // Other types are not convertible
+                _ => EvaluationResult::Empty,
+            }
+        }
         "distinct" => {
             // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
