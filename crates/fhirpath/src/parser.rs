@@ -4,11 +4,10 @@ use chumsky::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec; // For potential default values if needed
 use std::fmt;
-use std::fmt;
+// Removed duplicate fmt import
 use std::str::FromStr;
 
-// Type alias for the closure used in postfix operations
-type PostfixOpFn = Box<dyn Fn(Expression) -> Expression + Clone>;
+// Removed PostfixOpFn type alias
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
@@ -592,17 +591,17 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 ))
             )
             .map(|inv| {
-                // Explicitly create and box the closure to match PostfixOpFn
-                let op_fn: PostfixOpFn = Box::new(move |left| Expression::Invocation(Box::new(left), inv.clone()));
-                op_fn
+                // Closure now inferred, boxing happens below
+                Box::new(move |left: Expression| Expression::Invocation(Box::new(left), inv.clone()))
+                    as Box<dyn Fn(Expression) -> Expression> // Cast to dyn Fn trait object
             })
             .boxed(), // Box the parser returning the closure
             // Indexer
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
                 .map(|idx| {
-                    // Explicitly create and box the closure
-                    let op_fn: PostfixOpFn = Box::new(move |left| Expression::Indexer(Box::new(left), Box::new(idx.clone())));
-                    op_fn
+                     // Closure now inferred, boxing happens below
+                    Box::new(move |left: Expression| Expression::Indexer(Box::new(left), Box::new(idx.clone())))
+                        as Box<dyn Fn(Expression) -> Expression> // Cast to dyn Fn trait object
                 })
                 .boxed(), // Box the parser returning the closure
         )).boxed(); // Box the result of the choice combinator
