@@ -853,16 +853,26 @@ fn call_function(
                 }
                 EvaluationResult::Collection(items) => {
                     // Collection contains item (using equality)
-                    let contains = items
-                        .iter()
-                        .any(|item| compare_equality(item, "=", arg).to_boolean());
-                    EvaluationResult::Boolean(contains)
+                    // Check if arg is empty first (already done above, but double-check doesn't hurt)
+                    if arg == &EvaluationResult::Empty {
+                        EvaluationResult::Empty
+                    } else {
+                        let contains = items
+                            .iter()
+                            .any(|item| compare_equality(item, "=", arg).to_boolean());
+                        EvaluationResult::Boolean(contains)
+                    }
                 }
                  // contains on single non-collection/non-string item
                  EvaluationResult::Empty => EvaluationResult::Boolean(false), // Empty cannot contain anything
                  single_item => {
                      // Treat as single-item collection: check if the item equals the argument
-                     EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
+                     // Check if arg is empty first
+                     if arg == &EvaluationResult::Empty {
+                         EvaluationResult::Empty
+                     } else {
+                         EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
+                     }
                  }
             }
         }

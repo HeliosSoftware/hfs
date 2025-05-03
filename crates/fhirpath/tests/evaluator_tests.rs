@@ -1755,7 +1755,7 @@ fn test_function_string_substring() {
     );
     assert_eq!(
         eval("'abcdefg'.substring(7, 1)", &context),
-        EvaluationResult::Empty
+        EvaluationResult::String("".to_string()) // Spec: Start out of bounds returns empty string
     ); // Start out of bounds
     assert_eq!(
         eval("'abcdefg'.substring(-1, 1)", &context),
