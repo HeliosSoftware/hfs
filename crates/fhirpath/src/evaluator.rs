@@ -213,6 +213,19 @@ pub fn evaluate(
     }
 }
 
+/// Normalizes a vector of results according to FHIRPath singleton evaluation rules.
+/// Returns Empty if vec is empty, the single item if len is 1, or Collection(vec) otherwise.
+fn normalize_collection_result(mut items: Vec<EvaluationResult>) -> EvaluationResult {
+    if items.is_empty() {
+        EvaluationResult::Empty
+    } else if items.len() == 1 {
+        items.pop().unwrap() // Take the single item
+    } else {
+        EvaluationResult::Collection(items)
+    }
+}
+
+
 /// Evaluates a term in the given context, potentially with a specific item as context ($this).
 fn evaluate_term(
     term: &Term,
@@ -591,12 +604,8 @@ fn evaluate_where(
         }
     }
 
-    // Return Empty or Collection
-    if filtered_items.is_empty() {
-        EvaluationResult::Empty
-    } else {
-        EvaluationResult::Collection(filtered_items)
-    }
+    // Return Empty or Collection, apply normalization
+    normalize_collection_result(filtered_items)
 }
 
 /// Evaluates the 'select' function.
@@ -626,12 +635,8 @@ fn evaluate_select(
         }
     }
 
-    // Return Empty or Collection
-    if projected_items.is_empty() {
-        EvaluationResult::Empty
-    } else {
-        EvaluationResult::Collection(projected_items)
-    }
+    // Return Empty or Collection, apply normalization
+    normalize_collection_result(projected_items)
 }
 
 /// Evaluates the 'all' function with a criteria expression.
@@ -711,12 +716,8 @@ fn evaluate_of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) ->
         }
     }
 
-    // Return Empty or Collection
-    if filtered_items.is_empty() {
-        EvaluationResult::Empty
-    } else {
-        EvaluationResult::Collection(filtered_items)
-    }
+    // Return Empty or Collection, apply normalization
+    normalize_collection_result(filtered_items)
 }
 
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
@@ -727,19 +728,15 @@ fn call_function(
 ) -> EvaluationResult {
     match name {
         "count" => {
-            // Returns the number of items in the collection
-            if let EvaluationResult::Collection(items) = invocation_base {
-                EvaluationResult::Integer(items.len() as i64)
-            } else {
-                // Single items count as 1, empty counts as 0
-                match invocation_base {
-                    EvaluationResult::Empty => EvaluationResult::Integer(0),
-                    _ => EvaluationResult::Integer(1),
-                }
+            // Returns the number of items in the collection, including duplicates
+            match invocation_base {
+                EvaluationResult::Collection(items) => EvaluationResult::Integer(items.len() as i64),
+                EvaluationResult::Empty => EvaluationResult::Integer(0),
+                _ => EvaluationResult::Integer(1), // Single item counts as 1
             }
         }
         "empty" => {
-            // Returns true if the collection is empty
+            // Returns true if the collection is empty (0 items)
             match invocation_base {
                 // Use invocation_base, not context
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
@@ -932,7 +929,53 @@ fn call_function(
                 }
             }
 
-            EvaluationResult::Boolean(true) // No duplicates found
+            EvaluationResult::Boolean(true) // No duplicates found using strict equality
+        }
+        "subsetOf" => {
+            // Checks if the invocation collection is a subset of the argument collection
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            let other_collection = &args[0];
+
+            let self_items = match invocation_base {
+                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Empty => return EvaluationResult::Boolean(true), // Empty set is subset of anything
+                single => &[single.clone()][..], // Treat single item as slice
+            };
+            let other_items = match other_collection {
+                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Empty => &[][..], // Empty slice
+                single => &[single.clone()][..], // Treat single item as slice
+            };
+
+            // Use HashSet for efficient lookup in the 'other' collection
+            let other_set: HashSet<_> = other_items.iter().collect();
+
+            // Check if every item in self_items is present in other_set
+            let is_subset = self_items.iter().all(|item| other_set.contains(item));
+            EvaluationResult::Boolean(is_subset)
+        }
+        "supersetOf" => {
+            // Checks if the invocation collection is a superset of the argument collection
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            let other_collection = &args[0];
+
+            let self_items = match invocation_base {
+                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Empty => &[][..],
+                single => &[single.clone()][..],
+            };
+            let other_items = match other_collection {
+                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Empty => return EvaluationResult::Boolean(true), // Anything is superset of empty set
+                single => &[single.clone()][..],
+            };
+
+            // Use HashSet for efficient lookup in the 'self' collection
+            let self_set: HashSet<_> = self_items.iter().collect();
+
+            // Check if every item in other_items is present in self_set
+            let is_superset = other_items.iter().all(|item| self_set.contains(item));
+            EvaluationResult::Boolean(is_superset)
         }
         "toDecimal" => {
             // Converts the input to Decimal according to FHIRPath rules
@@ -1011,12 +1054,8 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection
-            if distinct_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(distinct_items)
-            }
+            // Return Empty or Collection, apply normalization
+            normalize_collection_result(distinct_items)
         }
         "skip" => {
             // Returns the collection with the first 'num' items removed
@@ -1044,12 +1083,8 @@ fn call_function(
                 EvaluationResult::Empty
             } else {
                 let skipped_items = items[num_to_skip..].to_vec();
-                // Return Empty or Collection
-                if skipped_items.is_empty() {
-                    EvaluationResult::Empty
-                } else {
-                    EvaluationResult::Collection(skipped_items)
-                }
+                // Return Empty or Collection, apply normalization
+                normalize_collection_result(skipped_items)
             }
         }
         "tail" => {
@@ -1098,15 +1133,11 @@ fn call_function(
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
 
-            // Return Empty or Collection
-            if taken_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(taken_items)
-            }
+            // Return Empty or Collection, apply normalization
+            normalize_collection_result(taken_items)
         }
         "intersect" => {
-            // Returns the intersection of two collections (items present in both)
+            // Returns the intersection of two collections (items present in both, order not guaranteed)
             if args.len() != 1 {
                 return EvaluationResult::Empty; // Intersect requires exactly one argument
             }
@@ -1149,15 +1180,11 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection, do not apply singleton rule here
-            if intersection_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(intersection_items)
-            }
+            // Return Empty or Collection, apply normalization
+            normalize_collection_result(intersection_items)
         }
         "exclude" => {
-            // Returns items in invocation_base that are NOT in the argument collection
+            // Returns items in invocation_base that are NOT in the argument collection (preserves order and duplicates)
             if args.len() != 1 {
                 return EvaluationResult::Empty; // Exclude requires exactly one argument
             }
@@ -1196,15 +1223,11 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection, preserving duplicates and order
-            if result_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(result_items)
-            }
+            // Return Empty or Collection, preserving duplicates and order, apply normalization
+            normalize_collection_result(result_items)
         }
         "union" => {
-            // Returns the union of two collections (distinct items from both)
+            // Returns the union of two collections (distinct items from both, order not guaranteed)
             if args.len() != 1 {
                 return EvaluationResult::Empty; // Union requires exactly one argument
             }
@@ -1241,15 +1264,11 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection
-            if union_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(union_items)
-            }
+            // Return Empty or Collection, apply normalization
+            normalize_collection_result(union_items)
         }
         "combine" => {
-            // Returns a collection containing all items from both collections, including duplicates
+            // Returns a collection containing all items from both collections, including duplicates, preserving order
             if args.len() != 1 {
                 return EvaluationResult::Empty; // Combine requires exactly one argument
             }
@@ -1272,11 +1291,21 @@ fn call_function(
             let mut combined_items = left_items;
             combined_items.extend(right_items);
 
-            // Return Empty or Collection
-            if combined_items.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                EvaluationResult::Collection(combined_items)
+            // Return Empty or Collection, apply normalization
+            normalize_collection_result(combined_items)
+        }
+        "single" => {
+            // Returns the single item in a collection, or empty if 0 or >1 items
+            match invocation_base {
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        items[0].clone()
+                    } else {
+                        EvaluationResult::Empty // 0 or >1 items
+                    }
+                }
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                single_item => single_item.clone(), // Single non-collection item is returned as is
             }
         }
         "convertsToDecimal" => {
@@ -1900,7 +1929,7 @@ fn call_function(
                         .chars()
                         .map(|c| EvaluationResult::String(c.to_string()))
                         .collect();
-                    EvaluationResult::Collection(chars)
+                    normalize_collection_result(chars) // Apply normalization
                 }
             }
             _ => EvaluationResult::Empty,
