@@ -976,6 +976,43 @@ fn call_function(
                 EvaluationResult::Empty
             }
         }
+        "take" => {
+            // Returns the first 'num' items from the collection
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Take requires exactly one argument
+            }
+            let num_to_take = match &args[0] {
+                EvaluationResult::Integer(i) => {
+                    if *i <= 0 { 0 } else { *i as usize } // Treat non-positive take as 0
+                },
+                // Add conversion from Decimal if it's an integer value
+                EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
+                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
+                },
+                _ => return EvaluationResult::Empty, // Invalid argument type
+            };
+
+            if num_to_take == 0 {
+                return EvaluationResult::Empty;
+            }
+
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
+
+            // Apply singleton evaluation rule
+            if taken_items.is_empty() {
+                EvaluationResult::Empty
+            } else if taken_items.len() == 1 {
+                taken_items.into_iter().next().unwrap()
+            } else {
+                EvaluationResult::Collection(taken_items)
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
