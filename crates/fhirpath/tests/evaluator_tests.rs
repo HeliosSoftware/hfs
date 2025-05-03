@@ -304,7 +304,7 @@ fn test_function_existence_subset_of() {
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("{}.subsetOf({1, 2})", &context),
+        eval("{}.subsetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
@@ -342,7 +342,7 @@ fn test_function_existence_superset_of() {
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf({1})", &context),
+        eval("(1 | 2).supersetOf(1)", &context), // Use | syntax (or single item)
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
@@ -350,15 +350,15 @@ fn test_function_existence_superset_of() {
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf({1, 2, 3})", &context),
+        eval("(1 | 2).supersetOf(1 | 2 | 3)", &context), // Use | syntax
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("{}.supersetOf({1, 2})", &context),
+        eval("{}.supersetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1).supersetOf({1, 2})", &context),
+        eval("(1).supersetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(false)
     );
 }
@@ -376,11 +376,11 @@ fn test_function_existence_count() {
         eval("(1 | 2 | 3).count()", &context),
         EvaluationResult::Integer(3)
     );
-    // Add test for duplicates
+    // Add test for duplicates - | operator creates distinct collection (1 | 2)
     assert_eq!(
         eval("(1 | 2 | 1).count()", &context),
-        EvaluationResult::Integer(3)
-    ); // Duplicates are counted
+        EvaluationResult::Integer(2) // Expect 2 because (1 | 2 | 1) becomes (1 | 2)
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#distinct--collection
@@ -427,7 +427,7 @@ fn test_function_existence_is_distinct() {
     );
     assert_eq!(
         eval("(1 | 2 | 1).isDistinct()", &context),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::Boolean(true) // Expect true because (1 | 2 | 1) becomes (1 | 2) which IS distinct
     );
 }
 
@@ -814,13 +814,12 @@ fn test_function_subsetting_intersect() {
     } else {
         panic!("Expected collection result from intersect");
     }
-    let result = eval("(1 | 2 | 1).intersect((1 | 3 | 1))", &context); // Changed {} to ()
-    if let EvaluationResult::Collection(items) = result {
-        assert_eq!(items.len(), 1);
-        assert!(matches!(items[0], EvaluationResult::Integer(1)));
-    } else {
-        panic!("Expected collection result from intersect");
-    }
+    // (1 | 2 | 1) -> (1 | 2)
+    // (1 | 3 | 1) -> (1 | 3)
+    // intersect -> (1)
+    let result = eval("(1 | 2 | 1).intersect(1 | 3 | 1)", &context); // Use | syntax
+    // Check if the result is the single integer 1, handling normalization
+    assert_eq!(result, EvaluationResult::Integer(1), "Intersect result mismatch");
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#excludeother-collection--collection
@@ -849,14 +848,17 @@ fn test_function_subsetting_exclude() {
             EvaluationResult::Integer(3)
         ])
     );
-    // Preserves duplicates and order
+    // Preserves duplicates and order - but | makes input distinct first
+    // (1 | 2 | 1 | 3 | 2) -> (1 | 2 | 3)
+    // (1 | 4) -> (1 | 4)
+    // exclude -> (2 | 3)
     assert_eq!(
         eval("(1 | 2 | 1 | 3 | 2).exclude(1 | 4)", &context),
-        // Expect collection result
+        // Expect collection result based on distinct input
         collection(vec![
             EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(2)
+            EvaluationResult::Integer(3)
+            // The second '2' is lost because the input collection becomes distinct
         ])
     );
 }
@@ -959,7 +961,10 @@ fn test_function_combining_combine() {
             })
             .collect();
         actual_items.sort();
-        assert_eq!(actual_items, vec![1, 1, 1, 1, 2, 3]);
+        // (1 | 2 | 1) -> (1 | 2)
+        // (1 | 3 | 1) -> (1 | 3)
+        // combine -> (1 | 2 | 1 | 3)
+        assert_eq!(actual_items, vec![1, 1, 2, 3]); // Correct expectation
     } else {
         panic!("Expected collection result from combine");
     }
