@@ -1,9 +1,9 @@
 use chumsky::Parser;
 // Removed duplicate Parser import
 // use chumsky::Parser; // Removed duplicate
-use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
 use fhir::FhirResource;
-use fhirpath::evaluator::{evaluate, EvaluationContext};
+use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
+use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
 // use rust_decimal::Decimal; // Removed unused import
@@ -85,17 +85,17 @@ fn test_expression_literals() {
     );
     // Quantity - Parser returns Decimal or Integer based on number format
     assert_eq!(
-        eval("10 'mg'", &context), // 10 is parsed as Integer
-        EvaluationResult::Integer(10) // Evaluator ignores unit for now
+        eval("10 'mg'", &context),     // 10 is parsed as Integer
+        EvaluationResult::Integer(10)  // Evaluator ignores unit for now
     );
     assert_eq!(
-        eval("4.5 'km'", &context), // 4.5 is parsed as Number (Decimal)
-        EvaluationResult::Decimal(dec!(4.5)) // Evaluator ignores unit for now
+        eval("4.5 'km'", &context),           // 4.5 is parsed as Number (Decimal)
+        EvaluationResult::Decimal(dec!(4.5))  // Evaluator ignores unit for now
     );
     // Quantity with date/time unit - Parser returns Decimal or Integer
     assert_eq!(
-        eval("100 days", &context), // 100 is parsed as Integer
-        EvaluationResult::Integer(100) // Evaluator ignores unit for now
+        eval("100 days", &context),     // 100 is parsed as Integer
+        EvaluationResult::Integer(100)  // Evaluator ignores unit for now
     );
 
     // Empty Collection (Null literal)
@@ -515,7 +515,7 @@ fn test_function_filtering_select() {
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2), // Expect Integer result for 1 + 1
             EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3)  // Expect Integer result for 2 + 1
+            EvaluationResult::Integer(3) // Expect Integer result for 2 + 1
         ])
     );
 }
@@ -583,10 +583,7 @@ fn test_function_filtering_of_type() {
             Some(&EvaluationResult::String("p1".to_string()))
         );
         // Patient.active should evaluate to its primitive value directly
-        assert_eq!(
-            fields.get("active"),
-            Some(&EvaluationResult::Boolean(true))
-        );
+        assert_eq!(fields.get("active"), Some(&EvaluationResult::Boolean(true)));
         // To access the id, we would need Patient.active.id() or similar (not tested here)
     }
 
@@ -826,11 +823,11 @@ fn test_function_subsetting_exclude() {
         ])
     );
     assert_eq!(
-        eval("{}.exclude({1 | 2 | 3})", &context),
+        eval("{}.exclude(1 | 2 | 3)", &context),
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(1 | 2 | 3).exclude({2 | 4})", &context),
+        eval("(1 | 2 | 3).exclude(2 | 4)", &context),
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(3)
@@ -838,7 +835,7 @@ fn test_function_subsetting_exclude() {
     );
     // Preserves duplicates and order
     assert_eq!(
-        eval("(1 | 2 | 1 | 3 | 2).exclude({1 | 4})", &context),
+        eval("(1 | 2 | 1 | 3 | 2).exclude(1 | 4)", &context),
         collection(vec![
             EvaluationResult::Integer(2),
             EvaluationResult::Integer(3),
@@ -1057,10 +1054,7 @@ fn test_function_conversion_to_boolean() {
         EvaluationResult::Boolean(false)
     );
     assert_eq!(eval("2.toBoolean()", &context), EvaluationResult::Empty); // Invalid integer
-    assert_eq!(
-        eval("2.5.toBoolean()", &context),
-        EvaluationResult::Empty
-    ); // Invalid decimal
+    assert_eq!(eval("2.5.toBoolean()", &context), EvaluationResult::Empty); // Invalid decimal
     assert_eq!(eval("'abc'.toBoolean()", &context), EvaluationResult::Empty); // Invalid string
 }
 
@@ -1303,7 +1297,7 @@ fn test_function_conversion_to_string() {
         eval("5.5 'mg'.toString()", &context), // Decimal quantity
         EvaluationResult::String("5.5".to_string())
     );
-     assert_eq!(
+    assert_eq!(
         eval("5 'mg'.toString()", &context), // Integer quantity
         EvaluationResult::String("5".to_string())
     );
@@ -1359,7 +1353,7 @@ fn test_function_conversion_converts_to_string() {
         eval("5.5 'mg'.convertsToString()", &context), // Decimal quantity
         EvaluationResult::Boolean(true)
     );
-     assert_eq!(
+    assert_eq!(
         eval("5 'mg'.convertsToString()", &context), // Integer quantity
         EvaluationResult::Boolean(true)
     );
@@ -1823,7 +1817,10 @@ fn test_function_utility_now() {
     assert!(matches!(result, EvaluationResult::DateTime(_)));
     // Check determinism (calling twice gives same result)
     let expr = parser().parse("now() = now()").unwrap();
-    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
+    assert_eq!(
+        evaluate(&expr, &context, None),
+        EvaluationResult::Boolean(true)
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#timeofday--time
@@ -1835,7 +1832,10 @@ fn test_function_utility_time_of_day() {
     assert!(matches!(result, EvaluationResult::Time(_)));
     // Check determinism
     let expr = parser().parse("timeOfDay() = timeOfDay()").unwrap();
-    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
+    assert_eq!(
+        evaluate(&expr, &context, None),
+        EvaluationResult::Boolean(true)
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#today--date
@@ -1847,7 +1847,10 @@ fn test_function_utility_today() {
     assert!(matches!(result, EvaluationResult::Date(_)));
     // Check determinism
     let expr = parser().parse("today() = today()").unwrap();
-    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
+    assert_eq!(
+        evaluate(&expr, &context, None),
+        EvaluationResult::Boolean(true)
+    );
 }
 
 // --- Operations ---
@@ -1862,10 +1865,7 @@ fn test_operator_equality_equals() {
     assert_eq!(eval("1 = 2", &context), EvaluationResult::Boolean(false));
     assert_eq!(eval("1 = 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal equality
     assert_eq!(eval("1.0 = 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer equality
-    assert_eq!(
-        eval("1.0 = 1.0", &context),
-        EvaluationResult::Boolean(true)
-    ); // Decimal vs Decimal
+    assert_eq!(eval("1.0 = 1.0", &context), EvaluationResult::Boolean(true)); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 = 2.0", &context),
         EvaluationResult::Boolean(false)
@@ -1932,10 +1932,7 @@ fn test_operator_equality_equivalent() {
     assert_eq!(eval("1 ~ 2", &context), EvaluationResult::Boolean(false));
     assert_eq!(eval("1 ~ 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal equivalence
     assert_eq!(eval("1.0 ~ 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer equivalence
-    assert_eq!(
-        eval("1.0 ~ 1.0", &context),
-        EvaluationResult::Boolean(true)
-    ); // Decimal vs Decimal
+    assert_eq!(eval("1.0 ~ 1.0", &context), EvaluationResult::Boolean(true)); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 ~ 2.0", &context),
         EvaluationResult::Boolean(false)
@@ -2542,10 +2539,7 @@ fn test_operator_math_div() {
     assert_eq!(eval("6 div 2", &context), EvaluationResult::Integer(3));
     assert_eq!(eval("-5 div 2", &context), EvaluationResult::Integer(-2));
     // Decimal div Decimal -> Integer (truncates)
-    assert_eq!(
-        eval("5.5 div 2.1", &context),
-        EvaluationResult::Integer(2)
-    );
+    assert_eq!(eval("5.5 div 2.1", &context), EvaluationResult::Integer(2));
     assert_eq!(
         eval("-5.5 div 2.1", &context),
         EvaluationResult::Integer(-2)
@@ -2577,7 +2571,7 @@ fn test_operator_math_mod() {
         eval("-5.5 mod 2.1", &context),
         EvaluationResult::Decimal(dec!(-1.3)) // Result has sign of dividend
     );
-     // Mixed types for mod -> Empty
+    // Mixed types for mod -> Empty
     assert_eq!(eval("5.5 mod 2", &context), EvaluationResult::Empty);
     assert_eq!(eval("5 mod 2.1", &context), EvaluationResult::Empty);
     // Modulo zero
@@ -2644,12 +2638,9 @@ fn test_operator_precedence() {
         eval("10 / 2 * 5", &context),
         EvaluationResult::Decimal(dec!(25.0))
     );
-     // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
-    assert_eq!(
-        eval("10 div 3 * 2", &context),
-        EvaluationResult::Integer(6)
-    );
-     // (10 mod 3) + 1 = 1 + 1 = 2.0 (mod -> Integer, then Integer + Integer -> Decimal)
+    // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
+    assert_eq!(eval("10 div 3 * 2", &context), EvaluationResult::Integer(6));
+    // (10 mod 3) + 1 = 1 + 1 = 2.0 (mod -> Integer, then Integer + Integer -> Decimal)
     assert_eq!(
         eval("10 mod 3 + 1", &context),
         EvaluationResult::Decimal(dec!(2.0))
@@ -2675,7 +2666,7 @@ fn test_operator_precedence() {
         eval("-1 + 5", &context),
         EvaluationResult::Decimal(dec!(4.0))
     );
-     // -(1 + 5) = -(6.0) = -6.0 (Addition -> Decimal, then Unary minus)
+    // -(1 + 5) = -(6.0) = -6.0 (Addition -> Decimal, then Unary minus)
     assert_eq!(
         eval("-(1 + 5)", &context),
         EvaluationResult::Decimal(dec!(-6.0))
@@ -2746,36 +2737,44 @@ fn test_environment_variables() {
 fn patient_context() -> EvaluationContext {
     let patient = r4::Patient {
         id: Some("p1".to_string().into()), // Resource ID - Use .to_string().into()
-        identifier: Some(vec![r4::Identifier { // Wrap in Some()
-            r#use: Some(Code { // Use imported Code
+        identifier: Some(vec![r4::Identifier {
+            // Wrap in Some()
+            r#use: Some(Code {
+                // Use imported Code
                 value: Some("usual".to_string()),
                 ..Default::default()
             }),
             system: Some("urn:oid:1.2.3.4".to_string().into()), // Use .to_string().into()
-            value: Some("12345".to_string().into()), // Use .to_string().into()
+            value: Some("12345".to_string().into()),            // Use .to_string().into()
             ..Default::default()
         }]),
-        active: Some(Boolean { // Use imported Boolean
+        active: Some(Boolean {
+            // Use imported Boolean
             // Element with value
             id: Some("active-id".to_string().into()), // Element ID - Use .to_string().into()
             value: Some(true),
             ..Default::default()
         }),
-        name: Some(vec![ // Wrap in Some()
+        name: Some(vec![
+            // Wrap in Some()
             r4::HumanName {
                 // Official Name
                 id: Some("name1".to_string().into()), // Use .to_string().into()
-                r#use: Some(Code { // Use imported Code
+                r#use: Some(Code {
+                    // Use imported Code
                     value: Some("official".to_string()),
                     ..Default::default()
                 }),
                 family: Some("Doe".to_string().into()), // Use .to_string().into()
-                given: Some(vec![ // Wrap in Some()
-                    FhirString { // Use imported FhirString
+                given: Some(vec![
+                    // Wrap in Some()
+                    FhirString {
+                        // Use imported FhirString
                         value: Some("John".to_string()),
                         ..Default::default()
                     }, // Element<String>
-                    FhirString { // Use imported FhirString
+                    FhirString {
+                        // Use imported FhirString
                         id: Some("given2-id".to_string().into()), // Use .to_string().into()
                         value: Some("Middle".to_string()),
                         ..Default::default()
@@ -2786,7 +2785,8 @@ fn patient_context() -> EvaluationContext {
             r4::HumanName {
                 // Usual Name (no family)
                 id: Some("name2".to_string().into()), // Use .to_string().into()
-                r#use: Some(Code { // Use imported Code
+                r#use: Some(Code {
+                    // Use imported Code
                     value: Some("usual".to_string()),
                     ..Default::default()
                 }),
@@ -2800,9 +2800,11 @@ fn patient_context() -> EvaluationContext {
                 ..Default::default()
             },
         ]),
-        telecom: Some(vec![ // Wrap in Some()
+        telecom: Some(vec![
+            // Wrap in Some()
             r4::ContactPoint {
-                system: Some(Code { // Use imported Code
+                system: Some(Code {
+                    // Use imported Code
                     value: Some("phone".to_string()),
                     ..Default::default()
                 }),
@@ -2810,7 +2812,8 @@ fn patient_context() -> EvaluationContext {
                 ..Default::default()
             },
             r4::ContactPoint {
-                system: Some(Code { // Use imported Code
+                system: Some(Code {
+                    // Use imported Code
                     value: Some("email".to_string()),
                     ..Default::default()
                 }),
@@ -2818,24 +2821,28 @@ fn patient_context() -> EvaluationContext {
                 ..Default::default()
             },
         ]),
-        birth_date: Some(Date { // Use imported Date
+        birth_date: Some(Date {
+            // Use imported Date
             // Element with value and extension
             id: Some("birthdate-id".to_string().into()), // Use .to_string().into()
             value: Some("1980-05-15".to_string()),
-            extension: Some(vec![Extension { // Use imported Extension, wrap in Some()
+            extension: Some(vec![Extension {
+                // Use imported Extension, wrap in Some()
                 url: "http://example.com/precision".to_string().into(), // Remove Some(), url is not Option
                 value: Some(ExtensionValue::String("day".to_string().into())), // Use imported ExtensionValue, .to_string().into()
                 ..Default::default()
             }]),
             ..Default::default()
         }),
-        deceased: Some(r4::PatientDeceased::Boolean(Boolean { // Use imported Boolean
+        deceased: Some(r4::PatientDeceased::Boolean(Boolean {
+            // Use imported Boolean
             value: Some(false),
             ..Default::default()
         })), // DeceasedBoolean (Element)
         ..Default::default()
     };
-    EvaluationContext::new(vec![FhirResource::R4(Box::new(r4::Resource::Patient( // Wrap in Resource::Patient
+    EvaluationContext::new(vec![FhirResource::R4(Box::new(r4::Resource::Patient(
+        // Wrap in Resource::Patient
         patient,
     )))])
 }
@@ -3054,7 +3061,7 @@ fn test_arithmetic_operations() {
         ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))), // Decimal Sub -> Decimal
         ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))), // Decimal Mult -> Decimal
         ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))), // Decimal Div -> Decimal
-        ("5.5 div 2.1", EvaluationResult::Integer(2)),       // Decimal div -> Integer
+        ("5.5 div 2.1", EvaluationResult::Integer(2)),   // Decimal div -> Integer
         ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // Decimal mod -> Decimal
         // Mixed type div/mod -> Empty
         ("5.5 div 2", EvaluationResult::Empty), // Decimal div Integer -> Empty
@@ -3294,7 +3301,8 @@ fn test_resource_access() {
     // Remove duplicate imports, they are already at the top level
     use fhir::r4::{Account, Code}; // Import only needed types locally if preferred, or rely on top-level
     // Create a dummy R4 resource for testing
-    let dummy_resource = r4::Resource::Account(Account { // Use imported Account
+    let dummy_resource = r4::Resource::Account(Account {
+        // Use imported Account
         id: Some("theid".to_string().into()), // Convert String to Id
         meta: None,
         implicit_rules: None,
@@ -3304,7 +3312,8 @@ fn test_resource_access() {
         extension: None,
         modifier_extension: None,
         identifier: None,
-        status: Code { // Use imported Code
+        status: Code {
+            // Use imported Code
             id: None,
             extension: None,
             value: None,
