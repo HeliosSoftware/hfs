@@ -845,10 +845,14 @@ fn call_function(
             match invocation_base {
                 EvaluationResult::String(s) => {
                     // String contains substring
-                    if let EvaluationResult::String(substr) = arg {
+                    // Explicitly check if arg is Empty *within this arm*
+                    if arg == &EvaluationResult::Empty {
+                         EvaluationResult::Empty
+                    } else if let EvaluationResult::String(substr) = arg {
                         EvaluationResult::Boolean(s.contains(substr))
                     } else {
-                        EvaluationResult::Empty // Invalid argument type for string contains
+                        // Argument is not Empty and not String
+                        EvaluationResult::Empty
                     }
                 }
                 EvaluationResult::Collection(items) => {
@@ -1697,8 +1701,12 @@ fn call_function(
                     if let Some(length_res) = length_res_opt {
                         // Two arguments: start and length
                         let length = match length_res {
-                            EvaluationResult::Integer(l) if *l >= 0 => *l as usize,
-                            _ => return EvaluationResult::Empty, // Invalid length type or negative
+                            // If length is negative, return empty string per spec
+                            EvaluationResult::Integer(l) if *l < 0 => return EvaluationResult::String("".to_string()),
+                            // If length is non-negative integer, use it
+                            EvaluationResult::Integer(l) => *l as usize,
+                            // Any other type for length is invalid
+                            _ => return EvaluationResult::Empty,
                         };
 
                         let result: String = s.chars().skip(start_index).take(length).collect();
