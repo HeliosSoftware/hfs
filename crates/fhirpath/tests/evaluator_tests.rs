@@ -3050,7 +3050,7 @@ fn test_environment_variables() {
         !matches!(context_var_result, EvaluationResult::Empty),
         "%context should be set"
     );
-    assert!(matches!(context_var, EvaluationResult::Object(_)));
+    assert!(matches!(context_var_result, EvaluationResult::Object(_)));
 
     // Test accessing %context implicitly at start of path
     // assert_eq!(eval("id", &ctx_res), EvaluationResult::String("p1".to_string())); // Requires member access
