@@ -3435,8 +3435,8 @@ fn test_resource_oftype() {
 fn test_arithmetic_operations() {
     // Note: Result types vary based on operator and operands
     let test_cases = vec![
-        ("1 + 2", EvaluationResult::Decimal(dec!(3.0))), // Addition -> Decimal
-        ("5 - 3", EvaluationResult::Decimal(dec!(2.0))), // Subtraction -> Decimal
+        ("1 + 2", EvaluationResult::Integer(3)),         // Addition -> Integer
+        ("5 - 3", EvaluationResult::Integer(2)),         // Subtraction -> Integer
         ("2 * 3", EvaluationResult::Integer(6)),         // Integer Multiplication -> Integer
         ("6 / 2", EvaluationResult::Decimal(dec!(3.0))), // Division -> Decimal
         ("7 / 2", EvaluationResult::Decimal(dec!(3.5))), // Division -> Decimal
