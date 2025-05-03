@@ -88,7 +88,7 @@ impl Serialize for PreciseDecimal {
             ))),
         }
     }
-} // <-- Add missing closing brace here
+}
 
 // Removed PreciseDecimalVisitor and its impl block
 
