@@ -1100,6 +1100,37 @@ fn call_function(
                 EvaluationResult::Collection(result_items)
             }
         }
+        "combine" => {
+            // Returns a collection containing all items from both collections, including duplicates
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Combine requires exactly one argument
+            }
+            let other_collection = &args[0];
+
+            // Convert inputs to Vec for processing
+            let left_items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+
+            let right_items = match other_collection {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+
+            // Concatenate the two vectors
+            let mut combined_items = left_items;
+            combined_items.extend(right_items);
+
+            // Return Empty or Collection
+            if combined_items.is_empty() {
+                EvaluationResult::Empty
+            } else {
+                EvaluationResult::Collection(combined_items)
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
