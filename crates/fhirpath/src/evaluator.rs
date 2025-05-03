@@ -2354,6 +2354,11 @@ fn compare_equality(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
+    // FHIRPath Spec 5.1 Equality: If either operand is empty, the result is empty.
+    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+        return EvaluationResult::Empty;
+    }
+
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();

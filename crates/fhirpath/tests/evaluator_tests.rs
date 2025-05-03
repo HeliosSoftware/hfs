@@ -2247,7 +2247,7 @@ fn test_operator_equality_equals() {
         eval("(1|1) = (1|1)", &context),
         EvaluationResult::Boolean(true)
     );
-    // Empty propagation
+    // Empty propagation - Per spec, comparison with empty results in empty
     assert_eq!(eval("{} = {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("1 = {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("{} = 1", &context), EvaluationResult::Empty);
@@ -2343,7 +2343,7 @@ fn test_operator_equality_not_equals() {
         eval("(1|2) != (1|2)", &context),
         EvaluationResult::Boolean(false)
     );
-    // Empty propagation
+    // Empty propagation - Per spec, comparison with empty results in empty
     assert_eq!(eval("{} != {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("1 != {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("{} != 1", &context), EvaluationResult::Empty);
