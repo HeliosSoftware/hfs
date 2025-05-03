@@ -2187,17 +2187,8 @@ fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationRe
 
 /// Applies an additive operator to two values
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
-    // Promote Integer to Decimal for numeric operations
-    let left_dec = match left {
-        EvaluationResult::Decimal(d) => Some(*d),
-        EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
-        _ => None,
-    };
-    let right_dec = match right {
-        EvaluationResult::Decimal(d) => Some(*d),
-        EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
-        _ => None,
-    };
+    // The variables left_dec and right_dec were removed as they were unused.
+    // The logic below handles type checking and promotion directly.
 
     match op {
         "+" => {
