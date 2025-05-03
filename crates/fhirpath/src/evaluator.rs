@@ -215,9 +215,15 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         }
         Literal::Time(t) => EvaluationResult::Time(t.clone()),
         Literal::Quantity(n, _) => {
-            // For now, we ignore the unit and just return the decimal value
-            // In a full implementation, we would handle units properly
-            EvaluationResult::Decimal(*n) // Use Decimal, corrected variable name to 'n'
+            // For now, we ignore the unit.
+            // Return Integer if the Decimal represents a whole number and fits in i64,
+            // otherwise return Decimal.
+            if n.is_integer() {
+                 // Attempt to convert to i64 if it fits
+                 n.to_i64().map(EvaluationResult::Integer).unwrap_or_else(|| EvaluationResult::Decimal(*n))
+            } else {
+                 EvaluationResult::Decimal(*n)
+            }
         }
     }
 }

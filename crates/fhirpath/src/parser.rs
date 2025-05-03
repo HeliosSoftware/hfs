@@ -382,7 +382,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             }
         }),
     ))
-    .padded(); // Allow whitespace around units
+    /* .padded() */; // Remove padding here, let number/integer padding handle space
 
     // Quantity needs to be a term-level construct to work in expressions
     // Allow either an integer or a number before the unit
