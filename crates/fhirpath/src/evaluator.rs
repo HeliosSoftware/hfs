@@ -181,9 +181,9 @@ fn evaluate_term(
             if let Invocation::This = invocation {
                 return current_item
                     .cloned()
-                    .unwrap_or_else(|| { // Remove explicit return type and parentheses
-                        // If no specific item context, use the main context resource(s)
-                        if context.resources.is_empty() {
+                    .unwrap_or_else(|| {
+                        // Assign the result of the if/else block to a variable inside the closure
+                        let result = if context.resources.is_empty() {
                             EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
                             // If only one resource, return it directly
@@ -197,7 +197,9 @@ fn evaluate_term(
                                     .map(convert_resource_to_result)
                                     .collect(),
                             )
-                        }
+                        };
+                        // Explicitly return the variable from the closure
+                        result
                     });
             }
 
