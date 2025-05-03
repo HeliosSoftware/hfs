@@ -201,7 +201,7 @@ fn evaluate_term(
                 }
                 // The code below this point in the `if let Invocation::This` block is now unreachable,
                 // but that's okay as we handle all cases above.
-            }
+            }; // Add semicolon here to explicitly mark the end of the statement
 
             // Check if this is a variable reference (starting with %)
             if let Invocation::Member(name) = invocation {
