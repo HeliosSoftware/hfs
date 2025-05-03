@@ -925,6 +925,21 @@ fn call_function(
                 EvaluationResult::Collection(distinct_items)
             }
         }
+        "tail" => {
+            // Returns the collection with all items except the first
+            if let EvaluationResult::Collection(items) = invocation_base {
+                if items.len() > 1 {
+                    // Create a new Vec containing elements from the second one onwards
+                    EvaluationResult::Collection(items[1..].to_vec())
+                } else {
+                    // Empty or single-item collection results in empty
+                    EvaluationResult::Empty
+                }
+            } else {
+                // Tail on a single non-collection item results in empty
+                EvaluationResult::Empty
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
