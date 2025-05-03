@@ -392,8 +392,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             // Then try parsing number
             number.clone().then_ignore(text::whitespace().at_least(1)).then(unit.clone())
         ))
-        .map(|(num_literal, u)| {
-             match num_literal {
+        .map(|(num_term, u)| { // Renamed num_literal to num_term for clarity
+             match num_term { // Match against the Term produced by the choice
                  Term::Literal(Literal::Integer(i)) => {
                      // Convert integer to Decimal for Quantity representation
                      Literal::Quantity(Decimal::from(i), Some(u))
@@ -401,7 +401,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                  Term::Literal(Literal::Number(d)) => Literal::Quantity(d, Some(u)),
                  _ => {
                      // This case should ideally not be reachable if integer/number parsers work correctly
-                     emit_error("Expected Literal::Integer or Literal::Number in quantity parser, got other term.");
+                     emit_error("Expected Term::Literal(Integer) or Term::Literal(Number) in quantity parser, got other term.");
                      Literal::Quantity(dec!(0), Some(u)) // Default value
                  }
              }
