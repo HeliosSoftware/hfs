@@ -2520,18 +2520,18 @@ fn test_operator_collections_union() {
             EvaluationResult::Integer(2)
         ])
     ); // Order not guaranteed
-    // Order not guaranteed, check contents
+    // Order not guaranteed, check contents - Union operator produces distinct results
     let result = eval("(1 | 2 | 3) | (2 | 3 | 4)", &context);
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
                 EvaluationResult::Integer(i) => i,
-                _ => panic!("Expected integers"),
+                _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
         actual_items.sort();
-        assert_eq!(actual_items, vec![1, 2, 3, 4]);
+        assert_eq!(actual_items, vec![1, 2, 3, 4]); // Expect distinct items
     } else {
         panic!("Expected collection result from union operator");
     }

@@ -2296,13 +2296,29 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
     };
 
     let mut result = left_items;
-    result.extend(right_items);
+    let mut union_items = Vec::new();
+    // Use HashSet to track items already added to ensure uniqueness based on FHIRPath equality
+    let mut added_items_set = HashSet::new();
 
-    // Return Empty or Collection, do not apply singleton rule here
-    if result.is_empty() {
+    // Add items from the left collection if they haven't been added
+    for item in left_items {
+        if added_items_set.insert(item.clone()) {
+            union_items.push(item);
+        }
+    }
+
+    // Add items from the right collection if they haven't been added
+    for item in right_items {
+        if added_items_set.insert(item.clone()) {
+            union_items.push(item);
+        }
+    }
+
+    // Return Empty or Collection
+    if union_items.is_empty() {
         EvaluationResult::Empty
     } else {
-        EvaluationResult::Collection(result)
+        EvaluationResult::Collection(union_items)
     }
 }
 
@@ -2481,17 +2497,22 @@ fn check_membership(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
-    // Per FHIRPath spec for operators: If either operand is empty, the result is empty.
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-        return EvaluationResult::Empty;
-    }
-
+    // Specific handling for 'in' and 'contains' based on FHIRPath spec regarding empty collections
     match op {
         "in" => {
-            // Check if left is in right (Empty check already handled above)
+            // If right operand (collection) is empty, result is false.
+            if right == &EvaluationResult::Empty {
+                return EvaluationResult::Boolean(false);
+            }
+            // If left operand (item) is empty, result is empty.
+            if left == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
+            // Proceed with check if both are non-empty
             let right_items = match right {
                 EvaluationResult::Collection(items) => items,
-                _ => return EvaluationResult::Boolean(false),
+                // If right is a single non-empty item, treat as collection of one
+                single_item => vec![single_item],
             };
 
             let is_in = right_items
@@ -2501,13 +2522,21 @@ fn check_membership(
             EvaluationResult::Boolean(is_in)
         }
         "contains" => {
+            // If left operand (collection) is empty, result is false.
+            if left == &EvaluationResult::Empty {
+                return EvaluationResult::Boolean(false);
+            }
+            // If right operand (item) is empty, result is empty.
+            if right == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
+            // Proceed with check if both are non-empty
             match left {
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
                     let contains = items
                         .iter()
                         .any(|item| compare_equality(item, "=", right).to_boolean());
-
                     EvaluationResult::Boolean(contains)
                 }
                 // For strings, check if the string contains the substring
@@ -2515,12 +2544,14 @@ fn check_membership(
                     EvaluationResult::String(substr) => {
                         EvaluationResult::Boolean(s.contains(substr))
                     }
-                    _ => EvaluationResult::Boolean(false),
+                    _ => EvaluationResult::Boolean(false), // Contains on string requires string argument
                 },
-                // For other types, return false
-                _ => EvaluationResult::Boolean(false),
+                // Treat single non-empty item as collection of one
+                single_item => {
+                     EvaluationResult::Boolean(compare_equality(single_item, "=", right).to_boolean())
+                }
             }
         }
-        _ => EvaluationResult::Empty,
+        _ => EvaluationResult::Empty, // Unknown operator
     }
 }
