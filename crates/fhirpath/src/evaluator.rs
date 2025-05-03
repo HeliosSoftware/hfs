@@ -609,6 +609,23 @@ fn call_function(
             }
             EvaluationResult::Boolean(true)
         }
+        "anyTrue" => {
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+            // anyTrue is false for an empty collection
+            if items.is_empty() {
+                return EvaluationResult::Boolean(false);
+            }
+            for item in items {
+                if matches!(item, EvaluationResult::Boolean(true)) {
+                    return EvaluationResult::Boolean(true);
+                }
+            }
+            EvaluationResult::Boolean(false) // No true item found
+        }
         "allFalse" => {
             let items = match invocation_base {
                 EvaluationResult::Collection(items) => items.clone(),
@@ -625,6 +642,23 @@ fn call_function(
                 }
             }
             EvaluationResult::Boolean(true)
+        }
+        "anyFalse" => {
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+            // anyFalse is false for an empty collection
+            if items.is_empty() {
+                return EvaluationResult::Boolean(false);
+            }
+            for item in items {
+                if matches!(item, EvaluationResult::Boolean(false)) {
+                    return EvaluationResult::Boolean(true);
+                }
+            }
+            EvaluationResult::Boolean(false) // No false item found
         }
         "first" => {
             // Returns the first item in the collection
