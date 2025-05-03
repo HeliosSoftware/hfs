@@ -137,74 +137,72 @@ pub fn evaluate(
             check_membership(&left_result, op, &right_result)
         }
         Expression::And(left, right) => {
-            let left_result = evaluate(left, context, current_item);
-            match left_result {
+            let left_eval = evaluate(left, context, current_item);
+            let left_bool = left_eval.to_boolean_for_logic(); // Convert using helper
+
+            match left_bool {
                 EvaluationResult::Boolean(false) => EvaluationResult::Boolean(false), // false and X -> false
                 EvaluationResult::Empty => {
-                    let right_result = evaluate(right, context, current_item);
-                    match right_result {
+                    let right_eval = evaluate(right, context, current_item);
+                    let right_bool = right_eval.to_boolean_for_logic(); // Convert using helper
+                    match right_bool {
                         EvaluationResult::Boolean(false) => EvaluationResult::Boolean(false), // {} and false -> false
                         _ => EvaluationResult::Empty, // {} and (true | {}) -> {}
                     }
                 }
                 EvaluationResult::Boolean(true) => {
-                    let right_result = evaluate(right, context, current_item);
-                    match right_result {
-                        EvaluationResult::Boolean(b) => EvaluationResult::Boolean(b), // true and true/false -> true/false
-                        EvaluationResult::Empty => EvaluationResult::Empty, // true and {} -> {}
-                        _ => EvaluationResult::Empty, // Should not happen if right is boolean or empty
-                    }
+                    let right_eval = evaluate(right, context, current_item);
+                    let right_bool = right_eval.to_boolean_for_logic(); // Convert using helper
+                    right_bool // true and X -> X (where X is Boolean or Empty)
                 }
-                _ => EvaluationResult::Empty, // Non-boolean left operand propagates Empty
+                _ => EvaluationResult::Empty, // Should not happen if to_boolean_for_logic is correct
             }
         }
         Expression::Or(left, op, right) => {
-            let left_result = evaluate(left, context, current_item);
-            let right_result = evaluate(right, context, current_item); // Evaluate right side always for 3VL
+            let left_eval = evaluate(left, context, current_item);
+            let left_bool = left_eval.to_boolean_for_logic(); // Convert using helper
+
+            // Evaluate right side only if needed for 'or', always for 'xor'
+            let right_eval = evaluate(right, context, current_item);
+            let right_bool = right_eval.to_boolean_for_logic(); // Convert using helper
 
             if op == "or" {
-                match (&left_result, &right_result) {
-                    (EvaluationResult::Boolean(true), _) | (_, EvaluationResult::Boolean(true)) => EvaluationResult::Boolean(true), // true or X -> true, X or true -> true
-                    (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Empty, // {} or {} -> {}
-                    (EvaluationResult::Empty, EvaluationResult::Boolean(false)) => EvaluationResult::Empty, // {} or false -> {}
-                    (EvaluationResult::Boolean(false), EvaluationResult::Empty) => EvaluationResult::Empty, // false or {} -> {}
-                    (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => EvaluationResult::Boolean(false), // false or false -> false
-                    // Handle cases where one side might not be boolean (should technically be error?)
-                    // For now, follow truth table logic assuming boolean conversion happens implicitly if needed,
-                    // but prioritize explicit boolean/empty checks.
-                    _ => EvaluationResult::Empty, // Default to Empty for unexpected combinations
+                match (&left_bool, &right_bool) {
+                    (EvaluationResult::Boolean(true), _) | (_, EvaluationResult::Boolean(true)) => EvaluationResult::Boolean(true),
+                    (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Empty,
+                    (EvaluationResult::Empty, EvaluationResult::Boolean(false)) => EvaluationResult::Empty,
+                    (EvaluationResult::Boolean(false), EvaluationResult::Empty) => EvaluationResult::Empty,
+                    (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => EvaluationResult::Boolean(false),
+                    _ => EvaluationResult::Empty, // Should not happen
                 }
             } else { // xor
-                match (&left_result, &right_result) {
-                    (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty, // X xor {} -> {}, {} xor X -> {}
+                match (&left_bool, &right_bool) {
+                    (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                     (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => EvaluationResult::Boolean(l != r),
-                    _ => EvaluationResult::Empty, // Non-boolean operands
+                    _ => EvaluationResult::Empty, // Should not happen
                 }
             }
         }
         Expression::Implies(left, right) => {
-            let left_result = evaluate(left, context, current_item);
-            // No need to evaluate right if left is false or empty (short-circuit/defined result)
-            match left_result {
+            let left_eval = evaluate(left, context, current_item);
+            let left_bool = left_eval.to_boolean_for_logic(); // Convert using helper
+
+            match left_bool {
                 EvaluationResult::Boolean(false) => EvaluationResult::Boolean(true), // false implies X -> true
                 EvaluationResult::Empty => {
-                    // Need right side to determine {} implies X
-                    let right_result = evaluate(right, context, current_item);
-                    match right_result {
+                    let right_eval = evaluate(right, context, current_item);
+                    let right_bool = right_eval.to_boolean_for_logic(); // Convert using helper
+                    match right_bool {
                         EvaluationResult::Boolean(true) => EvaluationResult::Boolean(true), // {} implies true -> true
                         _ => EvaluationResult::Empty, // {} implies (false | {}) -> {}
                     }
                 }
                 EvaluationResult::Boolean(true) => {
-                    // Need right side for true implies X
-                    let right_result = evaluate(right, context, current_item);
-                    match right_result {
-                        EvaluationResult::Boolean(b) => EvaluationResult::Boolean(b), // true implies true/false -> true/false
-                        EvaluationResult::Empty => EvaluationResult::Empty, // true implies {} -> {}
-                        _ => EvaluationResult::Empty, // Should not happen
-                    }
+                    let right_eval = evaluate(right, context, current_item);
+                    let right_bool = right_eval.to_boolean_for_logic(); // Convert using helper
+                    right_bool // true implies X -> X (Boolean or Empty)
                 }
-                 _ => EvaluationResult::Empty, // Non-boolean left operand
+                 _ => EvaluationResult::Empty, // Should not happen
             }
         }
         Expression::Lambda(_, _) => {
