@@ -1176,6 +1176,45 @@ fn call_function(
                 EvaluationResult::Collection(combined_items)
             }
         }
+        "toBoolean" => {
+            // Converts the input to Boolean according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Boolean(b) => EvaluationResult::Boolean(*b),
+                EvaluationResult::Integer(i) => match i {
+                    1 => EvaluationResult::Boolean(true),
+                    0 => EvaluationResult::Boolean(false),
+                    _ => EvaluationResult::Empty, // Other integers are not convertible
+                },
+                EvaluationResult::Decimal(d) => {
+                    if *d == Decimal::ONE {
+                        EvaluationResult::Boolean(true)
+                    } else if d.is_zero() { // Check for 0.0, -0.0 etc.
+                        EvaluationResult::Boolean(false)
+                    } else {
+                        EvaluationResult::Empty // Other decimals are not convertible
+                    }
+                }
+                EvaluationResult::String(s) => {
+                    match s.to_lowercase().as_str() {
+                        "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
+                        "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
+                        _ => EvaluationResult::Empty, // Other strings are not convertible
+                    }
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        // Recursively call toBoolean on the single item
+                        call_function("toBoolean", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty // Multi-item or empty collection -> Empty
+                    }
+                }
+                // Other types are not convertible
+                _ => EvaluationResult::Empty,
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
@@ -1187,7 +1226,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             if !["where", "select", "exists", "all", "iif", "ofType"].contains(&name) {
+             // Added "toBoolean" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
