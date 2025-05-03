@@ -422,10 +422,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // The outer choice directly produces Literal::Quantity or fails.
 
 
-    // Helper function to emit errors (replace with actual logging/error handling if needed)
-    fn emit_error(message: &str) {
-        eprintln!("Parser Error: {}", message);
-    }
+    // Removed unused emit_error helper function
 
     let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
