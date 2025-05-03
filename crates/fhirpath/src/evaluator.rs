@@ -1053,6 +1053,53 @@ fn call_function(
                 EvaluationResult::Collection(intersection_items)
             }
         }
+        "exclude" => {
+            // Returns items in invocation_base that are NOT in the argument collection
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Exclude requires exactly one argument
+            }
+            let other_collection = &args[0];
+
+            // If invocation_base is empty, result is empty
+            if invocation_base == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
+            // If other_collection is empty, result is invocation_base
+            if other_collection == &EvaluationResult::Empty {
+                return invocation_base.clone();
+            }
+
+            // Convert inputs to Vec for processing
+            let left_items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                single_item => vec![single_item.clone()],
+            };
+
+            let right_items = match other_collection {
+                EvaluationResult::Collection(items) => items.clone(),
+                single_item => vec![single_item.clone()],
+            };
+
+            let mut result_items = Vec::new();
+            for left_item in &left_items {
+                // Check if the left_item exists in the right_items (using equality '=')
+                let exists_in_right = right_items
+                    .iter()
+                    .any(|right_item| compare_equality(left_item, "=", right_item).to_boolean());
+
+                // Keep the item if it does NOT exist in the right collection
+                if !exists_in_right {
+                    result_items.push(left_item.clone());
+                }
+            }
+
+            // Return Empty or Collection, preserving duplicates and order
+            if result_items.is_empty() {
+                EvaluationResult::Empty
+            } else {
+                EvaluationResult::Collection(result_items)
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
