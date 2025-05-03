@@ -552,9 +552,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         .collect::<Vec<_>>()
                         .delimited_by(just('('), just(')'))
                 )
-                .map(|(name, params)| Invocation::Function(name, params)),
+                .map(|(name, params)| Invocation::Function(name, params))
+                .map(Term::Invocation), // Map this branch to Term::Invocation
         ))
-        .map(Term::Invocation) // Wrap invocation types into Term::Invocation
+        // .map(Term::Invocation) // Removed map after choice
         .or(literal.clone()) // Literals are already Term::Literal
         .or(external_constant.clone()) // External constants are already Term::ExternalConstant
         .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()).map(|e| Term::Parenthesized(Box::new(e)))) // Parenthesized expressions are Term::Parenthesized
@@ -584,11 +585,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             // Indexer
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
                 .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx))),
-        ));
+        )).boxed(); // Box the result of the choice
 
         let atom_with_postfix = atom.clone()
-            // Box the postfix_op parser before calling repeated()
-            .then(postfix_op.boxed().repeated())
+            // Now use the boxed parser with repeated()
+            .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
         // Prefix operators (Polarity)
