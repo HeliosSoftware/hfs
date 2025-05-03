@@ -558,12 +558,10 @@ fn evaluate_where(
         }
     }
 
+    // Return Empty or Collection
     if filtered_items.is_empty() {
         EvaluationResult::Empty
-    } else if filtered_items.len() == 1 {
-        filtered_items.into_iter().next().unwrap() // Return single item directly
-    }
-     else {
+    } else {
         EvaluationResult::Collection(filtered_items)
     }
 }
@@ -595,12 +593,10 @@ fn evaluate_select(
         }
     }
 
-     if projected_items.is_empty() {
+    // Return Empty or Collection
+    if projected_items.is_empty() {
         EvaluationResult::Empty
-    } else if projected_items.len() == 1 {
-        projected_items.into_iter().next().unwrap() // Return single item directly
-    }
-     else {
+    } else {
         EvaluationResult::Collection(projected_items)
     }
 }
@@ -686,10 +682,9 @@ fn evaluate_of_type(
         }
     }
 
+    // Return Empty or Collection
     if filtered_items.is_empty() {
         EvaluationResult::Empty
-    } else if filtered_items.len() == 1 {
-        filtered_items.into_iter().next().unwrap() // Return single item directly
     } else {
         EvaluationResult::Collection(filtered_items)
     }
@@ -897,13 +892,11 @@ fn call_function(
             // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
                 EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()], // Treat single item as collection
+                EvaluationResult::Empty => return EvaluationResult::Empty, // Distinct on empty is empty
+                single_item => return single_item.clone(), // Distinct on single item is the item itself
             };
 
-            if items.is_empty() {
-                return EvaluationResult::Empty;
-            }
+            // If we reach here, items has at least 2 elements
 
             // Use HashSet to efficiently find distinct items
             let mut distinct_set = HashSet::new();
@@ -917,11 +910,9 @@ fn call_function(
                 }
             }
 
-            // Return based on FHIRPath singleton evaluation
+            // Return Empty or Collection
             if distinct_items.is_empty() {
                 EvaluationResult::Empty
-            } else if distinct_items.len() == 1 {
-                distinct_items.into_iter().next().unwrap()
             } else {
                 EvaluationResult::Collection(distinct_items)
             }
@@ -952,11 +943,9 @@ fn call_function(
                 EvaluationResult::Empty
             } else {
                 let skipped_items = items[num_to_skip..].to_vec();
-                // Apply singleton evaluation rule
+                // Return Empty or Collection
                 if skipped_items.is_empty() {
                     EvaluationResult::Empty
-                } else if skipped_items.len() == 1 {
-                    skipped_items.into_iter().next().unwrap()
                 } else {
                     EvaluationResult::Collection(skipped_items)
                 }
@@ -972,6 +961,9 @@ fn call_function(
                     // Empty or single-item collection results in empty
                     EvaluationResult::Empty
                 }
+            } else if invocation_base == &EvaluationResult::Empty {
+                // Tail on Empty results in Empty
+                EvaluationResult::Empty
             } else {
                 // Tail on a single non-collection item results in empty
                 EvaluationResult::Empty
@@ -1005,11 +997,9 @@ fn call_function(
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
 
-            // Apply singleton evaluation rule
+            // Return Empty or Collection
             if taken_items.is_empty() {
                 EvaluationResult::Empty
-            } else if taken_items.len() == 1 {
-                taken_items.into_iter().next().unwrap()
             } else {
                 EvaluationResult::Collection(taken_items)
             }
@@ -1017,25 +1007,25 @@ fn call_function(
         "intersect" => {
             // Returns the intersection of two collections (items present in both)
             if args.len() != 1 {
-                return EvaluationResult::Empty; // Intersect requires exactly one argument (the other collection)
+                return EvaluationResult::Empty; // Intersect requires exactly one argument
             }
             let other_collection = &args[0];
 
+            // If either input is empty, the intersection is empty
+            if invocation_base == &EvaluationResult::Empty || other_collection == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
+
+            // Convert inputs to Vec for processing
             let left_items = match invocation_base {
                 EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()], // Treat single item as collection
+                single_item => vec![single_item.clone()],
             };
 
             let right_items = match other_collection {
                 EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()], // Treat single item as collection
+                single_item => vec![single_item.clone()],
             };
-
-            if left_items.is_empty() || right_items.is_empty() {
-                return EvaluationResult::Empty; // Intersection with empty is empty
-            }
 
             let mut intersection_items = Vec::new();
             // Use HashSet for efficient duplicate checking in the result
@@ -1056,11 +1046,9 @@ fn call_function(
                 }
             }
 
-            // Apply singleton evaluation rule
+            // Return Empty or Collection, do not apply singleton rule here
             if intersection_items.is_empty() {
                 EvaluationResult::Empty
-            } else if intersection_items.len() == 1 {
-                intersection_items.into_iter().next().unwrap()
             } else {
                 EvaluationResult::Collection(intersection_items)
             }
@@ -1344,6 +1332,7 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
     let mut result = left_items;
     result.extend(right_items);
 
+    // Return Empty or Collection, do not apply singleton rule here
     if result.is_empty() {
         EvaluationResult::Empty
     } else {
