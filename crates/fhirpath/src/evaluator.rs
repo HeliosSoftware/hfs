@@ -1006,15 +1006,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 _ => EvaluationResult::Empty,
             }
         }
-        "-" => {
-            // Handle numeric subtraction (always results in Decimal)
-            if let (Some(l), Some(r)) = (left_dec, right_dec) {
-                EvaluationResult::Decimal(l - r)
-            } else {
-                // Addition is not defined for other type combinations or if promotion failed
-                EvaluationResult::Empty
-            }
-        }
+        // Removed duplicate "-" arm
         "-" => {
             // Handle numeric subtraction (always results in Decimal)
             if let (Some(l), Some(r)) = (left_dec, right_dec) {
