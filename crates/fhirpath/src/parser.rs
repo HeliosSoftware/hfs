@@ -1,4 +1,4 @@
-use chumsky::attempt; // Import attempt directly from the crate root
+// Removed incorrect attempt import
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use chumsky::Parser;
@@ -582,21 +582,18 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             // Member/Function Invocation: '.' followed by an identifier or function call structure
             just('.').ignore_then(
                 choice((
-                    // Attempt to parse identifier followed by parentheses FIRST
-                    attempt( // Use the directly imported attempt
-                        identifier.clone()
-                            .then(
-                                expr.clone()
+                    // Try function call pattern first (identifier followed by parentheses)
+                    identifier.clone()
+                        .then(
+                            expr.clone()
                                     .separated_by(just(',').padded())
                                 .allow_trailing()
                                 .collect::<Vec<_>>()
-                                // Add padding to parentheses here
-                                    .delimited_by(just('(').padded(), just(')').padded())
-                            )
-                            .map(|(name, params)| Invocation::Function(name, params))
-                    ),
-                    // If the above fails (no parentheses), parse as simple member access
-                    identifier.clone().map(Invocation::Member),
+                                .delimited_by(just('(').padded(), just(')').padded()) // Padded parentheses
+                        )
+                        .map(|(name, params)| Invocation::Function(name, params)), // If successful, it's a function call
+                    // If the function call pattern fails, try simple member access
+                    identifier.clone().map(Invocation::Member), // Just the identifier
                 ))
             )
             .map(|inv| {
