@@ -55,126 +55,203 @@ impl EvaluationContext {
     }
 }
 
-/// Evaluates a FHIRPath expression in the given context
-pub fn evaluate(expr: &Expression, context: &EvaluationContext) -> EvaluationResult {
+/// Evaluates a FHIRPath expression in the given context, potentially with a specific item as context ($this).
+pub fn evaluate(
+    expr: &Expression,
+    context: &EvaluationContext,
+    current_item: Option<&EvaluationResult>,
+) -> EvaluationResult {
     match expr {
-        Expression::Term(term) => evaluate_term(term, context),
+        Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left, invocation) => {
-            let left_result = evaluate(left, context);
+            // Evaluate the left side first, passing the current item context
+            let left_result = evaluate(left, context, current_item);
+            // Pass the evaluated left side result and the original context for invocation
             evaluate_invocation(&left_result, invocation, context)
         }
         Expression::Indexer(left, index) => {
-            let left_result = evaluate(left, context);
-            let index_result = evaluate(index, context);
+            let left_result = evaluate(left, context, current_item);
+            // Index expression doesn't depend on $this, evaluate normally
+            let index_result = evaluate(index, context, None);
             evaluate_indexer(&left_result, &index_result)
         }
         Expression::Polarity(op, expr) => {
-            let result = evaluate(expr, context);
+            let result = evaluate(expr, context, current_item);
             apply_polarity(*op, &result)
         }
         Expression::Multiplicative(left, op, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item);
             apply_multiplicative(&left_result, op, &right_result)
         }
         Expression::Additive(left, op, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item);
             apply_additive(&left_result, op, &right_result)
         }
         Expression::Type(left, op, type_spec) => {
-            let result = evaluate(left, context);
+            let result = evaluate(left, context, current_item);
             apply_type_operation(&result, op, type_spec)
         }
         Expression::Union(left, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item);
             union_collections(&left_result, &right_result)
         }
         Expression::Inequality(left, op, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item);
             compare_inequality(&left_result, op, &right_result)
         }
         Expression::Equality(left, op, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item);
             compare_equality(&left_result, op, &right_result)
         }
         Expression::Membership(left, op, right) => {
-            let left_result = evaluate(left, context);
-            let right_result = evaluate(right, context);
+            let left_result = evaluate(left, context, current_item);
+            let right_result = evaluate(right, context, current_item); // Evaluate right side normally for 'in'/'contains'
             check_membership(&left_result, op, &right_result)
         }
         Expression::And(left, right) => {
-            let left_result = evaluate(left, context);
+            let left_result = evaluate(left, context, current_item);
             // Short-circuit evaluation
             if !left_result.to_boolean() {
                 return EvaluationResult::Boolean(false);
             }
-            let right_result = evaluate(right, context);
+            // Only evaluate right if left is true
+            let right_result = evaluate(right, context, current_item);
             EvaluationResult::Boolean(right_result.to_boolean())
         }
         Expression::Or(left, op, right) => {
-            let left_result = evaluate(left, context);
+            let left_result = evaluate(left, context, current_item);
             // Short-circuit for 'or'
             if op == "or" && left_result.to_boolean() {
                 return EvaluationResult::Boolean(true);
             }
-            let right_result = evaluate(right, context);
+            // Evaluate right side
+            let right_result = evaluate(right, context, current_item);
             if op == "or" {
                 EvaluationResult::Boolean(left_result.to_boolean() || right_result.to_boolean())
             } else {
-                // xor
-                EvaluationResult::Boolean(left_result.to_boolean() != right_result.to_boolean())
+                // xor: requires both sides to be evaluated unless one is Empty
+                if left_result == EvaluationResult::Empty || right_result == EvaluationResult::Empty {
+                    EvaluationResult::Empty // FHIRPath spec: xor with Empty is Empty
+                } else {
+                    EvaluationResult::Boolean(left_result.to_boolean() != right_result.to_boolean())
+                }
             }
         }
         Expression::Implies(left, right) => {
-            let left_result = evaluate(left, context);
-            // If the left side is false, the implication is true
-            if !left_result.to_boolean() {
+            let left_result = evaluate(left, context, current_item);
+            // Short-circuit: false implies anything is true
+            if !left_result.to_boolean() && left_result != EvaluationResult::Empty {
                 return EvaluationResult::Boolean(true);
             }
-            // Otherwise, the result is the same as the right side
-            let right_result = evaluate(right, context);
+            // Handle Empty implies X -> true
+            if left_result == EvaluationResult::Empty {
+                 return EvaluationResult::Boolean(true);
+            }
+            // Evaluate right side
+            let right_result = evaluate(right, context, current_item);
+            // Handle X implies Empty -> Empty
+            if right_result == EvaluationResult::Empty {
+                 return EvaluationResult::Empty;
+            }
+            // Otherwise, the result is the boolean value of the right side
             EvaluationResult::Boolean(right_result.to_boolean())
         }
         Expression::Lambda(_, _) => {
-            // Lambda expressions are not directly evaluated
+            // Lambda expressions are not directly evaluated here.
             // They are used in function calls
             EvaluationResult::Empty
         }
     }
 }
 
-/// Evaluates a term in the given context
-fn evaluate_term(term: &Term, context: &EvaluationContext) -> EvaluationResult {
+/// Evaluates a term in the given context, potentially with a specific item as context ($this).
+fn evaluate_term(
+    term: &Term,
+    context: &EvaluationContext,
+    current_item: Option<&EvaluationResult>,
+) -> EvaluationResult {
     match term {
         Term::Invocation(invocation) => {
+            // Handle $this invocation
+            if let Invocation::This = invocation {
+                return current_item
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // If no specific item context, use the main context resource(s)
+                        if context.resources.is_empty() {
+                            EvaluationResult::Empty
+                        } else if context.resources.len() == 1 {
+                            // If only one resource, return it directly
+                            convert_resource_to_result(&context.resources[0])
+                        } else {
+                            // If multiple resources, return them as a collection
+                            EvaluationResult::Collection(
+                                context
+                                    .resources
+                                    .iter()
+                                    .map(convert_resource_to_result)
+                                    .collect(),
+                            )
+                        }
+                    });
+            }
+
             // Check if this is a variable reference (starting with %)
             if let Invocation::Member(name) = invocation {
                 if name.starts_with('%') {
                     let var_name = &name[1..]; // Remove the % prefix
-                    return context.get_variable_as_result(var_name);
+                    // Handle %context explicitly if needed, otherwise lookup variable
+                    if var_name == "context" {
+                         if context.resources.is_empty() {
+                            EvaluationResult::Empty
+                        } else if context.resources.len() == 1 {
+                            convert_resource_to_result(&context.resources[0])
+                        } else {
+                            EvaluationResult::Collection(
+                                context
+                                    .resources
+                                    .iter()
+                                    .map(convert_resource_to_result)
+                                    .collect(),
+                            )
+                        }
+                    } else {
+                        return context.get_variable_as_result(var_name);
+                    }
                 }
             }
 
-            if context.resources.is_empty() {
-                // If there are no resources, return Empty for resource-based invocations
-                evaluate_invocation(&EvaluationResult::Empty, invocation, context)
-            } else {
-                // Convert the first FHIR resource to an EvaluationResult for processing
-                // In a more complete implementation, we might need to handle multiple resources
-                let resource_result = convert_resource_to_result(&context.resources[0]);
-                evaluate_invocation(&resource_result, invocation, context)
-            }
+            // Determine the base context for the invocation
+            let base_context = current_item.cloned().unwrap_or_else(|| {
+                // Default to the main resource context if no specific item
+                if context.resources.is_empty() {
+                    EvaluationResult::Empty
+                } else if context.resources.len() == 1 {
+                    convert_resource_to_result(&context.resources[0])
+                } else {
+                    EvaluationResult::Collection(
+                        context
+                            .resources
+                            .iter()
+                            .map(convert_resource_to_result)
+                            .collect(),
+                    )
+                }
+            });
+
+            evaluate_invocation(&base_context, invocation, context)
         }
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
             context.get_variable_as_result(name)
         }
-        Term::Parenthesized(expr) => evaluate(expr, context),
+        Term::Parenthesized(expr) => evaluate(expr, context, current_item),
     }
 }
 
@@ -230,14 +307,15 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
 
 /// Evaluates an invocation on a value
 fn evaluate_invocation(
-    value: &EvaluationResult,
+    invocation_base: &EvaluationResult, // The result of the expression the invocation is called on
     invocation: &Invocation,
-    context: &EvaluationContext,
+    context: &EvaluationContext, // The overall evaluation context (for variables etc.)
 ) -> EvaluationResult {
     match invocation {
         Invocation::Member(name) => {
+            // Handle member access on the invocation_base
             // Special handling for boolean literals that might be parsed as identifiers
-            if name == "true" {
+            if name == "true" && matches!(invocation_base, EvaluationResult::Empty) { // Only if base is empty context
                 return EvaluationResult::Boolean(true);
             } else if name == "false" {
                 return EvaluationResult::Boolean(false);
@@ -248,57 +326,81 @@ fn evaluate_invocation(
                 // For string contains without arguments, we need to handle it specially
                 // This is a workaround for the parser not handling method calls without parentheses
                 return call_function(name, value, &[]);
+            } else if name == "false" && matches!(invocation_base, EvaluationResult::Empty) {
+                return EvaluationResult::Boolean(false);
             }
 
-            // Access a member of the value
-            match value {
+            // Access a member of the invocation_base
+            match invocation_base {
                 EvaluationResult::Object(obj) => {
                     obj.get(name).cloned().unwrap_or(EvaluationResult::Empty)
                 }
                 EvaluationResult::Collection(items) => {
-                    // For collections, we apply the member access to each item
+                    // For collections, apply member access to each item and collect results
                     let results: Vec<EvaluationResult> = items
                         .iter()
-                        .filter_map(|item| {
-                            if let EvaluationResult::Object(obj) = item {
-                                obj.get(name).cloned()
-                            } else {
-                                None
-                            }
+                        .map(|item| {
+                            // Recursively call member access on each item
+                            evaluate_invocation(item, &Invocation::Member(name.clone()), context)
+                        })
+                        .filter(|res| *res != EvaluationResult::Empty) // Filter out empty results from individual items
+                        .collect();
+
+                    // Flatten nested collections that might result from member access on items
+                    let flattened_results: Vec<EvaluationResult> = results
+                        .into_iter()
+                        .flat_map(|res| match res {
+                            EvaluationResult::Collection(inner) => inner,
+                            EvaluationResult::Empty => vec![],
+                            other => vec![other],
                         })
                         .collect();
 
-                    if results.is_empty() {
+
+                    if flattened_results.is_empty() {
                         EvaluationResult::Empty
-                    } else {
-                        EvaluationResult::Collection(results)
+                    } else if flattened_results.len() == 1 {
+                         flattened_results.into_iter().next().unwrap() // Return single item directly
+                    }
+                     else {
+                        EvaluationResult::Collection(flattened_results)
                     }
                 }
-                // Special handling for empty values
-                EvaluationResult::Empty => {
-                    // Empty values return empty for any member access
-                    EvaluationResult::Empty
-                }
+                // Accessing member on primitive types or Empty returns Empty
                 _ => EvaluationResult::Empty,
             }
         }
-        Invocation::Function(name, args) => {
-            // Evaluate function arguments
-            let evaluated_args: Vec<EvaluationResult> =
-                args.iter().map(|arg| evaluate(arg, context)).collect();
-
-            // Call the appropriate function
-            call_function(name, value, &evaluated_args)
-        }
-        Invocation::This => {
-            if context.resources.is_empty() {
-                EvaluationResult::Empty
-            } else {
-                // Return the first resource as the context
-                convert_resource_to_result(&context.resources[0])
+        Invocation::Function(name, args_exprs) => { // Use args_exprs (AST)
+            // Handle functions that take lambdas specially
+            match name.as_str() {
+                "exists" if !args_exprs.is_empty() => {
+                    let criteria_expr = &args_exprs[0];
+                    evaluate_exists_with_criteria(invocation_base, criteria_expr, context)
+                }
+                "where" if !args_exprs.is_empty() => {
+                    let criteria_expr = &args_exprs[0];
+                    evaluate_where(invocation_base, criteria_expr, context)
+                }
+                "select" if !args_exprs.is_empty() => {
+                    let projection_expr = &args_exprs[0];
+                    evaluate_select(invocation_base, projection_expr, context)
+                }
+                // Add other functions taking lambdas here (e.g., all, any, repeat)
+                _ => {
+                    // Default: Evaluate all arguments first (without $this context), then call function
+                    let evaluated_args: Vec<EvaluationResult> = args_exprs
+                        .iter()
+                        .map(|arg_expr| evaluate(arg_expr, context, None)) // Evaluate args in outer context
+                        .collect();
+                    call_function(name, invocation_base, &evaluated_args)
+                }
             }
         }
-        Invocation::Index => {
+        Invocation::This => {
+             // This should be handled by evaluate_term, but as a fallback:
+             invocation_base.clone() // Return the base it was invoked on
+        }
+         Invocation::Index => {
             // $index should return the current index in a collection operation
             // This is typically used in filter expressions
             // For now, we return Empty as this requires tracking iteration state
@@ -312,9 +414,111 @@ fn evaluate_invocation(
     }
 }
 
-/// Calls a FHIRPath function
+
+// --- Helper functions for lambda evaluation ---
+
+/// Evaluates the 'exists' function with a criteria expression.
+fn evaluate_exists_with_criteria(
+    collection: &EvaluationResult,
+    criteria_expr: &Expression,
+    context: &EvaluationContext,
+) -> EvaluationResult {
+    let items_to_check = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        // Treat single item as a one-item collection
+        single_item => vec![single_item.clone()],
+    };
+
+    if items_to_check.is_empty() {
+        return EvaluationResult::Boolean(false); // Exists is false for empty collection
+    }
+
+    for item in items_to_check {
+        // Evaluate the criteria expression with the current item as $this
+        let criteria_result = evaluate(criteria_expr, context, Some(&item));
+        // exists returns true if the criteria evaluates to true for *any* item
+        if criteria_result.to_boolean() {
+            return EvaluationResult::Boolean(true);
+        }
+    }
+
+    // If no item satisfied the criteria
+    EvaluationResult::Boolean(false)
+}
+
+/// Evaluates the 'where' function.
+fn evaluate_where(
+    collection: &EvaluationResult,
+    criteria_expr: &Expression,
+    context: &EvaluationContext,
+) -> EvaluationResult {
+     let items_to_filter = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        single_item => vec![single_item.clone()],
+    };
+
+    let mut filtered_items = Vec::new();
+    for item in items_to_filter {
+        let criteria_result = evaluate(criteria_expr, context, Some(&item));
+        if criteria_result.to_boolean() {
+            filtered_items.push(item.clone());
+        }
+    }
+
+    if filtered_items.is_empty() {
+        EvaluationResult::Empty
+    } else if filtered_items.len() == 1 {
+        filtered_items.into_iter().next().unwrap() // Return single item directly
+    }
+     else {
+        EvaluationResult::Collection(filtered_items)
+    }
+}
+
+/// Evaluates the 'select' function.
+fn evaluate_select(
+    collection: &EvaluationResult,
+    projection_expr: &Expression,
+    context: &EvaluationContext,
+) -> EvaluationResult {
+    let items_to_project = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        single_item => vec![single_item.clone()],
+    };
+
+    let mut projected_items = Vec::new();
+    for item in items_to_project {
+        let projection_result = evaluate(projection_expr, context, Some(&item));
+        // Flatten results: if projection yields a collection, add its items individually
+        match projection_result {
+            EvaluationResult::Collection(inner_items) => {
+                projected_items.extend(inner_items);
+            }
+            EvaluationResult::Empty => {} // Skip empty results
+            single_result => {
+                projected_items.push(single_result);
+            }
+        }
+    }
+
+     if projected_items.is_empty() {
+        EvaluationResult::Empty
+    } else if projected_items.len() == 1 {
+        projected_items.into_iter().next().unwrap() // Return single item directly
+    }
+     else {
+        EvaluationResult::Collection(projected_items)
+    }
+}
+
+
+/// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
     name: &str,
+    invocation_base: &EvaluationResult, // Renamed from context to avoid confusion
     context: &EvaluationResult,
     args: &[EvaluationResult],
 ) -> EvaluationResult {
@@ -337,92 +541,105 @@ fn call_function(
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
                 _ => EvaluationResult::Boolean(false),
+            // Returns the number of items in the collection
+            if let EvaluationResult::Collection(items) = invocation_base {
+                EvaluationResult::Integer(items.len() as i64)
+            } else {
+                // Single items count as 1, empty counts as 0
+                match invocation_base {
+                    EvaluationResult::Empty => EvaluationResult::Integer(0),
+                    _ => EvaluationResult::Integer(1),
+                }
             }
         }
-        "exists" => {
-            // Returns true if the collection has any items
-            match context {
-                EvaluationResult::Empty => EvaluationResult::Boolean(false),
-                EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
-                _ => EvaluationResult::Boolean(true),
+        "empty" => {
+            // Returns true if the collection is empty
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Boolean(true),
+                EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
+                _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
             }
         }
+         "exists" => {
+             // This handles exists() without criteria.
+             // exists(criteria) is handled in evaluate_invocation.
+             match invocation_base {
+                 EvaluationResult::Empty => EvaluationResult::Boolean(false),
+                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
+                 _ => EvaluationResult::Boolean(true), // Single non-empty item exists
+             }
+         }
         "first" => {
             // Returns the first item in the collection
-            if let EvaluationResult::Collection(items) = context {
+            if let EvaluationResult::Collection(items) = invocation_base {
                 items.first().cloned().unwrap_or(EvaluationResult::Empty)
             } else {
-                // A single item is returned as is
-                context.clone()
+                // A single item is returned as is (unless it's Empty)
+                invocation_base.clone()
             }
         }
         "last" => {
             // Returns the last item in the collection
-            if let EvaluationResult::Collection(items) = context {
+            if let EvaluationResult::Collection(items) = invocation_base {
                 items.last().cloned().unwrap_or(EvaluationResult::Empty)
             } else {
-                // A single item is returned as is
-                context.clone()
+                // A single item is returned as is (unless it's Empty)
+                invocation_base.clone()
             }
         }
         "not" => {
             // Logical negation
-            EvaluationResult::Boolean(!context.to_boolean())
-        }
-        "contains" => {
-            // Check if the context contains the argument
-            if args.is_empty() {
-                return EvaluationResult::Empty;
+            match invocation_base {
+                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                 EvaluationResult::Empty => EvaluationResult::Empty, // not({}) is {}
+                 // Other types are implicitly converted to boolean first
+                 _ => EvaluationResult::Boolean(!invocation_base.to_boolean()),
             }
+        }
+        "contains" => { // Function call version
+            // Check if the invocation_base contains the argument
+            if args.is_empty() {
+                return EvaluationResult::Empty; // Requires one argument
+            }
+            let arg = &args[0];
 
-            match context {
+            match invocation_base {
                 EvaluationResult::String(s) => {
-                    if let EvaluationResult::String(arg) = &args[0] {
-                        EvaluationResult::Boolean(s.contains(arg))
+                    // String contains substring
+                    if let EvaluationResult::String(substr) = arg {
+                        EvaluationResult::Boolean(s.contains(substr))
                     } else {
-                        EvaluationResult::Boolean(false)
+                        EvaluationResult::Empty // Invalid argument type for string contains
                     }
                 }
                 EvaluationResult::Collection(items) => {
+                    // Collection contains item (using equality)
                     let contains = items
                         .iter()
-                        .any(|item| compare_equality(item, "=", &args[0]).to_boolean());
+                        .any(|item| compare_equality(item, "=", arg).to_boolean());
                     EvaluationResult::Boolean(contains)
                 }
-                _ => EvaluationResult::Boolean(false),
+                 // contains on single non-collection/non-string item
+                 EvaluationResult::Empty => EvaluationResult::Boolean(false), // Empty cannot contain anything
+                 single_item => {
+                     // Treat as single-item collection: check if the item equals the argument
+                     EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
+                 }
             }
         }
         "length" => {
             // Returns the length of a string
-            match context {
-                EvaluationResult::String(s) => EvaluationResult::Integer(s.len() as i64),
-                _ => EvaluationResult::Empty,
+            match invocation_base {
+                EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
+                _ => EvaluationResult::Empty, // Length only defined for strings
             }
         }
-        "where" => {
-            // Filter the collection based on a predicate
-            // The predicate is the first argument, which should be a lambda
-            if args.is_empty() {
-                return EvaluationResult::Empty;
-            }
-
-            // For now, we'll just return the original collection
-            // In a full implementation, we would evaluate the predicate for each item
-            context.clone()
+        // where and select are handled in evaluate_invocation
+        // Add other standard functions here
+        _ => {
+             eprintln!("Warning: Unsupported function called: {}", name);
+             EvaluationResult::Empty
         }
-        "select" => {
-            // Project each item in the collection to a new value
-            // The projection is the first argument, which should be a lambda
-            if args.is_empty() {
-                return EvaluationResult::Empty;
-            }
-
-            // For now, we'll just return the original collection
-            // In a full implementation, we would apply the projection to each item
-            context.clone()
-        }
-        // Add more functions as needed
-        _ => EvaluationResult::Empty,
     }
 }
 

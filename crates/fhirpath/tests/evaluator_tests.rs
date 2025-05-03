@@ -14,8 +14,8 @@ fn eval(input: &str, context: &EvaluationContext) -> EvaluationResult {
     let expr = parser().parse(input).unwrap_or_else(|e| {
         panic!("Parser error for input '{}': {:?}", input, e);
     });
-    // Pass the original context, evaluate will create the internal one with %context
-    evaluate(&expr, context)
+    // Pass the original context and None for current_item for top-level evaluation
+    evaluate(&expr, context, None)
 }
 
 // Helper to create a collection result
