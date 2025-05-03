@@ -513,9 +513,9 @@ fn test_function_filtering_select() {
         eval("(1 | 2).select( ( $this ) | ( $this + 1 ) )", &context),
         collection(vec![
             EvaluationResult::Integer(1),
+            EvaluationResult::Decimal(dec!(2.0)), // Result of 1 + 1 is Decimal
             EvaluationResult::Integer(2),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3)
+            EvaluationResult::Decimal(dec!(3.0))  // Result of 2 + 1 is Decimal
         ])
     );
 }
