@@ -2295,15 +2295,16 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
         _ => vec![right.clone()],
     };
 
-    let mut result = left_items;
+    // Removed unused `result` variable assignment
     let mut union_items = Vec::new();
     // Use HashSet to track items already added to ensure uniqueness based on FHIRPath equality
     let mut added_items_set = HashSet::new();
 
     // Add items from the left collection if they haven't been added
+    // Now iterates over `left_items` directly, which hasn't been moved
     for item in left_items {
         if added_items_set.insert(item.clone()) {
-            union_items.push(item);
+            union_items.push(item); // Push the original item, not a clone from `result`
         }
     }
 
@@ -2509,13 +2510,18 @@ fn check_membership(
                 return EvaluationResult::Empty;
             }
             // Proceed with check if both are non-empty
-            let right_items = match right {
-                EvaluationResult::Collection(items) => items,
-                // If right is a single non-empty item, treat as collection of one
-                single_item => vec![single_item],
+            let is_in = match right {
+                EvaluationResult::Collection(items) => items
+                    .iter()
+                    .any(|item| compare_equality(left, "=", item).to_boolean()),
+                // If right is a single non-empty item, compare directly
+                single_item => compare_equality(left, "=", single_item).to_boolean(),
             };
 
-            let is_in = right_items
+            EvaluationResult::Boolean(is_in)
+        }
+        "contains" => {
+            // If left operand (collection) is empty, result is false.
                 .iter()
                 .any(|item| compare_equality(left, "=", item).to_boolean());
 
