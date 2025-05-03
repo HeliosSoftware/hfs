@@ -2970,10 +2970,10 @@ fn test_operator_precedence() {
     );
     // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
     assert_eq!(eval("10 div 3 * 2", &context), EvaluationResult::Integer(6));
-    // (10 mod 3) + 1 = 1 + 1 = 2.0 (mod -> Integer, then Integer + Integer -> Decimal)
+    // (10 mod 3) + 1 = 1 + 1 = 2 (mod -> Integer, then Integer + Integer -> Integer)
     assert_eq!(
         eval("10 mod 3 + 1", &context),
-        EvaluationResult::Decimal(dec!(2.0))
+        EvaluationResult::Integer(2) // <-- Correct expectation
     );
     assert_eq!(
         eval("true or false and false", &context), // 'and' before 'or'
@@ -2991,15 +2991,15 @@ fn test_operator_precedence() {
         eval("1 < 2 and 3 > 2", &context), // Comparison before 'and'
         EvaluationResult::Boolean(true)
     );
-    // (-1) + 5 = 4.0 (Unary minus, then Integer + Integer -> Decimal)
+    // (-1) + 5 = 4 (Unary minus, then Integer + Integer -> Integer)
     assert_eq!(
         eval("-1 + 5", &context),
-        EvaluationResult::Decimal(dec!(4.0))
+        EvaluationResult::Integer(4) // <-- Correct expectation
     );
-    // -(1 + 5) = -(6.0) = -6.0 (Addition -> Decimal, then Unary minus)
+    // -(1 + 5) = -(6) = -6 (Addition -> Integer, then Unary minus)
     assert_eq!(
         eval("-(1 + 5)", &context),
-        EvaluationResult::Decimal(dec!(-6.0))
+        EvaluationResult::Integer(-6) // <-- Correct expectation
     );
     // assert_eq!(eval("Patient.name[0].given", &context), EvaluationResult::Empty); // Indexer before path (needs context)
     // Add more complex precedence tests as needed
