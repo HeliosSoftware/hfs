@@ -405,16 +405,32 @@ fn evaluate_invocation(
                     evaluate_all_with_criteria(invocation_base, criteria_expr, context)
                 }
                 "ofType" if args_exprs.len() == 1 => {
-                    // Extract the TypeSpecifier from the argument expression
-                    // The parser should ensure the argument is a TypeSpecifier term
-                    if let Expression::Term(Term::Invocation(Invocation::Member(type_name))) = &args_exprs[0] {
-                         // We only have the name here, reconstruct a simple TypeSpecifier
-                         // A more robust solution might involve passing the actual TypeSpecifier AST node
-                         let type_spec = TypeSpecifier::QualifiedIdentifier(type_name.clone(), None); // Assuming no namespace for now
-                         evaluate_of_type(invocation_base, &type_spec)
+                    let type_spec_opt = match &args_exprs[0] {
+                        // Handle simple identifier like 'Integer'
+                        Expression::Term(Term::Invocation(Invocation::Member(type_name))) => {
+                            Some(TypeSpecifier::QualifiedIdentifier(type_name.clone(), None))
+                        }
+                        // Handle qualified identifier like 'System.Integer'
+                        // The parser seems to produce Invocation(base, member) for this
+                        Expression::Invocation(base_expr, Invocation::Member(member_name)) => {
+                            // Check if the base is a simple member invocation (like 'System')
+                            if let Expression::Term(Term::Invocation(Invocation::Member(base_name))) = &**base_expr {
+                                 // Reconstruct the qualified name: "System.Integer"
+                                 // For now, store the full name as the identifier. evaluate_of_type will handle it.
+                                 let full_name = format!("{}.{}", base_name, member_name);
+                                 Some(TypeSpecifier::QualifiedIdentifier(full_name, None))
+                            } else {
+                                 None // Unexpected structure for qualified identifier base
+                            }
+                        }
+                        _ => None, // Argument is not a recognized type identifier structure
+                    };
+
+                    if let Some(type_spec) = type_spec_opt {
+                        evaluate_of_type(invocation_base, &type_spec)
                     } else {
-                         eprintln!("Warning: ofType argument was not a simple type identifier: {:?}", args_exprs[0]);
-                         EvaluationResult::Empty // Invalid argument for ofType
+                        eprintln!("Warning: ofType argument was not a recognized type identifier structure: {:?}", args_exprs[0]);
+                        EvaluationResult::Empty // Invalid argument for ofType
                     }
                 }
                 "iif" if args_exprs.len() >= 2 => { // iif(condition, trueResult, [otherwiseResult])
@@ -615,9 +631,14 @@ fn evaluate_of_type(
     };
 
     let target_type_name = match type_spec {
-        // TODO: Handle namespaces if present (e.g., System.String)
-        TypeSpecifier::QualifiedIdentifier(name, _namespace) => name.as_str(),
+        // The name might now be "System.Integer" or just "Integer"
+        TypeSpecifier::QualifiedIdentifier(name, _namespace) => {
+            // If the name contains '.', take the part after the last dot.
+            // This handles both "System.Integer" -> "Integer" and "Integer" -> "Integer".
+            name.split('.').last().unwrap_or(name.as_str())
+        }
     };
+
 
     let mut filtered_items = Vec::new();
     for item in items_to_filter {
