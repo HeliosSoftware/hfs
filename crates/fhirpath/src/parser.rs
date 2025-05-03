@@ -428,17 +428,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     }
 
     let date_datetime_time = just('@')
-                     Literal::Quantity(dec!(0), Some(u))
-                 }
-             }
-        });
-
-    // Helper function to emit errors (replace with actual logging/error handling if needed)
-    fn emit_error(message: &str) {
-        eprintln!("Parser Error: {}", message);
-    }
-
-    let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
         .then(
             just('T')
