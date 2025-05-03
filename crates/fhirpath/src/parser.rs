@@ -1,4 +1,4 @@
-// Removed direct import of attempt
+use chumsky::attempt; // Import attempt directly from the crate root
 use chumsky::error::Simple;
 use chumsky::prelude::*;
 use chumsky::Parser;
@@ -583,8 +583,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             just('.').ignore_then(
                 choice((
                     // Attempt to parse identifier followed by parentheses FIRST
-                    // Qualify attempt with chumsky::combinator
-                    chumsky::combinator::attempt( // Use attempt to allow backtracking if parentheses are not found
+                    attempt( // Use the imported attempt directly
                         identifier.clone()
                             .then(
                                 expr.clone()
