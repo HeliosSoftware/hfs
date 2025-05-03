@@ -179,26 +179,27 @@ fn evaluate_term(
         Term::Invocation(invocation) => {
             // Handle $this invocation
             if let Invocation::This = invocation {
-                return current_item
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        // Add explicit return statements for each branch within the closure
+                // Determine the value for $this without using unwrap_or_else
+                let this_value = match current_item.cloned() {
+                    Some(item) => item, // Use the provided current_item if it exists
+                    None => {
+                        // Otherwise, determine the default context based on resources
                         if context.resources.is_empty() {
-                            return EvaluationResult::Empty;
+                            EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
-                            // If only one resource, return it directly
-                            return convert_resource_to_result(&context.resources[0]);
+                            convert_resource_to_result(&context.resources[0])
                         } else {
-                            // If multiple resources, return them as a collection
-                            return EvaluationResult::Collection(
+                            EvaluationResult::Collection(
                                 context
                                     .resources
                                     .iter()
                                     .map(convert_resource_to_result)
                                     .collect(),
-                            );
+                            )
                         }
-                    });
+                    }
+                };
+                return this_value; // Return the determined value for $this
             }
 
             // Check if this is a variable reference (starting with %)
@@ -747,10 +748,14 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 }
                 _ => (None, None),
             };
+            // Handle numeric addition
             if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l - r) // Corrected: Use subtraction
+                EvaluationResult::Decimal(l + r) // Correct: Use addition for '+'
+            // Handle string concatenation
+            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right) {
+                EvaluationResult::String(format!("{}{}", l, r)) // Correct: Concatenate for '+'
             } else {
-                 // Subtraction is only defined for numeric types
+                // Addition is not defined for other type combinations
                 EvaluationResult::Empty
             }
         }
@@ -769,12 +774,11 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 }
                 _ => (None, None),
             };
+            // Handle numeric subtraction
             if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l + r)
-            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right)
-            {
-                EvaluationResult::String(format!("{}{}", l, r))
+                EvaluationResult::Decimal(l - r) // Correct: Use subtraction for '-'
             } else {
+                // Subtraction is only defined for numeric types
                 EvaluationResult::Empty
             }
         }
