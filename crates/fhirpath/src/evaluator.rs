@@ -1229,6 +1229,31 @@ fn call_function(
                 EvaluationResult::Collection(combined_items)
             }
         }
+        "convertsToDecimal" => {
+            // Checks if the input can be converted to Decimal
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
+                EvaluationResult::Collection(items) => {
+                    // Only single-item collections can be converted
+                    if items.len() == 1 {
+                        // Recursively call convertsToDecimal on the single item
+                        call_function("convertsToDecimal", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false) // Multi-item collection cannot be converted
+                    }
+                }
+                // Check convertibility for single items
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true), // Booleans can convert (1.0 or 0.0)
+                EvaluationResult::Integer(_) => EvaluationResult::Boolean(true), // Integers can convert
+                EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true), // Decimals can convert
+                EvaluationResult::String(s) => {
+                    // Check if the string parses to a Decimal
+                    EvaluationResult::Boolean(s.parse::<Decimal>().is_ok())
+                }
+                // Other types are not convertible to Decimal
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
         "convertsToInteger" => {
             // Checks if the input can be converted to Integer
             match invocation_base {
@@ -1330,8 +1355,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "toDecimal" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal"].contains(&name) {
+             // Added "toDecimal", "convertsToDecimal" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
