@@ -785,11 +785,11 @@ fn test_function_subsetting_intersect() {
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("{}.intersect({1 | 2 | 3})", &context),
+        eval("{}.intersect((1 | 2 | 3))", &context), // Changed {} to ()
         EvaluationResult::Empty
     );
     // Order not guaranteed, check contents
-    let result = eval("(1 | 2 | 3).intersect({2 | 3 | 4})", &context);
+    let result = eval("(1 | 2 | 3).intersect((2 | 3 | 4))", &context); // Changed {} to ()
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -803,7 +803,7 @@ fn test_function_subsetting_intersect() {
     } else {
         panic!("Expected collection result from intersect");
     }
-    let result = eval("(1 | 2 | 1).intersect({1 | 3 | 1})", &context);
+    let result = eval("(1 | 2 | 1).intersect((1 | 3 | 1))", &context); // Changed {} to ()
     if let EvaluationResult::Collection(items) = result {
         assert_eq!(items.len(), 1);
         assert!(matches!(items[0], EvaluationResult::Integer(1)));
