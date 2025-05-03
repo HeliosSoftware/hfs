@@ -988,12 +988,28 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
 
     match op {
         "+" => {
-            // Handle numeric addition (always results in Decimal)
+            // Handle numeric addition: Int + Int = Int, otherwise Decimal
+            match (left, right) {
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    // Check for potential overflow before adding
+                    l.checked_add(*r)
+                        .map(EvaluationResult::Integer)
+                        .unwrap_or(EvaluationResult::Empty) // Return Empty on overflow
+                }
+                // If either operand is Decimal, promote and result is Decimal
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => EvaluationResult::Decimal(*l + *r),
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => EvaluationResult::Decimal(*l + Decimal::from(*r)),
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => EvaluationResult::Decimal(Decimal::from(*l) + *r),
+                // Handle string concatenation with '+'
+                (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::String(format!("{}{}", l, r)),
+                // Other combinations are invalid for '+'
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "-" => {
+            // Handle numeric subtraction (always results in Decimal)
             if let (Some(l), Some(r)) = (left_dec, right_dec) {
-                EvaluationResult::Decimal(l + r)
-            // Handle string concatenation (operator '&' is preferred, but '+' is allowed)
-            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right) {
-                EvaluationResult::String(format!("{}{}", l, r))
+                EvaluationResult::Decimal(l - r)
             } else {
                 // Addition is not defined for other type combinations or if promotion failed
                 EvaluationResult::Empty
