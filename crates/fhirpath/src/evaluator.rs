@@ -1344,6 +1344,23 @@ fn call_function(
                 _ => EvaluationResult::Empty,
             }
         }
+        "toString" => {
+            // Converts the input to its string representation
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    // toString on collection: Empty if 0 or >1 items, string of item if 1 item
+                    if items.len() == 1 {
+                        // Recursively call toString on the single item
+                        call_function("toString", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty // Multi-item or empty collection -> Empty
+                    }
+                }
+                // For single items, use the existing helper
+                single_item => EvaluationResult::String(single_item.to_string_value()),
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
@@ -1355,8 +1372,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "toDecimal", "convertsToDecimal" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal"].contains(&name) {
+             // Added "toString" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal", "toString"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
