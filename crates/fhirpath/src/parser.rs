@@ -414,24 +414,6 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     }
 
     let date_datetime_time = just('@')
-                    // Convert integer to Decimal for Quantity representation
-                    Literal::Quantity(Decimal::from(i), Some(u))
-                }
-                Literal::Number(d) => Literal::Quantity(d, Some(u)),
-                _ => {
-                    // This case should ideally not be reachable
-                    emit_error("Expected Literal::Integer or Literal::Number in quantity parser, got other literal type.");
-                    Literal::Quantity(dec!(0), Some(u)) // Default value
-                }
-            }
-        });
-
-    // Helper function to emit errors (replace with actual logging/error handling if needed)
-    fn emit_error(message: &str) {
-        eprintln!("Parser Error: {}", message);
-    }
-
-    let date_datetime_time = just('@')
         .ignore_then(date_format.clone().or_not())
         .then(
             just('T')
