@@ -1881,11 +1881,21 @@ fn generate_fhirpath_enum_impl(
                 }
             }
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                // Newtype variant (e.g., String(String), Reference(Reference))
-                // Call into_evaluation_result on the inner value.
-                // No 'ref' needed; default binding mode handles borrowing.
+                // Newtype variant (e.g., Patient(Patient), Observation(Observation))
+                // Call into_evaluation_result on the inner value and add resourceType.
                 quote! {
-                    Self::#variant_name(value) => value.into_evaluation_result(), // Removed 'ref'
+                    Self::#variant_name(value) => {
+                        let mut result = value.into_evaluation_result(); // Call on inner value
+                        if let fhirpath_support::EvaluationResult::Object(ref mut map) = result {
+                            // Insert the resourceType field
+                            map.insert(
+                                "resourceType".to_string(),
+                                fhirpath_support::EvaluationResult::String(#variant_name_str.to_string())
+                            );
+                        }
+                        // Return the (potentially modified) result
+                        result
+                    }
                 }
            }
             // For tuple or struct variants, the direct FHIRPath evaluation is less clear.
