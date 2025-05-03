@@ -33,7 +33,8 @@ impl Hash for EvaluationResult {
             EvaluationResult::Empty => {} // No extra data to hash
             EvaluationResult::Boolean(b) => b.hash(state),
             EvaluationResult::String(s) => s.hash(state),
-            EvaluationResult::Decimal(d) => d.to_string().hash(state), // Hash string representation
+            // Hash the normalized decimal value for consistency with PartialEq
+            EvaluationResult::Decimal(d) => d.normalize().hash(state),
             EvaluationResult::Integer(i) => i.hash(state),
             EvaluationResult::Date(d) => d.hash(state),
             EvaluationResult::DateTime(dt) => dt.hash(state),
