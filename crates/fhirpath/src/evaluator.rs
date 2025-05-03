@@ -1100,6 +1100,51 @@ fn call_function(
                 EvaluationResult::Collection(result_items)
             }
         }
+        "union" => {
+            // Returns the union of two collections (distinct items from both)
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Union requires exactly one argument
+            }
+            let other_collection = &args[0];
+
+            // Convert inputs to Vec for processing
+            let left_items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+
+            let right_items = match other_collection {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+
+            let mut union_items = Vec::new();
+            // Use HashSet to track items already added to ensure uniqueness based on FHIRPath equality
+            let mut added_items_set = HashSet::new();
+
+            // Add items from the left collection if they haven't been added
+            for item in left_items {
+                if added_items_set.insert(item.clone()) {
+                    union_items.push(item);
+                }
+            }
+
+            // Add items from the right collection if they haven't been added
+            for item in right_items {
+                if added_items_set.insert(item.clone()) {
+                    union_items.push(item);
+                }
+            }
+
+            // Return Empty or Collection
+            if union_items.is_empty() {
+                EvaluationResult::Empty
+            } else {
+                EvaluationResult::Collection(union_items)
+            }
+        }
         "combine" => {
             // Returns a collection containing all items from both collections, including duplicates
             if args.len() != 1 {
