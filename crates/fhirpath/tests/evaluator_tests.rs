@@ -308,15 +308,15 @@ fn test_function_existence_subset_of() {
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1).subsetOf({1, 2})", &context),
+        eval("(1).subsetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).subsetOf({1, 2})", &context),
+        eval("(1 | 2).subsetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).subsetOf({1, 2})", &context),
+        eval("(1 | 2 | 3).subsetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
@@ -346,7 +346,7 @@ fn test_function_existence_superset_of() {
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf({1, 2})", &context),
+        eval("(1 | 2).supersetOf(1 | 2)", &context), // Use | syntax
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
