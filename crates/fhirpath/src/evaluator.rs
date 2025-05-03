@@ -1385,6 +1385,235 @@ fn call_function(
                  EvaluationResult::String(string_val)
             }
         }
+        "toDate" => {
+            // Converts the input to Date according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Date(d) => EvaluationResult::Date(d.clone()),
+                EvaluationResult::DateTime(dt) => {
+                    // Extract the date part
+                    if let Some(date_part) = dt.split('T').next() {
+                        EvaluationResult::Date(date_part.to_string())
+                    } else {
+                        EvaluationResult::Empty // Should not happen if DateTime format is valid
+                    }
+                }
+                EvaluationResult::String(s) => {
+                    // Attempt to parse as Date or DateTime and extract date part
+                    // This requires a robust date/datetime parsing logic
+                    // For now, assume valid FHIR date/datetime strings
+                    if s.contains('T') { // Looks like DateTime
+                        if let Some(date_part) = s.split('T').next() {
+                            // Basic validation: check if date_part looks like YYYY, YYYY-MM, or YYYY-MM-DD
+                            if date_part.len() == 4 || date_part.len() == 7 || date_part.len() == 10 {
+                                EvaluationResult::Date(date_part.to_string())
+                            } else {
+                                EvaluationResult::Empty
+                            }
+                        } else {
+                            EvaluationResult::Empty
+                        }
+                    } else { // Looks like Date
+                         // Basic validation
+                         if s.len() == 4 || s.len() == 7 || s.len() == 10 {
+                             EvaluationResult::Date(s.clone())
+                         } else {
+                             EvaluationResult::Empty
+                         }
+                    }
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("toDate", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                _ => EvaluationResult::Empty, // Other types cannot convert
+            }
+        }
+        "convertsToDate" => {
+            // Checks if the input can be converted to Date
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("convertsToDate", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                EvaluationResult::Date(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::DateTime(_) => EvaluationResult::Boolean(true), // Can extract date part
+                EvaluationResult::String(s) => {
+                    // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or start like a DateTime?
+                    let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
+                    let is_datetime_like = s.contains('T') && (s.starts_with(|c: char| c.is_ascii_digit()) && s.len() >= 5); // Basic check
+                    EvaluationResult::Boolean(is_date_like || is_datetime_like)
+                }
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
+        "toDateTime" => {
+            // Converts the input to DateTime according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::DateTime(dt) => EvaluationResult::DateTime(dt.clone()),
+                EvaluationResult::Date(d) => EvaluationResult::DateTime(d.clone()), // Date becomes DateTime (no time part)
+                EvaluationResult::String(s) => {
+                    // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or YYYY-MM-DDTHH...?
+                    let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
+                    let is_datetime_like = s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
+                    if is_date_like || is_datetime_like {
+                        EvaluationResult::DateTime(s.clone())
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("toDateTime", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                _ => EvaluationResult::Empty, // Other types cannot convert
+            }
+        }
+        "convertsToDateTime" => {
+            // Checks if the input can be converted to DateTime
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("convertsToDateTime", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                EvaluationResult::DateTime(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Date(_) => EvaluationResult::Boolean(true), // Can represent as DateTime
+                EvaluationResult::String(s) => {
+                    // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or YYYY-MM-DDTHH...?
+                    let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
+                    let is_datetime_like = s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
+                    EvaluationResult::Boolean(is_date_like || is_datetime_like)
+                }
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
+        "toTime" => {
+            // Converts the input to Time according to FHIRPath rules
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Time(t) => EvaluationResult::Time(t.clone()),
+                EvaluationResult::String(s) => {
+                    // Basic check: Does it look like HH, HH:mm, HH:mm:ss, HH:mm:ss.sss?
+                    let parts: Vec<&str> = s.split(':').collect();
+                    let is_time_like = match parts.len() {
+                        1 => parts[0].len() == 2 && parts[0].chars().all(|c| c.is_ascii_digit()),
+                        2 => parts[0].len() == 2 && parts[1].len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+                        3 => parts[0].len() == 2 && parts[1].len() == 2 && parts[2].len() >= 2 && parts[2].split('.').next().map_or(false, |sec| sec.len() == 2) && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.')),
+                        _ => false,
+                    };
+                    if is_time_like {
+                        EvaluationResult::Time(s.clone())
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("toTime", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                _ => EvaluationResult::Empty, // Other types cannot convert
+            }
+        }
+        "convertsToTime" => {
+            // Checks if the input can be converted to Time
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("convertsToTime", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::String(s) => {
+                    // Basic check (same as toTime)
+                    let parts: Vec<&str> = s.split(':').collect();
+                    let is_time_like = match parts.len() {
+                        1 => parts[0].len() == 2 && parts[0].chars().all(|c| c.is_ascii_digit()),
+                        2 => parts[0].len() == 2 && parts[1].len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+                        3 => parts[0].len() == 2 && parts[1].len() == 2 && parts[2].len() >= 2 && parts[2].split('.').next().map_or(false, |sec| sec.len() == 2) && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.')),
+                        _ => false,
+                    };
+                    EvaluationResult::Boolean(is_time_like)
+                }
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
+        "toQuantity" => {
+            // Converts the input to Quantity according to FHIRPath rules
+            // The result is just the numeric value (Decimal or Integer) as unit handling is complex
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Boolean(b) => EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO }), // Convert to 1.0 or 0.0
+                EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)), // Convert to Decimal with '1' unit implicitly
+                EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d), // Convert to Decimal with '1' unit implicitly
+                EvaluationResult::String(s) => {
+                    // Attempt to parse as "value unit" or just "value"
+                    let parts: Vec<&str> = s.split_whitespace().collect();
+                    if parts.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        // Try parsing the first part as Decimal
+                        parts[0].parse::<Decimal>()
+                            .map(EvaluationResult::Decimal)
+                            .unwrap_or(EvaluationResult::Empty) // Return Empty if number parsing fails
+                    }
+                }
+                // Collections: Convert single item, multiple items -> Empty
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("toQuantity", &items[0], &[])
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
+                _ => EvaluationResult::Empty, // Other types cannot convert
+            }
+        }
+        "convertsToQuantity" => {
+            // Checks if the input can be converted to Quantity
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        call_function("convertsToQuantity", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::String(s) => {
+                    // Check if the first part parses as a Decimal
+                    let first_part = s.split_whitespace().next().unwrap_or("");
+                    EvaluationResult::Boolean(first_part.parse::<Decimal>().is_ok())
+                }
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
         "length" => {
             // Returns the length of a string
             match invocation_base {
@@ -1396,8 +1625,19 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "convertsToString" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal", "convertsToDecimal", "toString", "convertsToString"].contains(&name) {
+             // Added conversion functions to the list
+             let handled_functions = [
+                 "where", "select", "exists", "all", "iif", "ofType",
+                 "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger",
+                 "toDecimal", "convertsToDecimal", "toString", "convertsToString",
+                 "toDate", "convertsToDate", "toDateTime", "convertsToDateTime",
+                 "toTime", "convertsToTime", "toQuantity", "convertsToQuantity",
+                 // Add other handled functions here
+                 "count", "empty", "first", "last", "not", "contains", "isDistinct",
+                 "distinct", "skip", "tail", "take", "intersect", "exclude", "union", "combine",
+                 "length",
+             ];
+             if !handled_functions.contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty

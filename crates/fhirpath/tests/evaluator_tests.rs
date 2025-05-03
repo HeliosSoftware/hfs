@@ -1368,7 +1368,328 @@ fn test_function_conversion_converts_to_string() {
     // Need object test once available
 }
 
-// TODO: Add tests for toDate, convertsToDate, toDateTime, convertsToDateTime, toTime, convertsToTime, toQuantity, convertsToQuantity
+// Spec: https://hl7.org/fhirpath/2025Jan/#todate--date
+#[test]
+fn test_function_conversion_to_date() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@2023-10-27.toDate()", &context),
+        EvaluationResult::Date("2023-10-27".to_string())
+    );
+    assert_eq!(
+        eval("@2023-10-27T10:30:00Z.toDate()", &context),
+        EvaluationResult::Date("2023-10-27".to_string())
+    ); // DateTime to Date
+    assert_eq!(
+        eval("'2023-10-27'.toDate()", &context),
+        EvaluationResult::Date("2023-10-27".to_string())
+    ); // String to Date
+    assert_eq!(
+        eval("'2023-10'.toDate()", &context),
+        EvaluationResult::Date("2023-10".to_string())
+    ); // Partial date string
+    assert_eq!(
+        eval("'2023'.toDate()", &context),
+        EvaluationResult::Date("2023".to_string())
+    ); // Partial date string
+    assert_eq!(
+        eval("'2023-10-27T10:30:00Z'.toDate()", &context),
+        EvaluationResult::Date("2023-10-27".to_string())
+    ); // DateTime string to Date
+    assert_eq!(eval("'invalid-date'.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("123.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("true.toDate()", &context), EvaluationResult::Empty);
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#convertstodate--boolean
+#[test]
+fn test_function_conversion_converts_to_date() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.convertsToDate()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@2023-10-27.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("@2023-10-27T10:30:00Z.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10-27'.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10'.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023'.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10-27T10:30:00Z'.convertsToDate()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'invalid-date'.convertsToDate()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("123.convertsToDate()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("true.convertsToDate()", &context),
+        EvaluationResult::Boolean(false)
+    );
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#todatetime--datetime
+#[test]
+fn test_function_conversion_to_date_time() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.toDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@2023-10-27T10:30:00Z.toDateTime()", &context),
+        EvaluationResult::DateTime("2023-10-27T10:30:00Z".to_string())
+    );
+    assert_eq!(
+        eval("@2023-10-27.toDateTime()", &context),
+        EvaluationResult::DateTime("2023-10-27".to_string())
+    ); // Date to DateTime (no time part)
+    assert_eq!(
+        eval("'2023-10-27T10:30:00Z'.toDateTime()", &context),
+        EvaluationResult::DateTime("2023-10-27T10:30:00Z".to_string())
+    ); // String to DateTime
+    assert_eq!(
+        eval("'2023-10-27'.toDateTime()", &context),
+        EvaluationResult::DateTime("2023-10-27".to_string())
+    ); // Date string to DateTime
+    assert_eq!(
+        eval("'2023-10'.toDateTime()", &context),
+        EvaluationResult::DateTime("2023-10".to_string())
+    ); // Partial date string
+    assert_eq!(
+        eval("'2023'.toDateTime()", &context),
+        EvaluationResult::DateTime("2023".to_string())
+    ); // Partial date string
+    assert_eq!(eval("'invalid-datetime'.toDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("123.toDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("true.toDateTime()", &context), EvaluationResult::Empty);
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#convertstodatetime--boolean
+#[test]
+fn test_function_conversion_converts_to_date_time() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.convertsToDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@2023-10-27T10:30:00Z.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("@2023-10-27.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10-27T10:30:00Z'.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10-27'.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023-10'.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'2023'.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'invalid-datetime'.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("123.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("true.convertsToDateTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#totime--time
+#[test]
+fn test_function_conversion_to_time() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@T10:30:00.toTime()", &context),
+        EvaluationResult::Time("10:30:00".to_string())
+    );
+    assert_eq!(
+        eval("'10:30:00'.toTime()", &context),
+        EvaluationResult::Time("10:30:00".to_string())
+    ); // String to Time
+    assert_eq!(
+        eval("'10:30'.toTime()", &context),
+        EvaluationResult::Time("10:30".to_string())
+    ); // Partial time string
+    assert_eq!(
+        eval("'10'.toTime()", &context),
+        EvaluationResult::Time("10".to_string())
+    ); // Partial time string
+    assert_eq!(eval("'invalid-time'.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("123.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("true.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("@2023-10-27.toTime()", &context), EvaluationResult::Empty); // Date cannot convert
+    assert_eq!(eval("@2023-10-27T10:30Z.toTime()", &context), EvaluationResult::Empty); // DateTime cannot convert
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#convertstotime--boolean
+#[test]
+fn test_function_conversion_converts_to_time() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.convertsToTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("@T10:30:00.convertsToTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'10:30:00'.convertsToTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'10:30'.convertsToTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'10'.convertsToTime()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'invalid-time'.convertsToTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("123.convertsToTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("true.convertsToTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("@2023-10-27.convertsToTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("@2023-10-27T10:30Z.convertsToTime()", &context),
+        EvaluationResult::Boolean(false)
+    );
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#toquantity--quantity
+#[test]
+fn test_function_conversion_to_quantity() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.toQuantity()", &context), EvaluationResult::Empty);
+    // Boolean to Quantity
+    assert_eq!(
+        eval("true.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(1.0)) // Spec implies conversion to Decimal 1.0 '1'
+    );
+    assert_eq!(
+        eval("false.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(0.0)) // Spec implies conversion to Decimal 0.0 '1'
+    );
+    // Integer to Quantity
+    assert_eq!(
+        eval("123.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(123.0)) // Spec implies conversion to Decimal 123.0 '1'
+    );
+    // Decimal to Quantity
+    assert_eq!(
+        eval("123.45.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(123.45)) // Spec implies conversion to Decimal 123.45 '1'
+    );
+    // String to Quantity (parses number and unit)
+    assert_eq!(
+        eval("'5.5 mg'.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(5.5)) // Evaluator currently ignores unit
+    );
+    assert_eq!(
+        eval("'100'.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(100.0)) // Evaluator currently ignores unit
+    );
+    assert_eq!(
+        eval("'100 days'.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(100.0)) // Evaluator currently ignores unit
+    );
+    assert_eq!(eval("'invalid'.toQuantity()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("'5.5 invalid-unit'.toQuantity()", &context), EvaluationResult::Empty); // Invalid unit part
+    // Quantity literal to Quantity (should just return the numeric part)
+    assert_eq!(
+        eval("5.5 'mg'.toQuantity()", &context),
+        EvaluationResult::Decimal(dec!(5.5))
+    );
+    assert_eq!(
+        eval("100 days.toQuantity()", &context),
+        EvaluationResult::Integer(100) // Parser returns Integer here
+    );
+}
+
+// Spec: https://hl7.org/fhirpath/2025Jan/#convertstoquantity--boolean
+#[test]
+fn test_function_conversion_converts_to_quantity() {
+    let context = EvaluationContext::new_empty();
+    assert_eq!(eval("{}.convertsToQuantity()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("true.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("123.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("123.45.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'5.5 mg'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'100'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'100 days'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'invalid'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("'5.5 invalid-unit'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(false) // Invalid unit part
+    );
+    // Quantity literal conversion
+    assert_eq!(
+        eval("5.5 'mg'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("100 days.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(true)
+    );
+}
 
 // --- String Manipulation ---
 // Spec: https://hl7.org/fhirpath/2025Jan/#indexofsubstring--string--integer
