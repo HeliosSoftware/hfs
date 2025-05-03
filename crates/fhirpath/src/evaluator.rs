@@ -1,5 +1,4 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
-use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use regex::Regex; // Import the regex crate
