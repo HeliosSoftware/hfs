@@ -1,6 +1,8 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use regex::Regex; // Import the regex crate
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 // Removed unused import: use rust_decimal_macros::dec;
@@ -1652,6 +1654,133 @@ fn call_function(
                 _ => EvaluationResult::Empty, // Length only defined for strings
             }
         }
+        "indexOf" => {
+            // Returns the 0-based index of the first occurrence of the substring
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0]) {
+                (EvaluationResult::String(s), EvaluationResult::String(substring)) => {
+                    match s.find(substring) {
+                        Some(index) => EvaluationResult::Integer(index as i64),
+                        None => EvaluationResult::Integer(-1),
+                    }
+                }
+                _ => EvaluationResult::Empty, // Invalid types or empty base/arg
+            }
+        }
+        "substring" => {
+            // Returns a part of the string
+            if args.is_empty() || args.len() > 2 { return EvaluationResult::Empty; } // Needs 1 or 2 args
+            let start_index_res = &args[0];
+            let length_res_opt = args.get(1);
+
+            match invocation_base {
+                EvaluationResult::String(s) => {
+                    let start_index = match start_index_res {
+                        EvaluationResult::Integer(i) if *i >= 0 => *i as usize,
+                        _ => return EvaluationResult::Empty, // Invalid start index type or negative
+                    };
+
+                    // If start index is out of bounds (>= length), return empty string
+                    if start_index >= s.chars().count() {
+                        return EvaluationResult::String("".to_string());
+                    }
+
+                    if let Some(length_res) = length_res_opt {
+                        // Two arguments: start and length
+                        let length = match length_res {
+                            EvaluationResult::Integer(l) if *l >= 0 => *l as usize,
+                            _ => return EvaluationResult::Empty, // Invalid length type or negative
+                        };
+
+                        let result: String = s.chars().skip(start_index).take(length).collect();
+                        EvaluationResult::String(result)
+                    } else {
+                        // One argument: start index only (substring to end)
+                        let result: String = s.chars().skip(start_index).collect();
+                        EvaluationResult::String(result)
+                    }
+                }
+                _ => EvaluationResult::Empty, // Substring only defined for strings
+            }
+        }
+        "startsWith" => {
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0]) {
+                (EvaluationResult::String(s), EvaluationResult::String(prefix)) => {
+                    EvaluationResult::Boolean(s.starts_with(prefix))
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "endsWith" => {
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0]) {
+                (EvaluationResult::String(s), EvaluationResult::String(suffix)) => {
+                    EvaluationResult::Boolean(s.ends_with(suffix))
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "upper" => {
+            match invocation_base {
+                EvaluationResult::String(s) => EvaluationResult::String(s.to_uppercase()),
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "lower" => {
+            match invocation_base {
+                EvaluationResult::String(s) => EvaluationResult::String(s.to_lowercase()),
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "replace" => {
+            if args.len() != 2 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0], &args[1]) {
+                (EvaluationResult::String(s), EvaluationResult::String(pattern), EvaluationResult::String(substitution)) => {
+                    EvaluationResult::String(s.replace(pattern, substitution))
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "matches" => {
+            if args.len() != 1 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0]) {
+                (EvaluationResult::String(s), EvaluationResult::String(regex_pattern)) => {
+                    match Regex::new(regex_pattern) {
+                        Ok(re) => EvaluationResult::Boolean(re.is_match(s)),
+                        Err(_) => EvaluationResult::Empty, // Invalid regex pattern
+                    }
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "replaceMatches" => {
+            if args.len() != 2 { return EvaluationResult::Empty; }
+            match (invocation_base, &args[0], &args[1]) {
+                (EvaluationResult::String(s), EvaluationResult::String(regex_pattern), EvaluationResult::String(substitution)) => {
+                    match Regex::new(regex_pattern) {
+                        Ok(re) => EvaluationResult::String(re.replace_all(s, substitution).to_string()),
+                        Err(_) => EvaluationResult::Empty, // Invalid regex pattern
+                    }
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
+        "toChars" => {
+            match invocation_base {
+                EvaluationResult::String(s) => {
+                    if s.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        let chars: Vec<EvaluationResult> = s.chars()
+                            .map(|c| EvaluationResult::String(c.to_string()))
+                            .collect();
+                        EvaluationResult::Collection(chars)
+                    }
+                }
+                _ => EvaluationResult::Empty,
+            }
+        }
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
@@ -1666,7 +1795,8 @@ fn call_function(
                  // Add other handled functions here
                  "count", "empty", "first", "last", "not", "contains", "isDistinct",
                  "distinct", "skip", "tail", "take", "intersect", "exclude", "union", "combine",
-                 "length",
+                 "length", "indexOf", "substring", "startsWith", "endsWith", "upper", "lower",
+                 "replace", "matches", "replaceMatches", "toChars",
              ];
              if !handled_functions.contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
