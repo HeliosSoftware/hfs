@@ -273,7 +273,24 @@ fn evaluate_term(
         Term::Literal(literal) => evaluate_literal(literal),
         Term::ExternalConstant(name) => {
             // Look up external constant in the context
-            context.get_variable_as_result(name)
+            // Special handling for %context
+            if name == "context" {
+                if context.resources.is_empty() {
+                    EvaluationResult::Empty
+                } else if context.resources.len() == 1 {
+                    convert_resource_to_result(&context.resources[0])
+                } else {
+                    EvaluationResult::Collection(
+                        context
+                            .resources
+                            .iter()
+                            .map(convert_resource_to_result)
+                            .collect(),
+                    )
+                }
+            } else {
+                context.get_variable_as_result(name)
+            }
         }
         Term::Parenthesized(expr) => evaluate(expr, context, current_item),
     }
