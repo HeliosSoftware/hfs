@@ -184,13 +184,13 @@ fn evaluate_term(
                     .unwrap_or_else(|| {
                         // If no specific item context, use the main context resource(s)
                         if context.resources.is_empty() {
-                            return EvaluationResult::Empty;
+                            EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
                             // If only one resource, return it directly
-                            return convert_resource_to_result(&context.resources[0]);
+                            convert_resource_to_result(&context.resources[0])
                         } else {
                             // If multiple resources, return them as a collection
-                            return EvaluationResult::Collection(
+                            EvaluationResult::Collection(
                                 context
                                     .resources
                                     .iter()
