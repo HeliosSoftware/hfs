@@ -502,22 +502,36 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .padded();
 
     // Combined identifier parser - allow true/false as identifiers
+    // Also allow keywords used in specific contexts (like 'as', 'is') to be parsed as identifiers
+    // when they appear where an identifier is expected (e.g., in function calls or member access).
+    // The context of the grammar will differentiate their use.
     let identifier = choice((
         standard_identifier.clone(),
         delimited_identifier,
+        // Allow keywords to be parsed as identifiers if they appear in identifier positions
         text::keyword("as").to(String::from("as")),
         text::keyword("contains").to(String::from("contains")),
         text::keyword("in").to(String::from("in")),
         text::keyword("is").to(String::from("is")),
+        text::keyword("true").to(String::from("true")), // Allow 'true' as identifier
+        text::keyword("false").to(String::from("false")), // Allow 'false' as identifier
+        // Add other keywords if they can appear as identifiers in some contexts
     ));
 
     // Qualified identifier (for type specifiers)
-    let qualified_identifier = identifier
-        .clone()
+    // Handles both `Identifier` and `Identifier.Identifier`
+    let qualified_identifier = identifier.clone()
         .then(just('.').ignore_then(identifier.clone()).or_not())
-        .map(|(namespace, name)| TypeSpecifier::QualifiedIdentifier(namespace, name))
+        .map(|(first_part, second_part_opt)| {
+            // If second_part exists, first_part is namespace, second_part is name.
+            // If second_part is None, first_part is the name, namespace is None.
+            match second_part_opt {
+                Some(name) => TypeSpecifier::QualifiedIdentifier(first_part, Some(name)),
+                None => TypeSpecifier::QualifiedIdentifier(first_part, None),
+            }
+        })
         .padded()
-        .boxed(); // Box the parser to make it easier to clone
+        .boxed();
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
