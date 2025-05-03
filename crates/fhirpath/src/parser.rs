@@ -438,11 +438,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                         Literal::Time(time_str)
                     }
                 }
-                    // @T12:30 (without timezone)
-                    (None, Some(Some((time_str, None)))) => Literal::Time(time_str),
-                    // Invalid combinations or parsing errors
-                    _ => {
-                        // This case indicates an unexpected parsing result.
+                // @T... (handled above)
+                // (None, Some(Some((time_str, None)))) => Literal::Time(time_str), // This pattern is unreachable
+                // Invalid combinations or parsing errors
+                _ => {
+                    // This case indicates an unexpected parsing result.
                         // Log or handle this error appropriately.
                         // Returning Null might mask issues. Consider a dedicated Error literal or panic.
                         eprintln!("Warning: Unexpected combination in date/time parsing.");

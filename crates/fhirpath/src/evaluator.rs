@@ -3,7 +3,7 @@ use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+// Removed unused import: use rust_decimal_macros::dec;
 use std::collections::HashMap;
 
 /// Context for evaluating FHIRPath expressions
@@ -205,7 +205,7 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         Literal::Quantity(n, _) => {
             // For now, we ignore the unit and just return the decimal value
             // In a full implementation, we would handle units properly
-            EvaluationResult::Decimal(*d) // Use Decimal
+            EvaluationResult::Decimal(*n) // Use Decimal, corrected variable name to 'n'
         }
     }
 }
@@ -412,10 +412,15 @@ fn call_function(
 fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> EvaluationResult {
     // Get the index as an integer
     let idx = match index {
-        EvaluationResult::Number(n) => *n as usize,
-        EvaluationResult::Integer(i) => *i as usize,
-        _ => return EvaluationResult::Empty,
+        EvaluationResult::Decimal(d) => d.to_usize().unwrap_or(usize::MAX), // Convert Decimal to usize, handle potential errors
+        EvaluationResult::Integer(i) => *i as usize, // Assuming i64 fits into usize for indexing
+        _ => return EvaluationResult::Empty, // Non-numeric index results in Empty
     };
+
+    // Handle potential conversion errors from Decimal (e.g., negative, fractional, too large)
+    if idx == usize::MAX {
+        return EvaluationResult::Empty;
+    }
 
     // Access the item at the given index
     match collection {
