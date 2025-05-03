@@ -533,311 +533,166 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .padded();
 
     // Recursive parser definition that directly mirrors the grammar structure
-    let expr_parser = recursive(|expr| {
-        // Function parameters
-        let param_list = expr
-            .clone()
-            .separated_by(just(',').padded())
-            .collect::<Vec<_>>()
-            .boxed();
-
-        // Function invocation
-        let function = identifier
-            .clone()
-            .then(
-                just('(')
-                    .ignore_then(param_list.clone().or_not().map(|p| p.unwrap_or_default()))
-                    .then_ignore(just(')')),
-            )
-            .map(|(name, params)| Invocation::Function(name, params))
-            .boxed();
-
-        // Member invocation
-        let invocation = choice((
-            function.clone(),
+    recursive(|expr| {
+        // Atom: the most basic elements like literals, identifiers, parenthesized expressions.
+        let atom = choice((
+            literal.clone(),
+            external_constant.clone(),
+            // Function calls, member access, $this etc. are handled as invocations
             identifier.clone().map(Invocation::Member),
             just("$this").to(Invocation::This),
             just("$index").to(Invocation::Index),
             just("$total").to(Invocation::Total),
-        ))
-        .boxed();
-
-        // Define parsers for terms
-        let term = {
-            // Term - following the grammar rule for 'term'
-            choice((
-                invocation.clone().map(Term::Invocation),
-                literal.clone(),
-                external_constant.clone(),
-                expr.clone()
-                    .delimited_by(just('('), just(')'))
-                    .map(|e| Term::Parenthesized(Box::new(e))),
-            ))
-            .map(Expression::Term)
-            .boxed()
-        };
-
-        // Now define the expression parser that directly mirrors the grammar structure
-        // Start with the base term expression
-        let expr_base = term.clone();
-
-        // Define all the operation parsers directly without the closure
-        // This avoids the lifetime issues with the previous approach
-
-        // Define a type for our operation functions
-        type OpFn = Box<dyn Fn(Expression) -> Expression>;
-        
-        // Create a vector to hold all our operation parsers
-        let mut operations = Vec::<BoxedParser<'_, char, OpFn, Simple<char>>>::new();
-
-        // Invocation expression: expression '.' invocation
-        let invocation_expr = just::<_, _, Simple<char>>('.')
-            .ignore_then(invocation.clone())
-            .map(move |inv| {
-                let inv_clone = inv.clone();
-                Box::new(move |left: Expression| {
-                    Expression::Invocation(Box::new(left), inv_clone.clone())
-                }) as OpFn
-            })
-            .boxed();
-        operations.push(invocation_expr);
-
-        // Indexer expression: expression '[' expression ']'
-        let indexer_expr = expr
-            .clone()
-            .delimited_by(
-                just::<_, _, Simple<char>>('['),
-                just::<_, _, Simple<char>>(']'),
-            )
-            .map(move |idx| {
-                let idx_clone = idx.clone();
-                Box::new(move |left: Expression| {
-                    Expression::Indexer(Box::new(left), Box::new(idx_clone.clone()))
-                }) as OpFn
-            })
-            .boxed();
-        operations.push(indexer_expr);
-
-        // Polarity expression: ('+' | '-') expression
-        // This is handled separately as a prefix operator
-
-        // Multiplicative expression: expression ('*' | '/' | 'div' | 'mod') expression
-        let multiplicative_expr = choice((
-            just::<_, _, Simple<char>>('*').to("*"),
-            just::<_, _, Simple<char>>('/').to("/"),
-            just::<_, _, Simple<char>>("div").padded().to("div"),
-            just::<_, _, Simple<char>>("mod").padded().to("mod"),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Multiplicative(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
+            // Function calls need parameters parsed using the main expression parser
+            identifier.clone()
+                .then(
+                    expr.clone()
+                        .separated_by(just(',').padded())
+                        .allow_trailing() // Allow trailing comma
+                        .collect::<Vec<_>>()
+                        .delimited_by(just('('), just(')'))
                 )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(multiplicative_expr);
-
-        // Additive expression: expression ('+' | '-' | '&') expression
-        let additive_expr = choice((
-            just::<_, _, Simple<char>>('+').to("+"),
-            just::<_, _, Simple<char>>('-').to("-"),
-            just::<_, _, Simple<char>>('&').to("&"),
+                .map(|(name, params)| Invocation::Function(name, params)),
         ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Additive(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
-                )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(additive_expr);
+        .map(Term::Invocation) // Wrap identifier-based invocations in Term::Invocation
+        .or(literal.clone()) // Literals are terms
+        .or(external_constant.clone()) // External constants are terms
+        .or(expr.clone().delimited_by(just('(').padded(), just(')').padded()).map(|e| Term::Parenthesized(Box::new(e)))) // Parenthesized expressions
+        .map(Expression::Term)
+        .padded();
 
-        // Type expression: expression ('is' | 'as') typeSpecifier
-        let type_expr = choice((
-            just::<_, _, Simple<char>>("is").padded().map(|_| "is"),
-            just::<_, _, Simple<char>>("as").padded().map(|_| "as"),
-        ))
-        .then(qualified_identifier.clone())
-        .map(move |(op, type_spec)| {
-            let op_str = op.to_string();
-            let type_spec_clone = type_spec.clone();
-            Box::new(move |left: Expression| {
-                Expression::Type(Box::new(left), op_str.clone(), type_spec_clone.clone())
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(type_expr);
+        // Postfix operators: . (member/function invocation) and [] (indexer)
+        let postfix_op = choice((
+            // Member/Function Invocation: '.' followed by an identifier or function call structure
+            just('.').ignore_then(
+                choice((
+                    // Function call after dot
+                    identifier.clone()
+                        .then(
+                            expr.clone()
+                                .separated_by(just(',').padded())
+                                .allow_trailing()
+                                .collect::<Vec<_>>()
+                                .delimited_by(just('('), just(')'))
+                        )
+                        .map(|(name, params)| Invocation::Function(name, params)),
+                    // Simple member access after dot
+                    identifier.clone().map(Invocation::Member),
+                ))
+            ).map(|inv| |left| Expression::Invocation(Box::new(left), inv)),
+            // Indexer
+            expr.clone().delimited_by(just('[').padded(), just(']').padded())
+                .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx))),
+        ));
 
-        // Union expression: expression '|' expression
-        let union_expr = just::<_, _, Simple<char>>('|')
-            .padded()
-            .ignore_then(expr.clone())
-            .map(move |right| {
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    Expression::Union(Box::new(left), Box::new(right_clone.clone()))
-                }) as OpFn
-            })
-            .boxed();
-        operations.push(union_expr);
+        let atom_with_postfix = atom.clone()
+            .then(postfix_op.repeated())
+            .foldl(|left, op_fn| op_fn(left));
 
-        // Inequality expression: expression ('<=' | '<' | '>' | '>=') expression
-        let inequality_expr = choice((
-            just::<_, _, Simple<char>>("<=").to("<="),
-            just::<_, _, Simple<char>>("<").to("<"),
-            just::<_, _, Simple<char>>(">=").to(">="),
-            just::<_, _, Simple<char>>(">").to(">"),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Inequality(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
-                )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(inequality_expr);
-
-        // Equality expression: expression ('=' | '~' | '!=' | '!~') expression
-        let equality_expr = choice((
-            just::<_, _, Simple<char>>("=").to("="),
-            just::<_, _, Simple<char>>("~").to("~"),
-            just::<_, _, Simple<char>>("!=").to("!="),
-            just::<_, _, Simple<char>>("!~").to("!~"),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Equality(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
-                )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(equality_expr);
-
-        // Membership expression: expression ('in' | 'contains') expression
-        let membership_expr = choice((
-            just::<_, _, Simple<char>>("in").padded().to("in"),
-            just::<_, _, Simple<char>>("contains")
-                .padded()
-                .to("contains"),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Membership(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
-                )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(membership_expr);
-
-        // And expression: expression 'and' expression
-        let and_expr = just::<_, _, Simple<char>>("and")
-            .padded()
-            .ignore_then(expr.clone())
-            .map(move |right| {
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    Expression::And(Box::new(left), Box::new(right_clone.clone()))
-                }) as OpFn
-            })
-            .boxed();
-        operations.push(and_expr);
-
-        // Or expression: expression ('or' | 'xor') expression
-        let or_expr = choice((
-            just::<_, _, Simple<char>>("or").padded().to("or"),
-            just::<_, _, Simple<char>>("xor").padded().to("xor"),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(move |(op, right)| {
-            let op_str = op.to_string();
-            let right_clone = right.clone();
-            Box::new(move |left: Expression| {
-                Expression::Or(
-                    Box::new(left),
-                    op_str.clone(),
-                    Box::new(right_clone.clone()),
-                )
-            }) as OpFn
-        })
-        .boxed();
-        operations.push(or_expr);
-
-        // Implies expression: expression 'implies' expression
-        let implies_expr = just::<_, _, Simple<char>>("implies")
-            .padded()
-            .ignore_then(expr.clone())
-            .map(move |right| {
-                let right_clone = right.clone();
-                Box::new(move |left: Expression| {
-                    Expression::Implies(Box::new(left), Box::new(right_clone.clone()))
-                }) as OpFn
-            })
-            .boxed();
-        operations.push(implies_expr);
-
-        // Combine all operation parsers using choice
-        let operation_parser = choice(operations);
-
-        // Apply operations to the base expression
-        let expr_with_operations =
-            expr_base
-                .clone()
-                .then(operation_parser.repeated())
-                .map(|(base, operations)| {
-                    operations.into_iter().fold(base, |acc, operation| {
-                        operation(acc)
-                    })
-                });
-
-        // Handle polarity expressions separately since they're prefix operators
-        let polarity_expr = choice((
+        // Prefix operators (Polarity)
+        let prefix_op = choice((
             just::<_, _, Simple<char>>('+').to('+'),
             just::<_, _, Simple<char>>('-').to('-'),
-        ))
-        .padded()
-        .then(expr.clone())
-        .map(|(op, expr)| Expression::Polarity(op, Box::new(expr)))
-        .or(expr_with_operations);
+        )).padded();
 
-        polarity_expr.boxed() // Return the final parser definition from the closure
-    });
+        let term_with_polarity = prefix_op.repeated()
+            .then(atom_with_postfix)
+            .foldr(|op, right| Expression::Polarity(op, Box::new(right)));
 
-    // Apply then_ignore(end()) to the fully defined recursive parser
-    expr_parser.then_ignore(end())
+        // Infix operators with precedence levels (from high to low)
+
+        // Level 1: Multiplicative (*, /, div, mod) - Left associative
+        let op_mul = choice((
+            just('*').to("*"),
+            just('/').to("/"),
+            text::keyword("div").to("div"),
+            text::keyword("mod").to("mod"),
+        )).padded();
+        let multiplicative = term_with_polarity.clone()
+            .then(op_mul.then(term_with_polarity).repeated())
+            .foldl(|left, (op_str, right)| Expression::Multiplicative(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 2: Additive (+, -, &) - Left associative
+        let op_add = choice((
+            just('+').to("+"),
+            just('-').to("-"),
+            just('&').to("&"),
+        )).padded();
+        let additive = multiplicative.clone()
+            .then(op_add.then(multiplicative).repeated())
+            .foldl(|left, (op_str, right)| Expression::Additive(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 3: Union (|) - Left associative (though spec doesn't strictly define associativity here)
+        let op_union = just('|').padded();
+        let union = additive.clone()
+            .then(op_union.then(additive).repeated())
+            .foldl(|left, (_, right)| Expression::Union(Box::new(left), Box::new(right)));
+
+        // Level 4: Type (is, as) - Left associative
+        let op_type = choice((
+            text::keyword("is").to("is"),
+            text::keyword("as").to("as"),
+        )).padded();
+        let type_expr = union.clone()
+            .then(op_type.then(qualified_identifier.clone()).repeated()) // Type specifier follows 'is'/'as'
+            .foldl(|left, (op_str, type_spec)| Expression::Type(Box::new(left), op_str.to_string(), type_spec));
+
+        // Level 5: Inequality (<, <=, >, >=) - Left associative
+        let op_ineq = choice((
+            just("<=").to("<="),
+            just("<").to("<"),
+            just(">=").to(">="),
+            just(">").to(">"),
+        )).padded();
+        let inequality = type_expr.clone()
+            .then(op_ineq.then(type_expr).repeated())
+            .foldl(|left, (op_str, right)| Expression::Inequality(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 6: Equality (=, ~, !=, !~) - Left associative
+        let op_eq = choice((
+            just("=").to("="),
+            just("~").to("~"),
+            just("!=").to("!="),
+            just("!~").to("!~"),
+        )).padded();
+        let equality = inequality.clone()
+            .then(op_eq.then(inequality).repeated())
+            .foldl(|left, (op_str, right)| Expression::Equality(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 7: Membership (in, contains) - Left associative
+        let op_mem = choice((
+            text::keyword("in").to("in"),
+            text::keyword("contains").to("contains"),
+        )).padded();
+        let membership = equality.clone()
+            .then(op_mem.then(equality).repeated())
+            .foldl(|left, (op_str, right)| Expression::Membership(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 8: Logical AND (and) - Left associative
+        let op_and = text::keyword("and").padded();
+        let logical_and = membership.clone()
+            .then(op_and.then(membership).repeated())
+            .foldl(|left, (_, right)| Expression::And(Box::new(left), Box::new(right)));
+
+        // Level 9: Logical OR/XOR (or, xor) - Left associative
+        let op_or = choice((
+            text::keyword("or").to("or"),
+            text::keyword("xor").to("xor"),
+        )).padded();
+        let logical_or = logical_and.clone()
+            .then(op_or.then(logical_and).repeated())
+            .foldl(|left, (op_str, right)| Expression::Or(Box::new(left), op_str.to_string(), Box::new(right)));
+
+        // Level 10: Implies (implies) - Right associative (or handle as non-assoc if simpler)
+        // Let's treat it as left-associative for simplicity, though the spec implies right-to-left evaluation.
+        // A proper right-associative fold might be needed if complex implies chains are common.
+        let op_implies = text::keyword("implies").padded();
+        let implies = logical_or.clone()
+            .then(op_implies.then(logical_or).repeated())
+            .foldl(|left, (_, right)| Expression::Implies(Box::new(left), Box::new(right)));
+
+        // The final expression parser is the one with the lowest precedence
+        implies
+    })
+    .then_ignore(end())
 }
