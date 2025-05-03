@@ -324,7 +324,7 @@ fn test_function_existence_subset_of() {
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1 | 2).subsetOf({1})", &context),
+        eval("(1 | 2).subsetOf(1)", &context), // Use valid syntax (1) instead of {1}
         EvaluationResult::Boolean(false)
     );
 }
