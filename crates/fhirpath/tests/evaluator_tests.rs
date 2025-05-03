@@ -2839,13 +2839,14 @@ fn test_operator_math_add() {
 #[test]
 fn test_operator_math_subtract() {
     let context = EvaluationContext::new_empty();
-    // All result in Decimal
+    // Integer - Integer -> Integer
     assert_eq!(
         eval("5 - 3", &context),
-        EvaluationResult::Decimal(dec!(2.0)) // Integer - Integer -> Decimal
+        EvaluationResult::Integer(2) // Integer - Integer -> Integer
     );
+    // Decimal involved -> Decimal result
     assert_eq!(
-        eval("5.5 - 3", &context), // Decimal - Integer -> Decimal
+        eval("5.5 - 3", &context),
         EvaluationResult::Decimal(dec!(2.5))
     ); // Decimal - Integer -> Decimal
     assert_eq!(
@@ -2958,10 +2959,10 @@ fn test_operator_precedence() {
         eval("(1 + 2) * 3", &context),
         EvaluationResult::Integer(9) // <-- Correct expectation
     );
-    // (5 - 2) + 1 = 3.0 + 1 = 4.0 (Subtraction -> Decimal, then Decimal + Integer -> Decimal)
+    // (5 - 2) + 1 = 3 + 1 = 4 (Subtraction -> Integer, then Integer + Integer -> Integer)
     assert_eq!(
         eval("5 - 2 + 1", &context),
-        EvaluationResult::Decimal(dec!(4.0)) // Subtraction always results in Decimal
+        EvaluationResult::Integer(4) // Corrected expectation
     );
     // (10 / 2) * 5 = 5.0 * 5 = 25.0 (Division -> Decimal, then Decimal * Integer -> Decimal)
     assert_eq!(
