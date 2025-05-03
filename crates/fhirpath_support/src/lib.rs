@@ -9,7 +9,7 @@ pub trait IntoEvaluationResult {
 }
 
 /// Result of evaluating a FHIRPath expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)] // Add Eq here
 pub enum EvaluationResult {
     Empty,
     Boolean(bool),
