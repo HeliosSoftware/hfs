@@ -376,6 +376,9 @@ fn test_function_existence_count() {
         eval("(1 | 2 | 3).count()", &context),
         EvaluationResult::Integer(3)
     );
+    // Add test for duplicates
+    assert_eq!(
+        eval("(1 | 2 | 1).count()", &context),
         EvaluationResult::Integer(3)
     ); // Duplicates are counted
 }
@@ -761,8 +764,8 @@ fn test_function_subsetting_take() {
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
-        ])
-    );
+        ]) // End collection for take(3)
+    ); // End assert_eq for take(3)
     assert_eq!(
         eval("(10 | 20 | 30).take(4)", &context),
         // Expect collection result
