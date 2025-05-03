@@ -1,6 +1,5 @@
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Keep only one import
 use rust_decimal::Decimal;
-// Removed unused import: use rust_decimal::prelude::ToPrimitive;
 use serde::{
     Deserialize, Serialize,
     de::{self, Deserializer, MapAccess, Visitor},
@@ -849,12 +848,7 @@ where
             Some(precise_decimal) => {
                 // Extract the Option<rust_decimal::Decimal>
                 match precise_decimal.value() {
-                    Some(decimal_val) => {
-                        // Convert to f64 for EvaluationResult::Number
-                        // WARNING: Potential precision loss.
-                        // Directly use the Decimal value with EvaluationResult::Decimal
-                        EvaluationResult::Decimal(decimal_val)
-                    }
+                    Some(decimal_val) => EvaluationResult::Decimal(decimal_val),
                     None => EvaluationResult::Empty, // PreciseDecimal held None
                 }
             }
@@ -875,8 +869,8 @@ impl IntoEvaluationResult for FhirResource {
             FhirResource::R5(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r5::Resource>
             #[cfg(feature = "R6")]
             FhirResource::R6(r) => (*r).into_evaluation_result(), // Call impl on inner Box<r6::Resource>
-            // Note: If no features are enabled, this match might be empty or non-exhaustive.
-            // This is generally okay as the enum itself wouldn't be usable.
+                                                                  // Note: If no features are enabled, this match might be empty or non-exhaustive.
+                                                                  // This is generally okay as the enum itself wouldn't be usable.
         }
     }
 }
