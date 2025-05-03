@@ -385,11 +385,28 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     .padded(); // Allow whitespace around units
 
     // Quantity needs to be a term-level construct to work in expressions
-    let quantity = number.then(unit).map(|(n_literal, u)| {
-        if let Literal::Number(num) = n_literal {
-            Literal::Quantity(num, Some(u))
-        } else {
-            // This case should ideally not be reachable if `number` always produces Literal::Number
+    // Allow either an integer or a number before the unit
+    let quantity = choice((integer.clone(), number.clone()))
+        .then(unit)
+        .map(|(num_literal, u)| {
+            match num_literal {
+                Literal::Integer(i) => {
+                    // Convert integer to Decimal for Quantity representation
+                    Literal::Quantity(Decimal::from(i), Some(u))
+                }
+                Literal::Number(d) => Literal::Quantity(d, Some(u)),
+                _ => {
+                    // This case should ideally not be reachable
+                    emit_error("Expected Literal::Integer or Literal::Number in quantity parser, got other literal type.");
+                    Literal::Quantity(dec!(0), Some(u)) // Default value
+                }
+            }
+        });
+
+    // Helper function to emit errors (replace with actual logging/error handling if needed)
+    fn emit_error(message: &str) {
+        eprintln!("Parser Error: {}", message);
+    }
             // Provide a default Decimal value if it occurs.
             emit_error("Expected Literal::Number in quantity parser, got other literal type.");
             Literal::Quantity(dec!(0), Some(u))
