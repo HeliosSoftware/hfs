@@ -2416,9 +2416,9 @@ fn compare_equality(
         "~" => {
             // Equivalence: Order doesn't matter, duplicates DO matter.
             match (left, right) {
-                // Handle Empty cases first
+                // Handle Empty cases specifically for '~'
                 (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(false),
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(false), // Empty is only equivalent to Empty
                 // String equivalence (normalized)
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
