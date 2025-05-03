@@ -908,14 +908,16 @@ fn test_function_combining_combine() {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
-    let r2 = eval("{}.combine({1 | 2})", &context);
+    // Use valid syntax (1 | 2) instead of {1 | 2}
+    let r2 = eval("{}.combine(1 | 2)", &context);
     assert!(matches!(&r2, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(v) = r2 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Order not guaranteed, check contents, duplicates preserved
-    let result = eval("(1 | 2 | 3).combine({2 | 3 | 4})", &context);
+    // Use valid syntax (2 | 3 | 4) instead of {2 | 3 | 4}
+    let result = eval("(1 | 2 | 3).combine(2 | 3 | 4)", &context);
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -929,7 +931,8 @@ fn test_function_combining_combine() {
     } else {
         panic!("Expected collection result from combine");
     }
-    let result = eval("(1 | 2 | 1).combine({1 | 3 | 1})", &context);
+    // Use valid syntax (1 | 3 | 1) instead of {1 | 3 | 1}
+    let result = eval("(1 | 2 | 1).combine(1 | 3 | 1)", &context);
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
