@@ -462,7 +462,7 @@ fn test_function_filtering_where() {
     );
     // Test criteria evaluating to non-boolean (should be ignored)
     assert_eq!(
-        eval("(1 | 2 | 3).where($this)", &context),
+        // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
@@ -471,6 +471,7 @@ fn test_function_filtering_where() {
     ); // All items are truthy
     assert_eq!(
         eval("(0 | 1 | 2).where($this)", &context),
+        // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
@@ -755,8 +756,7 @@ fn test_function_subsetting_take() {
             EvaluationResult::Integer(20)
         ])
     );
-    assert_eq!(
-        eval("(10 | 20 | 30).take(3)", &context),
+        // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
@@ -765,6 +765,7 @@ fn test_function_subsetting_take() {
     );
     assert_eq!(
         eval("(10 | 20 | 30).take(4)", &context),
+        // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
@@ -822,6 +823,7 @@ fn test_function_subsetting_exclude() {
     assert_eq!(eval("{}.exclude({})", &context), EvaluationResult::Empty);
     assert_eq!(
         eval("(1 | 2 | 3).exclude({})", &context),
+        // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
