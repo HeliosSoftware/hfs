@@ -384,37 +384,50 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ))
     .padded(); // Unit parser itself can be padded
 
-    // Define unpadded versions for quantity internal use
-    let integer_unpadded = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+    // Define integer/number parsers specifically for quantity, without consuming trailing whitespace.
+    let integer_for_quantity = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated().at_least(1).collect::<String>()
         .validate(|digits, span, emit| match i64::from_str(&digits) {
-            Ok(n) => Literal::Integer(n),
-            Err(_) => { emit(Simple::custom(span, format!("Invalid integer: {}", digits))); Literal::Integer(0) }
+            Ok(n) => n, // Return the i64 directly
+            Err(_) => { emit(Simple::custom(span, format!("Invalid integer: {}", digits))); 0 }
         });
 
-    let number_unpadded = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+    let number_for_quantity = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated().at_least(1).collect::<String>()
         .then(just('.'))
         .then(filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit()).repeated().at_least(1).collect::<String>())
         .validate(|((i, _), d), span, emit| {
             let num_str = format!("{}.{}", i, d);
             match Decimal::from_str(&num_str) {
-                Ok(decimal) => Literal::Number(decimal),
-                Err(_) => { emit(Simple::custom(span, format!("Invalid number: {}", num_str))); Literal::Number(dec!(0)) }
+                Ok(decimal) => decimal, // Return the Decimal directly
+                Err(_) => { emit(Simple::custom(span, format!("Invalid number: {}", num_str))); dec!(0) }
             }
         });
 
-    // Quantity parser: (unpadded integer | unpadded number) + required whitespace + unit
-    let quantity = choice((integer_unpadded, number_unpadded))
-        .then_ignore(text::whitespace().at_least(1)) // Require whitespace after number
-        .then(unit.clone()) // Parse the unit
-        .map(|(num_literal, u)| {
-             match num_literal {
-                 Literal::Integer(i) => Literal::Quantity(Decimal::from(i), Some(u)),
-                 Literal::Number(d) => Literal::Quantity(d, Some(u)),
-                 // This case should not be reached
-                 _ => {
-                     emit_error("Internal error: Expected Integer or Number literal in quantity parse");
+    // Quantity parser: (integer_for_quantity | number_for_quantity) + required whitespace + unit
+    // This parser consumes the whole quantity structure.
+    let quantity = choice((
+            // Try integer quantity first
+            integer_for_quantity
+                .then_ignore(text::whitespace().at_least(1))
+                .then(unit.clone())
+                .map(|(i, u)| Literal::Quantity(Decimal::from(i), Some(u))),
+            // Then try decimal quantity
+            number_for_quantity
+                .then_ignore(text::whitespace().at_least(1))
+                .then(unit.clone())
+                .map(|(d, u)| Literal::Quantity(d, Some(u))),
+        ));
+        // Note: No .map() or match needed here as the inner maps handle Literal creation.
+        // The outer choice directly produces Literal::Quantity or fails.
+
+
+    // Helper function to emit errors (replace with actual logging/error handling if needed)
+    fn emit_error(message: &str) {
+        eprintln!("Parser Error: {}", message);
+    }
+
+    let date_datetime_time = just('@')
                      Literal::Quantity(dec!(0), Some(u))
                  }
              }
