@@ -179,13 +179,13 @@ fn evaluate_term(
         Term::Invocation(invocation) => {
             // Handle $this invocation
             if let Invocation::This = invocation {
-                // Determine the value for $this without using unwrap_or_else
-                // Determine the value for $this and return immediately
+                // Let the if/else block evaluate to the result, which becomes the
+                // implicit return value for this match arm if invocation is $this.
                 if let Some(item) = current_item.cloned() {
-                    return item; // Return the provided current_item if it exists
+                    item // Evaluate to the item if Some
                 } else {
-                    // Determine the result without returning immediately from the inner block
-                    let result = if context.resources.is_empty() {
+                    // Evaluate to the default context if None
+                    if context.resources.is_empty() {
                         EvaluationResult::Empty
                     } else if context.resources.len() == 1 {
                         convert_resource_to_result(&context.resources[0])
@@ -197,11 +197,8 @@ fn evaluate_term(
                                 .map(convert_resource_to_result)
                                 .collect(),
                         )
-                    };
-                    // Return the determined result after the if/else block
-                    return result;
+                    }
                 }
-                // This part remains unreachable
             }
 
             // Check if this is a variable reference (starting with %)
