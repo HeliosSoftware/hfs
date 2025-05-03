@@ -579,41 +579,43 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // Postfix operators: . (member/function invocation) and [] (indexer)
         let postfix_op = choice((
-            // Member/Function Invocation: '.' followed by an identifier or function call structure
-            just('.').ignore_then(
-                choice((
-                    // Try function call pattern first (identifier followed by parentheses)
-                    identifier.clone()
-                        .then(
-                            expr.clone()
-                                    .separated_by(just(',').padded())
-                                .allow_trailing()
-                                .collect::<Vec<_>>()
-                                .delimited_by(just('(').padded(), just(')').padded()) // Padded parentheses
-                        )
-                        .map(|(name, params)| Invocation::Function(name, params)), // If successful, it's a function call
-                    // If the function call pattern fails, try simple member access
-                    identifier.clone().map(Invocation::Member), // Just the identifier
-                ))
-            )
-            .map(|inv| {
-                // Closure now inferred, boxing happens below
-                Box::new(move |left: Expression| Expression::Invocation(Box::new(left), inv.clone()))
-                    as Box<dyn Fn(Expression) -> Expression> // Cast to dyn Fn trait object
-            })
-            .boxed(), // Box the parser returning the closure
+            // Member/Function Invocation: '.' followed by identifier, optionally followed by args (...)
+            just('.')
+                .ignore_then(
+                    identifier.clone().then(
+                        // Optionally parse arguments
+                        expr.clone()
+                            .separated_by(just(',').padded())
+                            .allow_trailing()
+                            .collect::<Vec<_>>()
+                            .delimited_by(just('(').padded(), just(')').padded())
+                            .or_not(), // Make arguments optional
+                    ),
+                )
+                .map(|(name, params_opt)| {
+                    // Create the correct Invocation based on whether params were found
+                    let invocation = match params_opt {
+                        Some(params) => Invocation::Function(name, params),
+                        None => Invocation::Member(name),
+                    };
+                    // Return the closure
+                    Box::new(move |left: Expression| {
+                        Expression::Invocation(Box::new(left), invocation.clone())
+                    }) as Box<dyn Fn(Expression) -> Expression>
+                }),
             // Indexer
-            expr.clone().delimited_by(just('[').padded(), just(']').padded())
+            expr.clone()
+                .delimited_by(just('[').padded(), just(']').padded())
                 .map(|idx| {
-                     // Closure now inferred, boxing happens below
-                    Box::new(move |left: Expression| Expression::Indexer(Box::new(left), Box::new(idx.clone())))
-                        as Box<dyn Fn(Expression) -> Expression> // Cast to dyn Fn trait object
-                })
-                .boxed(), // Box the parser returning the closure
-        )).boxed(); // Box the result of the choice combinator
+                    Box::new(move |left: Expression| {
+                        Expression::Indexer(Box::new(left), Box::new(idx.clone()))
+                    }) as Box<dyn Fn(Expression) -> Expression>
+                }),
+        ))
+        .boxed(); // Box the choice result
 
-        let atom_with_postfix = atom.clone()
-            // Now call repeated on the boxed Choice parser
+        let atom_with_postfix = atom
+            .clone()
             .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
