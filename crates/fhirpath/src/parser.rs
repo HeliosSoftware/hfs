@@ -1,6 +1,6 @@
 use chumsky::error::Simple;
-use chumsky::prelude::{*, attempt}; // Add attempt here
-use chumsky::Parser;
+use chumsky::prelude::*; // Keep prelude import
+use chumsky::{attempt, Parser}; // Import attempt directly from chumsky
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec; // For potential default values if needed
 use std::fmt;
