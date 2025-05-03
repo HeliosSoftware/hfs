@@ -404,6 +404,19 @@ fn evaluate_invocation(
                     let criteria_expr = &args_exprs[0];
                     evaluate_all_with_criteria(invocation_base, criteria_expr, context)
                 }
+                "ofType" if args_exprs.len() == 1 => {
+                    // Extract the TypeSpecifier from the argument expression
+                    // The parser should ensure the argument is a TypeSpecifier term
+                    if let Expression::Term(Term::Invocation(Invocation::Member(type_name))) = &args_exprs[0] {
+                         // We only have the name here, reconstruct a simple TypeSpecifier
+                         // A more robust solution might involve passing the actual TypeSpecifier AST node
+                         let type_spec = TypeSpecifier::QualifiedIdentifier(type_name.clone(), None); // Assuming no namespace for now
+                         evaluate_of_type(invocation_base, &type_spec)
+                    } else {
+                         eprintln!("Warning: ofType argument was not a simple type identifier: {:?}", args_exprs[0]);
+                         EvaluationResult::Empty // Invalid argument for ofType
+                    }
+                }
                 "iif" if args_exprs.len() >= 2 => { // iif(condition, trueResult, [otherwiseResult])
                     let condition_expr = &args_exprs[0];
                     let true_result_expr = &args_exprs[1];
@@ -588,6 +601,60 @@ fn evaluate_all_with_criteria(
 
     // If all items satisfied the criteria
     EvaluationResult::Boolean(true)
+}
+
+/// Evaluates the 'ofType' function.
+fn evaluate_of_type(
+    collection: &EvaluationResult,
+    type_spec: &TypeSpecifier,
+) -> EvaluationResult {
+    let items_to_filter = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        single_item => vec![single_item.clone()],
+    };
+
+    let target_type_name = match type_spec {
+        // TODO: Handle namespaces if present (e.g., System.String)
+        TypeSpecifier::QualifiedIdentifier(name, _namespace) => name.as_str(),
+    };
+
+    let mut filtered_items = Vec::new();
+    for item in items_to_filter {
+        let matches = match (target_type_name, &item) {
+            ("Boolean", EvaluationResult::Boolean(_)) => true,
+            ("String", EvaluationResult::String(_)) => true,
+            ("Integer", EvaluationResult::Integer(_)) => true,
+            ("Decimal", EvaluationResult::Decimal(_)) => true,
+            ("Date", EvaluationResult::Date(_)) => true,
+            ("DateTime", EvaluationResult::DateTime(_)) => true,
+            ("Time", EvaluationResult::Time(_)) => true,
+            // Handle complex FHIR types by checking resourceType
+            (fhir_type, EvaluationResult::Object(fields)) => {
+                if let Some(EvaluationResult::String(rt)) = fields.get("resourceType") {
+                    rt == fhir_type
+                } else {
+                    false // Object has no resourceType field
+                }
+            }
+            // Add checks for other FHIR primitive types if needed (e.g., Quantity, Code)
+            // These might require inspecting the structure more deeply if not directly mapped
+            // to EvaluationResult variants. For now, basic types and resourceType check.
+            _ => false, // Type mismatch
+        };
+
+        if matches {
+            filtered_items.push(item.clone());
+        }
+    }
+
+    if filtered_items.is_empty() {
+        EvaluationResult::Empty
+    } else if filtered_items.len() == 1 {
+        filtered_items.into_iter().next().unwrap() // Return single item directly
+    } else {
+        EvaluationResult::Collection(filtered_items)
+    }
 }
 
 
@@ -827,10 +894,13 @@ fn call_function(
                 _ => EvaluationResult::Empty, // Length only defined for strings
             }
         }
-        // where and select are handled in evaluate_invocation
+        // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
-             eprintln!("Warning: Unsupported function called: {}", name);
+             // Only print warning for functions not handled elsewhere
+             if !["where", "select", "exists", "all", "iif", "ofType"].contains(&name) {
+                 eprintln!("Warning: Unsupported function called: {}", name);
+             }
              EvaluationResult::Empty
         }
     }
