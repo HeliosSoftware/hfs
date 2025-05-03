@@ -1,6 +1,6 @@
-use chumsky::combinator::attempt; // Import attempt from the combinator module
 use chumsky::error::Simple;
 use chumsky::prelude::*;
+use chumsky::primitive::attempt; // Import attempt from the primitive module
 use chumsky::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec; // For potential default values if needed
