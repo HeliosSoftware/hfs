@@ -541,35 +541,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         let atom = choice((
             // Box each branch individually to ensure type uniformity for choice
             literal.clone().map(Expression::Term).boxed(), // Map literal Term to Expression here
-            external_constant.clone().map(Expression::Term).boxed(), // Map external constant Term to Expression here
-            // Invocations (Member, Function, $this, $index, $total)
+            external_constant.clone().map(Expression::Term).boxed(),
+
+            // Function call: identifier(...) - Try this *before* simple identifier
+            identifier.clone()
+                .then(
+                    expr.clone()
+                        .separated_by(just(',').padded())
+                        .allow_trailing()
+                        .collect::<Vec<_>>()
+                        // Ensure parentheses are padded to handle potential whitespace
+                        .delimited_by(just('(').padded(), just(')').padded())
+                )
+                 // Directly create the Expression::Term(Term::Invocation(...)) structure
+                .map(|(name, params)| Expression::Term(Term::Invocation(Invocation::Function(name, params))))
+                .boxed(),
+
+            // Simple identifier, $this, $index, $total (parsed if not a function call)
             choice((
                 identifier.clone().map(Invocation::Member),
                 just("$this").to(Invocation::This),
                 just("$index").to(Invocation::Index),
                 just("$total").to(Invocation::Total),
-                identifier.clone()
-                    .then(
-                        expr.clone()
-                            .separated_by(just(',').padded())
-                            .allow_trailing()
-                            .collect::<Vec<_>>()
-                            .delimited_by(just('('), just(')'))
-                    )
-                    .map(|(name, params)| Invocation::Function(name, params)),
             ))
-            .map(Term::Invocation) // Map invocation variants to Term
+            .map(Term::Invocation) // Map these simple invocations to Term
             .map(Expression::Term) // Map Term to Expression
-            .boxed(), // Box the invocation branch
+            .boxed(),
+
             // Parenthesized expression
             expr.clone()
                 .delimited_by(just('(').padded(), just(')').padded())
-                // No need for Term::Parenthesized, just return the inner Expression
-                // .map(|e| Term::Parenthesized(Box::new(e)))
-                // .map(Expression::Term)
-                .boxed(), // Box the parenthesized branch
+                // Parenthesized expression directly yields an Expression
+                .boxed(),
         ))
-        .padded(); // Apply padding after choice
+        .padded();
 
         // Postfix operators: . (member/function invocation) and [] (indexer)
         let postfix_op = choice((
