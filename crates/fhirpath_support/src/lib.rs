@@ -1,6 +1,7 @@
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use std::collections::HashMap; // Removed HashSet import
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher}; // Import Hash and Hasher
 
 /// Trait to convert FHIR field values into EvaluationResult
@@ -22,6 +23,95 @@ pub enum EvaluationResult {
     Collection(Vec<EvaluationResult>),
     Object(HashMap<String, EvaluationResult>),
 }
+
+// --- Ord Implementation ---
+// Define an arbitrary but consistent order for variants for sorting purposes.
+// Note: This order does not necessarily reflect FHIRPath comparison rules,
+// which are handled separately by compare_equality/compare_inequality.
+impl PartialOrd for EvaluationResult {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other)) // Defer to Ord implementation
+    }
+}
+
+impl Ord for EvaluationResult {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            // Compare based on variant order first
+            (EvaluationResult::Empty, EvaluationResult::Empty) => Ordering::Equal,
+            (EvaluationResult::Empty, _) => Ordering::Less,
+            (_, EvaluationResult::Empty) => Ordering::Greater,
+
+            (EvaluationResult::Boolean(a), EvaluationResult::Boolean(b)) => a.cmp(b),
+            (EvaluationResult::Boolean(_), _) => Ordering::Less,
+            (_, EvaluationResult::Boolean(_)) => Ordering::Greater,
+
+            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => a.cmp(b),
+            (EvaluationResult::Integer(_), _) => Ordering::Less,
+            (_, EvaluationResult::Integer(_)) => Ordering::Greater,
+
+            (EvaluationResult::Decimal(a), EvaluationResult::Decimal(b)) => a.cmp(b),
+            (EvaluationResult::Decimal(_), _) => Ordering::Less,
+            (_, EvaluationResult::Decimal(_)) => Ordering::Greater,
+
+            (EvaluationResult::String(a), EvaluationResult::String(b)) => a.cmp(b),
+            (EvaluationResult::String(_), _) => Ordering::Less,
+            (_, EvaluationResult::String(_)) => Ordering::Greater,
+
+            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => a.cmp(b),
+            (EvaluationResult::Date(_), _) => Ordering::Less,
+            (_, EvaluationResult::Date(_)) => Ordering::Greater,
+
+            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => a.cmp(b),
+            (EvaluationResult::DateTime(_), _) => Ordering::Less,
+            (_, EvaluationResult::DateTime(_)) => Ordering::Greater,
+
+            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => a.cmp(b),
+            (EvaluationResult::Time(_), _) => Ordering::Less,
+            (_, EvaluationResult::Time(_)) => Ordering::Greater,
+
+            (EvaluationResult::Collection(a), EvaluationResult::Collection(b)) => {
+                // Compare collections lexicographically after sorting them internally
+                // This ensures consistent ordering for sorting purposes, even if FHIRPath
+                // equivalence doesn't strictly require it.
+                let mut a_sorted = a.clone();
+                let mut b_sorted = b.clone();
+                a_sorted.sort(); // Recursive call to Ord::cmp
+                b_sorted.sort();
+                a_sorted.cmp(&b_sorted)
+            }
+            (EvaluationResult::Collection(_), _) => Ordering::Less,
+            (_, EvaluationResult::Collection(_)) => Ordering::Greater,
+
+            (EvaluationResult::Object(a), EvaluationResult::Object(b)) => {
+                // Compare objects based on sorted keys and then values
+                let mut a_keys: Vec<_> = a.keys().collect();
+                let mut b_keys: Vec<_> = b.keys().collect();
+                a_keys.sort();
+                b_keys.sort();
+
+                match a_keys.cmp(&b_keys) {
+                    Ordering::Equal => {
+                        // Keys are the same, compare values in key order
+                        for key in a_keys {
+                            match a[key].cmp(&b[key]) {
+                                Ordering::Equal => continue,
+                                non_equal => return non_equal,
+                            }
+                        }
+                        Ordering::Equal // All keys and values matched
+                    }
+                    non_equal => non_equal, // Keys differ
+                }
+            }
+            // Object is the last variant in our defined order
+            // (EvaluationResult::Object(_), _) => Ordering::Less, // This arm is unreachable due to previous matches
+            // (_, EvaluationResult::Object(_)) => Ordering::Greater, // This arm is unreachable
+        }
+    }
+}
+// --- End Ord Implementation ---
+
 
 // Implement Hash for EvaluationResult to use it in HashSet for distinct/intersect
 // Note: Hashing floating-point numbers (Decimal) directly can be problematic due to precision.
