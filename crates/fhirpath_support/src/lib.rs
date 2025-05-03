@@ -212,7 +212,7 @@ impl EvaluationResult {
     /// Converts the result to Boolean specifically for logical operators (and, or, xor, implies).
     /// Handles String conversion ('true'/'false' variants) -> Boolean.
     /// Other types (including other strings and collections) result in Empty.
-    fn to_boolean_for_logic(&self) -> EvaluationResult {
+    pub fn to_boolean_for_logic(&self) -> EvaluationResult {
         match self {
             EvaluationResult::Boolean(b) => EvaluationResult::Boolean(*b),
             EvaluationResult::String(s) => match s.to_lowercase().as_str() {
