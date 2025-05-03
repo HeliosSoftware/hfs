@@ -1641,7 +1641,7 @@ fn call_function(
                         // More than two parts is invalid
                         false
                     }
-                }) // Wrap the boolean result directly
+                }.into(), // Convert bool to EvaluationResult::Boolean
                 _ => EvaluationResult::Boolean(false),
             }
         }
