@@ -1,6 +1,7 @@
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet}; // Import HashSet
+use std::hash::{Hash, Hasher}; // Import Hash and Hasher
 
 /// Trait to convert FHIR field values into EvaluationResult
 pub trait IntoEvaluationResult {
@@ -21,6 +22,43 @@ pub enum EvaluationResult {
     Collection(Vec<EvaluationResult>),
     Object(HashMap<String, EvaluationResult>),
 }
+
+// Implement Hash for EvaluationResult to use it in HashSet for distinct/intersect
+// Note: Hashing floating-point numbers (Decimal) directly can be problematic due to precision.
+// We'll hash their string representation for stability. Hashing collections/objects might be complex.
+impl Hash for EvaluationResult {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state); // Hash the enum variant first
+        match self {
+            EvaluationResult::Empty => {} // No extra data to hash
+            EvaluationResult::Boolean(b) => b.hash(state),
+            EvaluationResult::String(s) => s.hash(state),
+            EvaluationResult::Decimal(d) => d.to_string().hash(state), // Hash string representation
+            EvaluationResult::Integer(i) => i.hash(state),
+            EvaluationResult::Date(d) => d.hash(state),
+            EvaluationResult::DateTime(dt) => dt.hash(state),
+            EvaluationResult::Time(t) => t.hash(state),
+            EvaluationResult::Collection(items) => {
+                // Hash the length and potentially the elements (order matters for hash)
+                items.len().hash(state);
+                for item in items {
+                    item.hash(state);
+                }
+            }
+            EvaluationResult::Object(map) => {
+                // Hashing HashMaps requires sorting keys for consistency
+                let mut keys: Vec<_> = map.keys().collect();
+                keys.sort(); // Sort keys alphabetically
+                keys.len().hash(state); // Hash the number of keys
+                for key in keys {
+                    key.hash(state); // Hash the key
+                    map[key].hash(state); // Hash the value
+                }
+            }
+        }
+    }
+}
+
 
 impl EvaluationResult {
     /// Converts the result to a boolean value according to FHIRPath rules

@@ -905,14 +905,15 @@ fn call_function(
                 return EvaluationResult::Empty;
             }
 
-            let mut distinct_items = Vec::new();
+            // Use HashSet to efficiently find distinct items
+            let mut distinct_set = HashSet::new();
+            let mut distinct_items = Vec::new(); // Maintain original order of first appearance
+
             for item in items {
-                // Check if the item (using '=') is already in distinct_items
-                let is_present = distinct_items
-                    .iter()
-                    .any(|existing| compare_equality(&item, "=", existing).to_boolean());
-                if !is_present {
-                    distinct_items.push(item);
+                // Attempt to insert the item into the HashSet.
+                // If insert returns true, it's the first time we've seen this item (or an equivalent one).
+                if distinct_set.insert(item.clone()) {
+                    distinct_items.push(item); // Add to the result list to preserve order
                 }
             }
 
@@ -1011,6 +1012,57 @@ fn call_function(
                 taken_items.into_iter().next().unwrap()
             } else {
                 EvaluationResult::Collection(taken_items)
+            }
+        }
+        "intersect" => {
+            // Returns the intersection of two collections (items present in both)
+            if args.len() != 1 {
+                return EvaluationResult::Empty; // Intersect requires exactly one argument (the other collection)
+            }
+            let other_collection = &args[0];
+
+            let left_items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            let right_items = match other_collection {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()], // Treat single item as collection
+            };
+
+            if left_items.is_empty() || right_items.is_empty() {
+                return EvaluationResult::Empty; // Intersection with empty is empty
+            }
+
+            let mut intersection_items = Vec::new();
+            // Use HashSet for efficient duplicate checking in the result
+            let mut added_items_set = HashSet::new();
+
+            for left_item in &left_items {
+                // Check if the left_item exists in the right_items (using equality '=')
+                let exists_in_right = right_items
+                    .iter()
+                    .any(|right_item| compare_equality(left_item, "=", right_item).to_boolean());
+
+                if exists_in_right {
+                    // Attempt to insert the item into the HashSet.
+                    // If insert returns true, it means the item was not already present.
+                    if added_items_set.insert(left_item.clone()) {
+                        intersection_items.push(left_item.clone());
+                    }
+                }
+            }
+
+            // Apply singleton evaluation rule
+            if intersection_items.is_empty() {
+                EvaluationResult::Empty
+            } else if intersection_items.len() == 1 {
+                intersection_items.into_iter().next().unwrap()
+            } else {
+                EvaluationResult::Collection(intersection_items)
             }
         }
         "length" => {

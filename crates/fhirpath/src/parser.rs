@@ -588,7 +588,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                                 .separated_by(just(',').padded())
                                 .allow_trailing()
                                 .collect::<Vec<_>>()
-                                .delimited_by(just('('), just(')'))
+                                // Add padding to parentheses here
+                                .delimited_by(just('(').padded(), just(')').padded())
                         )
                         .map(|(name, params)| Invocation::Function(name, params)),
                     // Simple member access after dot
