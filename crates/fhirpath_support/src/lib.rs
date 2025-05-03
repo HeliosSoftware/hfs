@@ -62,6 +62,19 @@ impl Hash for EvaluationResult {
 
 
 impl EvaluationResult {
+    /// Checks if the result is a collection variant.
+    pub fn is_collection(&self) -> bool {
+        matches!(self, EvaluationResult::Collection(_))
+    }
+
+    /// Returns the count of items in the result according to FHIRPath rules.
+    pub fn count(&self) -> usize {
+        match self {
+            EvaluationResult::Empty => 0,
+            EvaluationResult::Collection(items) => items.len(),
+            _ => 1, // All single items count as 1
+        }
+    }
     /// Converts the result to a boolean value according to FHIRPath rules
     pub fn to_boolean(&self) -> bool {
         match self {
