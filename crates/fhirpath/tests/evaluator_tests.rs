@@ -1293,7 +1293,7 @@ fn test_function_conversion_to_string() {
     );
     assert_eq!(
         eval("@2023-10-27T10:30Z.toString()", &context), // Literal without seconds
-        EvaluationResult::String("2023-10-27T10:30Z".to_string()) // Expect output without seconds
+        EvaluationResult::String("2023-10-27T10:30Z".to_string())  // Expect output without seconds
     );
     // Quantity to string (evaluator returns Decimal or Integer, ignoring unit)
     assert_eq!(
@@ -1397,7 +1397,10 @@ fn test_function_conversion_to_date() {
         eval("'2023-10-27T10:30:00Z'.toDate()", &context),
         EvaluationResult::Date("2023-10-27".to_string())
     ); // DateTime string to Date
-    assert_eq!(eval("'invalid-date'.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("'invalid-date'.toDate()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(eval("123.toDate()", &context), EvaluationResult::Empty);
     assert_eq!(eval("true.toDate()", &context), EvaluationResult::Empty);
 }
@@ -1406,7 +1409,10 @@ fn test_function_conversion_to_date() {
 #[test]
 fn test_function_conversion_converts_to_date() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.convertsToDate()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{}.convertsToDate()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("@2023-10-27.convertsToDate()", &context),
         EvaluationResult::Boolean(true)
@@ -1474,7 +1480,10 @@ fn test_function_conversion_to_date_time() {
         eval("'2023'.toDateTime()", &context),
         EvaluationResult::DateTime("2023".to_string())
     ); // Partial date string
-    assert_eq!(eval("'invalid-datetime'.toDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("'invalid-datetime'.toDateTime()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(eval("123.toDateTime()", &context), EvaluationResult::Empty);
     assert_eq!(eval("true.toDateTime()", &context), EvaluationResult::Empty);
 }
@@ -1483,7 +1492,10 @@ fn test_function_conversion_to_date_time() {
 #[test]
 fn test_function_conversion_converts_to_date_time() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.convertsToDateTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{}.convertsToDateTime()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.convertsToDateTime()", &context),
         EvaluationResult::Boolean(true)
@@ -1543,18 +1555,30 @@ fn test_function_conversion_to_time() {
         eval("'10'.toTime()", &context),
         EvaluationResult::Time("10".to_string())
     ); // Partial time string
-    assert_eq!(eval("'invalid-time'.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("'invalid-time'.toTime()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(eval("123.toTime()", &context), EvaluationResult::Empty);
     assert_eq!(eval("true.toTime()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("@2023-10-27.toTime()", &context), EvaluationResult::Empty); // Date cannot convert
-    assert_eq!(eval("@2023-10-27T10:30Z.toTime()", &context), EvaluationResult::Empty); // DateTime cannot convert
+    assert_eq!(
+        eval("@2023-10-27.toTime()", &context),
+        EvaluationResult::Empty
+    ); // Date cannot convert
+    assert_eq!(
+        eval("@2023-10-27T10:30Z.toTime()", &context),
+        EvaluationResult::Empty
+    ); // DateTime cannot convert
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstotime--boolean
 #[test]
 fn test_function_conversion_converts_to_time() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.convertsToTime()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{}.convertsToTime()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("@T10:30:00.convertsToTime()", &context),
         EvaluationResult::Boolean(true)
@@ -1630,9 +1654,18 @@ fn test_function_conversion_to_quantity() {
         eval("'100 days'.toQuantity()", &context),
         EvaluationResult::Decimal(dec!(100.0)) // String with valid time unit
     );
-    assert_eq!(eval("'invalid'.toQuantity()", &context), EvaluationResult::Empty); // Not a number
-    assert_eq!(eval("'5.5 invalid-unit'.toQuantity()", &context), EvaluationResult::Empty); // Invalid unit part
-    assert_eq!(eval("'5.5 mg extra'.toQuantity()", &context), EvaluationResult::Empty); // Too many parts
+    assert_eq!(
+        eval("'invalid'.toQuantity()", &context),
+        EvaluationResult::Empty
+    ); // Not a number
+    assert_eq!(
+        eval("'5.5 invalid-unit'.toQuantity()", &context),
+        EvaluationResult::Empty
+    ); // Invalid unit part
+    assert_eq!(
+        eval("'5.5 mg extra'.toQuantity()", &context),
+        EvaluationResult::Empty
+    ); // Too many parts
     // Quantity literal to Quantity (should just return the numeric part)
     assert_eq!(
         eval("5.5 'mg'.toQuantity()", &context), // This uses the Quantity literal parser
@@ -1648,7 +1681,10 @@ fn test_function_conversion_to_quantity() {
 #[test]
 fn test_function_conversion_converts_to_quantity() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.convertsToQuantity()", &context), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{}.convertsToQuantity()", &context),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("true.convertsToQuantity()", &context),
         EvaluationResult::Boolean(true)
@@ -1681,7 +1717,7 @@ fn test_function_conversion_converts_to_quantity() {
         eval("'5.5 invalid-unit'.convertsToQuantity()", &context),
         EvaluationResult::Boolean(false) // Invalid unit part
     );
-     assert_eq!(
+    assert_eq!(
         eval("'5.5 mg extra'.convertsToQuantity()", &context),
         EvaluationResult::Boolean(false) // Too many parts
     );
@@ -3179,7 +3215,6 @@ fn patient_context() -> EvaluationContext {
 }
 
 #[test]
-#[ignore = "Requires full IntoEvaluationResult for Patient"] // Re-enable
 fn test_resource_simple_field_access() {
     let context = patient_context();
     assert_eq!(
@@ -3201,7 +3236,6 @@ fn test_resource_simple_field_access() {
 }
 
 #[test]
-#[ignore = "Requires full IntoEvaluationResult for Patient and list handling"] // Re-enable
 fn test_resource_nested_field_access() {
     let context = patient_context();
     // Accessing a field within a list - returns a collection of that field from each list item
@@ -3279,7 +3313,6 @@ fn test_resource_nested_field_access() {
 }
 
 #[test]
-#[ignore = "Requires full IntoEvaluationResult, expression passing, and list handling"] // Re-enable
 fn test_resource_filtering_and_projection() {
     let context = patient_context();
 
@@ -3329,7 +3362,6 @@ fn test_resource_filtering_and_projection() {
 }
 
 #[test]
-#[ignore = "Requires full IntoEvaluationResult and TypeSpecifier passing"] // Re-enable
 fn test_resource_oftype() {
     let patient = r4::Patient {
         id: Some("p1".to_string().into()), // Use .to_string().into()
