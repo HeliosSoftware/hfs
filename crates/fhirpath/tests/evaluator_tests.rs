@@ -2948,20 +2948,20 @@ fn test_operator_math_string_concat() {
 fn test_operator_precedence() {
     let context = EvaluationContext::new_empty();
     // Results depend on operators
-    // 1 + (2 * 3) = 1 + 6 = 7.0 (Addition -> Decimal)
+    // 1 + (2 * 3) = 1 + 6 = 7 (Integer + Integer -> Integer)
     assert_eq!(
         eval("1 + 2 * 3", &context),
-        EvaluationResult::Decimal(dec!(7.0))
+        EvaluationResult::Integer(7) // <-- Correct expectation
     );
-    // (1 + 2) * 3 = 3.0 * 3 = 9.0 (Addition -> Decimal, then Decimal * Integer -> Decimal)
+    // (1 + 2) * 3 = 3 * 3 = 9 (Integer + Integer -> Integer, then Integer * Integer -> Integer)
     assert_eq!(
         eval("(1 + 2) * 3", &context),
-        EvaluationResult::Decimal(dec!(9.0))
+        EvaluationResult::Integer(9) // <-- Correct expectation
     );
     // (5 - 2) + 1 = 3.0 + 1 = 4.0 (Subtraction -> Decimal, then Decimal + Integer -> Decimal)
     assert_eq!(
         eval("5 - 2 + 1", &context),
-        EvaluationResult::Decimal(dec!(4.0))
+        EvaluationResult::Decimal(dec!(4.0)) // Subtraction always results in Decimal
     );
     // (10 / 2) * 5 = 5.0 * 5 = 25.0 (Division -> Decimal, then Decimal * Integer -> Decimal)
     assert_eq!(
