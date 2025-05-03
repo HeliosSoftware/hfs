@@ -525,23 +525,6 @@ fn call_function(
     match name {
         "count" => {
             // Returns the number of items in the collection
-            if let EvaluationResult::Collection(items) = context {
-                EvaluationResult::Integer(items.len() as i64)
-            } else {
-                // Single items count as 1, empty counts as 0
-                match context {
-                    EvaluationResult::Empty => EvaluationResult::Integer(0),
-                    _ => EvaluationResult::Integer(1),
-                }
-            }
-        }
-        "empty" => {
-            // Returns true if the collection is empty
-            match context {
-                EvaluationResult::Empty => EvaluationResult::Boolean(true),
-                EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
-                _ => EvaluationResult::Boolean(false),
-            // Returns the number of items in the collection
             if let EvaluationResult::Collection(items) = invocation_base {
                 EvaluationResult::Integer(items.len() as i64)
             } else {
@@ -554,7 +537,7 @@ fn call_function(
         }
         "empty" => {
             // Returns true if the collection is empty
-            match invocation_base {
+            match context {
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
                 _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
@@ -645,17 +628,30 @@ fn call_function(
 
 /// Evaluates an indexer expression
 fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> EvaluationResult {
-    // Get the index as an integer
-    let idx = match index {
-        EvaluationResult::Decimal(d) => d.to_usize().unwrap_or(usize::MAX), // Convert Decimal to usize, handle potential errors
-        EvaluationResult::Integer(i) => *i as usize, // Assuming i64 fits into usize for indexing
-        _ => return EvaluationResult::Empty, // Non-numeric index results in Empty
+    // Get the index as an integer, ensuring it's non-negative
+    let idx_opt: Option<usize> = match index {
+        EvaluationResult::Integer(i) => {
+            if *i >= 0 {
+                (*i).try_into().ok() // Convert non-negative i64 to usize
+            } else {
+                None // Negative index is invalid
+            }
+        }
+        EvaluationResult::Decimal(d) => {
+            // Check if decimal is a non-negative integer before converting
+            if d.is_integer() && d.is_sign_positive() {
+                 d.to_usize() // Convert non-negative integer Decimal to usize
+            } else {
+                None // Non-integer or negative decimal is invalid
+            }
+        }
+        _ => None, // Non-numeric index is invalid
     };
 
-    // Handle potential conversion errors from Decimal (e.g., negative, fractional, too large)
-    if idx == usize::MAX {
-        return EvaluationResult::Empty;
-    }
+    let idx = match idx_opt {
+        Some(i) => i,
+        None => return EvaluationResult::Empty, // Invalid index results in Empty
+    };
 
     // Access the item at the given index
     match collection {
@@ -761,11 +757,9 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 _ => (None, None),
             };
             if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l + r)
-            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right)
-            {
-                EvaluationResult::String(format!("{}{}", l, r))
+                EvaluationResult::Decimal(l - r) // Corrected: Use subtraction
             } else {
+                 // Subtraction is only defined for numeric types
                 EvaluationResult::Empty
             }
         }
