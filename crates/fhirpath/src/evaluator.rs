@@ -1573,12 +1573,30 @@ fn call_function(
                     // Attempt to parse as "value unit" or just "value"
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.is_empty() {
-                        EvaluationResult::Empty
-                    } else {
-                        // Try parsing the first part as Decimal
+                        EvaluationResult::Empty // Empty string cannot convert
+                    } else if parts.len() == 1 {
+                        // Only a value part, try parsing it
                         parts[0].parse::<Decimal>()
                             .map(EvaluationResult::Decimal)
-                            .unwrap_or(EvaluationResult::Empty) // Return Empty if number parsing fails
+                            .unwrap_or(EvaluationResult::Empty)
+                    } else if parts.len() == 2 {
+                        // Value and unit parts
+                        let value_part = parts[0];
+                        let unit_part = parts[1];
+                        // Try parsing the value part
+                        if let Ok(decimal_value) = value_part.parse::<Decimal>() {
+                            // Check if the unit part is valid
+                            if is_valid_fhirpath_quantity_unit(unit_part) {
+                                EvaluationResult::Decimal(decimal_value)
+                            } else {
+                                EvaluationResult::Empty // Invalid unit
+                            }
+                        } else {
+                            EvaluationResult::Empty // Invalid value part
+                        }
+                    } else {
+                        // More than two parts is invalid format
+                        EvaluationResult::Empty
                     }
                 }
                 // Collections: Convert single item, multiple items -> Empty
@@ -1607,10 +1625,23 @@ fn call_function(
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::String(s) => {
-                    // Check if the first part parses as a Decimal
-                    let first_part = s.split_whitespace().next().unwrap_or("");
-                    EvaluationResult::Boolean(first_part.parse::<Decimal>().is_ok())
-                }
+                    // Check if the string represents a valid quantity format
+                    let parts: Vec<&str> = s.split_whitespace().collect();
+                    if parts.is_empty() {
+                        false // Empty string
+                    } else if parts.len() == 1 {
+                        // Only a value part, check if it parses as Decimal
+                        parts[0].parse::<Decimal>().is_ok()
+                    } else if parts.len() == 2 {
+                        // Value and unit parts, check both
+                        let value_parses = parts[0].parse::<Decimal>().is_ok();
+                        let unit_is_valid = is_valid_fhirpath_quantity_unit(parts[1]);
+                        value_parses && unit_is_valid
+                    } else {
+                        // More than two parts is invalid
+                        false
+                    }
+                }.into(), // Convert bool to EvaluationResult::Boolean
                 _ => EvaluationResult::Boolean(false),
             }
         }
@@ -1644,6 +1675,33 @@ fn call_function(
         }
     }
 }
+
+/// Checks if a string is a valid FHIRPath quantity unit (UCUM or time-based).
+/// Note: This is a simplified check. A full UCUM validator is complex.
+fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
+    // Allow known time-based units
+    const TIME_UNITS: &[&str] = &[
+        "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+    ];
+    if TIME_UNITS.contains(&unit) {
+        return true;
+    }
+
+    // Basic check for UCUM units (starts with non-digit, doesn't contain invalid chars like spaces after first char)
+    // This is NOT a full UCUM validation.
+    if unit.is_empty() { return false; }
+    let first_char = unit.chars().next().unwrap();
+    // UCUM units often start with letters or symbols like '{', '[', '(', etc.
+    // They generally don't start with digits.
+    if first_char.is_ascii_digit() { return false; }
+    // Check for invalid characters (e.g., whitespace within the unit)
+    if unit.chars().skip(1).any(|c| c.is_whitespace()) { return false; }
+
+    // Assume valid if it passes basic checks (placeholder for real UCUM validation)
+    true
+}
+
 
 /// Evaluates an indexer expression
 fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> EvaluationResult {

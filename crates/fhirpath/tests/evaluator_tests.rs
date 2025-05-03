@@ -1628,13 +1628,14 @@ fn test_function_conversion_to_quantity() {
     );
     assert_eq!(
         eval("'100 days'.toQuantity()", &context),
-        EvaluationResult::Decimal(dec!(100.0)) // Evaluator currently ignores unit
+        EvaluationResult::Decimal(dec!(100.0)) // String with valid time unit
     );
-    assert_eq!(eval("'invalid'.toQuantity()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("'invalid'.toQuantity()", &context), EvaluationResult::Empty); // Not a number
     assert_eq!(eval("'5.5 invalid-unit'.toQuantity()", &context), EvaluationResult::Empty); // Invalid unit part
+    assert_eq!(eval("'5.5 mg extra'.toQuantity()", &context), EvaluationResult::Empty); // Too many parts
     // Quantity literal to Quantity (should just return the numeric part)
     assert_eq!(
-        eval("5.5 'mg'.toQuantity()", &context),
+        eval("5.5 'mg'.toQuantity()", &context), // This uses the Quantity literal parser
         EvaluationResult::Decimal(dec!(5.5))
     );
     assert_eq!(
@@ -1674,13 +1675,17 @@ fn test_function_conversion_converts_to_quantity() {
     );
     assert_eq!(
         eval("'invalid'.convertsToQuantity()", &context),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::Boolean(false) // Not a number
     );
     assert_eq!(
         eval("'5.5 invalid-unit'.convertsToQuantity()", &context),
         EvaluationResult::Boolean(false) // Invalid unit part
     );
-    // Quantity literal conversion
+     assert_eq!(
+        eval("'5.5 mg extra'.convertsToQuantity()", &context),
+        EvaluationResult::Boolean(false) // Too many parts
+    );
+    // Quantity literal conversion (these use the Quantity literal parser, not string conversion)
     assert_eq!(
         eval("5.5 'mg'.convertsToQuantity()", &context),
         EvaluationResult::Boolean(true)
