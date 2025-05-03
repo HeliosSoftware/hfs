@@ -378,7 +378,11 @@ fn evaluate_invocation(
                     let projection_expr = &args_exprs[0];
                     evaluate_select(invocation_base, projection_expr, context)
                 }
-                // Add other functions taking lambdas here (e.g., all, any, repeat)
+                "all" if !args_exprs.is_empty() => {
+                    let criteria_expr = &args_exprs[0];
+                    evaluate_all_with_criteria(invocation_base, criteria_expr, context)
+                }
+                // Add other functions taking lambdas here (e.g., any, repeat)
                 _ => {
                     // Default: Evaluate all arguments first (without $this context), then call function
                     let evaluated_args: Vec<EvaluationResult> = args_exprs
@@ -508,6 +512,37 @@ fn evaluate_select(
     }
 }
 
+/// Evaluates the 'all' function with a criteria expression.
+fn evaluate_all_with_criteria(
+    collection: &EvaluationResult,
+    criteria_expr: &Expression,
+    context: &EvaluationContext,
+) -> EvaluationResult {
+    let items_to_check = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        // Treat single item as a one-item collection
+        single_item => vec![single_item.clone()],
+    };
+
+    // 'all' is true for an empty collection
+    if items_to_check.is_empty() {
+        return EvaluationResult::Boolean(true);
+    }
+
+    for item in items_to_check {
+        // Evaluate the criteria expression with the current item as $this
+        let criteria_result = evaluate(criteria_expr, context, Some(&item));
+        // 'all' returns false if the criteria evaluates to false for *any* item
+        if !criteria_result.to_boolean() {
+            return EvaluationResult::Boolean(false);
+        }
+    }
+
+    // If all items satisfied the criteria
+    EvaluationResult::Boolean(true)
+}
+
 
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
@@ -545,6 +580,52 @@ fn call_function(
                  _ => EvaluationResult::Boolean(true), // Single non-empty item exists
              }
          }
+        "all" => {
+            // This handles all() without criteria, which is equivalent to exists(criteria)
+            // where the criteria is implicitly '$this = true'.
+            // However, the spec implies all() without criteria might not be standard.
+            // For now, let's align with exists() logic for non-empty check.
+            // all(criteria) is handled in evaluate_invocation.
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
+                EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()), // Placeholder: Needs proper criteria check if used
+                _ => EvaluationResult::Boolean(true), // Single non-empty item exists
+            }
+        }
+        "allTrue" => {
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+            // allTrue is true for an empty collection
+            if items.is_empty() {
+                return EvaluationResult::Boolean(true);
+            }
+            for item in items {
+                if !matches!(item, EvaluationResult::Boolean(true)) {
+                    return EvaluationResult::Boolean(false);
+                }
+            }
+            EvaluationResult::Boolean(true)
+        }
+        "allFalse" => {
+            let items = match invocation_base {
+                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+            // allFalse is true for an empty collection
+            if items.is_empty() {
+                return EvaluationResult::Boolean(true);
+            }
+            for item in items {
+                 if !matches!(item, EvaluationResult::Boolean(false)) {
+                    return EvaluationResult::Boolean(false);
+                }
+            }
+            EvaluationResult::Boolean(true)
+        }
         "first" => {
             // Returns the first item in the collection
             if let EvaluationResult::Collection(items) = invocation_base {
