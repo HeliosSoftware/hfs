@@ -2236,9 +2236,14 @@ fn check_membership(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
+    // Per FHIRPath spec for operators: If either operand is empty, the result is empty.
+    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+        return EvaluationResult::Empty;
+    }
+
     match op {
         "in" => {
-            // Check if left is in right
+            // Check if left is in right (Empty check already handled above)
             let right_items = match right {
                 EvaluationResult::Collection(items) => items,
                 _ => return EvaluationResult::Boolean(false),
