@@ -177,14 +177,12 @@ fn evaluate_term(
 ) -> EvaluationResult {
     match term {
         Term::Invocation(invocation) => {
-            // Handle $this invocation
-            if let Invocation::This = invocation {
-                // Let the if/else block evaluate to the result, which becomes the
-                // implicit return value for this match arm if invocation is $this.
-                if let Some(item) = current_item.cloned() {
-                    item // Evaluate to the item if Some
+            // Explicitly handle $this first and return
+            if *invocation == Invocation::This {
+                return if let Some(item) = current_item.cloned() {
+                    item // Return the item if Some
                 } else {
-                    // Evaluate to the default context if None
+                    // Return the default context if None
                     if context.resources.is_empty() {
                         EvaluationResult::Empty
                     } else if context.resources.len() == 1 {
@@ -198,16 +196,16 @@ fn evaluate_term(
                                 .collect(),
                         )
                     }
-                }
+                };
             }
 
-            // Check if this is a variable reference (starting with %)
+            // Handle variables (%var, %context) next and return
             if let Invocation::Member(name) = invocation {
                 if name.starts_with('%') {
                     let var_name = &name[1..]; // Remove the % prefix
-                    // Handle %context explicitly if needed, otherwise lookup variable
                     if var_name == "context" {
-                         if context.resources.is_empty() {
+                        // Return %context value
+                        return if context.resources.is_empty() {
                             EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
                             convert_resource_to_result(&context.resources[0])
@@ -219,14 +217,16 @@ fn evaluate_term(
                                     .map(convert_resource_to_result)
                                     .collect(),
                             )
-                        }
+                        };
                     } else {
+                        // Return other variable value
                         return context.get_variable_as_result(var_name);
                     }
                 }
             }
 
-            // Determine the base context for the invocation
+            // If not $this or a variable, it must be a member/function invocation.
+            // Determine the base context for this invocation.
             let base_context = current_item.cloned().unwrap_or_else(|| {
                 // Default to the main resource context if no specific item
                 if context.resources.is_empty() {
@@ -244,6 +244,8 @@ fn evaluate_term(
                 }
             });
 
+            // Evaluate the member/function invocation on the base context.
+            // This is the final return value for this match arm in this case.
             evaluate_invocation(&base_context, invocation, context)
         }
         Term::Literal(literal) => evaluate_literal(literal),
