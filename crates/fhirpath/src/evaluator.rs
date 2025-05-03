@@ -2522,13 +2522,6 @@ fn check_membership(
         }
         "contains" => {
             // If left operand (collection) is empty, result is false.
-                .iter()
-                .any(|item| compare_equality(left, "=", item).to_boolean());
-
-            EvaluationResult::Boolean(is_in)
-        }
-        "contains" => {
-            // If left operand (collection) is empty, result is false.
             if left == &EvaluationResult::Empty {
                 return EvaluationResult::Boolean(false);
             }
