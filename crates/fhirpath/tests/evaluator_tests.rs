@@ -465,6 +465,7 @@ fn test_function_filtering_where() {
     );
     // Test criteria evaluating to non-boolean (should be ignored)
     assert_eq!(
+        eval("(1 | 2 | 3).where($this)", &context), // Restore the first argument
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
