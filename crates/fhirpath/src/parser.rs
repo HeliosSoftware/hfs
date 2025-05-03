@@ -593,10 +593,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             expr.clone().delimited_by(just('[').padded(), just(']').padded())
                 .map(|idx| |left| Expression::Indexer(Box::new(left), Box::new(idx)))
                 .boxed(), // Box the second branch explicitly
-        )); // Choice now combines two BoxedParsers
+        )).boxed(); // Box the *result* of the choice combinator
 
         let atom_with_postfix = atom.clone()
-            // Now call repeated on the Choice parser whose branches are boxed
+            // Now call repeated on the boxed Choice parser
             .then(postfix_op.repeated())
             .foldl(|left, op_fn| op_fn(left));
 
