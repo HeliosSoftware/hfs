@@ -534,24 +534,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 EvaluationResult::Empty
             }
         }
-
-/// Applies integer-only multiplicative operators (div, mod)
-fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationResult {
-    if right == 0 {
-        return EvaluationResult::Empty; // Division/Modulo by zero
-    }
-    match op {
-        "div" => EvaluationResult::Integer(left / right), // Integer division
-        "mod" => EvaluationResult::Integer(left % right), // Integer modulo
-        _ => EvaluationResult::Empty, // Should not happen if called correctly
-    }
-}
-
-
-/// Applies an additive operator to two values
-fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
-    match op {
-        "+" => {
+        "-" => {
             // Promote Integer to Decimal for mixed operations
             let (left_num, right_num) = match (left, right) {
                 (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
@@ -573,35 +556,6 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 EvaluationResult::String(format!("{}{}", l, r))
             } else {
                 EvaluationResult::Empty
-            }
-        }
-        "-" => {
-            // Promote Integer to Decimal for mixed operations
-            let (left_num, right_num) = match (left, right) {
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-                    (Some(*l), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-                    (Some(Decimal::from(*l)), Some(*r))
-                }
-                _ => (None, None),
-            };
-
-            if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l - r)
-            } else {
-                EvaluationResult::Empty
-            }
-        }
-        "&" => {
-            // String concatenation - handles Empty correctly
-            let left_str = left.to_string_value();
-            let right_str = right.to_string_value();
-            EvaluationResult::String(format!("{}{}", left_str, right_str))
         }
         _ => EvaluationResult::Empty,
     }
