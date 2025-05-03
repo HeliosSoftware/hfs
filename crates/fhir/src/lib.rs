@@ -824,35 +824,88 @@ where
     }
 }
 
-// For Element<V, E> - Extracts the primitive value
+// For Element<V, E> - Converts to an Object including id, extension, and value
 impl<V, E> IntoEvaluationResult for Element<V, E>
 where
-    V: IntoEvaluationResult + Clone, // V must also be convertible
-    E: Clone,                        // Assuming Extension needs to be Cloneable if used elsewhere
+    V: IntoEvaluationResult + Clone,
+    E: IntoEvaluationResult + Clone, // Extension type must also be convertible
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        match &self.value {
-            Some(v) => v.into_evaluation_result(), // Convert the inner value
-            None => EvaluationResult::Empty,
+        // Only return Empty if all fields (id, extension, value) are None
+        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
+            return EvaluationResult::Empty;
+        }
+
+        let mut map = std::collections::HashMap::new();
+        if let Some(id) = &self.id {
+            // Assuming id is String, directly convert
+            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+        }
+        if let Some(extensions) = &self.extension {
+            // Convert Vec<E> into EvaluationResult::Collection
+            let ext_results: Vec<EvaluationResult> = extensions
+                .iter()
+                .map(|e| e.into_evaluation_result())
+                .collect();
+            if !ext_results.is_empty() {
+                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_results));
+            }
+        }
+        if let Some(value) = &self.value {
+            // Convert the inner value V
+            let value_result = value.into_evaluation_result();
+            // Avoid inserting Empty if the value itself converts to Empty
+            if value_result != EvaluationResult::Empty {
+                 map.insert("value".to_string(), value_result);
+            }
+        }
+
+        // If the map is empty after processing (e.g., value was Some but converted to Empty), return Empty
+        if map.is_empty() {
+            EvaluationResult::Empty
+        } else {
+            EvaluationResult::Object(map)
         }
     }
 }
 
-// For DecimalElement<E> - Handles PreciseDecimal specifically
+// For DecimalElement<E> - Converts to an Object including id, extension, and value
 impl<E> IntoEvaluationResult for DecimalElement<E>
 where
-    E: Clone,
+    E: IntoEvaluationResult + Clone, // Extension type must also be convertible
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        match &self.value {
-            Some(precise_decimal) => {
-                // Extract the Option<rust_decimal::Decimal>
-                match precise_decimal.value() {
-                    Some(decimal_val) => EvaluationResult::Decimal(decimal_val),
-                    None => EvaluationResult::Empty, // PreciseDecimal held None
-                }
+        // Only return Empty if all fields (id, extension, value) are None
+        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
+            return EvaluationResult::Empty;
+        }
+
+        let mut map = std::collections::HashMap::new();
+        if let Some(id) = &self.id {
+            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+        }
+        if let Some(extensions) = &self.extension {
+            let ext_results: Vec<EvaluationResult> = extensions
+                .iter()
+                .map(|e| e.into_evaluation_result())
+                .collect();
+             if !ext_results.is_empty() {
+                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_results));
+             }
+        }
+        if let Some(precise_decimal) = &self.value {
+            // Extract the Option<rust_decimal::Decimal> from PreciseDecimal
+            if let Some(decimal_val) = precise_decimal.value() {
+                 map.insert("value".to_string(), EvaluationResult::Decimal(decimal_val));
             }
-            None => EvaluationResult::Empty, // DecimalElement held None
+            // If precise_decimal.value() is None, we don't insert the "value" field
+        }
+
+        // If the map is empty after processing, return Empty
+        if map.is_empty() {
+            EvaluationResult::Empty
+        } else {
+            EvaluationResult::Object(map)
         }
     }
 }
