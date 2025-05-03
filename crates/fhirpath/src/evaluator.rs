@@ -184,24 +184,25 @@ fn evaluate_term(
                 if let Some(item) = current_item.cloned() {
                     return item; // Return the provided current_item if it exists
                 } else {
-                    // Otherwise, determine the default context based on resources and return
-                    if context.resources.is_empty() {
-                        return EvaluationResult::Empty;
+                    // Determine the result without returning immediately from the inner block
+                    let result = if context.resources.is_empty() {
+                        EvaluationResult::Empty
                     } else if context.resources.len() == 1 {
-                        return convert_resource_to_result(&context.resources[0]);
+                        convert_resource_to_result(&context.resources[0])
                     } else {
-                        return EvaluationResult::Collection(
+                        EvaluationResult::Collection(
                             context
                                 .resources
                                 .iter()
                                 .map(convert_resource_to_result)
                                 .collect(),
-                        );
-                    }
+                        )
+                    };
+                    // Return the determined result after the if/else block
+                    return result;
                 }
-                // The code below this point in the `if let Invocation::This` block is now unreachable,
-                // but that's okay as we handle all cases above.
-            } // Remove semicolon here
+                // This part remains unreachable
+            }
 
             // Check if this is a variable reference (starting with %)
             if let Invocation::Member(name) = invocation {
