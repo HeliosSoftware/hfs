@@ -1624,7 +1624,7 @@ fn call_function(
                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
-                EvaluationResult::String(s) => {
+                EvaluationResult::String(s) => EvaluationResult::Boolean({ // Wrap the entire block
                     // Check if the string represents a valid quantity format
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.is_empty() {
@@ -1641,7 +1641,7 @@ fn call_function(
                         // More than two parts is invalid
                         false
                     }
-                }) // Wrap the boolean result directly
+                }), // Close the EvaluationResult::Boolean wrapper
                 _ => EvaluationResult::Boolean(false),
             }
         }
