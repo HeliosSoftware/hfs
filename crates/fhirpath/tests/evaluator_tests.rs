@@ -1,12 +1,12 @@
 use chumsky::Parser;
 // Removed duplicate Parser import
-use chumsky::Parser;
+// use chumsky::Parser; // Removed duplicate
 use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
 use fhir::FhirResource;
 use fhirpath::evaluator::{evaluate, EvaluationContext};
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
-use rust_decimal::Decimal; // Import Decimal
+// use rust_decimal::Decimal; // Removed unused import
 use rust_decimal_macros::dec;
 
 // Helper function to parse and evaluate
@@ -1275,7 +1275,7 @@ fn test_function_conversion_to_string() {
     );
     assert_eq!(
         eval("123.45.toString()", &context),
-        eval("123.45.toString()", &context),
+        // Removed duplicate eval call, compare directly to expected result
         EvaluationResult::String("123.45".to_string()) // Decimal to string
     );
     assert_eq!(
