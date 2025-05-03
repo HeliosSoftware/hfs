@@ -385,9 +385,46 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     /* .padded() */; // Remove padding here, let number/integer padding handle space
 
     // Quantity needs to be a term-level construct to work in expressions
-    // Allow either an integer or a number before the unit
-    let quantity = choice((integer.clone(), number.clone()))
-        .then(unit)
+    // Allow either an integer or a number, followed by optional whitespace, then the unit.
+    // Remove .padded() from integer/number here and handle padding explicitly.
+    let integer_no_pad = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
+        .validate(|digits, span, emit| match i64::from_str(&digits) {
+            Ok(n) => Literal::Integer(n),
+            Err(_) => {
+                emit(Simple::custom(span, format!("Invalid integer: {}", digits)));
+                Literal::Integer(0)
+            }
+        });
+
+    let number_no_pad = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
+        .then(just('.'))
+        .then(
+            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                .repeated()
+                .at_least(1)
+                .collect::<String>(),
+        )
+        .validate(|((i, _), d), span, emit| {
+            let num_str = format!("{}.{}", i, d);
+            match Decimal::from_str(&num_str) {
+                Ok(decimal) => Literal::Number(decimal),
+                Err(_) => {
+                    emit(Simple::custom(span, format!("Invalid number: {}", num_str)));
+                    Literal::Number(dec!(0))
+                }
+            }
+        });
+
+    let quantity = choice((integer_no_pad, number_no_pad))
+        .padded() // Allow padding around the number part
+        .then_ignore(text::whitespace().or_not()) // Explicitly consume optional whitespace *after* number
+        .then(unit) // Then parse the unit (which expects no leading padding now)
         .map(|(num_literal, u)| {
             match num_literal {
                 Literal::Integer(i) => {
