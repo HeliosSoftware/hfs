@@ -1823,7 +1823,7 @@ fn test_function_utility_now() {
     assert!(matches!(result, EvaluationResult::DateTime(_)));
     // Check determinism (calling twice gives same result)
     let expr = parser().parse("now() = now()").unwrap();
-    assert_eq!(evaluate(&expr, &context), EvaluationResult::Boolean(true));
+    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#timeofday--time
@@ -1835,7 +1835,7 @@ fn test_function_utility_time_of_day() {
     assert!(matches!(result, EvaluationResult::Time(_)));
     // Check determinism
     let expr = parser().parse("timeOfDay() = timeOfDay()").unwrap();
-    assert_eq!(evaluate(&expr, &context), EvaluationResult::Boolean(true));
+    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#today--date
@@ -1847,7 +1847,7 @@ fn test_function_utility_today() {
     assert!(matches!(result, EvaluationResult::Date(_)));
     // Check determinism
     let expr = parser().parse("today() = today()").unwrap();
-    assert_eq!(evaluate(&expr, &context), EvaluationResult::Boolean(true));
+    assert_eq!(evaluate(&expr, &context, None), EvaluationResult::Boolean(true));
 }
 
 // --- Operations ---
@@ -3063,7 +3063,7 @@ fn test_arithmetic_operations() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         assert_eq!(result, expected);
     }
 }
@@ -3087,7 +3087,7 @@ fn test_boolean_operations() {
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
         println!("Boolean op parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         println!("Boolean op result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", input);
     }
@@ -3111,7 +3111,7 @@ fn test_comparison_operations() {
 
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         assert_eq!(result, expected);
     }
 }
@@ -3138,7 +3138,7 @@ fn test_variable_access() {
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
         println!("Variable access parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         println!(
             "Variable access result: {:?}, Expected: {:?}",
             result, expected
@@ -3174,7 +3174,7 @@ fn test_string_operations() {
     for (input, expected) in test_cases {
         let expr = parser().parse(input).unwrap();
         println!("String operation parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         println!(
             "String operation result: {:?}, Expected: {:?}",
             result, expected
@@ -3254,7 +3254,7 @@ fn test_functions() {
 
         println!("Testing expression: {}", full_expr);
         let expr = parser().parse(&*full_expr).unwrap();
-        let result = evaluate(&expr, &context);
+        let result = evaluate(&expr, &context, None);
         println!("Function result: {:?}, Expected: {:?}", result, expected);
         assert_eq!(result, expected, "Failed for input: {}", full_expr);
     }
@@ -3267,13 +3267,13 @@ fn test_direct_string_operations() {
 
     // Test string operations through the parser instead of direct function calls
     let expr = parser().parse("'Hello, World!'.contains('World')").unwrap();
-    let result = evaluate(&expr, &context);
+    let result = evaluate(&expr, &context, None);
     assert_eq!(result, EvaluationResult::Boolean(true));
 
     let expr = parser()
         .parse("'Hello, World!'.contains('Goodbye')")
         .unwrap();
-    let result = evaluate(&expr, &context);
+    let result = evaluate(&expr, &context, None);
     assert_eq!(result, EvaluationResult::Boolean(false));
 }
 
@@ -3313,6 +3313,6 @@ fn test_resource_access() {
     let context = EvaluationContext::new(resources);
     // Test accessing the resource id
     let expr = parser().parse("id").unwrap(); // Use 'id' to access the field
-    let result = evaluate(&expr, &context);
+    let result = evaluate(&expr, &context, None);
     assert_eq!(result, EvaluationResult::String("theid".to_string())); // Expect the string value of the id
 }
