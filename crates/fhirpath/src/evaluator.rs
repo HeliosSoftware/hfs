@@ -2214,6 +2214,31 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::String(format!("{}{}", l, r))
                 }
+                // Handle String + Number (attempt conversion)
+                (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|d| EvaluationResult::Decimal(d + Decimal::from(*i)))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|d| EvaluationResult::Decimal(Decimal::from(*i) + d))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|sd| EvaluationResult::Decimal(sd + *d))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|sd| EvaluationResult::Decimal(*d + sd))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
                 // Other combinations are invalid for '+'
                 _ => EvaluationResult::Empty,
             }
@@ -2236,6 +2261,31 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 }
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Decimal(Decimal::from(*l) - *r)
+                }
+                // Handle String - Number (attempt conversion)
+                (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|d| EvaluationResult::Decimal(d - Decimal::from(*i)))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|d| EvaluationResult::Decimal(Decimal::from(*i) - d))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|sd| EvaluationResult::Decimal(sd - *d))
+                        .unwrap_or(EvaluationResult::Empty)
+                }
+                (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
+                    s.parse::<Decimal>()
+                        .ok()
+                        .map(|sd| EvaluationResult::Decimal(*d - sd))
+                        .unwrap_or(EvaluationResult::Empty)
                 }
                 // Other combinations are invalid for '-'
                 _ => EvaluationResult::Empty,
