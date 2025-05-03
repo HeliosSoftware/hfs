@@ -1057,6 +1057,10 @@ fn test_function_conversion_to_boolean() {
         EvaluationResult::Boolean(false)
     );
     assert_eq!(eval("2.toBoolean()", &context), EvaluationResult::Empty); // Invalid integer
+    assert_eq!(
+        eval("2.5.toBoolean()", &context),
+        EvaluationResult::Empty
+    ); // Invalid decimal
     assert_eq!(eval("'abc'.toBoolean()", &context), EvaluationResult::Empty); // Invalid string
 }
 
