@@ -2802,13 +2802,13 @@ fn test_operator_math_divide() {
 #[test]
 fn test_operator_math_add() {
     let context = EvaluationContext::new_empty();
-    // Numbers - All result in Decimal
+    // Numbers
     assert_eq!(
         eval("1 + 2", &context),
-        EvaluationResult::Decimal(dec!(3.0)) // Integer + Integer -> Decimal
+        EvaluationResult::Integer(3) // Integer + Integer -> Integer (per spec example)
     );
     assert_eq!(
-        eval("1.5 + 2", &context), // Decimal + Integer -> Decimal
+        eval("1.5 + 2", &context),
         EvaluationResult::Decimal(dec!(3.5))
     ); // Decimal + Integer -> Decimal
     assert_eq!(
