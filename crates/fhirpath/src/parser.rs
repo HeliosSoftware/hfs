@@ -1,5 +1,5 @@
 use chumsky::error::Simple;
-use chumsky::prelude::*;
+use chumsky::prelude::{*, attempt}; // Add attempt here
 use chumsky::Parser;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec; // For potential default values if needed
