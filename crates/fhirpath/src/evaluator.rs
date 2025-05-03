@@ -1,4 +1,4 @@
-use crate::parser::{Expression, Invocation, Literal, Term}; // Removed TypeSpecifier
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use rust_decimal::prelude::*;
@@ -556,6 +556,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 EvaluationResult::String(format!("{}{}", l, r))
             } else {
                 EvaluationResult::Empty
+            }
         }
         _ => EvaluationResult::Empty,
     }
