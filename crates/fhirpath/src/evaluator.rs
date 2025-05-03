@@ -2354,67 +2354,89 @@ fn compare_equality(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
+    // Helper function for string equivalence normalization
+    fn normalize_string(s: &str) -> String {
+        let trimmed = s.trim();
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        words.join(" ").to_lowercase()
+    }
+
     match op {
         "=" => {
-            // Strict equality
-            let result = match (left, right) {
-                (EvaluationResult::Empty, EvaluationResult::Empty) => true, // Empty equals Empty
-                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => l == r,
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => l == r,
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l == r,
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l == r,
-                // Mixed number/integer comparison
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-                    *l == Decimal::from(*r)
+            // Strict equality: Order and duplicates matter for collections
+            match (left, right) {
+                (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
+                    if l_items.len() != r_items.len() {
+                        EvaluationResult::Boolean(false)
+                    } else {
+                        // Compare element by element using '=' recursively
+                        let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
+                            compare_equality(li, "=", ri).to_boolean()
+                        });
+                        EvaluationResult::Boolean(all_equal)
+                    }
                 }
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-                    Decimal::from(*l) == *r
+                // If only one is a collection, they are not equal
+                (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
+                    EvaluationResult::Boolean(false)
                 }
-                (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l == r,
-                (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l == r,
-                (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l == r,
-                _ => false,
-            };
-            EvaluationResult::Boolean(result)
+                // Primitive/Empty comparison
+                (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
+                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => EvaluationResult::Boolean(*l == Decimal::from(*r)),
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => EvaluationResult::Boolean(Decimal::from(*l) == *r),
+                (EvaluationResult::Date(l), EvaluationResult::Date(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::Time(l), EvaluationResult::Time(r)) => EvaluationResult::Boolean(l == r),
+                // Any other combination (including one being Empty) is false
+                _ => EvaluationResult::Boolean(false),
+            }
         }
         "!=" => {
-            // Strict inequality
-            let result = match (left, right) {
-                (EvaluationResult::Empty, EvaluationResult::Empty) => false, // Empty equals Empty
-                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => l != r,
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => l != r,
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l != r,
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l != r,
-                // Mixed number/integer comparison
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-                    *l != Decimal::from(*r)
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-                    Decimal::from(*l) != *r
-                }
-                (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l != r,
-                (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l != r,
-                (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l != r,
-                _ => true,
-            };
-            EvaluationResult::Boolean(result)
+            // Strict inequality: Negation of '='
+            let eq_result = compare_equality(left, "=", right);
+            match eq_result {
+                EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                _ => EvaluationResult::Empty, // Should not happen if '=' returns boolean
+            }
         }
         "~" => {
-            // Equivalence (case-insensitive for strings)
-            let result = match (left, right) {
+            // Equivalence: Order and duplicates DON'T matter for collections
+            match (left, right) {
+                // Handle Empty cases first
+                (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(false),
+                // String equivalence (normalized)
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
-                    l.to_lowercase() == r.to_lowercase()
+                    EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
                 }
-                _ => compare_equality(left, "=", right).to_boolean(),
-            };
-            EvaluationResult::Boolean(result)
+                // Collection equivalence
+                (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
+                    // Compare the sets of distinct items
+                    let l_set: HashSet<_> = l_items.iter().cloned().collect();
+                    let r_set: HashSet<_> = r_items.iter().cloned().collect();
+                    EvaluationResult::Boolean(l_set == r_set)
+                }
+                // If only one is a collection, they are not equivalent
+                (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
+                    EvaluationResult::Boolean(false)
+                }
+                // Primitive equivalence falls back to strict equality ('=')
+                _ => compare_equality(left, "=", right),
+            }
         }
         "!~" => {
-            // Non-equivalence
-            let result = !compare_equality(left, "~", right).to_boolean();
-            EvaluationResult::Boolean(result)
+            // Non-equivalence: Negation of '~'
+            let equiv_result = compare_equality(left, "~", right);
+            match equiv_result {
+                EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                _ => EvaluationResult::Empty, // Should not happen if '~' returns boolean
+            }
         }
-        _ => EvaluationResult::Empty,
+        _ => EvaluationResult::Empty, // Unknown operator
     }
 }
 

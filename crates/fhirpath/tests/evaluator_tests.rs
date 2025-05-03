@@ -2234,10 +2234,11 @@ fn test_operator_equality_equals() {
         eval("(1|2) = (1|2)", &context),
         EvaluationResult::Boolean(true)
     );
+    // Test: Order matters for '='
     assert_eq!(
         eval("(1|2) = (2|1)", &context),
-        EvaluationResult::Boolean(false)
-    ); // Order matters
+        EvaluationResult::Boolean(false) // This assertion is correct per spec
+    );
     assert_eq!(
         eval("(1|2) = (1|2|3)", &context),
         EvaluationResult::Boolean(false)
@@ -2323,9 +2324,9 @@ fn test_operator_equality_equivalent() {
         EvaluationResult::Boolean(true)
     );
     // Empty comparison
-    assert_eq!(eval("{} ~ {}", &context), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 ~ {}", &context), EvaluationResult::Boolean(false));
-    assert_eq!(eval("{} ~ 1", &context), EvaluationResult::Boolean(false));
+    assert_eq!(eval("{} ~ {}", &context), EvaluationResult::Boolean(true)); // Empty is equivalent to Empty
+    assert_eq!(eval("1 ~ {}", &context), EvaluationResult::Boolean(false)); // Non-empty not equivalent to Empty
+    assert_eq!(eval("{} ~ 1", &context), EvaluationResult::Boolean(false)); // Empty not equivalent to Non-empty
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#-not-equals
@@ -2367,9 +2368,9 @@ fn test_operator_equality_not_equivalent() {
         EvaluationResult::Boolean(false)
     );
     // Empty comparison
-    assert_eq!(eval("{} !~ {}", &context), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 !~ {}", &context), EvaluationResult::Boolean(true));
-    assert_eq!(eval("{} !~ 1", &context), EvaluationResult::Boolean(true));
+    assert_eq!(eval("{} !~ {}", &context), EvaluationResult::Boolean(false)); // Empty is equivalent to Empty
+    assert_eq!(eval("1 !~ {}", &context), EvaluationResult::Boolean(true)); // Non-empty not equivalent to Empty
+    assert_eq!(eval("{} !~ 1", &context), EvaluationResult::Boolean(true)); // Empty not equivalent to Non-empty
 }
 
 // --- Comparison ---
