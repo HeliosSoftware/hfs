@@ -404,9 +404,34 @@ fn evaluate_invocation(
                     let criteria_expr = &args_exprs[0];
                     evaluate_all_with_criteria(invocation_base, criteria_expr, context)
                 }
+                "iif" if args_exprs.len() >= 2 => { // iif(condition, trueResult, [otherwiseResult])
+                    let condition_expr = &args_exprs[0];
+                    let true_result_expr = &args_exprs[1];
+                    let otherwise_result_expr = args_exprs.get(2); // Optional third argument
+
+                    // Evaluate the condition expression.
+                    // iif condition is evaluated in the context of the invocation_base ($this)
+                    let condition_result = evaluate(condition_expr, context, Some(invocation_base));
+
+                    if condition_result.to_boolean() {
+                        // Condition is true, evaluate the trueResult expression
+                        // trueResult is also evaluated in the context of the invocation_base ($this)
+                        evaluate(true_result_expr, context, Some(invocation_base))
+                    } else {
+                        // Condition is false or empty
+                        if let Some(otherwise_expr) = otherwise_result_expr {
+                            // Evaluate the otherwiseResult expression if present
+                            // otherwiseResult is also evaluated in the context of the invocation_base ($this)
+                            evaluate(otherwise_expr, context, Some(invocation_base))
+                        } else {
+                            // Otherwise result is omitted, return empty collection
+                            EvaluationResult::Empty
+                        }
+                    }
+                }
                 // Add other functions taking lambdas here (e.g., any, repeat)
                 _ => {
-                    // Default: Evaluate all arguments first (without $this context), then call function
+                    // Default: Evaluate all standard function arguments first (without $this context), then call function
                     let evaluated_args: Vec<EvaluationResult> = args_exprs
                         .iter()
                         .map(|arg_expr| evaluate(arg_expr, context, None)) // Evaluate args in outer context
