@@ -2521,15 +2521,15 @@ fn check_membership(
             EvaluationResult::Boolean(is_in)
         }
         "contains" => {
-            // Spec: {} contains X -> false
-            if left == &EvaluationResult::Empty {
-                return EvaluationResult::Boolean(false);
-            }
             // Spec: X contains {} -> {}
             if right == &EvaluationResult::Empty {
                 return EvaluationResult::Empty;
             }
-            // Proceed with check if both are non-empty (operands are not Empty)
+            // Spec: {} contains X -> false
+            if left == &EvaluationResult::Empty {
+                return EvaluationResult::Boolean(false);
+            }
+            // Proceed with check if both operands are non-empty
             match left {
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
