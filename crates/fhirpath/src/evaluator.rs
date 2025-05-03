@@ -1,12 +1,11 @@
-use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
-use fhir::FhirResource;
-use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier}; // Re-added TypeSpecifier
-use chrono::{Local, Timelike}; // Import chrono for date/time functions
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
+use chrono::{Local, Timelike};
 use fhir::FhirResource;
 use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
-use regex::Regex; // Import the regex crate
-// Removed unused import: use rust_decimal_macros::dec;
-use std::collections::{HashMap, HashSet}; // Import HashSet here
+use regex::Regex;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
+use std::collections::{HashMap, HashSet};
 
 /// Context for evaluating FHIRPath expressions
 pub struct EvaluationContext {
@@ -159,7 +158,8 @@ pub fn evaluate(
                 EvaluationResult::Boolean(left_result.to_boolean() || right_result.to_boolean())
             } else {
                 // xor: requires both sides to be evaluated unless one is Empty
-                if left_result == EvaluationResult::Empty || right_result == EvaluationResult::Empty {
+                if left_result == EvaluationResult::Empty || right_result == EvaluationResult::Empty
+                {
                     EvaluationResult::Empty // FHIRPath spec: xor with Empty is Empty
                 } else {
                     EvaluationResult::Boolean(left_result.to_boolean() != right_result.to_boolean())
@@ -174,13 +174,13 @@ pub fn evaluate(
             }
             // Handle Empty implies X -> true
             if left_result == EvaluationResult::Empty {
-                 return EvaluationResult::Boolean(true);
+                return EvaluationResult::Boolean(true);
             }
             // Evaluate right side
             let right_result = evaluate(right, context, current_item);
             // Handle X implies Empty -> Empty
             if right_result == EvaluationResult::Empty {
-                 return EvaluationResult::Empty;
+                return EvaluationResult::Empty;
             }
             // Otherwise, the result is the boolean value of the right side
             EvaluationResult::Boolean(right_result.to_boolean())
@@ -329,8 +329,11 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
                 // However, the Literal::Date variant should handle this.
                 // If we reach here with t=None, it might indicate a parser issue
                 // or an unexpected Literal variant. Let's treat it as just the date part for now.
-                 eprintln!("Warning: DateTime literal evaluated without time part: {}", d);
-                 EvaluationResult::DateTime(d.clone()) // Or potentially return Date(d.clone()) or Empty
+                eprintln!(
+                    "Warning: DateTime literal evaluated without time part: {}",
+                    d
+                );
+                EvaluationResult::DateTime(d.clone()) // Or potentially return Date(d.clone()) or Empty
             }
         }
         Literal::Time(t) => EvaluationResult::Time(t.clone()),
@@ -339,10 +342,12 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
             // Return Integer if the Decimal represents a whole number and fits in i64,
             // otherwise return Decimal.
             if n.is_integer() {
-                 // Attempt to convert to i64 if it fits
-                 n.to_i64().map(EvaluationResult::Integer).unwrap_or_else(|| EvaluationResult::Decimal(*n))
+                // Attempt to convert to i64 if it fits
+                n.to_i64()
+                    .map(EvaluationResult::Integer)
+                    .unwrap_or_else(|| EvaluationResult::Decimal(*n))
             } else {
-                 EvaluationResult::Decimal(*n)
+                EvaluationResult::Decimal(*n)
             }
         }
     }
@@ -358,7 +363,8 @@ fn evaluate_invocation(
         Invocation::Member(name) => {
             // Handle member access on the invocation_base
             // Special handling for boolean literals that might be parsed as identifiers
-            if name == "true" && matches!(invocation_base, EvaluationResult::Empty) { // Only if base is empty context
+            if name == "true" && matches!(invocation_base, EvaluationResult::Empty) {
+                // Only if base is empty context
                 return EvaluationResult::Boolean(true);
             } else if name == "false" && matches!(invocation_base, EvaluationResult::Empty) {
                 return EvaluationResult::Boolean(false);
@@ -390,13 +396,11 @@ fn evaluate_invocation(
                         })
                         .collect();
 
-
                     if flattened_results.is_empty() {
                         EvaluationResult::Empty
                     } else if flattened_results.len() == 1 {
-                         flattened_results.into_iter().next().unwrap() // Return single item directly
-                    }
-                     else {
+                        flattened_results.into_iter().next().unwrap() // Return single item directly
+                    } else {
                         EvaluationResult::Collection(flattened_results)
                     }
                 }
@@ -404,7 +408,8 @@ fn evaluate_invocation(
                 _ => EvaluationResult::Empty,
             }
         }
-        Invocation::Function(name, args_exprs) => { // Use args_exprs (AST)
+        Invocation::Function(name, args_exprs) => {
+            // Use args_exprs (AST)
             // Handle functions that take lambdas specially
             match name.as_str() {
                 "exists" if !args_exprs.is_empty() => {
@@ -433,13 +438,16 @@ fn evaluate_invocation(
                         // The parser seems to produce Invocation(base, member) for this
                         Expression::Invocation(base_expr, Invocation::Member(member_name)) => {
                             // Check if the base is a simple member invocation (like 'System')
-                            if let Expression::Term(Term::Invocation(Invocation::Member(base_name))) = &**base_expr {
-                                 // Reconstruct the qualified name: "System.Integer"
-                                 // For now, store the full name as the identifier. evaluate_of_type will handle it.
-                                 let full_name = format!("{}.{}", base_name, member_name);
-                                 Some(TypeSpecifier::QualifiedIdentifier(full_name, None))
+                            if let Expression::Term(Term::Invocation(Invocation::Member(
+                                base_name,
+                            ))) = &**base_expr
+                            {
+                                // Reconstruct the qualified name: "System.Integer"
+                                // For now, store the full name as the identifier. evaluate_of_type will handle it.
+                                let full_name = format!("{}.{}", base_name, member_name);
+                                Some(TypeSpecifier::QualifiedIdentifier(full_name, None))
                             } else {
-                                 None // Unexpected structure for qualified identifier base
+                                None // Unexpected structure for qualified identifier base
                             }
                         }
                         _ => None, // Argument is not a recognized type identifier structure
@@ -448,11 +456,15 @@ fn evaluate_invocation(
                     if let Some(type_spec) = type_spec_opt {
                         evaluate_of_type(invocation_base, &type_spec)
                     } else {
-                        eprintln!("Warning: ofType argument was not a recognized type identifier structure: {:?}", args_exprs[0]);
+                        eprintln!(
+                            "Warning: ofType argument was not a recognized type identifier structure: {:?}",
+                            args_exprs[0]
+                        );
                         EvaluationResult::Empty // Invalid argument for ofType
                     }
                 }
-                "iif" if args_exprs.len() >= 2 => { // iif(condition, trueResult, [otherwiseResult])
+                "iif" if args_exprs.len() >= 2 => {
+                    // iif(condition, trueResult, [otherwiseResult])
                     let condition_expr = &args_exprs[0];
                     let true_result_expr = &args_exprs[1];
                     let otherwise_result_expr = args_exprs.get(2); // Optional third argument
@@ -490,10 +502,10 @@ fn evaluate_invocation(
             }
         }
         Invocation::This => {
-             // This should be handled by evaluate_term, but as a fallback:
-             invocation_base.clone() // Return the base it was invoked on
+            // This should be handled by evaluate_term, but as a fallback:
+            invocation_base.clone() // Return the base it was invoked on
         }
-         Invocation::Index => {
+        Invocation::Index => {
             // $index should return the current index in a collection operation
             // This is typically used in filter expressions
             // For now, we return Empty as this requires tracking iteration state
@@ -506,7 +518,6 @@ fn evaluate_invocation(
         }
     }
 }
-
 
 // --- Helper functions for lambda evaluation ---
 
@@ -546,7 +557,7 @@ fn evaluate_where(
     criteria_expr: &Expression,
     context: &EvaluationContext,
 ) -> EvaluationResult {
-     let items_to_filter = match collection {
+    let items_to_filter = match collection {
         EvaluationResult::Collection(items) => items.clone(),
         EvaluationResult::Empty => vec![],
         single_item => vec![single_item.clone()],
@@ -635,10 +646,7 @@ fn evaluate_all_with_criteria(
 }
 
 /// Evaluates the 'ofType' function.
-fn evaluate_of_type(
-    collection: &EvaluationResult,
-    type_spec: &TypeSpecifier,
-) -> EvaluationResult {
+fn evaluate_of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> EvaluationResult {
     let items_to_filter = match collection {
         EvaluationResult::Collection(items) => items.clone(),
         EvaluationResult::Empty => vec![],
@@ -653,7 +661,6 @@ fn evaluate_of_type(
             name.split('.').last().unwrap_or(name.as_str())
         }
     };
-
 
     let mut filtered_items = Vec::new();
     for item in items_to_filter {
@@ -692,7 +699,6 @@ fn evaluate_of_type(
     }
 }
 
-
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
     name: &str,
@@ -714,21 +720,22 @@ fn call_function(
         }
         "empty" => {
             // Returns true if the collection is empty
-            match invocation_base { // Use invocation_base, not context
+            match invocation_base {
+                // Use invocation_base, not context
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
                 _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
             }
         }
-         "exists" => {
-             // This handles exists() without criteria.
-             // exists(criteria) is handled in evaluate_invocation.
-             match invocation_base {
-                 EvaluationResult::Empty => EvaluationResult::Boolean(false),
-                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
-                 _ => EvaluationResult::Boolean(true), // Single non-empty item exists
-             }
-         }
+        "exists" => {
+            // This handles exists() without criteria.
+            // exists(criteria) is handled in evaluate_invocation.
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Boolean(false),
+                EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
+                _ => EvaluationResult::Boolean(true), // Single non-empty item exists
+            }
+        }
         "all" => {
             // This handles all() without criteria, which is equivalent to exists(criteria)
             // where the criteria is implicitly '$this = true'.
@@ -786,7 +793,7 @@ fn call_function(
                 return EvaluationResult::Boolean(true);
             }
             for item in items {
-                 if !matches!(item, EvaluationResult::Boolean(false)) {
+                if !matches!(item, EvaluationResult::Boolean(false)) {
                     return EvaluationResult::Boolean(false);
                 }
             }
@@ -830,13 +837,14 @@ fn call_function(
         "not" => {
             // Logical negation
             match invocation_base {
-                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                 EvaluationResult::Empty => EvaluationResult::Empty, // not({}) is {}
-                 // Other types are implicitly converted to boolean first
-                 _ => EvaluationResult::Boolean(!invocation_base.to_boolean()),
+                EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                EvaluationResult::Empty => EvaluationResult::Empty, // not({}) is {}
+                // Other types are implicitly converted to boolean first
+                _ => EvaluationResult::Boolean(!invocation_base.to_boolean()),
             }
         }
-        "contains" => { // Function call version
+        "contains" => {
+            // Function call version
             // Check if the invocation_base contains the argument
             if args.is_empty() {
                 return EvaluationResult::Empty; // Requires one argument
@@ -848,7 +856,7 @@ fn call_function(
                     // String contains substring
                     // Explicitly check if arg is Empty *within this arm*
                     if arg == &EvaluationResult::Empty {
-                         EvaluationResult::Empty
+                        EvaluationResult::Empty
                     } else if let EvaluationResult::String(substr) = arg {
                         EvaluationResult::Boolean(s.contains(substr))
                     } else {
@@ -868,17 +876,19 @@ fn call_function(
                         EvaluationResult::Boolean(contains)
                     }
                 }
-                 // contains on single non-collection/non-string item
-                 EvaluationResult::Empty => EvaluationResult::Empty, // Spec: If input collection is empty, result is empty.
-                 single_item => {
-                     // Treat as single-item collection: check if the item equals the argument
-                     // Check if arg is empty first
-                     if arg == &EvaluationResult::Empty {
-                         EvaluationResult::Empty
-                     } else {
-                         EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
-                     }
-                 }
+                // contains on single non-collection/non-string item
+                EvaluationResult::Empty => EvaluationResult::Empty, // Spec: If input collection is empty, result is empty.
+                single_item => {
+                    // Treat as single-item collection: check if the item equals the argument
+                    // Check if arg is empty first
+                    if arg == &EvaluationResult::Empty {
+                        EvaluationResult::Empty
+                    } else {
+                        EvaluationResult::Boolean(
+                            compare_equality(single_item, "=", arg).to_boolean(),
+                        )
+                    }
+                }
             }
         }
         "isDistinct" => {
@@ -908,7 +918,9 @@ fn call_function(
             // Converts the input to Decimal according to FHIRPath rules
             match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                EvaluationResult::Boolean(b) => EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO }),
+                EvaluationResult::Boolean(b) => {
+                    EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
+                }
                 EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)),
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d),
                 EvaluationResult::String(s) => {
@@ -994,11 +1006,11 @@ fn call_function(
             let num_to_skip = match &args[0] {
                 EvaluationResult::Integer(i) => {
                     if *i < 0 { 0 } else { *i as usize } // Treat negative skip as 0
-                },
+                }
                 // Add conversion from Decimal if it's an integer value
                 EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
-                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
-                },
+                    d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
+                }
                 _ => return EvaluationResult::Empty, // Invalid argument type
             };
 
@@ -1046,11 +1058,11 @@ fn call_function(
             let num_to_take = match &args[0] {
                 EvaluationResult::Integer(i) => {
                     if *i <= 0 { 0 } else { *i as usize } // Treat non-positive take as 0
-                },
+                }
                 // Add conversion from Decimal if it's an integer value
                 EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
-                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
-                },
+                    d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
+                }
                 _ => return EvaluationResult::Empty, // Invalid argument type
             };
 
@@ -1081,7 +1093,9 @@ fn call_function(
             let other_collection = &args[0];
 
             // If either input is empty, the intersection is empty
-            if invocation_base == &EvaluationResult::Empty || other_collection == &EvaluationResult::Empty {
+            if invocation_base == &EvaluationResult::Empty
+                || other_collection == &EvaluationResult::Empty
+            {
                 return EvaluationResult::Empty;
             }
 
@@ -1291,7 +1305,9 @@ fn call_function(
                 }
                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true), // Booleans can convert (0 or 1)
                 // Per FHIRPath spec, Decimal cannot be converted unless it has no fractional part
-                EvaluationResult::Decimal(d) => EvaluationResult::Boolean(d.fract() == Decimal::ZERO),
+                EvaluationResult::Decimal(d) => {
+                    EvaluationResult::Boolean(d.fract() == Decimal::ZERO)
+                }
                 // Other types are not convertible to Integer
                 _ => EvaluationResult::Boolean(false),
             }
@@ -1312,10 +1328,15 @@ fn call_function(
                 // Check convertibility for single items
                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(i) => EvaluationResult::Boolean(*i == 0 || *i == 1),
-                EvaluationResult::Decimal(d) => EvaluationResult::Boolean(d.is_zero() || *d == Decimal::ONE),
+                EvaluationResult::Decimal(d) => {
+                    EvaluationResult::Boolean(d.is_zero() || *d == Decimal::ONE)
+                }
                 EvaluationResult::String(s) => {
                     let lower = s.to_lowercase();
-                    EvaluationResult::Boolean(matches!(lower.as_str(), "true" | "t" | "yes" | "1" | "1.0" | "false" | "f" | "no" | "0" | "0.0"))
+                    EvaluationResult::Boolean(matches!(
+                        lower.as_str(),
+                        "true" | "t" | "yes" | "1" | "1.0" | "false" | "f" | "no" | "0" | "0.0"
+                    ))
                 }
                 // Other types are not convertible to Boolean
                 _ => EvaluationResult::Boolean(false),
@@ -1334,7 +1355,8 @@ fn call_function(
                 EvaluationResult::Decimal(d) => {
                     if *d == Decimal::ONE {
                         EvaluationResult::Boolean(true)
-                    } else if d.is_zero() { // Check for 0.0, -0.0 etc.
+                    } else if d.is_zero() {
+                        // Check for 0.0, -0.0 etc.
                         EvaluationResult::Boolean(false)
                     } else {
                         EvaluationResult::Empty // Other decimals are not convertible
@@ -1374,13 +1396,13 @@ fn call_function(
                     }
                 }
                 // Check convertibility for single items (most primitives can be)
-                EvaluationResult::Boolean(_) |
-                EvaluationResult::String(_) |
-                EvaluationResult::Integer(_) |
-                EvaluationResult::Decimal(_) |
-                EvaluationResult::Date(_) |
-                EvaluationResult::DateTime(_) |
-                EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Boolean(_)
+                | EvaluationResult::String(_)
+                | EvaluationResult::Integer(_)
+                | EvaluationResult::Decimal(_)
+                | EvaluationResult::Date(_)
+                | EvaluationResult::DateTime(_)
+                | EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
             }
@@ -1390,15 +1412,20 @@ fn call_function(
             // Handles single items, collections (returning Empty for multi-item), and Empty correctly.
             let string_val = invocation_base.to_string_value();
             // Check if the helper returned the collection representation "[...]" which means Empty for toString
-            if string_val.starts_with('[') && string_val.ends_with(']') && invocation_base.is_collection() && invocation_base.count() != 1 {
-                 EvaluationResult::Empty
-            } else if string_val.is_empty() && invocation_base != &EvaluationResult::String("".to_string()) {
-                 // If the string is empty, but the original wasn't an empty string, return Empty
-                 // This handles the case where to_string_value returns "" for Empty input.
-                 EvaluationResult::Empty
-            }
-             else {
-                 EvaluationResult::String(string_val)
+            if string_val.starts_with('[')
+                && string_val.ends_with(']')
+                && invocation_base.is_collection()
+                && invocation_base.count() != 1
+            {
+                EvaluationResult::Empty
+            } else if string_val.is_empty()
+                && invocation_base != &EvaluationResult::String("".to_string())
+            {
+                // If the string is empty, but the original wasn't an empty string, return Empty
+                // This handles the case where to_string_value returns "" for Empty input.
+                EvaluationResult::Empty
+            } else {
+                EvaluationResult::String(string_val)
             }
         }
         "toDate" => {
@@ -1418,10 +1445,12 @@ fn call_function(
                     // Attempt to parse as Date or DateTime and extract date part
                     // This requires a robust date/datetime parsing logic
                     // For now, assume valid FHIR date/datetime strings
-                    if s.contains('T') { // Looks like DateTime
+                    if s.contains('T') {
+                        // Looks like DateTime
                         if let Some(date_part) = s.split('T').next() {
                             // Basic validation: check if date_part looks like YYYY, YYYY-MM, or YYYY-MM-DD
-                            if date_part.len() == 4 || date_part.len() == 7 || date_part.len() == 10 {
+                            if date_part.len() == 4 || date_part.len() == 7 || date_part.len() == 10
+                            {
                                 EvaluationResult::Date(date_part.to_string())
                             } else {
                                 EvaluationResult::Empty
@@ -1429,13 +1458,14 @@ fn call_function(
                         } else {
                             EvaluationResult::Empty
                         }
-                    } else { // Looks like Date
-                         // Basic validation
-                         if s.len() == 4 || s.len() == 7 || s.len() == 10 {
-                             EvaluationResult::Date(s.clone())
-                         } else {
-                             EvaluationResult::Empty
-                         }
+                    } else {
+                        // Looks like Date
+                        // Basic validation
+                        if s.len() == 4 || s.len() == 7 || s.len() == 10 {
+                            EvaluationResult::Date(s.clone())
+                        } else {
+                            EvaluationResult::Empty
+                        }
                     }
                 }
                 // Collections: Convert single item, multiple items -> Empty
@@ -1465,7 +1495,8 @@ fn call_function(
                 EvaluationResult::String(s) => {
                     // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or start like a DateTime?
                     let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
-                    let is_datetime_like = s.contains('T') && (s.starts_with(|c: char| c.is_ascii_digit()) && s.len() >= 5); // Basic check
+                    let is_datetime_like = s.contains('T')
+                        && (s.starts_with(|c: char| c.is_ascii_digit()) && s.len() >= 5); // Basic check
                     EvaluationResult::Boolean(is_date_like || is_datetime_like)
                 }
                 _ => EvaluationResult::Boolean(false),
@@ -1480,7 +1511,8 @@ fn call_function(
                 EvaluationResult::String(s) => {
                     // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or YYYY-MM-DDTHH...?
                     let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
-                    let is_datetime_like = s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
+                    let is_datetime_like =
+                        s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
                     if is_date_like || is_datetime_like {
                         EvaluationResult::DateTime(s.clone())
                     } else {
@@ -1514,7 +1546,8 @@ fn call_function(
                 EvaluationResult::String(s) => {
                     // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or YYYY-MM-DDTHH...?
                     let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
-                    let is_datetime_like = s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
+                    let is_datetime_like =
+                        s.contains('T') && s.starts_with(|c: char| c.is_ascii_digit());
                     EvaluationResult::Boolean(is_date_like || is_datetime_like)
                 }
                 _ => EvaluationResult::Boolean(false),
@@ -1530,8 +1563,23 @@ fn call_function(
                     let parts: Vec<&str> = s.split(':').collect();
                     let is_time_like = match parts.len() {
                         1 => parts[0].len() == 2 && parts[0].chars().all(|c| c.is_ascii_digit()),
-                        2 => parts[0].len() == 2 && parts[1].len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
-                        3 => parts[0].len() == 2 && parts[1].len() == 2 && parts[2].len() >= 2 && parts[2].split('.').next().map_or(false, |sec| sec.len() == 2) && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.')),
+                        2 => {
+                            parts[0].len() == 2
+                                && parts[1].len() == 2
+                                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+                        }
+                        3 => {
+                            parts[0].len() == 2
+                                && parts[1].len() == 2
+                                && parts[2].len() >= 2
+                                && parts[2]
+                                    .split('.')
+                                    .next()
+                                    .map_or(false, |sec| sec.len() == 2)
+                                && parts
+                                    .iter()
+                                    .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                        }
                         _ => false,
                     };
                     if is_time_like {
@@ -1568,8 +1616,23 @@ fn call_function(
                     let parts: Vec<&str> = s.split(':').collect();
                     let is_time_like = match parts.len() {
                         1 => parts[0].len() == 2 && parts[0].chars().all(|c| c.is_ascii_digit()),
-                        2 => parts[0].len() == 2 && parts[1].len() == 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
-                        3 => parts[0].len() == 2 && parts[1].len() == 2 && parts[2].len() >= 2 && parts[2].split('.').next().map_or(false, |sec| sec.len() == 2) && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.')),
+                        2 => {
+                            parts[0].len() == 2
+                                && parts[1].len() == 2
+                                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+                        }
+                        3 => {
+                            parts[0].len() == 2
+                                && parts[1].len() == 2
+                                && parts[2].len() >= 2
+                                && parts[2]
+                                    .split('.')
+                                    .next()
+                                    .map_or(false, |sec| sec.len() == 2)
+                                && parts
+                                    .iter()
+                                    .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                        }
                         _ => false,
                     };
                     EvaluationResult::Boolean(is_time_like)
@@ -1582,7 +1645,9 @@ fn call_function(
             // The result is just the numeric value (Decimal or Integer) as unit handling is complex
             match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                EvaluationResult::Boolean(b) => EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO }), // Convert to 1.0 or 0.0
+                EvaluationResult::Boolean(b) => {
+                    EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
+                } // Convert to 1.0 or 0.0
                 EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)), // Convert to Decimal with '1' unit implicitly
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d), // Convert to Decimal with '1' unit implicitly
                 EvaluationResult::String(s) => {
@@ -1592,7 +1657,8 @@ fn call_function(
                         EvaluationResult::Empty // Empty string cannot convert
                     } else if parts.len() == 1 {
                         // Only a value part, try parsing it
-                        parts[0].parse::<Decimal>()
+                        parts[0]
+                            .parse::<Decimal>()
                             .map(EvaluationResult::Decimal)
                             .unwrap_or(EvaluationResult::Empty)
                     } else if parts.len() == 2 {
@@ -1640,7 +1706,8 @@ fn call_function(
                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
-                EvaluationResult::String(s) => EvaluationResult::Boolean({ // Wrap the entire block
+                EvaluationResult::String(s) => EvaluationResult::Boolean({
+                    // Wrap the entire block
                     // Check if the string represents a valid quantity format
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.is_empty() {
@@ -1670,7 +1737,9 @@ fn call_function(
         }
         "indexOf" => {
             // Returns the 0-based index of the first occurrence of the substring
-            if args.len() != 1 { return EvaluationResult::Empty; }
+            if args.len() != 1 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0]) {
                 (EvaluationResult::String(s), EvaluationResult::String(substring)) => {
                     match s.find(substring) {
@@ -1683,7 +1752,9 @@ fn call_function(
         }
         "substring" => {
             // Returns a part of the string
-            if args.is_empty() || args.len() > 2 { return EvaluationResult::Empty; } // Needs 1 or 2 args
+            if args.is_empty() || args.len() > 2 {
+                return EvaluationResult::Empty;
+            } // Needs 1 or 2 args
             let start_index_res = &args[0];
             let length_res_opt = args.get(1);
 
@@ -1703,7 +1774,9 @@ fn call_function(
                         // Two arguments: start and length
                         let length = match length_res {
                             // If length is negative, return empty string per spec
-                            EvaluationResult::Integer(l) if *l < 0 => return EvaluationResult::String("".to_string()),
+                            EvaluationResult::Integer(l) if *l < 0 => {
+                                return EvaluationResult::String("".to_string());
+                            }
                             // If length is non-negative integer, use it
                             EvaluationResult::Integer(l) => *l as usize,
                             // Any other type for length is invalid
@@ -1722,7 +1795,9 @@ fn call_function(
             }
         }
         "startsWith" => {
-            if args.len() != 1 { return EvaluationResult::Empty; }
+            if args.len() != 1 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0]) {
                 (EvaluationResult::String(s), EvaluationResult::String(prefix)) => {
                     EvaluationResult::Boolean(s.starts_with(prefix))
@@ -1731,7 +1806,9 @@ fn call_function(
             }
         }
         "endsWith" => {
-            if args.len() != 1 { return EvaluationResult::Empty; }
+            if args.len() != 1 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0]) {
                 (EvaluationResult::String(s), EvaluationResult::String(suffix)) => {
                     EvaluationResult::Boolean(s.ends_with(suffix))
@@ -1739,29 +1816,31 @@ fn call_function(
                 _ => EvaluationResult::Empty,
             }
         }
-        "upper" => {
-            match invocation_base {
-                EvaluationResult::String(s) => EvaluationResult::String(s.to_uppercase()),
-                _ => EvaluationResult::Empty,
-            }
-        }
-        "lower" => {
-            match invocation_base {
-                EvaluationResult::String(s) => EvaluationResult::String(s.to_lowercase()),
-                _ => EvaluationResult::Empty,
-            }
-        }
+        "upper" => match invocation_base {
+            EvaluationResult::String(s) => EvaluationResult::String(s.to_uppercase()),
+            _ => EvaluationResult::Empty,
+        },
+        "lower" => match invocation_base {
+            EvaluationResult::String(s) => EvaluationResult::String(s.to_lowercase()),
+            _ => EvaluationResult::Empty,
+        },
         "replace" => {
-            if args.len() != 2 { return EvaluationResult::Empty; }
+            if args.len() != 2 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0], &args[1]) {
-                (EvaluationResult::String(s), EvaluationResult::String(pattern), EvaluationResult::String(substitution)) => {
-                    EvaluationResult::String(s.replace(pattern, substitution))
-                }
+                (
+                    EvaluationResult::String(s),
+                    EvaluationResult::String(pattern),
+                    EvaluationResult::String(substitution),
+                ) => EvaluationResult::String(s.replace(pattern, substitution)),
                 _ => EvaluationResult::Empty,
             }
         }
         "matches" => {
-            if args.len() != 1 { return EvaluationResult::Empty; }
+            if args.len() != 1 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0]) {
                 (EvaluationResult::String(s), EvaluationResult::String(regex_pattern)) => {
                     match Regex::new(regex_pattern) {
@@ -1773,32 +1852,39 @@ fn call_function(
             }
         }
         "replaceMatches" => {
-            if args.len() != 2 { return EvaluationResult::Empty; }
+            if args.len() != 2 {
+                return EvaluationResult::Empty;
+            }
             match (invocation_base, &args[0], &args[1]) {
-                (EvaluationResult::String(s), EvaluationResult::String(regex_pattern), EvaluationResult::String(substitution)) => {
+                (
+                    EvaluationResult::String(s),
+                    EvaluationResult::String(regex_pattern),
+                    EvaluationResult::String(substitution),
+                ) => {
                     match Regex::new(regex_pattern) {
-                        Ok(re) => EvaluationResult::String(re.replace_all(s, substitution).to_string()),
+                        Ok(re) => {
+                            EvaluationResult::String(re.replace_all(s, substitution).to_string())
+                        }
                         Err(_) => EvaluationResult::Empty, // Invalid regex pattern
                     }
                 }
                 _ => EvaluationResult::Empty,
             }
         }
-        "toChars" => {
-            match invocation_base {
-                EvaluationResult::String(s) => {
-                    if s.is_empty() {
-                        EvaluationResult::Empty
-                    } else {
-                        let chars: Vec<EvaluationResult> = s.chars()
-                            .map(|c| EvaluationResult::String(c.to_string()))
-                            .collect();
-                        EvaluationResult::Collection(chars)
-                    }
+        "toChars" => match invocation_base {
+            EvaluationResult::String(s) => {
+                if s.is_empty() {
+                    EvaluationResult::Empty
+                } else {
+                    let chars: Vec<EvaluationResult> = s
+                        .chars()
+                        .map(|c| EvaluationResult::String(c.to_string()))
+                        .collect();
+                    EvaluationResult::Collection(chars)
                 }
-                _ => EvaluationResult::Empty,
             }
-        }
+            _ => EvaluationResult::Empty,
+        },
         "now" => {
             // Returns the current DateTime
             let now = Local::now();
@@ -1826,24 +1912,66 @@ fn call_function(
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
-             // Only print warning for functions not handled elsewhere
-             // Added conversion functions and now/today/timeOfDay to the list
-             let handled_functions = [
-                 "where", "select", "exists", "all", "iif", "ofType",
-                 "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger",
-                 "toDecimal", "convertsToDecimal", "toString", "convertsToString",
-                 "toDate", "convertsToDate", "toDateTime", "convertsToDateTime",
-                 "toTime", "convertsToTime", "toQuantity", "convertsToQuantity",
-                 // Add other handled functions here
-                 "count", "empty", "first", "last", "not", "contains", "isDistinct",
-                 "distinct", "skip", "tail", "take", "intersect", "exclude", "union", "combine",
-                 "length", "indexOf", "substring", "startsWith", "endsWith", "upper", "lower",
-                 "replace", "matches", "replaceMatches", "toChars", "now", "today", "timeOfDay",
-             ];
-             if !handled_functions.contains(&name) {
-                 eprintln!("Warning: Unsupported function called: {}", name); // Keep this warning for truly unhandled functions
-             }
-             EvaluationResult::Empty
+            // Only print warning for functions not handled elsewhere
+            // Added conversion functions and now/today/timeOfDay to the list
+            let handled_functions = [
+                "where",
+                "select",
+                "exists",
+                "all",
+                "iif",
+                "ofType",
+                "toBoolean",
+                "convertsToBoolean",
+                "toInteger",
+                "convertsToInteger",
+                "toDecimal",
+                "convertsToDecimal",
+                "toString",
+                "convertsToString",
+                "toDate",
+                "convertsToDate",
+                "toDateTime",
+                "convertsToDateTime",
+                "toTime",
+                "convertsToTime",
+                "toQuantity",
+                "convertsToQuantity",
+                // Add other handled functions here
+                "count",
+                "empty",
+                "first",
+                "last",
+                "not",
+                "contains",
+                "isDistinct",
+                "distinct",
+                "skip",
+                "tail",
+                "take",
+                "intersect",
+                "exclude",
+                "union",
+                "combine",
+                "length",
+                "indexOf",
+                "substring",
+                "startsWith",
+                "endsWith",
+                "upper",
+                "lower",
+                "replace",
+                "matches",
+                "replaceMatches",
+                "toChars",
+                "now",
+                "today",
+                "timeOfDay",
+            ];
+            if !handled_functions.contains(&name) {
+                eprintln!("Warning: Unsupported function called: {}", name); // Keep this warning for truly unhandled functions
+            }
+            EvaluationResult::Empty
         }
     }
 }
@@ -1853,8 +1981,22 @@ fn call_function(
 fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     // Allow known time-based units
     const TIME_UNITS: &[&str] = &[
-        "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+        "year",
+        "month",
+        "week",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
     ];
     if TIME_UNITS.contains(&unit) {
         return true;
@@ -1862,23 +2004,29 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
 
     // Basic check for UCUM units (starts with non-digit, doesn't contain invalid chars like spaces after first char)
     // This is NOT a full UCUM validation.
-    if unit.is_empty() { return false; }
+    if unit.is_empty() {
+        return false;
+    }
     let first_char = unit.chars().next().unwrap();
     // UCUM units often start with letters or symbols like '{', '[', '(', etc.
     // They generally don't start with digits.
-    if first_char.is_ascii_digit() { return false; }
+    if first_char.is_ascii_digit() {
+        return false;
+    }
     // Check for invalid characters (e.g., whitespace within the unit)
-    if unit.chars().skip(1).any(|c| c.is_whitespace()) { return false; }
+    if unit.chars().skip(1).any(|c| c.is_whitespace()) {
+        return false;
+    }
 
     // Stricter check: Allow only alphanumeric, '.', '/', '{', '}', '[', ']', '(', ')', '%'
     // This is still a simplification of full UCUM validation.
     let is_potentially_ucum = unit.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '{' | '}' | '[' | ']' | '(' | ')' | '%')
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '/' | '{' | '}' | '[' | ']' | '(' | ')' | '%')
     });
 
     is_potentially_ucum // Return true only if it's a time unit or passes the stricter UCUM check
 }
-
 
 /// Evaluates an indexer expression
 fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> EvaluationResult {
@@ -1894,7 +2042,7 @@ fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> 
         EvaluationResult::Decimal(d) => {
             // Check if decimal is a non-negative integer before converting
             if d.is_integer() && d.is_sign_positive() {
-                 d.to_usize() // Convert non-negative integer Decimal to usize
+                d.to_usize() // Convert non-negative integer Decimal to usize
             } else {
                 None // Non-integer or negative decimal is invalid
             }
@@ -1984,7 +2132,7 @@ fn apply_multiplicative(
                 }
                 // Removed the incorrect inner else block
             } else {
-                 EvaluationResult::Empty // Invalid types for division (this else is correct)
+                EvaluationResult::Empty // Invalid types for division (this else is correct)
             }
         }
         "div" | "mod" => {
@@ -2011,10 +2159,9 @@ fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationRe
     match op {
         "div" => EvaluationResult::Integer(left / right), // Integer division
         "mod" => EvaluationResult::Integer(left % right), // Integer modulo
-        _ => EvaluationResult::Empty, // Should not happen if called correctly
+        _ => EvaluationResult::Empty,                     // Should not happen if called correctly
     }
 }
-
 
 /// Applies an additive operator to two values
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
@@ -2041,11 +2188,19 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                         .unwrap_or(EvaluationResult::Empty) // Return Empty on overflow
                 }
                 // If either operand is Decimal, promote and result is Decimal
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => EvaluationResult::Decimal(*l + *r),
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => EvaluationResult::Decimal(*l + Decimal::from(*r)),
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => EvaluationResult::Decimal(Decimal::from(*l) + *r),
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Decimal(*l + *r)
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    EvaluationResult::Decimal(*l + Decimal::from(*r))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Decimal(Decimal::from(*l) + *r)
+                }
                 // Handle string concatenation with '+'
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::String(format!("{}{}", l, r)),
+                (EvaluationResult::String(l), EvaluationResult::String(r)) => {
+                    EvaluationResult::String(format!("{}{}", l, r))
+                }
                 // Other combinations are invalid for '+'
                 _ => EvaluationResult::Empty,
             }
@@ -2061,10 +2216,10 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
             }
         }
         "&" => {
-             // Handle string concatenation using '&'
-             let left_str = left.to_string_value(); // Convert left to string
-             let right_str = right.to_string_value(); // Convert right to string
-             EvaluationResult::String(format!("{}{}", left_str, right_str))
+            // Handle string concatenation using '&'
+            let left_str = left.to_string_value(); // Convert left to string
+            let right_str = right.to_string_value(); // Convert right to string
+            EvaluationResult::String(format!("{}{}", left_str, right_str))
         }
         _ => EvaluationResult::Empty, // Unknown operator
     }
@@ -2209,8 +2364,12 @@ fn compare_equality(
                 (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l == r,
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l == r,
                 // Mixed number/integer comparison
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => *l == Decimal::from(*r),
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => Decimal::from(*l) == *r,
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    *l == Decimal::from(*r)
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    Decimal::from(*l) == *r
+                }
                 (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l == r,
                 (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l == r,
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l == r,
@@ -2227,8 +2386,12 @@ fn compare_equality(
                 (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => l != r,
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => l != r,
                 // Mixed number/integer comparison
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => *l != Decimal::from(*r),
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => Decimal::from(*l) != *r,
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    *l != Decimal::from(*r)
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    Decimal::from(*l) != *r
+                }
                 (EvaluationResult::Date(l), EvaluationResult::Date(r)) => l != r,
                 (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => l != r,
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => l != r,
