@@ -184,13 +184,13 @@ fn evaluate_term(
                     .unwrap_or_else(|| {
                         // If no specific item context, use the main context resource(s)
                         if context.resources.is_empty() {
-                            EvaluationResult::Empty
+                            return EvaluationResult::Empty;
                         } else if context.resources.len() == 1 {
                             // If only one resource, return it directly
-                            convert_resource_to_result(&context.resources[0])
+                            return convert_resource_to_result(&context.resources[0]);
                         } else {
                             // If multiple resources, return them as a collection
-                            EvaluationResult::Collection(
+                            return EvaluationResult::Collection(
                                 context
                                     .resources
                                     .iter()
@@ -317,15 +317,6 @@ fn evaluate_invocation(
             // Special handling for boolean literals that might be parsed as identifiers
             if name == "true" && matches!(invocation_base, EvaluationResult::Empty) { // Only if base is empty context
                 return EvaluationResult::Boolean(true);
-            } else if name == "false" {
-                return EvaluationResult::Boolean(false);
-            }
-
-            // Check if this is a function call without parentheses (e.g., "string.contains")
-            if name == "contains" {
-                // For string contains without arguments, we need to handle it specially
-                // This is a workaround for the parser not handling method calls without parentheses
-                return call_function(name, value, &[]);
             } else if name == "false" && matches!(invocation_base, EvaluationResult::Empty) {
                 return EvaluationResult::Boolean(false);
             }
@@ -392,6 +383,7 @@ fn evaluate_invocation(
                         .iter()
                         .map(|arg_expr| evaluate(arg_expr, context, None)) // Evaluate args in outer context
                         .collect();
+                    // Call with updated signature (name, base, args)
                     call_function(name, invocation_base, &evaluated_args)
                 }
             }
@@ -519,7 +511,6 @@ fn evaluate_select(
 fn call_function(
     name: &str,
     invocation_base: &EvaluationResult, // Renamed from context to avoid confusion
-    context: &EvaluationResult,
     args: &[EvaluationResult],
 ) -> EvaluationResult {
     match name {
@@ -537,7 +528,7 @@ fn call_function(
         }
         "empty" => {
             // Returns true if the collection is empty
-            match context {
+            match invocation_base { // Use invocation_base, not context
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
                 _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
