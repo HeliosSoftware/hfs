@@ -1176,6 +1176,31 @@ fn call_function(
                 EvaluationResult::Collection(combined_items)
             }
         }
+        "convertsToBoolean" => {
+            // Checks if the input can be converted to Boolean
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
+                EvaluationResult::Collection(items) => {
+                    // Only single-item collections can be converted
+                    if items.len() == 1 {
+                        // Recursively call convertsToBoolean on the single item
+                        call_function("convertsToBoolean", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false) // Multi-item collection cannot be converted
+                    }
+                }
+                // Check convertibility for single items
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Integer(i) => EvaluationResult::Boolean(*i == 0 || *i == 1),
+                EvaluationResult::Decimal(d) => EvaluationResult::Boolean(d.is_zero() || *d == Decimal::ONE),
+                EvaluationResult::String(s) => {
+                    let lower = s.to_lowercase();
+                    EvaluationResult::Boolean(matches!(lower.as_str(), "true" | "t" | "yes" | "1" | "1.0" | "false" | "f" | "no" | "0" | "0.0"))
+                }
+                // Other types are not convertible to Boolean
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
         "toBoolean" => {
             // Converts the input to Boolean according to FHIRPath rules
             match invocation_base {
@@ -1226,8 +1251,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "toBoolean" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean"].contains(&name) {
+             // Added "convertsToBoolean" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
