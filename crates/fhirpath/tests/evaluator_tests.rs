@@ -42,11 +42,11 @@ fn test_expression_literals() {
         eval("'urn:oid:1.2.3'", &context),
         EvaluationResult::String("urn:oid:1.2.3".to_string())
     );
-    // Integer
+    // Integer - Should now be parsed as Integer
     assert_eq!(eval("123", &context), EvaluationResult::Integer(123));
     assert_eq!(eval("0", &context), EvaluationResult::Integer(0));
     assert_eq!(eval("-5", &context), EvaluationResult::Integer(-5));
-    // Decimal
+    // Decimal - Requires a decimal point
     assert_eq!(
         eval("123.45", &context),
         EvaluationResult::Decimal(dec!(123.45)) // Use Decimal
@@ -83,19 +83,19 @@ fn test_expression_literals() {
         eval("@T14:30", &context),
         EvaluationResult::Time("14:30".to_string())
     );
-    // Quantity - Parser now returns Decimal, evaluator ignores unit for now
+    // Quantity - Parser returns Decimal or Integer based on number format
     assert_eq!(
-        eval("10 'mg'", &context),
-        EvaluationResult::Decimal(dec!(10))
+        eval("10 'mg'", &context), // 10 is parsed as Integer
+        EvaluationResult::Integer(10) // Evaluator ignores unit for now
     );
     assert_eq!(
-        eval("4.5 'km'", &context),
-        EvaluationResult::Decimal(dec!(4.5))
+        eval("4.5 'km'", &context), // 4.5 is parsed as Number (Decimal)
+        EvaluationResult::Decimal(dec!(4.5)) // Evaluator ignores unit for now
     );
-    // Quantity with date/time unit - Parser returns Decimal, evaluator ignores unit
+    // Quantity with date/time unit - Parser returns Decimal or Integer
     assert_eq!(
-        eval("100 days", &context),
-        EvaluationResult::Decimal(dec!(100))
+        eval("100 days", &context), // 100 is parsed as Integer
+        EvaluationResult::Integer(100) // Evaluator ignores unit for now
     );
 
     // Empty Collection (Null literal)
@@ -539,7 +539,7 @@ fn test_function_filtering_of_type() {
     );
     assert_eq!(
         eval("(1 | 'a' | true | 1.5).ofType(Decimal)", &context),
-        EvaluationResult::Decimal(dec!(1.5)) // Added decimal to input
+        EvaluationResult::Decimal(dec!(1.5))
     );
     assert_eq!(
         eval("{}.ofType(Integer)", &context),
@@ -1197,7 +1197,7 @@ fn test_function_conversion_to_decimal() {
     assert_eq!(eval("{}.toDecimal()", &context), EvaluationResult::Empty);
     assert_eq!(
         eval("123.toDecimal()", &context),
-        EvaluationResult::Decimal(dec!(123)) // Integer to Decimal
+        EvaluationResult::Decimal(dec!(123.0)) // Integer to Decimal (explicit .0)
     );
     assert_eq!(
         eval("123.45.toDecimal()", &context),
@@ -1217,15 +1217,15 @@ fn test_function_conversion_to_decimal() {
     );
     assert_eq!(
         eval("'789'.toDecimal()", &context),
-        EvaluationResult::Decimal(dec!(789)) // Integer string
+        EvaluationResult::Decimal(dec!(789.0)) // Integer string -> Decimal (explicit .0)
     );
     assert_eq!(
         eval("true.toDecimal()", &context),
-        EvaluationResult::Decimal(dec!(1)) // Boolean to Decimal
+        EvaluationResult::Decimal(dec!(1.0)) // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
         eval("false.toDecimal()", &context),
-        EvaluationResult::Decimal(dec!(0)) // Boolean to Decimal
+        EvaluationResult::Decimal(dec!(0.0)) // Boolean to Decimal (explicit .0)
     );
     assert_eq!(eval("'abc'.toDecimal()", &context), EvaluationResult::Empty); // Invalid string
 }
@@ -1298,10 +1298,14 @@ fn test_function_conversion_to_string() {
         eval("@2023-10-27T10:30:00Z.toString()", &context),
         EvaluationResult::String("2023-10-27T10:30:00+00:00".to_string()) // RFC3339 format
     );
-    // Quantity to string (evaluator currently returns Decimal, ignoring unit)
+    // Quantity to string (evaluator returns Decimal or Integer, ignoring unit)
     assert_eq!(
-        eval("5.5 'mg'.toString()", &context),
+        eval("5.5 'mg'.toString()", &context), // Decimal quantity
         EvaluationResult::String("5.5".to_string())
+    );
+     assert_eq!(
+        eval("5 'mg'.toString()", &context), // Integer quantity
+        EvaluationResult::String("5".to_string())
     );
     // Collection to string
     assert_eq!(
@@ -1350,9 +1354,13 @@ fn test_function_conversion_converts_to_string() {
         eval("@2023-10-27T10:30:00Z.convertsToString()", &context),
         EvaluationResult::Boolean(true)
     );
-    // Quantity conversion (evaluator currently returns Decimal)
+    // Quantity conversion (evaluator returns Decimal or Integer)
     assert_eq!(
-        eval("5.5 'mg'.convertsToString()", &context),
+        eval("5.5 'mg'.convertsToString()", &context), // Decimal quantity
+        EvaluationResult::Boolean(true)
+    );
+     assert_eq!(
+        eval("5 'mg'.convertsToString()", &context), // Integer quantity
         EvaluationResult::Boolean(true)
     );
     // Object/Collection are not convertible
@@ -1852,8 +1860,8 @@ fn test_operator_equality_equals() {
     // Primitives
     assert_eq!(eval("1 = 1", &context), EvaluationResult::Boolean(true));
     assert_eq!(eval("1 = 2", &context), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 = 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal
-    assert_eq!(eval("1.0 = 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer
+    assert_eq!(eval("1 = 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal equality
+    assert_eq!(eval("1.0 = 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer equality
     assert_eq!(
         eval("1.0 = 1.0", &context),
         EvaluationResult::Boolean(true)
@@ -1922,8 +1930,8 @@ fn test_operator_equality_equivalent() {
     // Primitives
     assert_eq!(eval("1 ~ 1", &context), EvaluationResult::Boolean(true));
     assert_eq!(eval("1 ~ 2", &context), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 ~ 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal
-    assert_eq!(eval("1.0 ~ 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer
+    assert_eq!(eval("1 ~ 1.0", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal equivalence
+    assert_eq!(eval("1.0 ~ 1", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer equivalence
     assert_eq!(
         eval("1.0 ~ 1.0", &context),
         EvaluationResult::Boolean(true)
@@ -2409,20 +2417,20 @@ fn test_operator_math_multiply() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("2 * 3", &context),
-        EvaluationResult::Decimal(dec!(6))
-    ); // Result is Decimal
+        EvaluationResult::Decimal(dec!(6.0)) // Result is Decimal (explicit .0)
+    );
     assert_eq!(
         eval("2.5 * 2", &context),
         EvaluationResult::Decimal(dec!(5.0))
-    ); // Decimal * Integer
+    ); // Decimal * Integer -> Decimal
     assert_eq!(
         eval("2 * 2.5", &context),
         EvaluationResult::Decimal(dec!(5.0))
-    ); // Integer * Decimal
+    ); // Integer * Decimal -> Decimal
     assert_eq!(
         eval("2.5 * 2.0", &context),
         EvaluationResult::Decimal(dec!(5.0))
-    ); // Decimal * Decimal
+    ); // Decimal * Decimal -> Decimal
     // Empty propagation
     assert_eq!(eval("2 * {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("{} * 3", &context), EvaluationResult::Empty);
@@ -2434,8 +2442,8 @@ fn test_operator_math_divide() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("6 / 2", &context),
-        EvaluationResult::Decimal(dec!(3))
-    ); // Integer / Integer -> Decimal
+        EvaluationResult::Decimal(dec!(3.0)) // Integer / Integer -> Decimal (explicit .0)
+    );
     assert_eq!(
         eval("7 / 2", &context),
         EvaluationResult::Decimal(dec!(3.5))
@@ -2453,7 +2461,7 @@ fn test_operator_math_divide() {
         EvaluationResult::Decimal(dec!(2.5))
     ); // Decimal / Decimal -> Decimal
     // Divide by zero
-    assert_eq!(eval("5 / 0", &context), EvaluationResult::Empty);
+    assert_eq!(eval("5 / 0", &context), EvaluationResult::Empty); // Integer / 0
     assert_eq!(eval("5.0 / 0", &context), EvaluationResult::Empty);
     assert_eq!(eval("5 / 0.0", &context), EvaluationResult::Empty);
     // Empty propagation
@@ -2465,11 +2473,11 @@ fn test_operator_math_divide() {
 #[test]
 fn test_operator_math_add() {
     let context = EvaluationContext::new_empty();
-    // Numbers
+    // Numbers - All result in Decimal
     assert_eq!(
         eval("1 + 2", &context),
-        EvaluationResult::Decimal(dec!(3))
-    ); // Integer + Integer -> Decimal
+        EvaluationResult::Decimal(dec!(3.0)) // Integer + Integer -> Decimal (explicit .0)
+    );
     assert_eq!(
         eval("1.5 + 2", &context),
         EvaluationResult::Decimal(dec!(3.5))
@@ -2502,10 +2510,11 @@ fn test_operator_math_add() {
 #[test]
 fn test_operator_math_subtract() {
     let context = EvaluationContext::new_empty();
+    // All result in Decimal
     assert_eq!(
         eval("5 - 3", &context),
-        EvaluationResult::Decimal(dec!(2))
-    ); // Integer - Integer -> Decimal
+        EvaluationResult::Decimal(dec!(2.0)) // Integer - Integer -> Decimal (explicit .0)
+    );
     assert_eq!(
         eval("5.5 - 3", &context),
         EvaluationResult::Decimal(dec!(2.5))
@@ -2530,16 +2539,20 @@ fn test_operator_math_div() {
     assert_eq!(eval("5 div 2", &context), EvaluationResult::Integer(2)); // Integer div Integer -> Integer
     assert_eq!(eval("6 div 2", &context), EvaluationResult::Integer(3));
     assert_eq!(eval("-5 div 2", &context), EvaluationResult::Integer(-2));
+    // Decimal div Decimal -> Integer (truncates)
     assert_eq!(
         eval("5.5 div 2.1", &context),
         EvaluationResult::Integer(2)
-    ); // Decimal div Decimal -> Integer
+    );
     assert_eq!(
         eval("-5.5 div 2.1", &context),
-        EvaluationResult::Integer(-2) // Decimal div Decimal -> Integer
+        EvaluationResult::Integer(-2)
     );
+    // Mixed types for div -> Empty
+    assert_eq!(eval("5.5 div 2", &context), EvaluationResult::Empty);
+    assert_eq!(eval("5 div 2.1", &context), EvaluationResult::Empty);
     // Divide by zero
-    assert_eq!(eval("5 div 0", &context), EvaluationResult::Empty);
+    assert_eq!(eval("5 div 0", &context), EvaluationResult::Empty); // Integer div 0
     assert_eq!(eval("5.0 div 0", &context), EvaluationResult::Empty);
     // Empty propagation
     assert_eq!(eval("5 div {}", &context), EvaluationResult::Empty);
@@ -2552,17 +2565,21 @@ fn test_operator_math_mod() {
     let context = EvaluationContext::new_empty();
     assert_eq!(eval("5 mod 2", &context), EvaluationResult::Integer(1)); // Integer mod Integer -> Integer
     assert_eq!(eval("6 mod 2", &context), EvaluationResult::Integer(0));
-    assert_eq!(eval("-5 mod 2", &context), EvaluationResult::Integer(-1));
+    assert_eq!(eval("-5 mod 2", &context), EvaluationResult::Integer(-1)); // Result has sign of dividend
+    // Decimal mod Decimal -> Decimal
     assert_eq!(
         eval("5.5 mod 2.1", &context),
         EvaluationResult::Decimal(dec!(1.3))
-    ); // Decimal mod Decimal -> Decimal
+    );
     assert_eq!(
         eval("-5.5 mod 2.1", &context),
-        EvaluationResult::Decimal(dec!(-1.3)) // Decimal mod Decimal -> Decimal
+        EvaluationResult::Decimal(dec!(-1.3)) // Result has sign of dividend
     );
+     // Mixed types for mod -> Empty
+    assert_eq!(eval("5.5 mod 2", &context), EvaluationResult::Empty);
+    assert_eq!(eval("5 mod 2.1", &context), EvaluationResult::Empty);
     // Modulo zero
-    assert_eq!(eval("5 mod 0", &context), EvaluationResult::Empty);
+    assert_eq!(eval("5 mod 0", &context), EvaluationResult::Empty); // Integer mod 0
     assert_eq!(eval("5.0 mod 0", &context), EvaluationResult::Empty);
     // Empty propagation
     assert_eq!(eval("5 mod {}", &context), EvaluationResult::Empty);
@@ -2604,26 +2621,35 @@ fn test_operator_math_string_concat() {
 #[test]
 fn test_operator_precedence() {
     let context = EvaluationContext::new_empty();
+    // Results are Decimal due to promotion rules
     assert_eq!(
         eval("1 + 2 * 3", &context),
-        EvaluationResult::Decimal(dec!(7))
+        EvaluationResult::Decimal(dec!(7.0))
     ); // * before +
     assert_eq!(
         eval("(1 + 2) * 3", &context),
-        EvaluationResult::Decimal(dec!(9))
+        EvaluationResult::Decimal(dec!(9.0))
     ); // Parentheses
     assert_eq!(
         eval("5 - 2 + 1", &context),
-        EvaluationResult::Decimal(dec!(4))
+        EvaluationResult::Decimal(dec!(4.0))
     ); // Left-to-right for same precedence (+/-)
     assert_eq!(
         eval("10 / 2 * 5", &context),
-        EvaluationResult::Decimal(dec!(25))
-    ); // Left-to-right for same precedence (*/div/mod)
+        EvaluationResult::Decimal(dec!(25.0))
+    ); // Left-to-right for same precedence (/, *)
+    assert_eq!(
+        eval("10 div 3 * 2", &context), // (10 div 3) * 2 = 3 * 2 = 6
+        EvaluationResult::Decimal(dec!(6.0)) // div before *, result is Decimal
+    );
+     assert_eq!(
+        eval("10 mod 3 + 1", &context), // (10 mod 3) + 1 = 1 + 1 = 2
+        EvaluationResult::Decimal(dec!(2.0)) // mod before +, result is Decimal
+    );
     assert_eq!(
         eval("true or false and false", &context),
         EvaluationResult::Boolean(true)
-    ); // and before or
+    ); // 'and' before 'or'
     assert_eq!(
         eval("(true or false) and false", &context),
         EvaluationResult::Boolean(false)
@@ -2631,14 +2657,14 @@ fn test_operator_precedence() {
     assert_eq!(
         eval("1 < 2 and 3 > 2", &context),
         EvaluationResult::Boolean(true)
-    ); // Comparison before and
+    ); // Comparison before 'and'
     assert_eq!(
         eval("-1 + 5", &context),
-        EvaluationResult::Decimal(dec!(4))
+        EvaluationResult::Decimal(dec!(4.0))
     ); // Unary minus higher than +
     assert_eq!(
         eval("-(1 + 5)", &context),
-        EvaluationResult::Decimal(dec!(-6))
+        EvaluationResult::Decimal(dec!(-6.0))
     );
     // assert_eq!(eval("Patient.name[0].given", &context), EvaluationResult::Empty); // Indexer before path (needs context)
     // Add more complex precedence tests as needed
@@ -3001,20 +3027,33 @@ fn test_resource_oftype() {
 
 #[test]
 fn test_arithmetic_operations() {
+    // Note: Most operations result in Decimal according to FHIRPath spec
     let test_cases = vec![
-        ("1 + 2", EvaluationResult::Decimal(dec!(3))),
-        ("5 - 3", EvaluationResult::Decimal(dec!(2))),
-        ("2 * 3", EvaluationResult::Decimal(dec!(6))),
-        ("6 / 2", EvaluationResult::Decimal(dec!(3))),
+        ("1 + 2", EvaluationResult::Decimal(dec!(3.0))),
+        ("5 - 3", EvaluationResult::Decimal(dec!(2.0))),
+        ("2 * 3", EvaluationResult::Decimal(dec!(6.0))),
+        ("6 / 2", EvaluationResult::Decimal(dec!(3.0))),
         ("7 / 2", EvaluationResult::Decimal(dec!(3.5))),
-        ("7 div 2", EvaluationResult::Integer(3)),
-        ("7 mod 2", EvaluationResult::Integer(1)),
+        ("7 div 2", EvaluationResult::Integer(3)), // div returns Integer
+        ("7 mod 2", EvaluationResult::Integer(1)), // mod returns Integer
         ("5.5 + 2.1", EvaluationResult::Decimal(dec!(7.6))),
         ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))),
         ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))),
         ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))),
-        ("5.5 div 2.1", EvaluationResult::Integer(2)),
-        ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))),
+        ("5.5 div 2.1", EvaluationResult::Integer(2)), // div returns Integer
+        ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // mod returns Decimal
+        // Mixed type div/mod -> Empty
+        ("5.5 div 2", EvaluationResult::Empty),
+        ("5 div 2.1", EvaluationResult::Empty),
+        ("5.5 mod 2", EvaluationResult::Empty),
+        ("5 mod 2.1", EvaluationResult::Empty),
+        // Division by zero -> Empty
+        ("5 / 0", EvaluationResult::Empty),
+        ("5.0 / 0", EvaluationResult::Empty),
+        ("5 div 0", EvaluationResult::Empty),
+        ("5.0 div 0", EvaluationResult::Empty),
+        ("5 mod 0", EvaluationResult::Empty),
+        ("5.0 mod 0", EvaluationResult::Empty),
     ];
 
     // For arithmetic operations, we don't need any resources

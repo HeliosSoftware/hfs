@@ -11,8 +11,8 @@ pub enum Literal {
     Null,
     Boolean(bool),
     String(String),
-    Number(Decimal), // Changed from f64 to Decimal
-    LongNumber(i64),
+    Number(Decimal), // Represents numbers with a decimal point
+    Integer(i64),    // Represents numbers without a decimal point
     Date(String),
     DateTime(String, Option<(String, Option<String>)>),
     Time(String),
@@ -108,7 +108,7 @@ impl fmt::Display for Literal {
             Literal::Boolean(b) => write!(f, "{}", b),
             Literal::String(s) => write!(f, "'{}'", s),
             Literal::Number(d) => write!(f, "{}", d), // Use Decimal's Display
-            Literal::LongNumber(n) => write!(f, "{}", n),
+            Literal::Integer(n) => write!(f, "{}", n),
             Literal::Date(d) => write!(f, "@{}", d),
             Literal::DateTime(date, time_part) => {
                 write!(f, "@{}T", date)?;
@@ -183,46 +183,40 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .map(Literal::String)
         .boxed();
 
+    // Integer parser: matches sequences of digits without a decimal point.
+    let integer = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
+        .validate(|digits, span, emit| match i64::from_str(&digits) {
+            Ok(n) => Literal::Integer(n),
+            Err(_) => {
+                emit(Simple::custom(span, format!("Invalid integer: {}", digits)));
+                Literal::Integer(0) // Default value on error
+            }
+        })
+        .padded(); // Allow whitespace around integers
+
+    // Number parser: matches sequences of digits WITH a decimal point.
     let number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
         .at_least(1)
         .collect::<String>()
+        .then(just('.')) // Require the decimal point
         .then(
-            just('.')
-                .then(
-                    filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-                        .repeated()
-                        .at_least(1)
-                        .collect::<String>(),
-                )
-                .or_not(),
+            filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+                .repeated()
+                .at_least(1) // Require digits after the decimal point
+                .collect::<String>(),
         )
-        .validate(|(i, d_opt), span, emit| {
-            let num_str = if let Some((_, d)) = d_opt {
-                format!("{}.{}", i, d)
-            } else {
-                i
-            };
+        .validate(|((i, _), d), span, emit| {
+            let num_str = format!("{}.{}", i, d);
             match Decimal::from_str(&num_str) {
                 Ok(decimal) => Literal::Number(decimal),
                 Err(_) => {
                     emit(Simple::custom(span, format!("Invalid number: {}", num_str)));
                     Literal::Number(dec!(0)) // Default value on error
                 }
-            }
-        })
-        .padded(); // Allow whitespace around numbers
-
-    let long_number = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
-        .repeated()
-        .at_least(1)
-        .collect::<String>()
-        .then(just('L').or_not())
-        .map(|(i, l)| {
-            if l.is_some() {
-                Literal::LongNumber(i.parse().unwrap())
-            } else {
-                Literal::LongNumber(i.parse().unwrap())
             }
         })
         .padded(); // Allow whitespace around numbers
@@ -452,13 +446,14 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             })
             .padded();
 
+    // Order matters: try integer before number to avoid ambiguity
     let literal = choice((
         null,
         boolean,
         string,
-        quantity,
-        number,
-        long_number,
+        quantity, // Quantity uses number, so must come after integer
+        number,   // Number requires '.', so must come after integer
+        integer,  // Try integer first
         date_datetime_time,
     ))
     .map(Term::Literal);

@@ -191,8 +191,8 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         Literal::Null => EvaluationResult::Empty,
         Literal::Boolean(b) => EvaluationResult::Boolean(*b),
         Literal::String(s) => EvaluationResult::String(s.clone()),
-        Literal::Number(d) => EvaluationResult::Decimal(*d), // Use Decimal
-        Literal::LongNumber(n) => EvaluationResult::Integer(*n),
+        Literal::Number(d) => EvaluationResult::Decimal(*d), // Decimal literal
+        Literal::Integer(n) => EvaluationResult::Integer(*n), // Integer literal
         Literal::Date(d) => EvaluationResult::Date(d.clone()),
         Literal::DateTime(d, t) => {
             if let Some((time, _)) = t {
@@ -454,9 +454,13 @@ fn apply_multiplicative(
     right: &EvaluationResult,
 ) -> EvaluationResult {
     // Promote Integer to Decimal for mixed operations
-    let (left_dec, right_dec) = match (left, right) {
+    let (left_num, right_num) = match (left, right) {
         (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
         (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+            // Keep as Integer if both are Integer for div/mod
+            if op == "div" || op == "mod" {
+                return apply_integer_multiplicative(*l, op, *r);
+            }
             (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
         }
         (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
@@ -467,6 +471,11 @@ fn apply_multiplicative(
         }
         _ => (None, None),
     };
+
+    if let (Some(l), Some(r)) = (left_num, right_num) {
+        match op {
+            "*" => EvaluationResult::Decimal(l * r),
+            "/" => {
 
     if let (Some(l), Some(r)) = (left_dec, right_dec) {
         match op {
@@ -481,53 +490,46 @@ fn apply_multiplicative(
                         .unwrap_or(EvaluationResult::Empty) // Handle potential overflow/errors
                 }
             }
-            "div" => {
-                if r.is_zero() {
-                    EvaluationResult::Empty
-                } else {
-                    // Integer division truncates towards zero
-                    l.checked_div(r)
-                        .map(|d| EvaluationResult::Integer(d.trunc().to_i64().unwrap_or(0))) // Convert truncated Decimal to i64
-                        .unwrap_or(EvaluationResult::Empty)
-                }
-            }
-            "mod" => {
-                if r.is_zero() {
-                    EvaluationResult::Empty
-                } else {
-                    // Modulo operation for Decimals
-                    l.checked_rem(r)
-                        .map(EvaluationResult::Decimal)
-                        .unwrap_or(EvaluationResult::Empty)
-                }
-            }
-            _ => EvaluationResult::Empty, // Unknown operator
+            // div and mod handled by integer path or return Empty if mixed with non-integer
+            _ => EvaluationResult::Empty, // Unknown operator or invalid type combination for div/mod
         }
     } else {
-        // Operands are not compatible numeric types
+        // Operands are not compatible numeric types for *, /
         EvaluationResult::Empty
     }
 }
 
+/// Applies integer-only multiplicative operators (div, mod)
+fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationResult {
+    if right == 0 {
+        return EvaluationResult::Empty; // Division/Modulo by zero
+    }
+    match op {
+        "div" => EvaluationResult::Integer(left / right), // Integer division
+        "mod" => EvaluationResult::Integer(left % right), // Integer modulo
+        _ => EvaluationResult::Empty, // Should not happen if called correctly
+    }
+}
+
+
 /// Applies an additive operator to two values
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
-    // Promote Integer to Decimal for mixed operations
-    let (left_num, right_num) = match (left, right) {
-        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
-        }
-        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-            (Some(*l), Some(Decimal::from(*r)))
-        }
-        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-            (Some(Decimal::from(*l)), Some(*r))
-        }
-        _ => (None, None),
-    };
-
     match op {
         "+" => {
+            // Promote Integer to Decimal for mixed operations
+            let (left_num, right_num) = match (left, right) {
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    (Some(*l), Some(Decimal::from(*r)))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    (Some(Decimal::from(*l)), Some(*r))
+                }
+                _ => (None, None),
+            };
             if let (Some(l), Some(r)) = (left_num, right_num) {
                 EvaluationResult::Decimal(l + r)
             } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right)
@@ -538,6 +540,21 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
             }
         }
         "-" => {
+            // Promote Integer to Decimal for mixed operations
+            let (left_num, right_num) = match (left, right) {
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    (Some(*l), Some(Decimal::from(*r)))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    (Some(Decimal::from(*l)), Some(*r))
+                }
+                _ => (None, None),
+            };
+
             if let (Some(l), Some(r)) = (left_num, right_num) {
                 EvaluationResult::Decimal(l - r)
             } else {
@@ -638,23 +655,43 @@ fn compare_inequality(
     right: &EvaluationResult,
 ) -> EvaluationResult {
     // Promote Integer to Decimal for mixed comparisons
-    let (left_num, right_num) = match (left, right) {
-        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
-        }
+    let compare_result = match (left, right) {
+        // Both Decimal
+        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => Some(l.cmp(r)),
+        // Both Integer
+        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => Some(l.cmp(r)),
+        // Mixed Decimal/Integer
         (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-            (Some(*l), Some(Decimal::from(*r)))
+            Some(l.cmp(&Decimal::from(*r)))
         }
         (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-            (Some(Decimal::from(*l)), Some(*r))
+            Some(Decimal::from(*l).cmp(r))
         }
-        _ => (None, None),
+        // String comparison
+        (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
+        // Date comparison
+        (EvaluationResult::Date(l), EvaluationResult::Date(r)) => Some(l.cmp(r)),
+        // DateTime comparison
+        (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
+        // Time comparison
+        (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
+        // Incomparable types
+        _ => None,
     };
 
-    if let (Some(l), Some(r)) = (left_num, right_num) {
+    if let Some(ordering) = compare_result {
         let result = match op {
-            "<" => l < r,
+            "<" => ordering.is_lt(),
+            "<=" => ordering.is_le(),
+            ">" => ordering.is_gt(),
+            ">=" => ordering.is_ge(),
+            _ => false, // Should not happen
+        };
+        EvaluationResult::Boolean(result)
+    } else {
+        EvaluationResult::Empty // Incomparable types result in Empty
+    }
+}
             "<=" => l <= r,
                 ">" => l > r,
                 ">=" => l >= r,
