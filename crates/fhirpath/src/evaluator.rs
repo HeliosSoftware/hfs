@@ -2354,11 +2354,6 @@ fn compare_equality(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
-    // FHIRPath Spec 5.1 Equality: If either operand is empty, the result is empty.
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-        return EvaluationResult::Empty;
-    }
-
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();
@@ -2368,6 +2363,10 @@ fn compare_equality(
 
     match op {
         "=" => {
+            // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
+            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
             // Strict equality: Order and duplicates matter for collections
             match (left, right) {
                 (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
@@ -2401,15 +2400,21 @@ fn compare_equality(
             }
         }
         "!=" => {
+            // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
+            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+                return EvaluationResult::Empty;
+            }
             // Strict inequality: Negation of '='
             let eq_result = compare_equality(left, "=", right);
             match eq_result {
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                _ => EvaluationResult::Empty, // Should not happen if '=' returns boolean
+                // If '=' returned Empty (due to empty operand), '!=' also returns Empty
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                _ => EvaluationResult::Empty, // Should not happen otherwise
             }
         }
         "~" => {
-            // Equivalence: Order and duplicates DON'T matter for collections
+            // Equivalence: Order doesn't matter, duplicates DO matter.
             match (left, right) {
                 // Handle Empty cases first
                 (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
@@ -2447,10 +2452,20 @@ fn compare_equality(
         }
         "!~" => {
             // Non-equivalence: Negation of '~'
-            let equiv_result = compare_equality(left, "~", right);
-            match equiv_result {
-                EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                _ => EvaluationResult::Empty, // Should not happen if '~' returns boolean
+            // Handle empty cases specifically for '!~'
+            match (left, right) {
+                 (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(false), // Empty is equivalent to Empty
+                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(true), // Empty is not equivalent to non-empty
+                 // For non-empty operands, negate the result of '~'
+                 _ => {
+                     let equiv_result = compare_equality(left, "~", right);
+                     match equiv_result {
+                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                         // If '~' somehow returned Empty for non-empty operands, propagate Empty
+                         EvaluationResult::Empty => EvaluationResult::Empty,
+                         _ => EvaluationResult::Empty, // Should not happen
+                     }
+                 }
             }
         }
         _ => EvaluationResult::Empty, // Unknown operator
