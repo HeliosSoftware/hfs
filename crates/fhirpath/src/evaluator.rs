@@ -183,7 +183,7 @@ fn evaluate_term(
                     .cloned()
                     .unwrap_or_else(|| {
                         // If no specific item context, use the main context resource(s)
-                        if context.resources.is_empty() {
+                        let result = if context.resources.is_empty() {
                             EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
                             // If only one resource, return it directly
@@ -197,7 +197,8 @@ fn evaluate_term(
                                     .map(convert_resource_to_result)
                                     .collect(),
                             )
-                        }
+                        };
+                        result // Explicitly return the result from the closure
                     });
             }
 
