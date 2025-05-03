@@ -51,7 +51,7 @@ fn test_expression_literals() {
         eval("123.45", &context),
         EvaluationResult::Decimal(dec!(123.45)) // Use Decimal
     );
-    assert_eq!(eval("0.0", &context), EvaluationResult::Decimal(dec!(0.0))); // Use Decimal
+    assert_eq!(eval("0.0", &context), EvaluationResult::Decimal(dec!(0.0)));
     // Date
     assert_eq!(
         eval("@2015-02-04", &context),
@@ -2077,8 +2077,10 @@ fn test_operator_comparison() {
     assert_eq!(eval("'a' < 'b'", &context), EvaluationResult::Boolean(true));
     // Implicit conversion
     assert_eq!(eval("2 > 1.5", &context), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1.5 < 2", &context), EvaluationResult::Boolean(true)); // Decimal vs Integer
-    assert_eq!(eval("2 > 1.5", &context), EvaluationResult::Boolean(true)); // Integer vs Decimal
+    assert_eq!(eval("1.5 < 2", &context), EvaluationResult::Boolean(true)); // Decimal < Integer
+    assert_eq!(eval("2 > 1.5", &context), EvaluationResult::Boolean(true)); // Integer > Decimal
+    assert_eq!(eval("1 <= 1.0", &context), EvaluationResult::Boolean(true)); // Integer <= Decimal
+    assert_eq!(eval("1.0 >= 1", &context), EvaluationResult::Boolean(true)); // Decimal >= Integer
     // Empty propagation
     assert_eq!(eval("1 > {}", &context), EvaluationResult::Empty);
     assert_eq!(eval("{} > 1", &context), EvaluationResult::Empty);
