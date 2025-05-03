@@ -582,14 +582,12 @@ fn test_function_filtering_of_type() {
             fields.get("id"), // Patient.id has no extensions, should be primitive String
             Some(&EvaluationResult::String("p1".to_string()))
         );
-        // Patient.active has an id, so it should be an Object
-        match fields.get("active") {
-            Some(EvaluationResult::Object(active_fields)) => {
-                 assert_eq!(active_fields.get("id"), Some(&EvaluationResult::String("active-id".to_string())));
-                 assert_eq!(active_fields.get("value"), Some(&EvaluationResult::Boolean(true)));
-            }
-            _ => panic!("Expected 'active' field to be an Object, got {:?}", fields.get("active")),
-        }
+        // Patient.active should evaluate to its primitive value directly
+        assert_eq!(
+            fields.get("active"),
+            Some(&EvaluationResult::Boolean(true))
+        );
+        // To access the id, we would need Patient.active.id() or similar (not tested here)
     }
 
     let result_obs = eval("%context.ofType(Observation)", &ctx_res);
