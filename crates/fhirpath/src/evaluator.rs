@@ -1203,6 +1203,32 @@ fn call_function(
                 EvaluationResult::Collection(combined_items)
             }
         }
+        "convertsToInteger" => {
+            // Checks if the input can be converted to Integer
+            match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
+                EvaluationResult::Collection(items) => {
+                    // Only single-item collections can be converted
+                    if items.len() == 1 {
+                        // Recursively call convertsToInteger on the single item
+                        call_function("convertsToInteger", &items[0], &[])
+                    } else {
+                        EvaluationResult::Boolean(false) // Multi-item collection cannot be converted
+                    }
+                }
+                // Check convertibility for single items
+                EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::String(s) => {
+                    // Check if the string parses to an i64
+                    EvaluationResult::Boolean(s.parse::<i64>().is_ok())
+                }
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true), // Booleans can convert (0 or 1)
+                // Per FHIRPath spec, Decimal cannot be converted unless it has no fractional part
+                EvaluationResult::Decimal(d) => EvaluationResult::Boolean(d.fract() == Decimal::ZERO),
+                // Other types are not convertible to Integer
+                _ => EvaluationResult::Boolean(false),
+            }
+        }
         "convertsToBoolean" => {
             // Checks if the input can be converted to Boolean
             match invocation_base {
@@ -1278,8 +1304,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "convertsToBoolean" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean"].contains(&name) {
+             // Added "convertsToInteger" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
