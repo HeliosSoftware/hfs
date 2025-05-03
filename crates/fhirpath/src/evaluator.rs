@@ -55,6 +55,28 @@ impl EvaluationContext {
     }
 }
 
+/// Applies decimal-only multiplicative operators (div, mod)
+fn apply_decimal_multiplicative(left: Decimal, op: &str, right: Decimal) -> EvaluationResult {
+    if right.is_zero() {
+        return EvaluationResult::Empty; // Division/Modulo by zero
+    }
+    match op {
+        "div" => {
+            // Decimal div Decimal -> Integer (truncate)
+            (left / right)
+                .trunc() // Truncate the result
+                .to_i64() // Convert to i64
+                .map(EvaluationResult::Integer)
+                .unwrap_or(EvaluationResult::Empty) // Handle potential conversion errors
+        }
+        "mod" => {
+            // Decimal mod Decimal -> Decimal
+            EvaluationResult::Decimal(left % right)
+        }
+        _ => EvaluationResult::Empty, // Should not happen
+    }
+}
+
 /// Evaluates a FHIRPath expression in the given context, potentially with a specific item as context ($this).
 pub fn evaluate(
     expr: &Expression,
@@ -847,44 +869,70 @@ fn apply_multiplicative(
     op: &str,
     right: &EvaluationResult,
 ) -> EvaluationResult {
-    // Promote Integer to Decimal for mixed operations
-    let (left_num, right_num) = match (left, right) {
-        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-            // Keep as Integer if both are Integer for div/mod
-            if op == "div" || op == "mod" {
-                return apply_integer_multiplicative(*l, op, *r);
+    match op {
+        "*" => {
+            // Handle multiplication: Int * Int = Int, otherwise Decimal
+            match (left, right) {
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    // Check for potential overflow before multiplying
+                    l.checked_mul(*r)
+                        .map(EvaluationResult::Integer)
+                        .unwrap_or(EvaluationResult::Empty) // Return Empty on overflow
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Decimal(*l * *r)
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    EvaluationResult::Decimal(*l * Decimal::from(*r))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Decimal(Decimal::from(*l) * *r)
+                }
+                _ => EvaluationResult::Empty, // Invalid types for multiplication
             }
-            (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
         }
-        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-            (Some(*l), Some(Decimal::from(*r)))
-        }
-        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-            (Some(Decimal::from(*l)), Some(*r))
-        }
-        _ => (None, None),
-    };
+        "/" => {
+            // Handle division: Always results in Decimal
+            let left_dec = match left {
+                EvaluationResult::Decimal(d) => Some(*d),
+                EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+                _ => None,
+            };
+            let right_dec = match right {
+                EvaluationResult::Decimal(d) => Some(*d),
+                EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+                _ => None,
+            };
 
-    if let (Some(l), Some(r)) = (left_num, right_num) {
-        match op {
-            "*" => EvaluationResult::Decimal(l * r),
-            "/" => {
+            if let (Some(l), Some(r)) = (left_dec, right_dec) {
                 if r.is_zero() {
-                    EvaluationResult::Empty
+                    EvaluationResult::Empty // Division by zero
                 } else {
                     // Decimal division preserves precision
                     l.checked_div(r)
                         .map(EvaluationResult::Decimal)
+                        .map(EvaluationResult::Decimal)
                         .unwrap_or(EvaluationResult::Empty) // Handle potential overflow/errors
+                } else {
+                    EvaluationResult::Empty // Invalid types for division
                 }
+            } else {
+                 EvaluationResult::Empty // Invalid types for division
             }
-            // div and mod handled by integer path or return Empty if mixed with non-integer
-            _ => EvaluationResult::Empty, // Unknown operator or invalid type combination for div/mod
         }
-    } else {
-        // Operands are not compatible numeric types for *, /
-        EvaluationResult::Empty
+        "div" | "mod" => {
+            // Handle div/mod: Int/Int -> Int, Dec/Dec -> Int/Dec, mixed -> Empty
+            match (left, right) {
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    apply_integer_multiplicative(*l, op, *r)
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => {
+                    apply_decimal_multiplicative(*l, op, *r) // Need helper for Decimal div/mod
+                }
+                _ => EvaluationResult::Empty, // Mixed types are invalid for div/mod
+            }
+        }
+        _ => EvaluationResult::Empty, // Unknown operator
     }
 }
 
@@ -903,57 +951,47 @@ fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationRe
 
 /// Applies an additive operator to two values
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
+    // Promote Integer to Decimal for numeric operations
+    let left_dec = match left {
+        EvaluationResult::Decimal(d) => Some(*d),
+        EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+        _ => None,
+    };
+    let right_dec = match right {
+        EvaluationResult::Decimal(d) => Some(*d),
+        EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+        _ => None,
+    };
+
     match op {
         "+" => {
-            // Promote Integer to Decimal for mixed operations
-            let (left_num, right_num) = match (left, right) {
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-                    (Some(*l), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-                    (Some(Decimal::from(*l)), Some(*r))
-                }
-                _ => (None, None),
-            };
-            // Handle numeric addition
-            if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l + r) // Correct: Use addition for '+'
-            // Handle string concatenation
+            // Handle numeric addition (always results in Decimal)
+            if let (Some(l), Some(r)) = (left_dec, right_dec) {
+                EvaluationResult::Decimal(l + r)
+            // Handle string concatenation (operator '&' is preferred, but '+' is allowed)
             } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right) {
-                EvaluationResult::String(format!("{}{}", l, r)) // Correct: Concatenate for '+'
+                EvaluationResult::String(format!("{}{}", l, r))
             } else {
-                // Addition is not defined for other type combinations
+                // Addition is not defined for other type combinations or if promotion failed
                 EvaluationResult::Empty
             }
         }
         "-" => {
-            // Promote Integer to Decimal for mixed operations
-            let (left_num, right_num) = match (left, right) {
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
-                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-                    (Some(*l), Some(Decimal::from(*r)))
-                }
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-                    (Some(Decimal::from(*l)), Some(*r))
-                }
-                _ => (None, None),
-            };
-            // Handle numeric subtraction
-            if let (Some(l), Some(r)) = (left_num, right_num) {
-                EvaluationResult::Decimal(l - r) // Correct: Use subtraction for '-'
+            // Handle numeric subtraction (always results in Decimal)
+            if let (Some(l), Some(r)) = (left_dec, right_dec) {
+                EvaluationResult::Decimal(l - r)
             } else {
-                // Subtraction is only defined for numeric types
+                // Subtraction is only defined for numeric types or if promotion failed
                 EvaluationResult::Empty
             }
         }
-        _ => EvaluationResult::Empty,
+        "&" => {
+             // Handle string concatenation using '&'
+             let left_str = left.to_string_value(); // Convert left to string
+             let right_str = right.to_string_value(); // Convert right to string
+             EvaluationResult::String(format!("{}{}", left_str, right_str))
+        }
+        _ => EvaluationResult::Empty, // Unknown operator
     }
 }
 

@@ -488,9 +488,9 @@ fn test_function_filtering_select() {
     assert_eq!(
         eval("(1 | 2 | 3).select($this * 2)", &context),
         collection(vec![
-            EvaluationResult::Decimal(dec!(2.0)), // Result should be Decimal
-            EvaluationResult::Decimal(dec!(4.0)), // Result should be Decimal
-            EvaluationResult::Decimal(dec!(6.0))  // Result should be Decimal
+            EvaluationResult::Integer(2), // Result should be Integer
+            EvaluationResult::Integer(4), // Result should be Integer
+            EvaluationResult::Integer(6)  // Result should be Integer
         ])
     );
     // Test flattening
@@ -2419,10 +2419,10 @@ fn test_operator_math_multiply() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("2 * 3", &context),
-        EvaluationResult::Decimal(dec!(6.0)) // Result is Decimal (explicit .0)
+        EvaluationResult::Integer(6) // Result is Integer
     );
     assert_eq!(
-        eval("2.5 * 2", &context),
+        eval("2.5 * 2", &context), // Decimal * Integer -> Decimal
         EvaluationResult::Decimal(dec!(5.0))
     ); // Decimal * Integer -> Decimal
     assert_eq!(
@@ -2478,10 +2478,10 @@ fn test_operator_math_add() {
     // Numbers - All result in Decimal
     assert_eq!(
         eval("1 + 2", &context),
-        EvaluationResult::Decimal(dec!(3.0)) // Integer + Integer -> Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(3.0)) // Integer + Integer -> Decimal
     );
     assert_eq!(
-        eval("1.5 + 2", &context),
+        eval("1.5 + 2", &context), // Decimal + Integer -> Decimal
         EvaluationResult::Decimal(dec!(3.5))
     ); // Decimal + Integer -> Decimal
     assert_eq!(
@@ -2515,10 +2515,10 @@ fn test_operator_math_subtract() {
     // All result in Decimal
     assert_eq!(
         eval("5 - 3", &context),
-        EvaluationResult::Decimal(dec!(2.0)) // Integer - Integer -> Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(2.0)) // Integer - Integer -> Decimal
     );
     assert_eq!(
-        eval("5.5 - 3", &context),
+        eval("5.5 - 3", &context), // Decimal - Integer -> Decimal
         EvaluationResult::Decimal(dec!(2.5))
     ); // Decimal - Integer -> Decimal
     assert_eq!(
@@ -2623,47 +2623,59 @@ fn test_operator_math_string_concat() {
 #[test]
 fn test_operator_precedence() {
     let context = EvaluationContext::new_empty();
-    // Results are Decimal due to promotion rules
+    // Results depend on operators
+    // 1 + (2 * 3) = 1 + 6 = 7.0 (Addition -> Decimal)
     assert_eq!(
         eval("1 + 2 * 3", &context),
         EvaluationResult::Decimal(dec!(7.0))
-    ); // * before +
+    );
+    // (1 + 2) * 3 = 3.0 * 3 = 9.0 (Addition -> Decimal, then Decimal * Integer -> Decimal)
     assert_eq!(
         eval("(1 + 2) * 3", &context),
         EvaluationResult::Decimal(dec!(9.0))
-    ); // Parentheses
+    );
+    // (5 - 2) + 1 = 3.0 + 1 = 4.0 (Subtraction -> Decimal, then Decimal + Integer -> Decimal)
     assert_eq!(
         eval("5 - 2 + 1", &context),
         EvaluationResult::Decimal(dec!(4.0))
-    ); // Left-to-right for same precedence (+/-)
+    );
+    // (10 / 2) * 5 = 5.0 * 5 = 25.0 (Division -> Decimal, then Decimal * Integer -> Decimal)
     assert_eq!(
         eval("10 / 2 * 5", &context),
         EvaluationResult::Decimal(dec!(25.0))
-    ); // Left-to-right for same precedence (/, *)
-    assert_eq!(
-        eval("10 div 3 * 2", &context), // (10 div 3) * 2 = 3 * 2 = 6
-        EvaluationResult::Decimal(dec!(6.0)) // div before *, result is Decimal
     );
-     assert_eq!(
-        eval("10 mod 3 + 1", &context), // (10 mod 3) + 1 = 1 + 1 = 2
-        EvaluationResult::Decimal(dec!(2.0)) // mod before +, result is Decimal
+     // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
+    assert_eq!(
+        eval("10 div 3 * 2", &context),
+        EvaluationResult::Integer(6)
+    );
+     // (10 mod 3) + 1 = 1 + 1 = 2.0 (mod -> Integer, then Integer + Integer -> Decimal)
+    assert_eq!(
+        eval("10 mod 3 + 1", &context),
+        EvaluationResult::Decimal(dec!(2.0))
     );
     assert_eq!(
-        eval("true or false and false", &context),
+        eval("true or false and false", &context), // 'and' before 'or'
         EvaluationResult::Boolean(true)
     ); // 'and' before 'or'
     assert_eq!(
         eval("(true or false) and false", &context),
         EvaluationResult::Boolean(false)
-    ); // Parentheses
+    );
     assert_eq!(
-        eval("1 < 2 and 3 > 2", &context),
+        eval("(true or false) and false", &context), // Parentheses
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 < 2 and 3 > 2", &context), // Comparison before 'and'
         EvaluationResult::Boolean(true)
-    ); // Comparison before 'and'
+    );
+    // (-1) + 5 = 4.0 (Unary minus, then Integer + Integer -> Decimal)
     assert_eq!(
         eval("-1 + 5", &context),
         EvaluationResult::Decimal(dec!(4.0))
-    ); // Unary minus higher than +
+    );
+     // -(1 + 5) = -(6.0) = -6.0 (Addition -> Decimal, then Unary minus)
     assert_eq!(
         eval("-(1 + 5)", &context),
         EvaluationResult::Decimal(dec!(-6.0))
@@ -3029,23 +3041,23 @@ fn test_resource_oftype() {
 
 #[test]
 fn test_arithmetic_operations() {
-    // Note: Most operations result in Decimal according to FHIRPath spec
+    // Note: Result types vary based on operator and operands
     let test_cases = vec![
-        ("1 + 2", EvaluationResult::Decimal(dec!(3.0))),
-        ("5 - 3", EvaluationResult::Decimal(dec!(2.0))),
-        ("2 * 3", EvaluationResult::Decimal(dec!(6.0))),
-        ("6 / 2", EvaluationResult::Decimal(dec!(3.0))),
-        ("7 / 2", EvaluationResult::Decimal(dec!(3.5))),
-        ("7 div 2", EvaluationResult::Integer(3)), // div returns Integer
-        ("7 mod 2", EvaluationResult::Integer(1)), // mod returns Integer
-        ("5.5 + 2.1", EvaluationResult::Decimal(dec!(7.6))),
-        ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))),
-        ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))),
-        ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))),
-        ("5.5 div 2.1", EvaluationResult::Integer(2)), // div returns Integer
-        ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // mod returns Decimal
+        ("1 + 2", EvaluationResult::Decimal(dec!(3.0))), // Addition -> Decimal
+        ("5 - 3", EvaluationResult::Decimal(dec!(2.0))), // Subtraction -> Decimal
+        ("2 * 3", EvaluationResult::Integer(6)),         // Integer Multiplication -> Integer
+        ("6 / 2", EvaluationResult::Decimal(dec!(3.0))), // Division -> Decimal
+        ("7 / 2", EvaluationResult::Decimal(dec!(3.5))), // Division -> Decimal
+        ("7 div 2", EvaluationResult::Integer(3)),       // Integer div -> Integer
+        ("7 mod 2", EvaluationResult::Integer(1)),       // Integer mod -> Integer
+        ("5.5 + 2.1", EvaluationResult::Decimal(dec!(7.6))), // Decimal Add -> Decimal
+        ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))), // Decimal Sub -> Decimal
+        ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))), // Decimal Mult -> Decimal
+        ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))), // Decimal Div -> Decimal
+        ("5.5 div 2.1", EvaluationResult::Integer(2)),       // Decimal div -> Integer
+        ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // Decimal mod -> Decimal
         // Mixed type div/mod -> Empty
-        ("5.5 div 2", EvaluationResult::Empty),
+        ("5.5 div 2", EvaluationResult::Empty), // Decimal div Integer -> Empty
         ("5 div 2.1", EvaluationResult::Empty),
         ("5.5 mod 2", EvaluationResult::Empty),
         ("5 mod 2.1", EvaluationResult::Empty),
