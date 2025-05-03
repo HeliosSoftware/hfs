@@ -195,10 +195,22 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
         Literal::Integer(n) => EvaluationResult::Integer(*n), // Integer literal
         Literal::Date(d) => EvaluationResult::Date(d.clone()),
         Literal::DateTime(d, t) => {
-            if let Some((time, _)) = t {
-                EvaluationResult::DateTime(format!("{}T{}", d, time))
+            // Include timezone in the result string if present
+            if let Some((time, timezone_opt)) = t {
+                let mut dt_string = format!("{}T{}", d, time);
+                if let Some(tz) = timezone_opt {
+                    dt_string.push_str(tz);
+                }
+                EvaluationResult::DateTime(dt_string)
             } else {
-                EvaluationResult::DateTime(d.clone())
+                // Handle date-only DateTime literals (e.g., @2023T) if necessary,
+                // though the parser might prevent this specific case.
+                // For now, assume if 't' is None, it's just a date.
+                // However, the Literal::Date variant should handle this.
+                // If we reach here with t=None, it might indicate a parser issue
+                // or an unexpected Literal variant. Let's treat it as just the date part for now.
+                 eprintln!("Warning: DateTime literal evaluated without time part: {}", d);
+                 EvaluationResult::DateTime(d.clone()) // Or potentially return Date(d.clone()) or Empty
             }
         }
         Literal::Time(t) => EvaluationResult::Time(t.clone()),
