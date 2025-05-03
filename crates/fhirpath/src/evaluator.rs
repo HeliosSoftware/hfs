@@ -511,23 +511,29 @@ fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationRe
 fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> EvaluationResult {
     match op {
         "+" => {
-                if r.is_zero() {
-                    EvaluationResult::Empty
-                } else {
-                    // Decimal division preserves precision
-                    l.checked_div(r)
-                        .map(EvaluationResult::Decimal)
-                        .unwrap_or(EvaluationResult::Empty) // Handle potential overflow/errors
+            // Promote Integer to Decimal for mixed operations
+            let (left_num, right_num) = match (left, right) {
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => (Some(*l), Some(*r)),
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    (Some(Decimal::from(*l)), Some(Decimal::from(*r)))
                 }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    (Some(*l), Some(Decimal::from(*r)))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    (Some(Decimal::from(*l)), Some(*r))
+                }
+                _ => (None, None),
+            };
+            if let (Some(l), Some(r)) = (left_num, right_num) {
+                EvaluationResult::Decimal(l + r)
+            } else if let (EvaluationResult::String(l), EvaluationResult::String(r)) = (left, right)
+            {
+                EvaluationResult::String(format!("{}{}", l, r))
+            } else {
+                EvaluationResult::Empty
             }
-            // div and mod handled by integer path or return Empty if mixed with non-integer
-            _ => EvaluationResult::Empty, // Unknown operator or invalid type combination for div/mod
         }
-    } else {
-        // Operands are not compatible numeric types for *, /
-        EvaluationResult::Empty
-    }
-}
 
 /// Applies integer-only multiplicative operators (div, mod)
 fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> EvaluationResult {
@@ -711,29 +717,6 @@ fn compare_inequality(
 
     if let Some(ordering) = compare_result {
         let result = match op {
-            "<" => ordering.is_lt(),
-            "<=" => ordering.is_le(),
-            ">" => ordering.is_gt(),
-            ">=" => ordering.is_ge(),
-            _ => false, // Should not happen
-        };
-        EvaluationResult::Boolean(result)
-    } else {
-        EvaluationResult::Empty // Incomparable types result in Empty
-        // String comparison
-        (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
-        // Date comparison
-        (EvaluationResult::Date(l), EvaluationResult::Date(r)) => Some(l.cmp(r)),
-        // DateTime comparison
-        (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
-        // Time comparison
-        (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
-        // Incomparable types
-        _ => None,
-    };
-
-    if let Some(ordering) = compare_result {
-        let result = match op { // Define result here
             "<" => ordering.is_lt(),
             "<=" => ordering.is_le(),
             ">" => ordering.is_gt(),
