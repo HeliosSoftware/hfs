@@ -180,24 +180,27 @@ fn evaluate_term(
             // Handle $this invocation
             if let Invocation::This = invocation {
                 // Determine the value for $this without using unwrap_or_else
-                let this_value = match current_item.cloned() {
-                    Some(item) => item, // Use the provided current_item if it exists
-                    // Remove braces, treat if/else if/else directly as the expression for the None arm
-                    None => if context.resources.is_empty() {
-                        EvaluationResult::Empty
+                // Determine the value for $this and return immediately
+                if let Some(item) = current_item.cloned() {
+                    return item; // Return the provided current_item if it exists
+                } else {
+                    // Otherwise, determine the default context based on resources and return
+                    if context.resources.is_empty() {
+                        return EvaluationResult::Empty;
                     } else if context.resources.len() == 1 {
-                        convert_resource_to_result(&context.resources[0])
+                        return convert_resource_to_result(&context.resources[0]);
                     } else {
-                        EvaluationResult::Collection(
+                        return EvaluationResult::Collection(
                             context
                                 .resources
                                 .iter()
                                 .map(convert_resource_to_result)
                                 .collect(),
-                        )
-                    }, // Add comma after the expression for the None arm
-                };
-                return this_value; // Return the determined value for $this
+                        );
+                    }
+                }
+                // The code below this point in the `if let Invocation::This` block is now unreachable,
+                // but that's okay as we handle all cases above.
             }
 
             // Check if this is a variable reference (starting with %)
