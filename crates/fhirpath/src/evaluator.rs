@@ -2418,14 +2418,26 @@ fn compare_equality(
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
                 }
-                // Collection equivalence
+                // Collection equivalence: Order doesn't matter, duplicates DO matter.
                 (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
-                    // Compare the sets of distinct items
-                    let l_set: HashSet<_> = l_items.iter().cloned().collect();
-                    let r_set: HashSet<_> = r_items.iter().cloned().collect();
-                    EvaluationResult::Boolean(l_set == r_set)
+                    if l_items.len() != r_items.len() {
+                        EvaluationResult::Boolean(false) // Different counts cannot be equivalent
+                    } else {
+                        // Sort copies of the collections
+                        let mut l_sorted = l_items.clone();
+                        let mut r_sorted = r_items.clone();
+                        // Note: Sorting requires Ord. EvaluationResult implements Ord.
+                        l_sorted.sort();
+                        r_sorted.sort();
+
+                        // Compare sorted collections element-wise using '~' recursively
+                        let all_equivalent = l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
+                            compare_equality(li, "~", ri).to_boolean()
+                        });
+                        EvaluationResult::Boolean(all_equivalent)
+                    }
                 }
-                // If only one is a collection, they are not equivalent
+                // If only one is a collection, they are not equivalent (Empty case handled earlier)
                 (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
                     EvaluationResult::Boolean(false)
                 }

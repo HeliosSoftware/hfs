@@ -2317,10 +2317,10 @@ fn test_operator_equality_equivalent() {
     ); // Different count
     assert_eq!(
         eval("(1|1) ~ (1)", &context),
-        EvaluationResult::Boolean(false)
-    ); // Duplicates matter for count
+        EvaluationResult::Boolean(false) // Duplicates matter, counts differ
+    );
     assert_eq!(
-        eval("(1|2|1) ~ (1|1|2)", &context),
+        eval("(1|2|1) ~ (1|1|2)", &context), // Same elements, different order, same counts
         EvaluationResult::Boolean(true)
     );
     // Empty comparison
