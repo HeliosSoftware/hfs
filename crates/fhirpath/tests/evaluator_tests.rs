@@ -759,6 +759,9 @@ fn test_function_subsetting_take() {
             EvaluationResult::Integer(20)
         ])
     );
+    // Add the missing assert_eq! for take(3)
+    assert_eq!(
+        eval("(10 | 20 | 30).take(3)", &context),
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
