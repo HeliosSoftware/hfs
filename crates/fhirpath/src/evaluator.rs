@@ -2214,20 +2214,37 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::String(format!("{}{}", l, r))
                 }
-                // Handle String + Number (attempt conversion)
+                // Handle String + Number (attempt conversion, prioritize Integer result if possible)
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
-                    s.parse::<Decimal>()
-                        .ok()
-                        .map(|d| EvaluationResult::Decimal(d + Decimal::from(*i)))
-                        .unwrap_or(EvaluationResult::Empty)
+                    // Try parsing string as Integer first
+                    if let Ok(s_int) = s.parse::<i64>() {
+                        s_int.checked_add(*i)
+                             .map(EvaluationResult::Integer)
+                             .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                    } else {
+                        // If not integer, try parsing as Decimal
+                        s.parse::<Decimal>()
+                            .ok()
+                            .map(|d| EvaluationResult::Decimal(d + Decimal::from(*i)))
+                            .unwrap_or(EvaluationResult::Empty)
+                    }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
-                    s.parse::<Decimal>()
-                        .ok()
-                        .map(|d| EvaluationResult::Decimal(Decimal::from(*i) + d))
-                        .unwrap_or(EvaluationResult::Empty)
+                    // Try parsing string as Integer first
+                    if let Ok(s_int) = s.parse::<i64>() {
+                         i.checked_add(s_int)
+                          .map(EvaluationResult::Integer)
+                          .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                    } else {
+                        // If not integer, try parsing as Decimal
+                        s.parse::<Decimal>()
+                            .ok()
+                            .map(|d| EvaluationResult::Decimal(Decimal::from(*i) + d))
+                            .unwrap_or(EvaluationResult::Empty)
+                    }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
+                    // String + Decimal -> Decimal
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd + *d))
@@ -2262,20 +2279,37 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Decimal(Decimal::from(*l) - *r)
                 }
-                // Handle String - Number (attempt conversion)
+                // Handle String - Number (attempt conversion, prioritize Integer result if possible)
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
-                    s.parse::<Decimal>()
-                        .ok()
-                        .map(|d| EvaluationResult::Decimal(d - Decimal::from(*i)))
-                        .unwrap_or(EvaluationResult::Empty)
+                    // Try parsing string as Integer first
+                    if let Ok(s_int) = s.parse::<i64>() {
+                        s_int.checked_sub(*i)
+                             .map(EvaluationResult::Integer)
+                             .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                    } else {
+                        // If not integer, try parsing as Decimal
+                        s.parse::<Decimal>()
+                            .ok()
+                            .map(|d| EvaluationResult::Decimal(d - Decimal::from(*i)))
+                            .unwrap_or(EvaluationResult::Empty)
+                    }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
-                    s.parse::<Decimal>()
-                        .ok()
-                        .map(|d| EvaluationResult::Decimal(Decimal::from(*i) - d))
-                        .unwrap_or(EvaluationResult::Empty)
+                    // Try parsing string as Integer first
+                    if let Ok(s_int) = s.parse::<i64>() {
+                         i.checked_sub(s_int)
+                          .map(EvaluationResult::Integer)
+                          .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                    } else {
+                        // If not integer, try parsing as Decimal
+                        s.parse::<Decimal>()
+                            .ok()
+                            .map(|d| EvaluationResult::Decimal(Decimal::from(*i) - d))
+                            .unwrap_or(EvaluationResult::Empty)
+                    }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
+                    // String - Decimal -> Decimal
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd - *d))
