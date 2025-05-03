@@ -1304,8 +1304,8 @@ fn call_function(
         // Add other standard functions here
         _ => {
              // Only print warning for functions not handled elsewhere
-             // Added "convertsToInteger" to the list of handled functions
-             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger"].contains(&name) {
+             // Added "toDecimal" to the list of handled functions
+             if !["where", "select", "exists", "all", "iif", "ofType", "toBoolean", "convertsToBoolean", "toInteger", "convertsToInteger", "toDecimal"].contains(&name) {
                  eprintln!("Warning: Unsupported function called: {}", name);
              }
              EvaluationResult::Empty
