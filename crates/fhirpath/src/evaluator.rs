@@ -593,7 +593,7 @@ fn evaluate_exists_with_criteria(
         let criteria_result = evaluate(criteria_expr, context, Some(&item))?;
         // exists returns true if the criteria evaluates to true for *any* item
         if criteria_result.to_boolean() {
-            return Ok(EvaluationResult::Boolean(true)); // Already Ok, no change needed here, error is elsewhere
+            return Ok(EvaluationResult::Boolean(true)); // Ensure this return is Ok()
         }
     }
 
@@ -1037,11 +1037,7 @@ fn call_function(
                         .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(), // This arm is unreachable due to the count check above
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1065,11 +1061,7 @@ fn call_function(
                 // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
                 EvaluationResult::Decimal(_) => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1078,8 +1070,8 @@ fn call_function(
             // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
                 EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // Wrap in Ok
-                single_item => return Ok(single_item.clone()), // Wrap in Ok
+                EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
+                single_item => return Ok(single_item.clone()), // Wrap single_item return in Ok
             };
 
             // If we reach here, items has at least 2 elements
@@ -1502,11 +1494,7 @@ fn call_function(
             Ok(match invocation_base { // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // toString on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Convert single item to string
                 single_item => EvaluationResult::String(single_item.to_string_value()),
             })
@@ -1556,11 +1544,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1608,11 +1592,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1678,11 +1658,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1773,10 +1749,14 @@ fn call_function(
                 }
                 // Collections handled by initial check
                 EvaluationResult::Collection(items) => {
-                    // This case is now unreachable due to the initial count check
-                    // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
+                    // This case is now unreachable due to the initial count check,
+                    // but if it were reachable, it would need the ? operator.
+                    // For now, keep it as Empty to satisfy types.
+                    if items.len() == 1 {
+                       call_function("toQuantity", &items[0], &[])? // Add ?
+                    } else {
+                       unreachable!("Multi-item collection should have caused an error earlier")
+                    }
                 }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             }) // Close the Ok() wrapper here
@@ -1822,11 +1802,7 @@ fn call_function(
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
                 EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => return Err(EvaluationError::TypeError("length() requires a String input".to_string())),
             })
         }
@@ -2061,11 +2037,7 @@ fn call_function(
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
                  // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => return Err(EvaluationError::TypeError("toChars requires a String input".to_string())),
             })
         }
@@ -2294,7 +2266,7 @@ fn apply_multiplicative(
                 // Handle empty operands
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot multiply {:?} and {:?}", left.variant_name(), right.variant_name() // Use variant_name()
+                    "Cannot multiply {:?} and {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
                 ))),
             })
         }
@@ -2326,7 +2298,7 @@ fn apply_multiplicative(
                     Ok(EvaluationResult::Empty)
                 } else {
                     Err(EvaluationError::TypeError(format!(
-                        "Cannot divide {:?} by {:?}", left.variant_name(), right.variant_name() // Use variant_name()
+                        "Cannot divide {:?} by {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
                     )))
                 }
             }
@@ -2344,7 +2316,7 @@ fn apply_multiplicative(
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
                 _ => Err(EvaluationError::TypeError(format!( // Mixed types are invalid
                     "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {:?} and {:?}",
-                    op, left.variant_name(), right.variant_name() // Use variant_name()
+                    op, (*left).variant_name(), (*right).variant_name() // Dereference before calling
                 ))),
             }
         }
@@ -2443,7 +2415,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 // Other combinations are invalid for '+'
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot add {:?} and {:?}", left.variant_name(), right.variant_name() // Use variant_name()
+                    "Cannot add {:?} and {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
                 ))),
             })
         }
@@ -2516,7 +2488,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 // Other combinations are invalid for '-'
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot subtract {:?} from {:?}", right.variant_name(), left.variant_name() // Use variant_name()
+                    "Cannot subtract {:?} from {:?}", (*right).variant_name(), (*left).variant_name() // Dereference before calling
                 ))),
             })
         }
@@ -2896,7 +2868,7 @@ fn check_membership(
                     }
                     // Contains on string requires string argument, otherwise error
                     _ => return Err(EvaluationError::TypeError(format!(
-                        "'contains' on String requires String argument, found {:?}", right.variant_name() // Use variant_name()
+                        "'contains' on String requires String argument, found {:?}", (*right).variant_name() // Dereference before calling
                     ))),
                 },
                 // Treat single non-empty item as collection of one
