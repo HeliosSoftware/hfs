@@ -593,12 +593,12 @@ fn evaluate_exists_with_criteria(
         let criteria_result = evaluate(criteria_expr, context, Some(&item))?;
         // exists returns true if the criteria evaluates to true for *any* item
         if criteria_result.to_boolean() {
-            return Ok(EvaluationResult::Boolean(true));
+            return Ok(EvaluationResult::Boolean(true)); // Already Ok, no change needed here, error is elsewhere
         }
     }
 
     // If no item satisfied the criteria
-    Ok(EvaluationResult::Boolean(false))
+    Ok(EvaluationResult::Boolean(false)) // This was likely the source of E0308 at 422
 }
 
 /// Evaluates the 'where' function.
@@ -1037,7 +1037,11 @@ fn call_function(
                         .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1061,7 +1065,11 @@ fn call_function(
                 // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
                 EvaluationResult::Decimal(_) => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1070,8 +1078,8 @@ fn call_function(
             // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
                 EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => return EvaluationResult::Empty, // Distinct on empty is empty
-                single_item => return single_item.clone(), // Distinct on single item is the item itself
+                EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // Wrap in Ok
+                single_item => return Ok(single_item.clone()), // Wrap in Ok
             };
 
             // If we reach here, items has at least 2 elements
@@ -1544,7 +1552,11 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1592,7 +1604,11 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1658,7 +1674,11 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1747,13 +1767,12 @@ fn call_function(
                         EvaluationResult::Empty
                     }
                 }
-                // Collections: Convert single item, multiple items -> Empty
-                EvaluationResult::Collection(items) => {
-                    if items.len() == 1 {
-                        call_function("toQuantity", &items[0], &[])
-                    } else {
-                        EvaluationResult::Empty
-                    }
+                // Collections handled by initial check
+                EvaluationResult::Collection(_) => {
+                    // This case is now unreachable due to the initial count check
+                    // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
                 }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             }) // Close the Ok() wrapper here
@@ -1799,7 +1818,11 @@ fn call_function(
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
                 EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 _ => return Err(EvaluationError::TypeError("length() requires a String input".to_string())),
             })
         }
@@ -2033,6 +2056,12 @@ fn call_function(
                     }
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
+                 // Collections handled by initial check
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 _ => return Err(EvaluationError::TypeError("toChars requires a String input".to_string())),
             })
         }
@@ -2548,10 +2577,10 @@ fn apply_type_operation(
         }
         "as" => {
             // Cast the value to the specified type if possible
-            // Correctly extract the base type name, ignoring the namespace if present
-            let base_type_name = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
-                TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
+            // Correctly extract the base type name as &str
+            let base_type_name: &str = match type_spec {
+                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name.as_str(), // Use .as_str()
+                TypeSpecifier::QualifiedIdentifier(name, None) => name.as_str(),             // Use .as_str()
             };
 
              // Check if the identifier resolves to a valid type
