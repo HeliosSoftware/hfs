@@ -870,22 +870,22 @@ fn test_function_subsetting_exclude() {
 fn test_function_combining_union() {
     // Note: HashSet used internally, order is not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.union({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.union({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
 
-    let r1 = eval("(1 | 2).union({})", &context);
+    let r1 = eval("(1 | 2).union({})", &context).unwrap(); // Add unwrap
     assert!(matches!(&r1, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(v) = r1 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
-    let r2 = eval("{}.union(1 | 2)", &context);
+    let r2 = eval("{}.union(1 | 2)", &context).unwrap(); // Add unwrap
     assert!(matches!(&r2, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(v) = r2 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Order not guaranteed, check contents
-    let result = eval("(1 | 2 | 3).union(2 | 3 | 4)", &context);
+    let result = eval("(1 | 2 | 3).union(2 | 3 | 4)", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -899,7 +899,7 @@ fn test_function_combining_union() {
     } else {
         panic!("Expected collection result from union");
     }
-    let result = eval("(1 | 2 | 1).union(1 | 3 | 1)", &context);
+    let result = eval("(1 | 2 | 1).union(1 | 3 | 1)", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
