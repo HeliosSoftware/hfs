@@ -3273,7 +3273,7 @@ fn test_resource_simple_field_access() {
 fn test_resource_nested_field_access() {
     let context = patient_context();
     // Accessing a field within a list - returns a collection of that field from each list item
-    let name_family = eval("name.family", &context);
+    let name_family = eval("name.family", &context).unwrap(); // Add unwrap
     assert!(matches!(name_family, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(items) = name_family {
         assert_eq!(items.len(), 2); // Doe, Smith (usual name has no family)
@@ -3282,7 +3282,7 @@ fn test_resource_nested_field_access() {
     }
 
     // Accessing 'name.given' should return a collection of primitive strings
-    let name_given = eval("name.given", &context);
+    let name_given = eval("name.given", &context).unwrap(); // Add unwrap
     assert!(matches!(name_given, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(items) = name_given {
         assert_eq!(items.len(), 4); // John, Middle, Johnny, Jane
@@ -3293,7 +3293,7 @@ fn test_resource_nested_field_access() {
     }
 
     // Accessing a field that doesn't exist in all items
-    let name_use = eval("name.use", &context); // official, usual, (empty for Smith)
+    let name_use = eval("name.use", &context).unwrap(); // Add unwrap
     assert!(
         matches!(name_use, EvaluationResult::Collection(_)),
         "Expected Collection for name.use, got {:?}",
@@ -3318,7 +3318,7 @@ fn test_resource_nested_field_access() {
     // );
 
     // Access id on complex type (HumanName) - this should still work
-    let name_ids = eval("name.id", &context); // name1, name2, (empty for Smith)
+    let name_ids = eval("name.id", &context).unwrap(); // Add unwrap
     assert!(
         matches!(name_ids, EvaluationResult::Collection(_)), // Expect Collection even if only 2 results
         "Expected Collection for name.id, got {:?}",
