@@ -249,7 +249,7 @@ fn evaluate_term(
         Term::Invocation(invocation) => {
             // Explicitly handle $this first and return
             if *invocation == Invocation::This {
-                return Ok(if let Some(item) = current_item.cloned() { // Wrap in Ok()
+                return Ok(if let Some(item) = current_item.cloned() {
                     item // Return the item if Some
                 } else {
                     // Return the default context if None
@@ -788,7 +788,8 @@ fn call_function(
                 EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
                 EvaluationResult::Collection(items) => {
                     // Check if all items evaluate to true
-                    items.iter().all(|item| item.to_boolean())
+                    // Wrap the boolean result
+                    EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean()))
                 },
                 single_item => EvaluationResult::Boolean(single_item.to_boolean()), // Check single item
             })
@@ -1035,13 +1036,8 @@ fn call_function(
                         .map(EvaluationResult::Decimal)
                         .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
                 }
-                // Collections: Convert single item, multiple items -> Empty
-                EvaluationResult::Collection(items) => {
-                    if items.len() == 1 {
-                        // This case is now unreachable due to the initial count check
-                        unreachable!("Multi-item collection should have caused an error earlier")
-                    }
-                }
+                // Collections handled by initial check
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1064,13 +1060,8 @@ fn call_function(
                 }
                 // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
                 EvaluationResult::Decimal(_) => EvaluationResult::Empty,
-                // Collections: Convert single item, multiple items -> Empty
-                EvaluationResult::Collection(items) => {
-                    if items.len() == 1 {
-                        // This case is now unreachable due to the initial count check
-                        unreachable!("Multi-item collection should have caused an error earlier")
-                    }
-                }
+                // Collections handled by initial check
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -2270,7 +2261,7 @@ fn apply_multiplicative(
                 // Handle empty operands
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot multiply {:?} and {:?}", left.variant_name(), right.variant_name()
+                    "Cannot multiply {:?} and {:?}", left.variant_name(), right.variant_name() // Use variant_name()
                 ))),
             })
         }
@@ -2302,7 +2293,7 @@ fn apply_multiplicative(
                     Ok(EvaluationResult::Empty)
                 } else {
                     Err(EvaluationError::TypeError(format!(
-                        "Cannot divide {:?} by {:?}", left.variant_name(), right.variant_name()
+                        "Cannot divide {:?} by {:?}", left.variant_name(), right.variant_name() // Use variant_name()
                     )))
                 }
             }
@@ -2320,7 +2311,7 @@ fn apply_multiplicative(
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
                 _ => Err(EvaluationError::TypeError(format!( // Mixed types are invalid
                     "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {:?} and {:?}",
-                    op, left.variant_name(), right.variant_name()
+                    op, left.variant_name(), right.variant_name() // Use variant_name()
                 ))),
             }
         }
@@ -2419,7 +2410,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 // Other combinations are invalid for '+'
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot add {:?} and {:?}", left.variant_name(), right.variant_name()
+                    "Cannot add {:?} and {:?}", left.variant_name(), right.variant_name() // Use variant_name()
                 ))),
             })
         }
@@ -2492,7 +2483,7 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
                 // Other combinations are invalid for '-'
                 _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot subtract {:?} from {:?}", right.variant_name(), left.variant_name()
+                    "Cannot subtract {:?} from {:?}", right.variant_name(), left.variant_name() // Use variant_name()
                 ))),
             })
         }
@@ -2574,7 +2565,7 @@ fn apply_type_operation(
                 ));
             }
 
-            Ok(match (base_type_name, value) { // Use base_type_name, Wrap in Ok
+            Ok(match (base_type_name.as_ref(), value) { // Use base_type_name.as_ref(), Wrap in Ok
                 (_, EvaluationResult::Empty) => EvaluationResult::Empty, // 'as' on empty is empty
                 // Collections handled by initial check
                 (_, EvaluationResult::Collection(_)) => unreachable!(),
@@ -2872,7 +2863,7 @@ fn check_membership(
                     }
                     // Contains on string requires string argument, otherwise error
                     _ => return Err(EvaluationError::TypeError(format!(
-                        "'contains' on String requires String argument, found {:?}", right.variant_name()
+                        "'contains' on String requires String argument, found {:?}", right.variant_name() // Use variant_name()
                     ))),
                 },
                 // Treat single non-empty item as collection of one
