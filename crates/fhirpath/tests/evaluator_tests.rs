@@ -2073,45 +2073,53 @@ fn test_function_string_lower() {
 fn test_function_string_replace() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.replace('cde', '123')", &context),
+        eval("'abcdefg'.replace('cde', '123')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("ab123fg".to_string())
     );
     assert_eq!(
-        eval("'abcabc'.replace('bc', 'XY')", &context),
+        eval("'abcabc'.replace('bc', 'XY')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("aXYaXY".to_string())
     ); // All instances
     assert_eq!(
-        eval("'abcdefg'.replace('xyz', '123')", &context),
+        eval("'abcdefg'.replace('xyz', '123')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abcdefg".to_string())
     ); // Pattern not found
     assert_eq!(
-        eval("'abcdefg'.replace('cde', '')", &context),
+        eval("'abcdefg'.replace('cde', '')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abfg".to_string())
     ); // Empty substitution
     assert_eq!(
-        eval("'abc'.replace('', 'x')", &context),
+        eval("'abc'.replace('', 'x')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("xaxbxcx".to_string())
     ); // Empty pattern
     assert_eq!(
-        eval("''.replace('a', 'b')", &context),
+        eval("''.replace('a', 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
     assert_eq!(
-        eval("'abc'.replace('', '')", &context),
+        eval("'abc'.replace('', '')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc".to_string())
     );
     assert_eq!(
-        eval("{}.replace('a', 'b')", &context),
+        eval("{}.replace('a', 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.replace({}, 'b')", &context),
+        eval("'abc'.replace({}, 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.replace('a', {})", &context),
+        eval("'abc'.replace('a', {})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').replace('a', 'x')", &context).is_err());
+    assert!(eval("'abc'.replace(('a' | 'b'), 'x')", &context).is_err());
+    assert!(eval("'abc'.replace('a', ('x' | 'y'))", &context).is_err());
+    // Test invalid argument types - should error
+    assert!(eval("123.replace('1', 'x')", &context).is_err());
+    assert!(eval("'abc'.replace(1, 'x')", &context).is_err());
+    assert!(eval("'abc'.replace('a', 1)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#matchesregex--string--boolean
