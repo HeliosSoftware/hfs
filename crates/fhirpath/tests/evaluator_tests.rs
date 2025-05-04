@@ -2249,11 +2249,15 @@ fn test_function_string_replace_matches() {
 fn test_function_string_length() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.length()", &context),
+        eval("'abcdefg'.length()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(7)
     );
-    assert_eq!(eval("''.length()", &context), EvaluationResult::Integer(0));
-    assert_eq!(eval("{}.length()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("''.length()", &context).unwrap(), EvaluationResult::Integer(0)); // Add unwrap
+    assert_eq!(eval("{}.length()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Length on non-string should be empty (or error depending on strictness, current impl returns Empty)
+    assert_eq!(eval("123.length()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Length on multi-item collection should error
+    assert!(eval("('a' | 'b').length()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#tochars--collection
