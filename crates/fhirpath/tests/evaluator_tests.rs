@@ -2194,44 +2194,54 @@ fn test_function_string_matches() {
 fn test_function_string_replace_matches() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abc123def'.replaceMatches('\\\\d+', '#')", &context),
+        eval("'abc123def'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc#def".to_string())
     );
     assert_eq!(
-        eval("'abc123def456'.replaceMatches('\\\\d+', '#')", &context),
+        eval("'abc123def456'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc#def#".to_string())
     ); // All matches
     assert_eq!(
-        eval("'abc'.replaceMatches('\\\\d+', '#')", &context),
+        eval("'abc'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc".to_string())
     ); // No match
     // Groups (example from spec)
     let expr = "'11/30/1972'.replaceMatches('\\\\b(?<month>\\\\d{1,2})/(?<day>\\\\d{1,2})/(?<year>\\\\d{2,4})\\\\b', '${day}-${month}-${year}')";
     assert_eq!(
-        eval(expr, &context),
+        eval(expr, &context).unwrap(), // Add unwrap
         EvaluationResult::String("30-11-1972".to_string())
     );
     // Empty cases
     assert_eq!(
-        eval("'abc'.replaceMatches('', '#')", &context),
+        eval("'abc'.replaceMatches('', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("#a#b#c#".to_string())
     ); // Empty regex matches everywhere
     assert_eq!(
-        eval("''.replaceMatches('a', '#')", &context),
+        eval("''.replaceMatches('a', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
     assert_eq!(
-        eval("{}.replaceMatches('a', '#')", &context),
+        eval("{}.replaceMatches('a', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.replaceMatches({}, '#')", &context),
+        eval("'abc'.replaceMatches({}, '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.replaceMatches('a', {})", &context),
+        eval("'abc'.replaceMatches('a', {})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Invalid regex should error
+    assert!(eval("'abc'.replaceMatches('[', '#')", &context).is_err());
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').replaceMatches('a', 'x')", &context).is_err());
+    assert!(eval("'abc'.replaceMatches(('a' | 'b'), 'x')", &context).is_err());
+    assert!(eval("'abc'.replaceMatches('a', ('x' | 'y'))", &context).is_err());
+    // Test invalid argument types - should error
+    assert!(eval("123.replaceMatches('1', 'x')", &context).is_err());
+    assert!(eval("'abc'.replaceMatches(1, 'x')", &context).is_err());
+    assert!(eval("'abc'.replaceMatches('a', 1)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#length--integer
