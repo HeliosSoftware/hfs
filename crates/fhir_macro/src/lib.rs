@@ -1830,10 +1830,6 @@ fn generate_fhirpath_struct_impl(
                     let field_result = inner_value.into_evaluation_result();
                     // Only insert if the inner evaluation is not Empty
                     if field_result != fhirpath_support::EvaluationResult::Empty {
-                        // Add unconditional debug print for 'deceased' field when generating for Patient
-                        if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
-                            eprintln!("Debug [FhirPath derive for Patient]: Field '{}' (from Option) evaluated to: {:?}", #field_key_str, field_result);
-                        }
                         map.insert(#field_key_str.to_string(), field_result);
                     }
                 }
@@ -1843,10 +1839,6 @@ fn generate_fhirpath_struct_impl(
             // For non-Option<T>, evaluate directly
             quote! {
                 let field_result = self.#field_name_ident.into_evaluation_result();
-                // Add unconditional debug print for 'deceased' field when generating for Patient
-                if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
-                    eprintln!("Debug [FhirPath derive for Patient]: Field '{}' (direct) evaluated to: {:?}", #field_key_str, field_result);
-                }
                 // Only insert if the evaluation is not Empty
                 if field_result != fhirpath_support::EvaluationResult::Empty {
                     map.insert(#field_key_str.to_string(), field_result);
@@ -1863,10 +1855,6 @@ fn generate_fhirpath_struct_impl(
                 // Use fully qualified path for HashMap
                 let mut map = std::collections::HashMap::new();
                 #(#field_conversions)* // Expand the field conversion logic
-                // Add final debug print for Patient struct map
-                if stringify!(#name) == "Patient" {
-                    eprintln!("Debug [FhirPath derive for Patient]: Final map: {:?}", map);
-                }
                 fhirpath_support::EvaluationResult::Object(map)
             }
         }
