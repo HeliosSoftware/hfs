@@ -3359,48 +3359,45 @@ fn test_resource_filtering_and_projection() {
     let context = patient_context();
 
     // Where on a list field
-    let official_name = eval("name.where(use = 'official')", &context);
+    let official_name = eval("name.where(use = 'official')", &context).unwrap(); // Add unwrap
     assert!(matches!(official_name, EvaluationResult::Object(_)), "Expected Object for official name, got {:?}", official_name); // Should return the HumanName object
 
     // Select from the filtered list
     assert_eq!(
-        eval("name.where(use = 'official').family", &context), // Accessing family on the HumanName object
+        eval("name.where(use = 'official').family", &context).unwrap(), // Add unwrap
         EvaluationResult::String("Doe".to_string()) // Expect primitive string
     );
     // .given returns a collection of primitive strings
     assert_eq!(
-        eval("name.where(use = 'usual').given", &context),
+        eval("name.where(use = 'usual').given", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![EvaluationResult::String("Johnny".to_string())])
     );
     assert_eq!(
-        eval("name.where(family = 'Smith').given", &context),
+        eval("name.where(family = 'Smith').given", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![EvaluationResult::String("Jane".to_string())])
     );
 
-    // Select multiple fields - This expression should return Empty because 'given' is a collection
-    // and cannot be concatenated directly with strings using '+'.
-    let official_details = eval(
+    // Select multiple fields - This expression should error because 'given' is a collection
+    // and '+' requires singletons.
+    let official_details_result = eval(
         "name.where(use = 'official').select(given + ' ' + family)",
         &context,
     );
-    assert_eq!(
-        official_details,
-        EvaluationResult::Empty // Correct expectation based on FHIRPath spec
-    );
+    assert!(official_details_result.is_err()); // Expect error
 
     // Select on a non-list field (acts on the single item) - birthDate is now primitive
     assert_eq!(
-        eval("birthDate.select($this.toString())", &context),
+        eval("birthDate.select($this.toString())", &context).unwrap(), // Add unwrap
         EvaluationResult::String("1980-05-15".to_string())
     );
 
     // Where on root context - 'active' is now primitive
     assert_eq!(
-        eval("%context.where(active = true).id", &context),
+        eval("%context.where(active = true).id", &context).unwrap(), // Add unwrap
         EvaluationResult::String("p1".to_string())
     );
     assert_eq!(
-        eval("%context.where(active = false).id", &context),
+        eval("%context.where(active = false).id", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
 }
