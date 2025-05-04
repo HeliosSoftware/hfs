@@ -1296,56 +1296,53 @@ fn test_function_conversion_converts_to_decimal() {
 #[test]
 fn test_function_conversion_to_string() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toString()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toString()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("'abc'.toString()", &context),
+        eval("'abc'.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc".to_string())
     );
     assert_eq!(
-        eval("123.toString()", &context),
+        eval("123.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("123".to_string())
     );
     assert_eq!(
-        eval("123.45.toString()", &context),
+        eval("123.45.toString()", &context).unwrap(), // Add unwrap
         // Removed duplicate eval call, compare directly to expected result
         EvaluationResult::String("123.45".to_string()) // Decimal to string
     );
     assert_eq!(
-        eval("true.toString()", &context),
+        eval("true.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("true".to_string())
     );
     assert_eq!(
-        eval("false.toString()", &context),
+        eval("false.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("false".to_string())
     );
     assert_eq!(
-        eval("@2023-10-27.toString()", &context),
+        eval("@2023-10-27.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("2023-10-27".to_string())
     );
     assert_eq!(
-        eval("@T10:30:00.toString()", &context),
+        eval("@T10:30:00.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("10:30:00".to_string())
     );
     assert_eq!(
-        eval("@2023-10-27T10:30Z.toString()", &context), // Literal without seconds
+        eval("@2023-10-27T10:30Z.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("2023-10-27T10:30Z".to_string())  // Expect output without seconds
     );
     // Quantity to string (evaluator returns Decimal or Integer, ignoring unit)
     assert_eq!(
-        eval("5.5 'mg'.toString()", &context), // Decimal quantity
+        eval("5.5 'mg'.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("5.5".to_string())
     );
     assert_eq!(
-        eval("5 'mg'.toString()", &context), // Integer quantity
+        eval("5 'mg'.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("5".to_string())
     );
-    // Collection to string
-    //assert_eq!(
-    //    eval("(1|2).toString()", &context),
-    //    EvaluationResult::String("".to_string())
-    //); // Multi-item collection -> empty string
+    // Collection to string - should error per spec
+    assert!(eval("(1|2).toString()", &context).is_err());
     assert_eq!(
-        eval("(1).toString()", &context),
+        eval("(1).toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("1".to_string())
     ); // Single-item collection -> item string
 }
