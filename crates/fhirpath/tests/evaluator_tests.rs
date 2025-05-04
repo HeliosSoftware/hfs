@@ -530,27 +530,27 @@ fn test_function_filtering_of_type() {
     let context = EvaluationContext::new_empty();
     // Simple types - expect single item results due to normalization
     assert_eq!(
-        eval("(1 | 'a' | true).ofType(Integer)", &context),
+        eval("(1 | 'a' | true).ofType(Integer)", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
     assert_eq!(
-        eval("(1 | 'a' | true).ofType(String)", &context),
+        eval("(1 | 'a' | true).ofType(String)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
     );
     assert_eq!(
-        eval("(1 | 'a' | true).ofType(Boolean)", &context),
+        eval("(1 | 'a' | true).ofType(Boolean)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 'a' | true | 1.5).ofType(Decimal)", &context),
+        eval("(1 | 'a' | true | 1.5).ofType(Decimal)", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(1.5))
     );
     assert_eq!(
-        eval("{}.ofType(Integer)", &context),
+        eval("{}.ofType(Integer)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(1 | 'a' | true).ofType(System.Integer)", &context),
+        eval("(1 | 'a' | true).ofType(System.Integer)", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
 
