@@ -2274,8 +2274,8 @@ fn test_function_string_to_chars() {
     );
     assert_eq!(eval("''.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(eval("{}.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    // toChars on non-string should be empty (or error, current impl returns Empty)
-    assert_eq!(eval("123.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // toChars on non-string should error
+    assert!(eval("123.toChars()", &context).is_err());
     // toChars on multi-item collection should error
     assert!(eval("('a' | 'b').toChars()", &context).is_err());
 }
