@@ -3418,7 +3418,7 @@ fn test_resource_oftype() {
     ];
     let context = EvaluationContext::new(resources);
 
-    let patients = eval("%context.ofType(Patient)", &context);
+    let patients = eval("%context.ofType(Patient)", &context).unwrap(); // Add unwrap
     assert!(matches!(patients, EvaluationResult::Object(_)), "Expected Object for Patient, got {:?}", patients); // Only one patient
     if let EvaluationResult::Object(fields) = patients {
         assert_eq!(
@@ -3432,7 +3432,7 @@ fn test_resource_oftype() {
         );
     }
 
-    let observations = eval("%context.ofType(Observation)", &context);
+    let observations = eval("%context.ofType(Observation)", &context).unwrap(); // Add unwrap
     assert!(matches!(observations, EvaluationResult::Object(_)), "Expected Object for Observation, got {:?}", observations); // Only one observation
     if let EvaluationResult::Object(fields) = observations {
         assert_eq!(
@@ -3447,7 +3447,7 @@ fn test_resource_oftype() {
     }
 
     assert_eq!(
-        eval("%context.ofType(Practitioner)", &context),
+        eval("%context.ofType(Practitioner)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
 }
