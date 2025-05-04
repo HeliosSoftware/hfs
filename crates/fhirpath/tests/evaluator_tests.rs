@@ -1667,60 +1667,62 @@ fn test_function_conversion_converts_to_time() {
 #[test]
 fn test_function_conversion_to_quantity() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toQuantity()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toQuantity()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     // Boolean to Quantity
     assert_eq!(
-        eval("true.toQuantity()", &context),
+        eval("true.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(1.0)) // Spec implies conversion to Decimal 1.0 '1'
     );
     assert_eq!(
-        eval("false.toQuantity()", &context),
+        eval("false.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(0.0)) // Spec implies conversion to Decimal 0.0 '1'
     );
     // Integer to Quantity
     assert_eq!(
-        eval("123.toQuantity()", &context),
+        eval("123.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(123.0)) // Spec implies conversion to Decimal 123.0 '1'
     );
     // Decimal to Quantity
     assert_eq!(
-        eval("123.45.toQuantity()", &context),
+        eval("123.45.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(123.45)) // Spec implies conversion to Decimal 123.45 '1'
     );
     // String to Quantity (parses number and unit)
     assert_eq!(
-        eval("'5.5 mg'.toQuantity()", &context),
+        eval("'5.5 mg'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(5.5)) // Evaluator currently ignores unit
     );
     assert_eq!(
-        eval("'100'.toQuantity()", &context),
+        eval("'100'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(100.0)) // Evaluator currently ignores unit
     );
     assert_eq!(
-        eval("'100 days'.toQuantity()", &context),
+        eval("'100 days'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(100.0)) // String with valid time unit
     );
     assert_eq!(
-        eval("'invalid'.toQuantity()", &context),
+        eval("'invalid'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Not a number
     assert_eq!(
-        eval("'5.5 invalid-unit'.toQuantity()", &context),
+        eval("'5.5 invalid-unit'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Invalid unit part
     assert_eq!(
-        eval("'5.5 mg extra'.toQuantity()", &context),
+        eval("'5.5 mg extra'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Too many parts
     // Quantity literal to Quantity (should just return the numeric part)
     assert_eq!(
-        eval("5.5 'mg'.toQuantity()", &context), // This uses the Quantity literal parser
+        eval("5.5 'mg'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(5.5))
     );
     assert_eq!(
-        eval("100 days.toQuantity()", &context),
+        eval("100 days.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(100.0)) // Expect Decimal conversion
     );
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2).toQuantity()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstoquantity--boolean
