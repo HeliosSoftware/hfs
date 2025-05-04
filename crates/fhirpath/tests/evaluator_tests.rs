@@ -2285,13 +2285,13 @@ fn test_function_string_to_chars() {
 #[test]
 fn test_function_utility_now() {
     let context = EvaluationContext::new_empty();
-    let result = eval("now()", &context);
+    let result = eval("now()", &context).unwrap(); // Add unwrap
     // Check it's a DateTime, format might vary slightly
     assert!(matches!(result, EvaluationResult::DateTime(_)));
     // Check determinism (calling twice gives same result)
     let expr = parser().parse("now() = now()").unwrap();
     assert_eq!(
-        evaluate(&expr, &context, None),
+        evaluate(&expr, &context, None).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
 }
