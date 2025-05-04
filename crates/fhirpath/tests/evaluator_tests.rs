@@ -447,11 +447,11 @@ fn test_function_existence_is_distinct() {
 fn test_function_filtering_where() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.where($this > 1)", &context),
+        eval("{}.where($this > 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(1 | 2 | 3 | 4).where($this > 2)", &context),
+        eval("(1 | 2 | 3 | 4).where($this > 2)", &context).unwrap(), // Add unwrap
         // Expect collection even if normalization happens
         collection(vec![
             EvaluationResult::Integer(3),
@@ -459,38 +459,23 @@ fn test_function_filtering_where() {
         ])
     );
     assert_eq!(
-        eval("(1 | 2 | 3 | 4).where($this > 5)", &context),
+        eval("(1 | 2 | 3 | 4).where($this > 5)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("('a' | 'b' | 'c').where($this = 'b')", &context),
+        eval("('a' | 'b' | 'c').where($this = 'b')", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
         EvaluationResult::String("b".to_string())
     );
     // Test empty result from criteria is ignored
     assert_eq!(
-        eval("(1 | 2 | {}).where($this > 1)", &context),
+        eval("(1 | 2 | {}).where($this > 1)", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
         EvaluationResult::Integer(2)
     );
-    // Test criteria evaluating to non-boolean (should be ignored)
-    assert_eq!(
-        eval("(1 | 2 | 3).where($this)", &context), // Restore the first argument
-        // Expect collection result
-        collection(vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3)
-        ])
-    ); // All items are truthy
-    assert_eq!(
-        eval("(0 | 1 | 2).where($this)", &context),
-        // Expect collection result
-        collection(vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2)
-        ])
-    ); // 0 is falsy
+    // Test criteria evaluating to non-boolean (should error per spec)
+    assert!(eval("(1 | 2 | 3).where($this)", &context).is_err());
+    assert!(eval("(0 | 1 | 2).where($this)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#selectprojection-expression--collection
