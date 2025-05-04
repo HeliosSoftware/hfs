@@ -699,9 +699,9 @@ fn test_function_subsetting_tail() {
 #[test]
 fn test_function_subsetting_skip() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.skip(1)", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.skip(1)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10 | 20 | 30).skip(0)", &context),
+        eval("(10 | 20 | 30).skip(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
@@ -709,28 +709,31 @@ fn test_function_subsetting_skip() {
         ])
     );
     assert_eq!(
-        eval("(10 | 20 | 30).skip(1)", &context),
+        eval("(10 | 20 | 30).skip(1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
         ])
     );
     assert_eq!(
-        eval("(10 | 20 | 30).skip(3)", &context),
+        eval("(10 | 20 | 30).skip(3)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(10 | 20 | 30).skip(4)", &context),
+        eval("(10 | 20 | 30).skip(4)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Negative skip is treated as 0
     assert_eq!(
-        eval("(10 | 20 | 30).skip(-1)", &context),
+        eval("(10 | 20 | 30).skip(-1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
         ])
     );
+    // Non-integer skip should error
+    assert!(eval("(10 | 20 | 30).skip('a')", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#takenum--integer--collection
