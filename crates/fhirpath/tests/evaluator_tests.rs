@@ -310,31 +310,31 @@ fn test_function_existence_any_false() {
 fn test_function_existence_subset_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.subsetOf({})", &context),
+        eval("{}.subsetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("{}.subsetOf(1 | 2)", &context), // Use | syntax
+        eval("{}.subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1).subsetOf(1 | 2)", &context), // Use | syntax
+        eval("(1).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).subsetOf(1 | 2)", &context), // Use | syntax
+        eval("(1 | 2).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).subsetOf(1 | 2)", &context), // Use | syntax
+        eval("(1 | 2 | 3).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1 | 2).subsetOf({})", &context),
+        eval("(1 | 2).subsetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1 | 2).subsetOf(1)", &context), // Use valid syntax (1) instead of {1}
+        eval("(1 | 2).subsetOf(1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
 }
