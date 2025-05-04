@@ -1265,29 +1265,31 @@ fn test_function_conversion_to_decimal() {
 fn test_function_conversion_converts_to_decimal() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToDecimal()", &context),
+        eval("{}.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("123.convertsToDecimal()", &context),
+        eval("123.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("123.45.convertsToDecimal()", &context),
+        eval("123.45.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'456.78'.convertsToDecimal()", &context),
+        eval("'456.78'.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("true.convertsToDecimal()", &context),
+        eval("true.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abc'.convertsToDecimal()", &context),
+        eval("'abc'.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Invalid string
+    // Test multi-item collection - should error
+    assert!(eval("(1.0 | 2.0).convertsToDecimal()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#tostring--string
