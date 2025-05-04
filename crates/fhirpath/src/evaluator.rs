@@ -1772,11 +1772,13 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                    // This case is now unreachable due to the initial count check
-                    // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
+                EvaluationResult::Collection(items) => { // Restore original logic but use ?
+                    if items.len() == 1 {
+                       call_function("toQuantity", &items[0], &[])? // Add ?
+                    } else {
+                       // This case is now unreachable due to the initial count check
+                       unreachable!("Multi-item collection should have caused an error earlier")
+                    }
                 }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             }) // Close the Ok() wrapper here
@@ -2583,7 +2585,7 @@ fn apply_type_operation(
             // Cast the value to the specified type if possible
             // Correctly extract the base type name as &str
             let base_type_name: &str = match type_spec {
-                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => name.as_str(), // Use .as_str()
+                TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name.as_str(), // Prefix unused var with _
                 TypeSpecifier::QualifiedIdentifier(name, None) => name.as_str(),             // Use .as_str()
             };
 
