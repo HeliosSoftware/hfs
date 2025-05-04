@@ -3842,7 +3842,8 @@ fn test_resource_access() {
     let resources = vec![FhirResource::R4(Box::new(dummy_resource))]; // No need for mut
     let context = EvaluationContext::new(resources);
     // Test accessing the resource id
-    let expr = parser().parse("id").unwrap(); // Use 'id' to access the field
-    let result = evaluate(&expr, &context, None);
-    assert_eq!(result, EvaluationResult::String("theid".to_string())); // Expect the primitive string value of the id
+    assert_eq!(
+        eval("id", &context).unwrap(), // Add unwrap
+        EvaluationResult::String("theid".to_string())
+    ); // Expect the primitive string value of the id
 }
