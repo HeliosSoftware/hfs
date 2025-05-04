@@ -2128,57 +2128,65 @@ fn test_function_string_matches() {
     let context = EvaluationContext::new_empty();
     // Basic matching
     assert_eq!(
-        eval("'abc'.matches('b')", &context),
+        eval("'abc'.matches('b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abc'.matches('^b')", &context),
+        eval("'abc'.matches('^b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'abc'.matches('bc$')", &context),
+        eval("'abc'.matches('bc$')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abc'.matches('^abc$')", &context),
+        eval("'abc'.matches('^abc$')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abc'.matches('x')", &context),
+        eval("'abc'.matches('x')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     // Regex features (basic)
     assert_eq!(
-        eval("'123'.matches('\\\\d+')", &context),
+        eval("'123'.matches('\\\\d+')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     ); // Need double escape for Rust string literal then FHIRPath string literal
     assert_eq!(
-        eval("'abc'.matches('\\\\d+')", &context),
+        eval("'abc'.matches('\\\\d+')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'a.c'.matches('a.c')", &context),
+        eval("'a.c'.matches('a.c')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     ); // '.' matches any char
     assert_eq!(
-        eval("'axc'.matches('a.c')", &context),
+        eval("'axc'.matches('a.c')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     // Empty cases
     assert_eq!(
-        eval("'abc'.matches('')", &context),
+        eval("'abc'.matches('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     ); // Empty regex matches
     assert_eq!(
-        eval("''.matches('a')", &context),
+        eval("''.matches('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("''.matches('')", &context),
+        eval("''.matches('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.matches('a')", &context), EvaluationResult::Empty);
-    assert_eq!(eval("'abc'.matches({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.matches('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("'abc'.matches({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Invalid regex should error
+    assert!(eval("'abc'.matches('[')", &context).is_err());
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').matches('a')", &context).is_err());
+    assert!(eval("'abc'.matches(('a' | 'b'))", &context).is_err());
+    // Test invalid argument types - should error
+    assert!(eval("123.matches('1')", &context).is_err());
+    assert!(eval("'abc'.matches(1)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#replacematchesregex--string-substitution-string--string
