@@ -125,15 +125,15 @@ fn test_expression_singleton_evaluation() {
 fn test_function_existence_empty() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.empty()", &context),
+        eval("{}.empty()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'test'.empty()", &context),
+        eval("'test'.empty()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1 | 2).empty()", &context),
+        eval("(1 | 2).empty()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
 }
