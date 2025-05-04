@@ -2315,13 +2315,13 @@ fn test_function_utility_time_of_day() {
 #[test]
 fn test_function_utility_today() {
     let context = EvaluationContext::new_empty();
-    let result = eval("today()", &context);
+    let result = eval("today()", &context).unwrap(); // Add unwrap
     // Check it's a Date
     assert!(matches!(result, EvaluationResult::Date(_)));
     // Check determinism
     let expr = parser().parse("today() = today()").unwrap();
     assert_eq!(
-        evaluate(&expr, &context, None),
+        evaluate(&expr, &context, None).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
 }
