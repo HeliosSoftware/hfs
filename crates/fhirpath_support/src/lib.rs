@@ -24,6 +24,48 @@ pub enum EvaluationResult {
     Object(HashMap<String, EvaluationResult>),
 }
 
+/// Represents errors that can occur during FHIRPath evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluationError {
+    TypeError(String), // e.g., "Expected Boolean, found Integer"
+    InvalidArgument(String), // e.g., "Invalid argument for function 'where'"
+    UndefinedVariable(String), // e.g., "Variable '%undefinedVar' not found"
+    InvalidOperation(String), // e.g., "Cannot add String and Integer"
+    InvalidArity(String), // e.g., "Function 'substring' expects 1 or 2 arguments, got 3"
+    InvalidIndex(String), // e.g., "Index must be a non-negative integer"
+    DivisionByZero,
+    ArithmeticOverflow,
+    InvalidRegex(String),
+    InvalidTypeSpecifier(String),
+    // Error for singleton evaluation failures
+    SingletonEvaluationError(String), // e.g., "Expected singleton, found collection with N items"
+    // Add more specific errors as needed
+    Other(String), // Generic error
+}
+
+// Implement standard Error trait for EvaluationError
+impl std::error::Error for EvaluationError {}
+
+// Implement Display trait for EvaluationError
+impl std::fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvaluationError::TypeError(msg) => write!(f, "Type Error: {}", msg),
+            EvaluationError::InvalidArgument(msg) => write!(f, "Invalid Argument: {}", msg),
+            EvaluationError::UndefinedVariable(name) => write!(f, "Undefined Variable: {}", name),
+            EvaluationError::InvalidOperation(msg) => write!(f, "Invalid Operation: {}", msg),
+            EvaluationError::InvalidArity(msg) => write!(f, "Invalid Arity: {}", msg),
+            EvaluationError::InvalidIndex(msg) => write!(f, "Invalid Index: {}", msg),
+            EvaluationError::DivisionByZero => write!(f, "Division by zero"),
+            EvaluationError::ArithmeticOverflow => write!(f, "Arithmetic overflow"),
+            EvaluationError::InvalidRegex(msg) => write!(f, "Invalid Regex: {}", msg),
+            EvaluationError::InvalidTypeSpecifier(msg) => write!(f, "Invalid Type Specifier: {}", msg),
+            EvaluationError::SingletonEvaluationError(msg) => write!(f, "Singleton Evaluation Error: {}", msg),
+            EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
+        }
+    }
+}
+
 // --- Ord Implementation ---
 // Define an arbitrary but consistent order for variants for sorting purposes.
 // Note: This order does not necessarily reflect FHIRPath comparison rules,
