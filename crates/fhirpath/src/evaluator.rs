@@ -2251,13 +2251,14 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     if let Ok(s_int) = s.parse::<i64>() {
                         s_int.checked_add(*i)
                              .map(EvaluationResult::Integer)
-                             .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                             .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(d + Decimal::from(*i)))
-                            .unwrap_or(EvaluationResult::Empty)
+                            // If string cannot be parsed as number, it's a type error for '+'
+                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add String '{}' and Integer {}", s, i)))?
                     }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
@@ -2265,13 +2266,14 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     if let Ok(s_int) = s.parse::<i64>() {
                          i.checked_add(s_int)
                           .map(EvaluationResult::Integer)
-                          .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                          .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(Decimal::from(*i) + d))
-                            .unwrap_or(EvaluationResult::Empty)
+                            // If string cannot be parsed as number, it's a type error for '+'
+                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add Integer {} and String '{}'", i, s)))?
                     }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
@@ -2279,16 +2281,18 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd + *d))
-                        .unwrap_or(EvaluationResult::Empty)
+                        // If string cannot be parsed as number, it's a type error for '+'
+                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add String '{}' and Decimal {}", s, d)))?
                 }
                 (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(*d + sd))
-                        .unwrap_or(EvaluationResult::Empty)
+                        // If string cannot be parsed as number, it's a type error for '+'
+                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add Decimal {} and String '{}'", d, s)))?
                 }
-                // Other combinations are invalid for '+'
-                _ => EvaluationResult::Empty,
+                 // Handle empty operands
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
             }
         }
         "-" => {
@@ -2316,13 +2320,14 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     if let Ok(s_int) = s.parse::<i64>() {
                         s_int.checked_sub(*i)
                              .map(EvaluationResult::Integer)
-                             .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                             .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(d - Decimal::from(*i)))
-                            .unwrap_or(EvaluationResult::Empty)
+                            // If string cannot be parsed as number, it's a type error for '-'
+                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract Integer {} from String '{}'", i, s)))?
                     }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
@@ -2330,13 +2335,14 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     if let Ok(s_int) = s.parse::<i64>() {
                          i.checked_sub(s_int)
                           .map(EvaluationResult::Integer)
-                          .unwrap_or(EvaluationResult::Empty) // Handle potential overflow
+                          .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(Decimal::from(*i) - d))
-                            .unwrap_or(EvaluationResult::Empty)
+                            // If string cannot be parsed as number, it's a type error for '-'
+                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract String '{}' from Integer {}", s, i)))?
                     }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
@@ -2344,25 +2350,41 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd - *d))
-                        .unwrap_or(EvaluationResult::Empty)
+                         // If string cannot be parsed as number, it's a type error for '-'
+                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract Decimal {} from String '{}'", d, s)))?
                 }
                 (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(*d - sd))
-                        .unwrap_or(EvaluationResult::Empty)
+                         // If string cannot be parsed as number, it's a type error for '-'
+                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract String '{}' from Decimal {}", s, d)))?
                 }
-                // Other combinations are invalid for '-'
-                _ => EvaluationResult::Empty,
+                 // Handle empty operands
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
             }
         }
         "&" => {
             // Handle string concatenation using '&'
-            let left_str = left.to_string_value(); // Convert left to string
-            let right_str = right.to_string_value(); // Convert right to string
-            EvaluationResult::String(format!("{}{}", left_str, right_str))
+            let left_str = match left {
+                EvaluationResult::Empty => "".to_string(),
+                _ => left.to_string_value(),
+            };
+            let right_str = match right {
+                 EvaluationResult::Empty => "".to_string(),
+                _ => right.to_string_value(),
+            };
+            // Check if either operand was originally non-string/non-empty, if so, error for '&'
+            if (!left.is_string_or_empty() && !left.is_empty()) || (!right.is_string_or_empty() && !right.is_empty()) {
+                 Err(EvaluationError::TypeError(format!(
+                    "Operator '&' requires String operands, found {:?} and {:?}",
+                    left.variant_name(), right.variant_name()
+                )))
+            } else {
+                Ok(EvaluationResult::String(format!("{}{}", left_str, right_str)))
+            }
         }
-        _ => EvaluationResult::Empty, // Unknown operator
+        _ => Err(EvaluationError::InvalidOperation(format!("Unknown additive operator: {}", op))),
     }
 }
 
@@ -2638,17 +2660,21 @@ fn check_membership(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> EvaluationResult {
+) -> Result<EvaluationResult, EvaluationError> {
     // Specific handling for 'in' and 'contains' based on FHIRPath spec regarding empty collections
     match op {
         "in" => {
             // Spec: {} in X -> {}
             if left == &EvaluationResult::Empty {
-                return EvaluationResult::Empty;
+                return Ok(EvaluationResult::Empty);
             }
             // Spec: X in {} -> false
             if right == &EvaluationResult::Empty {
-                return EvaluationResult::Boolean(false);
+                return Ok(EvaluationResult::Boolean(false));
+            }
+            // Check for multi-item left operand (error)
+            if left.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError("'in' operator requires singleton left operand".to_string()));
             }
             // Proceed with check if both are non-empty (operands are not Empty)
             let is_in = match right {
