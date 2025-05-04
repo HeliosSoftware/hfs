@@ -424,19 +424,19 @@ fn test_function_existence_distinct() {
 fn test_function_existence_is_distinct() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.isDistinct()", &context),
+        eval("{}.isDistinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1).isDistinct()", &context),
+        eval("(1).isDistinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).isDistinct()", &context),
+        eval("(1 | 2 | 3).isDistinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 1).isDistinct()", &context),
+        eval("(1 | 2 | 1).isDistinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true) // Expect true because (1 | 2 | 1) becomes (1 | 2) which IS distinct
     );
 }
