@@ -2622,25 +2622,27 @@ fn test_operator_types_is() {
 #[test]
 fn test_operator_types_as() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("1 as Integer", &context), EvaluationResult::Integer(1));
+    assert_eq!(eval("1 as Integer", &context).unwrap(), EvaluationResult::Integer(1)); // Add unwrap
     assert_eq!(
-        eval("'a' as String", &context),
+        eval("'a' as String", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
     );
     assert_eq!(
-        eval("1.0 as Decimal", &context),
+        eval("1.0 as Decimal", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(1.0))
     ); // 'as' Decimal
-    assert_eq!(eval("1 as String", &context), EvaluationResult::Empty); // Cannot cast Integer to String
-    assert_eq!(eval("'a' as Integer", &context), EvaluationResult::Empty); // Cannot cast String to Integer
-    assert_eq!(eval("1 as Decimal", &context), EvaluationResult::Empty); // Cannot cast Integer to Decimal via 'as' (per spec)
-    assert_eq!(eval("1.0 as Integer", &context), EvaluationResult::Empty); // Cannot cast Decimal to Integer via 'as'
-    assert_eq!(eval("{} as Integer", &context), EvaluationResult::Empty);
+    assert_eq!(eval("1 as String", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("'a' as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("1 as Decimal", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("1.0 as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("{} as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     // Test 'System' namespace explicitly
     assert_eq!(
-        eval("1 as System.Integer", &context),
+        eval("1 as System.Integer", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2) as Integer", &context).is_err());
 }
 
 // --- Collections ---
@@ -2648,23 +2650,23 @@ fn test_operator_types_as() {
 #[test]
 fn test_operator_collections_union() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{} | {}", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{} | {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(1 | 2) | {}", &context),
+        eval("(1 | 2) | {}", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
         ])
     ); // Order not guaranteed
     assert_eq!(
-        eval("{} | (1 | 2)", &context),
+        eval("{} | (1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
         ])
     ); // Order not guaranteed
     // Order not guaranteed, check contents - Union operator produces distinct results
-    let result = eval("(1 | 2 | 3) | (2 | 3 | 4)", &context);
+    let result = eval("(1 | 2 | 3) | (2 | 3 | 4)", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -2685,24 +2687,26 @@ fn test_operator_collections_union() {
 fn test_operator_collections_in() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("1 in (1 | 2 | 3)", &context),
+        eval("1 in (1 | 2 | 3)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("4 in (1 | 2 | 3)", &context),
+        eval("4 in (1 | 2 | 3)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'a' in ('a' | 'b')", &context),
+        eval("'a' in ('a' | 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'c' in ('a' | 'b')", &context),
+        eval("'c' in ('a' | 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("1 in {}", &context), EvaluationResult::Boolean(false)); // Item in empty collection
-    assert_eq!(eval("{} in (1 | 2)", &context), EvaluationResult::Empty); // Empty item
-    assert_eq!(eval("{} in {}", &context), EvaluationResult::Empty); // Empty item
+    assert_eq!(eval("1 in {}", &context).unwrap(), EvaluationResult::Boolean(false)); // Add unwrap
+    assert_eq!(eval("{} in (1 | 2)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("{} in {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item left operand - should error
+    assert!(eval("(1 | 2) in (1 | 2 | 3)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#contains-containership
@@ -2710,30 +2714,32 @@ fn test_operator_collections_in() {
 fn test_operator_collections_contains() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("(1 | 2 | 3) contains 1", &context),
+        eval("(1 | 2 | 3) contains 1", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3) contains 4", &context),
+        eval("(1 | 2 | 3) contains 4", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("('a' | 'b') contains 'a'", &context),
+        eval("('a' | 'b') contains 'a'", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("('a' | 'b') contains 'c'", &context),
+        eval("('a' | 'b') contains 'c'", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("{} contains 1", &context),
+        eval("{} contains 1", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Empty collection contains item
     assert_eq!(
-        eval("(1 | 2) contains {}", &context),
+        eval("(1 | 2) contains {}", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Contains empty item
-    assert_eq!(eval("{} contains {}", &context), EvaluationResult::Empty); // Contains empty item
+    assert_eq!(eval("{} contains {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item right operand - should error
+    assert!(eval("(1 | 2 | 3) contains (1 | 2)", &context).is_err());
 }
 
 // --- Boolean Logic ---
