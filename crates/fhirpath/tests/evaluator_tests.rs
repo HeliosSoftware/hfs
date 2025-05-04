@@ -3645,26 +3645,23 @@ fn test_variable_access() {
     context.set_variable("name", "John Doe".to_string());
     context.set_variable("age", "42".to_string()); // Store as string, FHIRPath handles conversion if needed
 
-    let test_cases = vec![
+    // --- Success Cases ---
+    let success_cases = vec![
         // Access variables directly
         ("%name", EvaluationResult::String("John Doe".to_string())),
         // Accessing %age should return the string value stored
         ("%age", EvaluationResult::String("42".to_string())),
         // Test conversion within expression
         ("%age.toInteger()", EvaluationResult::Integer(42)),
-        ("%address", EvaluationResult::Empty), // Non-existent variable
     ];
 
-    for (input, expected) in test_cases {
-        let expr = parser().parse(input).unwrap();
-        println!("Variable access parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context, None);
-        println!(
-            "Variable access result: {:?}, Expected: {:?}",
-            result, expected
-        );
-        assert_eq!(result, expected, "Failed for input: {}", input);
+    for (input, expected) in success_cases {
+        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
     }
+
+    // --- Error Case (Undefined Variable) ---
+    assert!(eval("%address", &context).is_err(), "Expected error for undefined variable %address");
+
 }
 
 #[test]
