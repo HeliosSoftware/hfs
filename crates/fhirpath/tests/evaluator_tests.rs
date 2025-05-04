@@ -1091,45 +1091,47 @@ fn test_function_conversion_to_boolean() {
 fn test_function_conversion_converts_to_boolean() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToBoolean()", &context),
+        eval("{}.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("true.convertsToBoolean()", &context),
+        eval("true.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("1.convertsToBoolean()", &context),
+        eval("1.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("0.convertsToBoolean()", &context),
+        eval("0.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("1.0.convertsToBoolean()", &context),
+        eval("1.0.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("0.0.convertsToBoolean()", &context),
+        eval("0.0.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'true'.convertsToBoolean()", &context),
+        eval("'true'.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'false'.convertsToBoolean()", &context),
+        eval("'false'.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("2.convertsToBoolean()", &context),
+        eval("2.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Invalid decimal
     assert_eq!(
-        eval("'abc'.convertsToBoolean()", &context),
+        eval("'abc'.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Invalid string
+    // Test multi-item collection - should error
+    assert!(eval("(true | false).convertsToBoolean()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#tointeger--integer
