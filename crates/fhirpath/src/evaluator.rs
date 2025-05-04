@@ -1502,7 +1502,11 @@ fn call_function(
             Ok(match invocation_base { // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // toString on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection(_) => {
+                     // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
+                }
                 // Convert single item to string
                 single_item => EvaluationResult::String(single_item.to_string_value()),
             })
@@ -2594,7 +2598,7 @@ fn apply_type_operation(
                 ));
             }
 
-            Ok(match (base_type_name.as_ref(), value) { // Use base_type_name.as_ref(), Wrap in Ok
+            Ok(match (base_type_name, value) { // Match on &str directly
                 (_, EvaluationResult::Empty) => EvaluationResult::Empty, // 'as' on empty is empty
                 // Collections handled by initial check
                 (_, EvaluationResult::Collection(_)) => unreachable!(),
