@@ -1222,40 +1222,42 @@ fn test_function_conversion_converts_to_integer() {
 #[test]
 fn test_function_conversion_to_decimal() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toDecimal()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toDecimal()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("123.toDecimal()", &context),
+        eval("123.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(123.0)) // Integer to Decimal (explicit .0)
     );
     assert_eq!(
-        eval("123.45.toDecimal()", &context),
+        eval("123.45.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(123.45)) // Decimal to Decimal
     );
     assert_eq!(
-        eval("'456.78'.toDecimal()", &context),
+        eval("'456.78'.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(456.78)) // String to Decimal
     );
     assert_eq!(
-        eval("'+12.3'.toDecimal()", &context),
+        eval("'+12.3'.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(12.3)) // String with sign
     );
     assert_eq!(
-        eval("'-45.6'.toDecimal()", &context),
+        eval("'-45.6'.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(-45.6)) // String with sign
     );
     assert_eq!(
-        eval("'789'.toDecimal()", &context),
+        eval("'789'.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(789.0)) // Integer string -> Decimal (explicit .0)
     );
     assert_eq!(
-        eval("true.toDecimal()", &context),
+        eval("true.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(1.0)) // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
-        eval("false.toDecimal()", &context),
+        eval("false.toDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(0.0)) // Boolean to Decimal (explicit .0)
     );
-    assert_eq!(eval("'abc'.toDecimal()", &context), EvaluationResult::Empty); // Invalid string
+    assert_eq!(eval("'abc'.toDecimal()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("(1.0 | 2.0).toDecimal()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstodecimal--boolean
