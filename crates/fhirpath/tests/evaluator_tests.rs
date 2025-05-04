@@ -827,9 +827,9 @@ fn test_function_subsetting_intersect() {
 #[test]
 fn test_function_subsetting_exclude() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.exclude({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.exclude({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(1 | 2 | 3).exclude({})", &context),
+        eval("(1 | 2 | 3).exclude({})", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
@@ -838,11 +838,11 @@ fn test_function_subsetting_exclude() {
         ])
     );
     assert_eq!(
-        eval("{}.exclude(1 | 2 | 3)", &context),
+        eval("{}.exclude(1 | 2 | 3)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(1 | 2 | 3).exclude(2 | 4)", &context),
+        eval("(1 | 2 | 3).exclude(2 | 4)", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
@@ -854,7 +854,7 @@ fn test_function_subsetting_exclude() {
     // (1 | 4) -> (1 | 4)
     // exclude -> (2 | 3)
     assert_eq!(
-        eval("(1 | 2 | 1 | 3 | 2).exclude(1 | 4)", &context),
+        eval("(1 | 2 | 1 | 3 | 2).exclude(1 | 4)", &context).unwrap(), // Add unwrap
         // Expect collection result based on distinct input
         collection(vec![
             EvaluationResult::Integer(2),
