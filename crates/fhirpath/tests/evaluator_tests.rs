@@ -672,10 +672,10 @@ fn test_function_subsetting_first() {
 #[test]
 fn test_function_subsetting_last() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.last()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("(10).last()", &context), EvaluationResult::Integer(10));
+    assert_eq!(eval("{}.last()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("(10).last()", &context).unwrap(), EvaluationResult::Integer(10)); // Add unwrap
     assert_eq!(
-        eval("(10 | 20 | 30).last()", &context),
+        eval("(10 | 20 | 30).last()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(30)
     );
 }
