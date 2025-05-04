@@ -1818,38 +1818,59 @@ fn generate_fhirpath_struct_impl(
     let field_conversions = fields.iter().map(|field| {
         let field_name_ident = field.ident.as_ref().unwrap();
         let field_key_str = get_fhirpath_field_name(field); // Use the specific FHIRPath naming helper
+        let field_ty = &field.ty; // Get the field type
 
-        // Handle potential flattening - flattened fields are skipped for direct map insertion
-        if is_flattened(field) {
-             quote! {
-                // Flattened fields are handled differently - serialize the inner map
-                // Note: This requires the flattened field's type to also implement IntoEvaluationResult
-                // and return an Object variant.
-                 if let Some(inner_value) = &self.#field_name_ident {
+        // Generate code to handle the field based on whether it's Option, flattened, etc.
+        let field_handling_code = if is_flattened(field) {
+            // Handle flattened fields
+            quote! {
+                if let Some(inner_value) = &self.#field_name_ident { // Check if Option field is Some
                     match inner_value.into_evaluation_result() {
                         fhirpath_support::EvaluationResult::Object(inner_map) => {
-                            map.extend(inner_map);
+                            map.extend(inner_map); // Merge the inner map
                         }
-                        // Decide how to handle non-object results from flattened fields.
-                        // Option 1: Ignore them silently.
-                        // Option 2: Panic or return an error.
-                        // Option 3: Insert a placeholder?
-                        // Let's ignore for now.
+                        // Ignore non-object results from flattened fields
                         _ => {}
                     }
-                 }
-             }
-        } else {
-            quote! {
-                // For non-flattened fields, insert directly into the map
-                let field_result = self.#field_name_ident.into_evaluation_result();
-                // Add debug print specifically for the 'deceased' field when generating for Patient
-                if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
-                    eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}': {:?}", #field_key_str, field_result);
                 }
-                map.insert(#field_key_str.to_string(), field_result);
+                // If the Option field is None, do nothing for flatten
             }
-        }
+        } else {
+            // Handle non-flattened fields
+            let is_option = get_option_inner_type(field_ty).is_some();
+
+            if is_option {
+                // For Option<T>, evaluate the inner value only if Some
+                quote! {
+                    if let Some(inner_value) = &self.#field_name_ident {
+                        let field_result = inner_value.into_evaluation_result();
+                        // Only insert if the inner evaluation is not Empty
+                        if field_result != fhirpath_support::EvaluationResult::Empty {
+                            // Add debug print specifically for the 'deceased' field when generating for Patient
+                            if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
+                                eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}' (from Option): {:?}", #field_key_str, field_result);
+                            }
+                            map.insert(#field_key_str.to_string(), field_result);
+                        }
+                    }
+                    // If self.#field_name_ident is None, do nothing (don't insert Empty)
+                }
+            } else {
+                // For non-Option<T>, evaluate directly
+                quote! {
+                    let field_result = self.#field_name_ident.into_evaluation_result();
+                    // Only insert if the evaluation is not Empty
+                    if field_result != fhirpath_support::EvaluationResult::Empty {
+                         // Add debug print specifically for the 'deceased' field when generating for Patient
+                         if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
+                             eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}' (direct): {:?}", #field_key_str, field_result);
+                         }
+                        map.insert(#field_key_str.to_string(), field_result);
+                    }
+                }
+            }
+        };
+        field_handling_code // Return the generated code for this field
     });
 
 
