@@ -644,13 +644,13 @@ fn test_function_subsetting_indexer() {
 #[test]
 fn test_function_subsetting_single() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.single()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.single()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10).single()", &context),
+        eval("(10).single()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
     );
-    // Multiple items should return Empty
-    assert_eq!(eval("(10 | 20).single()", &context), EvaluationResult::Empty);
+    // Multiple items should error per spec
+    assert!(eval("(10 | 20).single()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#first--collection
