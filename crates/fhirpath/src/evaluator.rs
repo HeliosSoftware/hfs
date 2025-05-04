@@ -1037,11 +1037,7 @@ fn call_function(
                         .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(), // This arm is unreachable due to the count check above
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1065,11 +1061,7 @@ fn call_function(
                 // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
                 EvaluationResult::Decimal(_) => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -1502,11 +1494,7 @@ fn call_function(
             Ok(match invocation_base { // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // toString on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Convert single item to string
                 single_item => EvaluationResult::String(single_item.to_string_value()),
             })
@@ -1556,11 +1544,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1608,11 +1592,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1678,11 +1658,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
             })
         }
@@ -1772,13 +1748,11 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(items) => { // Restore original logic but use ?
-                    if items.len() == 1 {
-                       call_function("toQuantity", &items[0], &[])? // Add ?
-                    } else {
-                       // This case is now unreachable due to the initial count check
-                       unreachable!("Multi-item collection should have caused an error earlier")
-                    }
+                EvaluationResult::Collection(items) => {
+                    // This case is now unreachable due to the initial count check
+                    // Return Empty explicitly to satisfy type checker inside Ok()
+                    EvaluationResult::Empty
+                    // unreachable!("Multi-item collection should have caused an error earlier")
                 }
                 _ => EvaluationResult::Empty, // Other types cannot convert
             }) // Close the Ok() wrapper here
@@ -1824,11 +1798,7 @@ fn call_function(
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
                 EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => return Err(EvaluationError::TypeError("length() requires a String input".to_string())),
             })
         }
@@ -2063,11 +2033,7 @@ fn call_function(
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
                  // Collections handled by initial check
-                EvaluationResult::Collection(_) => {
-                     // Return Empty explicitly to satisfy type checker inside Ok()
-                    EvaluationResult::Empty
-                    // unreachable!("Multi-item collection should have caused an error earlier")
-                }
+                EvaluationResult::Collection(_) => unreachable!(),
                 _ => return Err(EvaluationError::TypeError("toChars requires a String input".to_string())),
             })
         }
