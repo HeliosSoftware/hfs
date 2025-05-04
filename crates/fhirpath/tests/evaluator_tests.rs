@@ -657,13 +657,13 @@ fn test_function_subsetting_single() {
 #[test]
 fn test_function_subsetting_first() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.first()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.first()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10).first()", &context),
+        eval("(10).first()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
     );
     assert_eq!(
-        eval("(10 | 20 | 30).first()", &context),
+        eval("(10 | 20 | 30).first()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
     );
 }
