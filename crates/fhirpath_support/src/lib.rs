@@ -221,15 +221,27 @@ impl EvaluationResult {
                 "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
                 "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
                 _ => EvaluationResult::Empty, // Other strings evaluate to empty in boolean logic
-            },
+            }),
+            EvaluationResult::Collection(items) => {
+                if items.len() == 1 {
+                    // Recursively call on the single item
+                    items[0].to_boolean_for_logic()
+                } else if items.is_empty() {
+                    Ok(EvaluationResult::Empty) // Empty collection -> Empty
+                } else {
+                    // Multi-item collection -> Error
+                    Err(EvaluationError::SingletonEvaluationError(format!(
+                        "Boolean logic requires singleton collection, found {} items", items.len()
+                    )))
+                }
+            }
             // Other types evaluate to Empty for logical operators per spec section 5.2
             EvaluationResult::Integer(_)
             | EvaluationResult::Decimal(_)
             | EvaluationResult::Date(_)
             | EvaluationResult::DateTime(_)
             | EvaluationResult::Time(_)
-            | EvaluationResult::Collection(_) // Collections evaluate to Empty in boolean logic context
-            | EvaluationResult::Object(_) => EvaluationResult::Empty,
+            | EvaluationResult::Object(_) => Ok(EvaluationResult::Empty),
             EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         }
     }
