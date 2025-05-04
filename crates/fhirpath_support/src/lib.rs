@@ -211,11 +211,13 @@ impl EvaluationResult {
 
     /// Converts the result to Boolean specifically for logical operators (and, or, xor, implies).
     /// Handles String conversion ('true'/'false' variants) -> Boolean.
-    /// Other types (including other strings and collections) result in Empty.
-    pub fn to_boolean_for_logic(&self) -> EvaluationResult {
+    /// Other types (including other strings) result in Empty.
+    /// Collections with > 1 item result in an error.
+    /// Single-item collections are evaluated based on the item.
+    pub fn to_boolean_for_logic(&self) -> Result<EvaluationResult, EvaluationError> {
         match self {
-            EvaluationResult::Boolean(b) => EvaluationResult::Boolean(*b),
-            EvaluationResult::String(s) => match s.to_lowercase().as_str() {
+            EvaluationResult::Boolean(b) => Ok(EvaluationResult::Boolean(*b)),
+            EvaluationResult::String(s) => Ok(match s.to_lowercase().as_str() {
                 "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
                 "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
                 _ => EvaluationResult::Empty, // Other strings evaluate to empty in boolean logic
