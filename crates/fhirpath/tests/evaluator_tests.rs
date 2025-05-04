@@ -3240,18 +3240,18 @@ fn patient_context() -> EvaluationContext {
 fn test_resource_simple_field_access() {
     let context = patient_context();
     assert_eq!(
-        eval("id", &context),
+        eval("id", &context).unwrap(), // Add unwrap
         EvaluationResult::String("p1".to_string())
     );
     // Accessing 'active' should now return the primitive boolean directly
-    assert_eq!(eval("active", &context), EvaluationResult::Boolean(true));
+    assert_eq!(eval("active", &context).unwrap(), EvaluationResult::Boolean(true)); // Add unwrap
     // Accessing 'birthDate' should now return the primitive string directly
     assert_eq!(
-        eval("birthDate", &context),
+        eval("birthDate", &context).unwrap(), // Add unwrap
         EvaluationResult::String("1980-05-15".to_string())
     );
     // Evaluate the context first to check the object structure directly
-    let context_result = eval("%context", &context);
+    let context_result = eval("%context", &context).unwrap(); // Add unwrap
     eprintln!("Debug [test_resource_simple_field_access]: %context result: {:?}", context_result);
     if let EvaluationResult::Object(patient_obj) = context_result {
         // Check the 'deceased' field within the evaluated object map
@@ -3263,10 +3263,10 @@ fn test_resource_simple_field_access() {
     } else {
         panic!("%context did not evaluate to an Object");
     }
-    // Keep the check for the incorrect access pattern
-    assert_eq!(eval("deceasedBoolean", &context), EvaluationResult::Empty);
-    assert_eq!(eval("deceasedDateTime", &context), EvaluationResult::Empty); // Accessing non-existent choice type name
-    assert_eq!(eval("nonExistentField", &context), EvaluationResult::Empty);
+    // Accessing non-existent fields should still return Empty for now
+    assert_eq!(eval("deceasedBoolean", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("deceasedDateTime", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("nonExistentField", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
 }
 
 #[test]
