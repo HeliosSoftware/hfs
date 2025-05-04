@@ -483,11 +483,11 @@ fn test_function_filtering_where() {
 fn test_function_filtering_select() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.select($this + 1)", &context),
+        eval("{}.select($this + 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(1 | 2 | 3).select($this * 2)", &context),
+        eval("(1 | 2 | 3).select($this * 2)", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(2),
@@ -497,7 +497,7 @@ fn test_function_filtering_select() {
     );
     // Test flattening
     assert_eq!(
-        eval("( (1|2) | (3|4) ).select($this)", &context),
+        eval("( (1|2) | (3|4) ).select($this)", &context).unwrap(), // Add unwrap
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
@@ -507,13 +507,13 @@ fn test_function_filtering_select() {
     );
     // Test empty result from projection is skipped
     assert_eq!(
-        eval("(1 | 2 | 3).select(iif($this > 2, $this, {}))", &context),
+        eval("(1 | 2 | 3).select(iif($this > 2, $this, {}))", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
         EvaluationResult::Integer(3)
     );
     // Test projection resulting in collection
     assert_eq!(
-        eval("(1 | 2).select( ( $this ) | ( $this + 1 ) )", &context),
+        eval("(1 | 2).select( ( $this ) | ( $this + 1 ) )", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(1),
