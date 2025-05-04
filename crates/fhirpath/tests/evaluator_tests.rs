@@ -2046,22 +2046,26 @@ fn test_function_string_upper() {
 fn test_function_string_lower() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'ABCDEFG'.lower()", &context),
+        eval("'ABCDEFG'.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abcdefg".to_string())
     );
     assert_eq!(
-        eval("'aBcDeFg'.lower()", &context),
+        eval("'aBcDeFg'.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abcdefg".to_string())
     );
     assert_eq!(
-        eval("'123'.lower()", &context),
+        eval("'123'.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("123".to_string())
     );
     assert_eq!(
-        eval("''.lower()", &context),
+        eval("''.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.lower()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.lower()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("('A' | 'B').lower()", &context).is_err());
+    // Test non-string input - should error
+    assert!(eval("123.lower()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#replacepattern--string-substitution--string--string
