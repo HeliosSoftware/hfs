@@ -740,18 +740,18 @@ fn test_function_subsetting_skip() {
 #[test]
 fn test_function_subsetting_take() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.take(1)", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.take(1)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10 | 20 | 30).take(0)", &context),
+        eval("(10 | 20 | 30).take(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("(10 | 20 | 30).take(1)", &context),
+        eval("(10 | 20 | 30).take(1)", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
         EvaluationResult::Integer(10)
     );
     assert_eq!(
-        eval("(10 | 20 | 30).take(2)", &context),
+        eval("(10 | 20 | 30).take(2)", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
@@ -760,7 +760,7 @@ fn test_function_subsetting_take() {
     );
     // Add the missing assert_eq! for take(3)
     assert_eq!(
-        eval("(10 | 20 | 30).take(3)", &context),
+        eval("(10 | 20 | 30).take(3)", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
@@ -769,7 +769,7 @@ fn test_function_subsetting_take() {
         ]) // End collection for take(3)
     ); // End assert_eq for take(3)
     assert_eq!(
-        eval("(10 | 20 | 30).take(4)", &context),
+        eval("(10 | 20 | 30).take(4)", &context).unwrap(), // Add unwrap
         // Expect collection result
         collection(vec![
             EvaluationResult::Integer(10),
@@ -777,10 +777,13 @@ fn test_function_subsetting_take() {
             EvaluationResult::Integer(30)
         ])
     );
+    // Negative take returns empty
     assert_eq!(
-        eval("(10 | 20 | 30).take(-1)", &context),
+        eval("(10 | 20 | 30).take(-1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Non-integer take should error
+    assert!(eval("(10 | 20 | 30).take('a')", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#intersectother-collection--collection
