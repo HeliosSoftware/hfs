@@ -1869,6 +1869,9 @@ fn generate_fhirpath_enum_impl(
     where_clause: Option<&syn::WhereClause>,
 ) -> proc_macro2::TokenStream {
 
+    // Check if the enum being derived is the top-level Resource enum
+    let is_resource_enum = name == "Resource";
+
     let match_arms = data.variants.iter().map(|variant| {
         let variant_name = &variant.ident;
         let variant_name_str = variant_name.to_string();
@@ -1876,30 +1879,39 @@ fn generate_fhirpath_enum_impl(
         match &variant.fields {
             Fields::Unit => {
                 // For unit variants, return the variant name as a string (like a code)
+                // This is likely for status codes etc., not the Resource enum
                 quote! {
                     Self::#variant_name => fhirpath_support::EvaluationResult::String(#variant_name_str.to_string()),
                 }
             }
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
-                // Newtype variant (e.g., Patient(Patient), Observation(Observation))
-                // Call into_evaluation_result on the inner value and add resourceType.
-                quote! {
-                    Self::#variant_name(value) => {
-                        let mut result = value.into_evaluation_result(); // Call on inner value
-                        if let fhirpath_support::EvaluationResult::Object(ref mut map) = result {
-                            // Insert the resourceType field
-                            map.insert(
-                                "resourceType".to_string(),
-                                fhirpath_support::EvaluationResult::String(#variant_name_str.to_string())
-                            );
+                // Newtype variant
+                if is_resource_enum {
+                    // Special handling for the Resource enum: add resourceType
+                    quote! {
+                        Self::#variant_name(value) => {
+                            let mut result = value.into_evaluation_result(); // Call on inner Box<ResourceStruct>
+                            if let fhirpath_support::EvaluationResult::Object(ref mut map) = result {
+                                // Insert the resourceType field using the variant name
+                                map.insert(
+                                    "resourceType".to_string(),
+                                    fhirpath_support::EvaluationResult::String(#variant_name_str.to_string())
+                                );
+                            }
+                            // Return the (potentially modified) result
+                            result
                         }
-                        // Return the (potentially modified) result
-                        result
+                    }
+                } else {
+                    // For other enums (like choice types), just delegate to the inner value
+                    quote! {
+                        Self::#variant_name(value) => value.into_evaluation_result(),
                     }
                 }
            }
-            // For tuple or struct variants, the direct FHIRPath evaluation is less clear.
-            // Returning Empty seems like a reasonable default for now.
+            // For tuple or struct variants (uncommon in FHIR choice types or Resource enum),
+            // the direct FHIRPath evaluation is less clear.
+            // Returning Empty seems like a reasonable default.
             Fields::Unnamed(_) | Fields::Named(_) => {
                  quote! {
                      // Match all fields but ignore them for now
