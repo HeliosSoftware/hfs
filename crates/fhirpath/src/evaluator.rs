@@ -287,10 +287,13 @@ fn evaluate_term(
                                     .map(convert_resource_to_result)
                                     .collect(),
                             )
-                        };
+                        });
                     } else {
-                        // Return other variable value
-                        return context.get_variable_as_result(var_name);
+                        // Return other variable value or error if undefined
+                        return match context.get_variable(var_name) {
+                            Some(value) => Ok(EvaluationResult::String(value.clone())),
+                            None => Err(EvaluationError::UndefinedVariable(format!("%{}", var_name))),
+                        };
                     }
                 }
             }
