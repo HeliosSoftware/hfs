@@ -791,17 +791,17 @@ fn test_function_subsetting_take() {
 fn test_function_subsetting_intersect() {
     // Note: HashSet used internally, order is not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.intersect({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.intersect({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(1 | 2 | 3).intersect({})", &context),
+        eval("(1 | 2 | 3).intersect({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("{}.intersect((1 | 2 | 3))", &context), // Changed {} to ()
+        eval("{}.intersect((1 | 2 | 3))", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     // Order not guaranteed, check contents
-    let result = eval("(1 | 2 | 3).intersect((2 | 3 | 4))", &context); // Changed {} to ()
+    let result = eval("(1 | 2 | 3).intersect((2 | 3 | 4))", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -818,7 +818,7 @@ fn test_function_subsetting_intersect() {
     // (1 | 2 | 1) -> (1 | 2)
     // (1 | 3 | 1) -> (1 | 3)
     // intersect -> (1)
-    let result = eval("(1 | 2 | 1).intersect(1 | 3 | 1)", &context); // Use | syntax
+    let result = eval("(1 | 2 | 1).intersect(1 | 3 | 1)", &context).unwrap(); // Add unwrap
     // Check if the result is the single integer 1, handling normalization
     assert_eq!(result, EvaluationResult::Integer(1), "Intersect result mismatch");
 }
