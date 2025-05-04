@@ -1533,45 +1533,47 @@ fn test_function_conversion_to_date_time() {
 fn test_function_conversion_converts_to_date_time() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToDateTime()", &context),
+        eval("{}.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("@2023-10-27T10:30:00Z.convertsToDateTime()", &context),
+        eval("@2023-10-27T10:30:00Z.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("@2023-10-27.convertsToDateTime()", &context),
+        eval("@2023-10-27.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'2023-10-27T10:30:00Z'.convertsToDateTime()", &context),
+        eval("'2023-10-27T10:30:00Z'.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'2023-10-27'.convertsToDateTime()", &context),
+        eval("'2023-10-27'.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'2023-10'.convertsToDateTime()", &context),
+        eval("'2023-10'.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'2023'.convertsToDateTime()", &context),
+        eval("'2023'.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'invalid-datetime'.convertsToDateTime()", &context),
+        eval("'invalid-datetime'.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("123.convertsToDateTime()", &context),
+        eval("123.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("true.convertsToDateTime()", &context),
+        eval("true.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
+    // Test multi-item collection - should error
+    assert!(eval("(@2023 | @2024).convertsToDateTime()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#totime--time
