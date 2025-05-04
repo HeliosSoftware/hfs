@@ -3380,8 +3380,9 @@ fn test_resource_filtering_and_projection() {
     );
 
     // Select on a non-list field (acts on the single item) - birthDate is now an Object
+    // Access the value field for the string representation
     assert_eq!(
-        eval("birthDate.select($this.toString())", &context),
+        eval("birthDate.value.select($this.toString())", &context),
         EvaluationResult::String("1980-05-15".to_string())
     );
 
