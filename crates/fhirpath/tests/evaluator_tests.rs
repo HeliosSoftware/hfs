@@ -397,13 +397,13 @@ fn test_function_existence_count() {
 #[test]
 fn test_function_existence_distinct() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.distinct()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.distinct()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(1).distinct()", &context),
+        eval("(1).distinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
     // Order not guaranteed, so check contents
-    let result = eval("(1 | 2 | 1 | 3 | 2).distinct()", &context);
+    let result = eval("(1 | 2 | 1 | 3 | 2).distinct()", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
