@@ -1018,70 +1018,72 @@ fn test_function_conversion_iif() {
 #[test]
 fn test_function_conversion_to_boolean() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toBoolean()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("true.toBoolean()", &context),
+        eval("true.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("1.toBoolean()", &context),
+        eval("1.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("0.toBoolean()", &context),
+        eval("0.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("1.0.toBoolean()", &context),
+        eval("1.0.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("0.0.toBoolean()", &context),
+        eval("0.0.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'true'.toBoolean()", &context),
+        eval("'true'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'false'.toBoolean()", &context),
+        eval("'false'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'T'.toBoolean()", &context),
+        eval("'T'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     ); // Case-insensitive
     assert_eq!(
-        eval("'f'.toBoolean()", &context),
+        eval("'f'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Case-insensitive
     assert_eq!(
-        eval("'yes'.toBoolean()", &context),
+        eval("'yes'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'no'.toBoolean()", &context),
+        eval("'no'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'1'.toBoolean()", &context),
+        eval("'1'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'0'.toBoolean()", &context),
+        eval("'0'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'1.0'.toBoolean()", &context),
+        eval("'1.0'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'0.0'.toBoolean()", &context),
+        eval("'0.0'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("2.toBoolean()", &context), EvaluationResult::Empty); // Invalid integer
-    assert_eq!(eval("2.5.toBoolean()", &context), EvaluationResult::Empty); // Invalid decimal
-    assert_eq!(eval("'abc'.toBoolean()", &context), EvaluationResult::Empty); // Invalid string
+    assert_eq!(eval("2.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid integer, Add unwrap
+    assert_eq!(eval("2.5.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid decimal, Add unwrap
+    assert_eq!(eval("'abc'.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("(true | false).toBoolean()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstoboolean--boolean
