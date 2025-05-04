@@ -3686,18 +3686,31 @@ fn test_string_operations() {
             "%message.contains('World')",
             EvaluationResult::Boolean(true),
         ),
+        // Test contains with non-string argument (should return false or empty, current impl returns false)
+        (
+            "'abc'.contains(1)",
+            EvaluationResult::Boolean(false),
+        ),
+        // Test contains with empty argument (should return empty)
+        (
+            "'abc'.contains({})",
+            EvaluationResult::Empty,
+        ),
+        // Test contains on empty string
+        (
+            "{}.contains('a')",
+            EvaluationResult::Empty, // Spec: {} contains X -> false, but function call on {} -> {}
+        ),
+
     ];
 
     for (input, expected) in test_cases {
-        let expr = parser().parse(input).unwrap();
-        println!("String operation parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context, None);
-        println!(
-            "String operation result: {:?}, Expected: {:?}",
-            result, expected
-        );
-        assert_eq!(result, expected, "Failed for input: {}", input);
+        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
     }
+
+     // Test multi-item errors for contains function
+    assert!(eval("('a' | 'b').contains('a')", &context).is_err());
+    assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
 }
 
 #[test]
