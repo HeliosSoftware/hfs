@@ -3258,10 +3258,12 @@ fn test_resource_simple_field_access() {
     if let EvaluationResult::Object(fields) = deceased_result {
          assert_eq!(fields.get("value"), Some(&EvaluationResult::Boolean(false)));
     }
+    // Accessing the choice type name directly yields the primitive value here,
+    // because the underlying Boolean element only has a value.
     assert_eq!(
-        eval("deceasedBoolean.value", &context), // Access the value within the element
-        EvaluationResult::Boolean(false) // Expect the primitive boolean value
-    ); // Accessing specific choice type name
+        eval("deceasedBoolean", &context),
+        EvaluationResult::Boolean(false)
+    );
     assert_eq!(eval("deceasedDateTime", &context), EvaluationResult::Empty); // Accessing non-existent choice type name
     assert_eq!(eval("nonExistentField", &context), EvaluationResult::Empty);
 }
