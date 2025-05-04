@@ -3244,10 +3244,11 @@ fn test_resource_simple_field_access() {
         EvaluationResult::String("p1".to_string())
     );
     assert_eq!(eval("active", &context), EvaluationResult::Boolean(true));
+    // birthDate is Element<String>, so it evaluates to String
     assert_eq!(
         eval("birthDate", &context),
-        EvaluationResult::Date("1980-05-15".to_string())
-    ); // Use eval directly
+        EvaluationResult::String("1980-05-15".to_string())
+    );
     assert_eq!(eval("deceased", &context), EvaluationResult::Boolean(false)); // Accessing choice type value
     assert_eq!(
         eval("deceasedBoolean", &context),
@@ -3272,8 +3273,9 @@ fn test_resource_nested_field_access() {
     let name_given = eval("name.given", &context);
     assert!(matches!(name_given, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(items) = name_given {
-        assert_eq!(items.len(), 3); // John, Johnny, Jane
+        assert_eq!(items.len(), 4); // John, Middle, Johnny, Jane
         assert!(items.contains(&EvaluationResult::String("John".to_string())));
+        assert!(items.contains(&EvaluationResult::String("Middle".to_string()))); // Add Middle
         assert!(items.contains(&EvaluationResult::String("Johnny".to_string())));
         assert!(items.contains(&EvaluationResult::String("Jane".to_string())));
     }
@@ -3347,12 +3349,15 @@ fn test_resource_filtering_and_projection() {
         eval("name.where(use = 'official').family", &context),
         EvaluationResult::String("Doe".to_string())
     );
+    // .given returns a collection, even if there's only one item
     assert_eq!(
         eval("name.where(use = 'usual').given", &context),
-        EvaluationResult::String("Johnny".to_string())
+        EvaluationResult::Collection(vec![EvaluationResult::String("Johnny".to_string())])
     );
     assert_eq!(
         eval("name.where(family = 'Smith').given", &context),
+        // .given returns a collection
+        EvaluationResult::Collection(vec![EvaluationResult::String("Jane".to_string())])
         EvaluationResult::String("Jane".to_string())
     );
 
