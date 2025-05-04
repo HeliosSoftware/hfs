@@ -831,69 +831,74 @@ where
     E: IntoEvaluationResult + Clone,
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        // If no id, extension, or value, return Empty
-        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
-            return EvaluationResult::Empty;
+        // Prioritize returning the primitive value if it exists
+        if let Some(v) = &self.value {
+            return v.into_evaluation_result();
         }
 
-        // Always construct an Object if id, extension, OR value is present.
-        let mut map = std::collections::HashMap::new();
-        if let Some(id) = &self.id {
-            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
-        }
-        if let Some(ext) = &self.extension {
-            // Convert Vec<E> to EvaluationResult::Collection
-            let ext_collection: Vec<EvaluationResult> = ext
-                .iter()
-                .map(|e| e.into_evaluation_result())
-                .collect();
-            // Only insert if the collection is not empty
-            if !ext_collection.is_empty() {
-                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
+        // If value is None, but id or extension exist, return an Object with those
+        if self.id.is_some() || self.extension.is_some() {
+            let mut map = std::collections::HashMap::new();
+            if let Some(id) = &self.id {
+                map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+            }
+            if let Some(ext) = &self.extension {
+                let ext_collection: Vec<EvaluationResult> = ext
+                    .iter()
+                    .map(|e| e.into_evaluation_result())
+                    .collect();
+                if !ext_collection.is_empty() {
+                    map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
+                }
+            }
+            // Only return Object if map is not empty (i.e., id or extension was actually present)
+            if !map.is_empty() {
+                return EvaluationResult::Object(map);
             }
         }
-        if let Some(v) = &self.value {
-            map.insert("value".to_string(), v.into_evaluation_result());
-        }
 
-        EvaluationResult::Object(map)
+        // If value, id, and extension are all None, return Empty
+        EvaluationResult::Empty
     }
 }
 
-// For DecimalElement<E> - Returns Object with id, extension, value if present
+// For DecimalElement<E> - Returns Decimal value if present, otherwise handles id/extension
 impl<E> IntoEvaluationResult for DecimalElement<E>
 where
     E: IntoEvaluationResult + Clone,
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-         // If no id, extension, or value, return Empty
-        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
-            return EvaluationResult::Empty;
-        }
-
-        // Always construct an Object if id, extension, OR value is present.
-        let mut map = std::collections::HashMap::new();
-        if let Some(id) = &self.id {
-            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
-        }
-        if let Some(ext) = &self.extension {
-            // Convert Vec<E> to EvaluationResult::Collection
-            let ext_collection: Vec<EvaluationResult> = ext
-                .iter()
-                .map(|e| e.into_evaluation_result())
-                .collect();
-             // Only insert if the collection is not empty
-            if !ext_collection.is_empty() {
-                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
-            }
-        }
+        // Prioritize returning the primitive decimal value if it exists
         if let Some(precise_decimal) = &self.value {
-             if let Some(decimal_val) = precise_decimal.value() {
-                map.insert("value".to_string(), EvaluationResult::Decimal(decimal_val));
+            if let Some(decimal_val) = precise_decimal.value() {
+                return EvaluationResult::Decimal(decimal_val);
+            }
+            // If PreciseDecimal holds None for value, fall through to check id/extension
+        }
+
+        // If value is None, but id or extension exist, return an Object with those
+        if self.id.is_some() || self.extension.is_some() {
+            let mut map = std::collections::HashMap::new();
+            if let Some(id) = &self.id {
+                map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+            }
+            if let Some(ext) = &self.extension {
+                let ext_collection: Vec<EvaluationResult> = ext
+                    .iter()
+                    .map(|e| e.into_evaluation_result())
+                    .collect();
+                if !ext_collection.is_empty() {
+                    map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
+                }
+            }
+             // Only return Object if map is not empty
+            if !map.is_empty() {
+                return EvaluationResult::Object(map);
             }
         }
 
-        EvaluationResult::Object(map)
+        // If value, id, and extension are all None, return Empty
+        EvaluationResult::Empty
     }
 }
 
