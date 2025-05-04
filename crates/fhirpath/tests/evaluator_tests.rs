@@ -3455,7 +3455,10 @@ fn test_resource_oftype() {
 #[test]
 fn test_arithmetic_operations() {
     // Note: Result types vary based on operator and operands
-    let test_cases = vec![
+    let context = EvaluationContext::new_empty();
+
+    // --- Success Cases ---
+    let success_cases = vec![
         ("1 + 2", EvaluationResult::Integer(3)),         // Addition -> Integer
         ("5 - 3", EvaluationResult::Integer(2)),         // Subtraction -> Integer
         ("2 * 3", EvaluationResult::Integer(6)),         // Integer Multiplication -> Integer
@@ -3469,27 +3472,50 @@ fn test_arithmetic_operations() {
         ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))), // Decimal Div -> Decimal
         ("5.5 div 2.1", EvaluationResult::Integer(2)),   // Decimal div -> Integer
         ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // Decimal mod -> Decimal
-        // Mixed type div/mod -> Empty
-        ("5.5 div 2", EvaluationResult::Empty), // Decimal div Integer -> Empty
-        ("5 div 2.1", EvaluationResult::Empty),
-        ("5.5 mod 2", EvaluationResult::Empty),
-        ("5 mod 2.1", EvaluationResult::Empty),
-        // Division by zero -> Empty
-        ("5 / 0", EvaluationResult::Empty),
-        ("5.0 / 0", EvaluationResult::Empty),
-        ("5 div 0", EvaluationResult::Empty),
-        ("5.0 div 0", EvaluationResult::Empty),
-        ("5 mod 0", EvaluationResult::Empty),
-        ("5.0 mod 0", EvaluationResult::Empty),
     ];
 
-    // For arithmetic operations, we don't need any resources
-    let context = EvaluationContext::new_empty();
+    for (input, expected) in success_cases {
+        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+    }
 
-    for (input, expected) in test_cases {
-        let expr = parser().parse(input).unwrap();
-        let result = evaluate(&expr, &context, None);
-        assert_eq!(result, expected);
+    // --- Error Cases ---
+    let error_cases = vec![
+        // Mixed type div/mod -> Error
+        "5.5 div 2",
+        "5 div 2.1",
+        "5.5 mod 2",
+        "5 mod 2.1",
+        // Division by zero -> Error
+        "5 / 0",
+        "5.0 / 0",
+        "5 div 0",
+        "5.0 div 0.0", // Changed to 0.0 for Decimal div
+        "5 mod 0",
+        "5.0 mod 0.0", // Changed to 0.0 for Decimal mod
+        // Type Mismatches
+        "1 + 'a'",
+        "'a' + 1",
+        "1 * 'a'",
+        "1 / 'a'",
+        "1 div 'a'",
+        "1 mod 'a'",
+    ];
+
+    for input in error_cases {
+        assert!(eval(input, &context).is_err(), "Expected error for input: {}", input);
+    }
+
+    // --- Empty Propagation Cases ---
+    let empty_cases = vec![
+        "1 + {}", "{} + 1",
+        "1 - {}", "{} - 1",
+        "1 * {}", "{} * 1",
+        "1 / {}", "{} / 1",
+        "1 div {}", "{} div 1",
+        "1 mod {}", "{} mod 1",
+    ];
+    for input in empty_cases {
+         assert_eq!(eval(input, &context).unwrap(), EvaluationResult::Empty, "Failed for input: {}", input);
     }
 }
 
