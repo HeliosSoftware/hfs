@@ -1973,42 +1973,45 @@ fn test_function_string_ends_with() {
 fn test_function_string_contains() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.contains('cde')", &context),
+        eval("'abcdefg'.contains('cde')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.contains('abc')", &context),
+        eval("'abcdefg'.contains('abc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.contains('efg')", &context),
+        eval("'abcdefg'.contains('efg')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.contains('ace')", &context),
+        eval("'abcdefg'.contains('ace')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'abcdefg'.contains('x')", &context),
+        eval("'abcdefg'.contains('x')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'abcdefg'.contains('')", &context),
+        eval("'abcdefg'.contains('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("''.contains('a')", &context),
+        eval("''.contains('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("''.contains('')", &context),
+        eval("''.contains('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.contains('a')", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.contains('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("'abc'.contains({})", &context),
+        eval("'abc'.contains({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').contains('a')", &context).is_err());
+    assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#upper--string
