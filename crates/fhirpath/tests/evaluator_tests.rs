@@ -1186,34 +1186,36 @@ fn test_function_conversion_to_integer() {
 fn test_function_conversion_converts_to_integer() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToInteger()", &context),
+        eval("{}.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("123.convertsToInteger()", &context),
+        eval("123.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'456'.convertsToInteger()", &context),
+        eval("'456'.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("true.convertsToInteger()", &context),
+        eval("true.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     // Decimal conversion check
     assert_eq!(
-        eval("123.45.convertsToInteger()", &context),
+        eval("123.45.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false) // Per spec
     );
     assert_eq!(
-        eval("123.0.convertsToInteger()", &context),
+        eval("123.0.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abc'.convertsToInteger()", &context),
+        eval("'abc'.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     ); // Invalid string
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2).convertsToInteger()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#todecimal--decimal
