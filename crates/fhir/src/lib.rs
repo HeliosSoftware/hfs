@@ -824,35 +824,97 @@ where
     }
 }
 
-// For Element<V, E> - Extracts the primitive value, ignoring id/extension for direct access
+// For Element<V, E> - Returns Object with id, extension, value if present
 impl<V, E> IntoEvaluationResult for Element<V, E>
 where
     V: IntoEvaluationResult + Clone,
-    E: IntoEvaluationResult + Clone, // Keep E bound for potential future use
+    E: IntoEvaluationResult + Clone,
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        // Always return the primitive value's result, or Empty if value is None
-        match &self.value {
-            Some(v) => v.into_evaluation_result(), // Convert the inner value
-            None => EvaluationResult::Empty,
+        // If no id, extension, or value, return Empty
+        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
+            return EvaluationResult::Empty;
         }
+
+        // If only value is present, return the primitive result directly
+        if self.id.is_none() && self.extension.is_none() {
+            if let Some(v) = &self.value {
+                return v.into_evaluation_result();
+            } else {
+                // This case should be caught by the first check, but defensively return Empty
+                return EvaluationResult::Empty;
+            }
+        }
+
+        // Otherwise, construct an Object
+        let mut map = std::collections::HashMap::new();
+        if let Some(id) = &self.id {
+            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+        }
+        if let Some(ext) = &self.extension {
+            // Convert Vec<E> to EvaluationResult::Collection
+            let ext_collection: Vec<EvaluationResult> = ext
+                .iter()
+                .map(|e| e.into_evaluation_result())
+                .collect();
+            // Only insert if the collection is not empty
+            if !ext_collection.is_empty() {
+                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
+            }
+        }
+        if let Some(v) = &self.value {
+            map.insert("value".to_string(), v.into_evaluation_result());
+        }
+
+        EvaluationResult::Object(map)
     }
 }
 
-// For DecimalElement<E> - Extracts the primitive value, ignoring id/extension for direct access
+// For DecimalElement<E> - Returns Object with id, extension, value if present
 impl<E> IntoEvaluationResult for DecimalElement<E>
 where
-    E: IntoEvaluationResult + Clone, // Keep E bound for potential future use
+    E: IntoEvaluationResult + Clone,
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        // Always return the primitive value's result, or Empty if value is None
-        match &self.value {
-            Some(precise_decimal) => match precise_decimal.value() {
-                Some(decimal_val) => EvaluationResult::Decimal(decimal_val),
-                None => EvaluationResult::Empty, // PreciseDecimal held None
-            },
-            None => EvaluationResult::Empty, // DecimalElement held None
+         // If no id, extension, or value, return Empty
+        if self.id.is_none() && self.extension.is_none() && self.value.is_none() {
+            return EvaluationResult::Empty;
         }
+
+        // If only value is present, return the primitive result directly
+        if self.id.is_none() && self.extension.is_none() {
+             if let Some(precise_decimal) = &self.value {
+                if let Some(decimal_val) = precise_decimal.value() {
+                    return EvaluationResult::Decimal(decimal_val);
+                }
+            }
+            // If value is None or PreciseDecimal holds None, return Empty
+            return EvaluationResult::Empty;
+        }
+
+        // Otherwise, construct an Object
+        let mut map = std::collections::HashMap::new();
+        if let Some(id) = &self.id {
+            map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+        }
+        if let Some(ext) = &self.extension {
+            // Convert Vec<E> to EvaluationResult::Collection
+            let ext_collection: Vec<EvaluationResult> = ext
+                .iter()
+                .map(|e| e.into_evaluation_result())
+                .collect();
+             // Only insert if the collection is not empty
+            if !ext_collection.is_empty() {
+                 map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection));
+            }
+        }
+        if let Some(precise_decimal) = &self.value {
+             if let Some(decimal_val) = precise_decimal.value() {
+                map.insert("value".to_string(), EvaluationResult::Decimal(decimal_val));
+            }
+        }
+
+        EvaluationResult::Object(map)
     }
 }
 
