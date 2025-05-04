@@ -1352,52 +1352,54 @@ fn test_function_conversion_to_string() {
 fn test_function_conversion_converts_to_string() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToString()", &context),
+        eval("{}.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.convertsToString()", &context),
+        eval("'abc'.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("123.convertsToString()", &context),
+        eval("123.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("123.45.convertsToString()", &context),
+        eval("123.45.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("true.convertsToString()", &context),
+        eval("true.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("@2023-10-27.convertsToString()", &context),
+        eval("@2023-10-27.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("@T10:30:00.convertsToString()", &context),
+        eval("@T10:30:00.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("@2023-10-27T10:30:00Z.convertsToString()", &context),
+        eval("@2023-10-27T10:30:00Z.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     // Quantity conversion (evaluator returns Decimal or Integer)
     assert_eq!(
-        eval("5.5 'mg'.convertsToString()", &context), // Decimal quantity
+        eval("5.5 'mg'.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("5 'mg'.convertsToString()", &context), // Integer quantity
+        eval("5 'mg'.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     // Object/Collection are not convertible
     assert_eq!(
-        eval("(1|2).convertsToString()", &context),
+        eval("(1|2).convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     // Need object test once available
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2).convertsToString()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#todate--date
