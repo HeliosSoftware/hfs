@@ -1855,37 +1855,6 @@ fn generate_fhirpath_struct_impl(
         };
         field_handling_code // Return the generated code for this field
     });
-                quote! {
-                    if let Some(inner_value) = &self.#field_name_ident {
-                        let field_result = inner_value.into_evaluation_result();
-                        // Only insert if the inner evaluation is not Empty
-                        if field_result != fhirpath_support::EvaluationResult::Empty {
-                            // Add debug print specifically for the 'deceased' field when generating for Patient
-                            if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
-                                eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}' (from Option): {:?}", #field_key_str, field_result);
-                            }
-                            map.insert(#field_key_str.to_string(), field_result);
-                        }
-                    }
-                    // If self.#field_name_ident is None, do nothing (don't insert Empty)
-                }
-            } else {
-                // For non-Option<T>, evaluate directly
-                quote! {
-                    let field_result = self.#field_name_ident.into_evaluation_result();
-                    // Only insert if the evaluation is not Empty
-                    if field_result != fhirpath_support::EvaluationResult::Empty {
-                         // Add debug print specifically for the 'deceased' field when generating for Patient
-                         if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
-                             eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}' (direct): {:?}", #field_key_str, field_result);
-                         }
-                        map.insert(#field_key_str.to_string(), field_result);
-                    }
-                }
-            }
-        };
-        field_handling_code // Return the generated code for this field
-    });
 
 
     quote! {
