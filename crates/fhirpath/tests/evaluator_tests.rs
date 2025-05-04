@@ -684,10 +684,10 @@ fn test_function_subsetting_last() {
 #[test]
 fn test_function_subsetting_tail() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.tail()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("(10).tail()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.tail()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("(10).tail()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10 | 20 | 30).tail()", &context),
+        eval("(10 | 20 | 30).tail()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
