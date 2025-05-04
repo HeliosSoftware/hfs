@@ -3250,8 +3250,9 @@ fn test_resource_simple_field_access() {
         eval("birthDate.value", &context),
         EvaluationResult::String("1980-05-15".to_string())
     );
-    // deceasedBoolean is an Element, access its value
-    assert_eq!(eval("deceasedBoolean.value", &context), EvaluationResult::Boolean(false));
+    // Accessing the choice type name directly yields the primitive value here,
+    // because the underlying Boolean element only has a value.
+    assert_eq!(eval("deceasedBoolean", &context), EvaluationResult::Boolean(false));
     // Accessing the choice type directly should yield the element object
     let deceased_result = eval("deceased", &context);
     assert!(matches!(deceased_result, EvaluationResult::Object(_)));
