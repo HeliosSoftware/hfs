@@ -3783,10 +3783,8 @@ fn test_functions() {
         };
 
         println!("Testing expression: {}", full_expr);
-        let expr = parser().parse(&*full_expr).unwrap();
-        let result = evaluate(&expr, &context, None);
-        println!("Function result: {:?}, Expected: {:?}", result, expected);
-        assert_eq!(result, expected, "Failed for input: {}", full_expr);
+        // Evaluate and unwrap, as these are expected success cases
+        assert_eq!(eval(&full_expr, &context).unwrap(), expected, "Failed for input: {}", full_expr);
     }
 }
 
