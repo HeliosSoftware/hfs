@@ -3250,21 +3250,12 @@ fn test_resource_simple_field_access() {
         eval("birthDate.value", &context),
         EvaluationResult::String("1980-05-15".to_string())
     );
-    // Accessing the choice type name directly yields the primitive value here,
-    // because the underlying Boolean element only has a value.
-    assert_eq!(eval("deceasedBoolean", &context), EvaluationResult::Boolean(false));
-    // Accessing the choice type directly should yield the element object
-    let deceased_result = eval("deceased", &context);
-    assert!(matches!(deceased_result, EvaluationResult::Object(_)));
-    if let EvaluationResult::Object(fields) = deceased_result {
-         assert_eq!(fields.get("value"), Some(&EvaluationResult::Boolean(false)));
-    }
-    // Accessing the choice type name directly yields the primitive value here,
-    // because the underlying Boolean element only has a value.
-    assert_eq!(
-        eval("deceasedBoolean", &context),
-        EvaluationResult::Boolean(false)
-    );
+    // Accessing the choice type field 'deceased' should yield the primitive boolean,
+    // because the underlying Boolean element only has a value and no id/extension.
+    assert_eq!(eval("deceased", &context), EvaluationResult::Boolean(false));
+    // Accessing a specific choice type name like 'deceasedBoolean' is not standard FHIRPath
+    // for member access on the resource itself. It should return Empty.
+    assert_eq!(eval("deceasedBoolean", &context), EvaluationResult::Empty);
     assert_eq!(eval("deceasedDateTime", &context), EvaluationResult::Empty); // Accessing non-existent choice type name
     assert_eq!(eval("nonExistentField", &context), EvaluationResult::Empty);
 }
