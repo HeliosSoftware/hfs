@@ -1788,35 +1788,38 @@ fn test_function_conversion_converts_to_quantity() {
 fn test_function_string_index_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.indexOf('bc')", &context),
+        eval("'abcdefg'.indexOf('bc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
     assert_eq!(
-        eval("'abcdefg'.indexOf('x')", &context),
+        eval("'abcdefg'.indexOf('x')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(-1)
     );
     assert_eq!(
-        eval("'abcdefg'.indexOf('abc')", &context),
+        eval("'abcdefg'.indexOf('abc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(0)
     );
     assert_eq!(
-        eval("'abcabc'.indexOf('bc')", &context),
+        eval("'abcabc'.indexOf('bc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     ); // First occurrence
     assert_eq!(
-        eval("'abcdefg'.indexOf('')", &context),
+        eval("'abcdefg'.indexOf('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(0)
     );
     assert_eq!(
-        eval("''.indexOf('a')", &context),
+        eval("''.indexOf('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(-1)
     );
     assert_eq!(
-        eval("''.indexOf('')", &context),
+        eval("''.indexOf('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(0)
     );
-    assert_eq!(eval("{}.indexOf('a')", &context), EvaluationResult::Empty);
-    assert_eq!(eval("'abc'.indexOf({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.indexOf('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("'abc'.indexOf({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').indexOf('a')", &context).is_err());
+    assert!(eval("'abc'.indexOf(('a' | 'b'))", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#substringstart--integer--length--integer--string
