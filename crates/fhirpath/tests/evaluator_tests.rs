@@ -3794,15 +3794,15 @@ fn test_direct_string_operations() {
     let context = EvaluationContext::new_empty();
 
     // Test string operations through the parser instead of direct function calls
-    let expr = parser().parse("'Hello, World!'.contains('World')").unwrap();
-    let result = evaluate(&expr, &context, None);
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(
+        eval("'Hello, World!'.contains('World')", &context).unwrap(), // Add unwrap
+        EvaluationResult::Boolean(true)
+    );
 
-    let expr = parser()
-        .parse("'Hello, World!'.contains('Goodbye')")
-        .unwrap();
-    let result = evaluate(&expr, &context, None);
-    assert_eq!(result, EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("'Hello, World!'.contains('Goodbye')", &context).unwrap(), // Add unwrap
+        EvaluationResult::Boolean(false)
+    );
 }
 
 #[test]
