@@ -406,7 +406,8 @@ fn evaluate_invocation(
             // Access a member of the invocation_base
             match invocation_base {
                 EvaluationResult::Object(obj) => {
-                    obj.get(name).cloned().unwrap_or(EvaluationResult::Empty)
+                    // Ensure the key comparison is exact
+                    obj.get(name.as_str()).cloned().unwrap_or(EvaluationResult::Empty)
                 }
                 EvaluationResult::Collection(items) => {
                     // For collections, apply member access to each item and collect results

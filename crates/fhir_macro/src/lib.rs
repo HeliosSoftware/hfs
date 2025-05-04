@@ -1842,7 +1842,12 @@ fn generate_fhirpath_struct_impl(
         } else {
             quote! {
                 // For non-flattened fields, insert directly into the map
-                map.insert(#field_key_str.to_string(), self.#field_name_ident.into_evaluation_result());
+                let field_result = self.#field_name_ident.into_evaluation_result();
+                // Add debug print specifically for the 'deceased' field when generating for Patient
+                if stringify!(#name) == "Patient" && #field_key_str == "deceased" {
+                    eprintln!("Debug [FhirPath derive for Patient]: Inserting field '{}': {:?}", #field_key_str, field_result);
+                }
+                map.insert(#field_key_str.to_string(), field_result);
             }
         }
     });
