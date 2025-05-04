@@ -1138,45 +1138,47 @@ fn test_function_conversion_converts_to_boolean() {
 #[test]
 fn test_function_conversion_to_integer() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toInteger()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toInteger()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("123.toInteger()", &context),
+        eval("123.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(123)
     );
     assert_eq!(
-        eval("'456'.toInteger()", &context),
+        eval("'456'.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(456)
     );
     assert_eq!(
-        eval("'+789'.toInteger()", &context),
+        eval("'+789'.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(789)
     );
     assert_eq!(
-        eval("'-12'.toInteger()", &context),
+        eval("'-12'.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(-12)
     );
     assert_eq!(
-        eval("true.toInteger()", &context),
+        eval("true.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
     assert_eq!(
-        eval("false.toInteger()", &context),
+        eval("false.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(0)
     );
     // Decimal conversion to Integer (truncates) - FHIRPath spec says Empty if not integer representable
     assert_eq!(
-        eval("123.45.toInteger()", &context),
+        eval("123.45.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty // Per spec
     );
     assert_eq!(
-        eval("123.0.toInteger()", &context),
+        eval("123.0.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty // Per spec (even if whole number)
     );
-    assert_eq!(eval("'abc'.toInteger()", &context), EvaluationResult::Empty); // Invalid string
+    assert_eq!(eval("'abc'.toInteger()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
     assert_eq!(
-        eval("'123.45'.toInteger()", &context),
+        eval("'123.45'.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Invalid string format
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2).toInteger()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstointeger--boolean
