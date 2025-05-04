@@ -3358,7 +3358,6 @@ fn test_resource_filtering_and_projection() {
         eval("name.where(family = 'Smith').given", &context),
         // .given returns a collection
         EvaluationResult::Collection(vec![EvaluationResult::String("Jane".to_string())])
-        EvaluationResult::String("Jane".to_string())
     );
 
     // Select multiple fields
