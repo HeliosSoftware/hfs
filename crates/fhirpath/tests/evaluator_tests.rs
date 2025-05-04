@@ -377,18 +377,18 @@ fn test_function_existence_superset_of() {
 #[test]
 fn test_function_existence_count() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.count()", &context), EvaluationResult::Integer(0));
+    assert_eq!(eval("{}.count()", &context).unwrap(), EvaluationResult::Integer(0)); // Add unwrap
     assert_eq!(
-        eval("'test'.count()", &context),
+        eval("'test'.count()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).count()", &context),
+        eval("(1 | 2 | 3).count()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(3)
     );
     // Add test for duplicates - | operator creates distinct collection (1 | 2)
     assert_eq!(
-        eval("(1 | 2 | 1).count()", &context),
+        eval("(1 | 2 | 1).count()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(2) // Expect 2 because (1 | 2 | 1) becomes (1 | 2)
     );
 }
