@@ -198,25 +198,27 @@ fn test_function_existence_all() {
 fn test_function_existence_all_true() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.allTrue()", &context),
+        eval("{}.allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(true).allTrue()", &context),
+        eval("(true).allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(true | true).allTrue()", &context),
+        eval("(true | true).allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(true | false).allTrue()", &context),
+        eval("(true | false).allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(false | false).allTrue()", &context),
+        eval("(false | false).allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
+    // Test with non-boolean - should error
+    assert!(eval("(true | 1).allTrue()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#anytrue--boolean
