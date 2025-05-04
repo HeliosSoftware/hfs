@@ -174,21 +174,23 @@ fn test_function_existence_exists() {
 fn test_function_existence_all() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.all($this > 1)", &context),
+        eval("{}.all($this > 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     ); // Empty collection is true
     assert_eq!(
-        eval("(1 | 2 | 3).all($this > 0)", &context),
+        eval("(1 | 2 | 3).all($this > 0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).all($this > 1)", &context),
+        eval("(1 | 2 | 3).all($this > 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).all($this.toString() = '1')", &context),
+        eval("(1 | 2 | 3).all($this.toString() = '1')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
+    // Test with non-boolean criteria - should error
+    assert!(eval("(1 | 2 | 3).all($this)", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#alltrue--boolean
