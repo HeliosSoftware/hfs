@@ -2019,22 +2019,26 @@ fn test_function_string_contains() {
 fn test_function_string_upper() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.upper()", &context),
+        eval("'abcdefg'.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("ABCDEFG".to_string())
     );
     assert_eq!(
-        eval("'AbCdEfG'.upper()", &context),
+        eval("'AbCdEfG'.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("ABCDEFG".to_string())
     );
     assert_eq!(
-        eval("'123'.upper()", &context),
+        eval("'123'.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("123".to_string())
     );
     assert_eq!(
-        eval("''.upper()", &context),
+        eval("''.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.upper()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.upper()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').upper()", &context).is_err());
+    // Test non-string input - should error
+    assert!(eval("123.upper()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#lower--string
