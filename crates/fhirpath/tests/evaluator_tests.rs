@@ -3573,7 +3573,10 @@ fn test_boolean_operations() {
 
 #[test]
 fn test_comparison_operations() {
-    let test_cases = vec![
+    let context = EvaluationContext::new_empty();
+
+    // --- Success Cases ---
+    let success_cases = vec![
         ("1 < 2", EvaluationResult::Boolean(true)),
         ("2 <= 2", EvaluationResult::Boolean(true)),
         ("3 > 2", EvaluationResult::Boolean(true)),
@@ -3582,16 +3585,55 @@ fn test_comparison_operations() {
         ("1 != 2", EvaluationResult::Boolean(true)),
         ("'abc' ~ 'ABC'", EvaluationResult::Boolean(true)),
         ("'abc' !~ 'def'", EvaluationResult::Boolean(true)),
+        // Add more specific comparison cases
+        ("1.0 < 2", EvaluationResult::Boolean(true)),
+        ("2 >= 1.5", EvaluationResult::Boolean(true)),
+        ("'b' > 'a'", EvaluationResult::Boolean(true)),
+        ("'a' <= 'a'", EvaluationResult::Boolean(true)),
+        ("@2024 > @2023", EvaluationResult::Boolean(true)),
+        ("@T10:00 < @T11:00", EvaluationResult::Boolean(true)),
     ];
 
-    // For comparison operations, we don't need any resources
-    let context = EvaluationContext::new_empty();
-
-    for (input, expected) in test_cases {
-        let expr = parser().parse(input).unwrap();
-        let result = evaluate(&expr, &context, None);
-        assert_eq!(result, expected);
+    for (input, expected) in success_cases {
+        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
     }
+
+    // --- Error Cases (Comparing collections or incompatible types) ---
+    let error_cases = vec![
+        "(1 | 2) < 3", // Collection comparison should error
+        "1 < (2 | 3)",
+        "1 < 'a'",     // Incompatible types
+        "'a' > true",
+        "@2023 = @T10:00", // Incompatible date/time types
+    ];
+    for input in error_cases {
+        assert!(eval(input, &context).is_err(), "Expected error for input: {}", input);
+    }
+
+    // --- Empty Propagation Cases ---
+    let empty_cases = vec![
+        "1 < {}", "{} < 1",
+        "1 <= {}", "{} <= 1",
+        "1 > {}", "{} > 1",
+        "1 >= {}", "{} >= 1",
+        "1 = {}", "{} = 1", // = with empty -> empty
+        "1 != {}", "{} != 1", // != with empty -> empty
+        "1 ~ {}", "{} ~ 1", // ~ with empty -> false (handled by assert_eq below)
+        "1 !~ {}", "{} !~ 1", // !~ with empty -> true (handled by assert_eq below)
+        "{} = {}", // = with empty -> empty
+        "{} != {}", // != with empty -> empty
+    ];
+     for input in empty_cases {
+         assert_eq!(eval(input, &context).unwrap(), EvaluationResult::Empty, "Failed for input: {}", input);
+    }
+
+    // Specific checks for ~ and !~ with empty
+    assert_eq!(eval("1 ~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(eval("{} ~ 1", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(eval("{} ~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(eval("1 !~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(eval("{} !~ 1", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(eval("{} !~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
 }
 
 #[test]
