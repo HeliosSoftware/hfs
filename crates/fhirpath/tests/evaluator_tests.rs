@@ -1730,54 +1730,56 @@ fn test_function_conversion_to_quantity() {
 fn test_function_conversion_converts_to_quantity() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToQuantity()", &context),
+        eval("{}.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("true.convertsToQuantity()", &context),
+        eval("true.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("123.convertsToQuantity()", &context),
+        eval("123.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("123.45.convertsToQuantity()", &context),
+        eval("123.45.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'5.5 mg'.convertsToQuantity()", &context),
+        eval("'5.5 mg'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'100'.convertsToQuantity()", &context),
+        eval("'100'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'100 days'.convertsToQuantity()", &context),
+        eval("'100 days'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'invalid'.convertsToQuantity()", &context),
+        eval("'invalid'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false) // Not a number
     );
     assert_eq!(
-        eval("'5.5 invalid-unit'.convertsToQuantity()", &context),
+        eval("'5.5 invalid-unit'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false) // Invalid unit part
     );
     assert_eq!(
-        eval("'5.5 mg extra'.convertsToQuantity()", &context),
+        eval("'5.5 mg extra'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false) // Too many parts
     );
     // Quantity literal conversion (these use the Quantity literal parser, not string conversion)
     assert_eq!(
-        eval("5.5 'mg'.convertsToQuantity()", &context),
+        eval("5.5 'mg'.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("100 days.convertsToQuantity()", &context),
+        eval("100 days.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
+    // Test multi-item collection - should error
+    assert!(eval("(1 | 2).convertsToQuantity()", &context).is_err());
 }
 
 // --- String Manipulation ---
