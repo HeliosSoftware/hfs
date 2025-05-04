@@ -3245,10 +3245,10 @@ fn test_resource_simple_field_access() {
     );
     // Access the primitive value of 'active' since it has an id
     assert_eq!(eval("active.value", &context), EvaluationResult::Boolean(true));
-    // birthDate is Element<String>, so it evaluates to String
+    // birthDate has id/extension, access its value field
     assert_eq!(
-        eval("birthDate", &context),
-        EvaluationResult::String("1980-05-15".to_string()) // birthDate has extension, so it's an object now
+        eval("birthDate.value", &context),
+        EvaluationResult::String("1980-05-15".to_string())
     );
     // deceasedBoolean is an Element, access its value
     assert_eq!(eval("deceasedBoolean.value", &context), EvaluationResult::Boolean(false));
