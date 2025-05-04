@@ -1894,6 +1894,10 @@ fn generate_fhirpath_struct_impl(
                 // Use fully qualified path for HashMap
                 let mut map = std::collections::HashMap::new();
                 #(#field_conversions)* // Expand the field conversion logic
+                // Add final debug print for Patient struct map
+                if stringify!(#name) == "Patient" {
+                    eprintln!("Debug [FhirPath derive for Patient]: Final map: {:?}", map);
+                }
                 fhirpath_support::EvaluationResult::Object(map)
             }
         }
