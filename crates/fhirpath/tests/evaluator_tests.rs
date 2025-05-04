@@ -3530,18 +3530,45 @@ fn test_boolean_operations() {
         ("true xor true", EvaluationResult::Boolean(false)),
         ("false implies true", EvaluationResult::Boolean(true)),
         ("true implies false", EvaluationResult::Boolean(false)),
+        // Test empty propagation (should return Empty, not error)
+        ("true and {}", EvaluationResult::Empty),
+        ("{} and true", EvaluationResult::Empty),
+        ("false and {}", EvaluationResult::Boolean(false)), // Spec table
+        ("{} and false", EvaluationResult::Boolean(false)), // Spec table
+        ("{} and {}", EvaluationResult::Empty),
+        ("true or {}", EvaluationResult::Boolean(true)), // Spec table
+        ("{} or true", EvaluationResult::Boolean(true)), // Spec table
+        ("false or {}", EvaluationResult::Empty),
+        ("{} or false", EvaluationResult::Empty),
+        ("{} or {}", EvaluationResult::Empty),
+        ("true xor {}", EvaluationResult::Empty),
+        ("{} xor true", EvaluationResult::Empty),
+        ("false xor {}", EvaluationResult::Empty),
+        ("{} xor false", EvaluationResult::Empty),
+        ("{} xor {}", EvaluationResult::Empty),
+        ("true implies {}", EvaluationResult::Empty),
+        ("{} implies true", EvaluationResult::Boolean(true)), // Spec table
+        ("false implies {}", EvaluationResult::Boolean(true)), // Spec table
+        ("{} implies false", EvaluationResult::Empty),
+        ("{} implies {}", EvaluationResult::Empty),
     ];
 
     // For boolean operations, we don't need any resources
     let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
-        let expr = parser().parse(input).unwrap();
-        println!("Boolean op parsed expression: {:?}", expr);
-        let result = evaluate(&expr, &context, None);
-        println!("Boolean op result: {:?}, Expected: {:?}", result, expected);
-        assert_eq!(result, expected, "Failed for input: {}", input);
+        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
     }
+
+    // Test type errors (should error)
+    assert!(eval("1 and true", &context).is_err());
+    assert!(eval("true and 'a'", &context).is_err());
+    assert!(eval("1 or true", &context).is_err());
+    assert!(eval("true or 'a'", &context).is_err());
+    assert!(eval("1 xor true", &context).is_err());
+    assert!(eval("true xor 'a'", &context).is_err());
+    assert!(eval("1 implies true", &context).is_err());
+    assert!(eval("true implies 'a'", &context).is_err());
 }
 
 #[test]
