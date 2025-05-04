@@ -2265,15 +2265,19 @@ fn test_function_string_length() {
 fn test_function_string_to_chars() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abc'.toChars()", &context),
+        eval("'abc'.toChars()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
             EvaluationResult::String("a".to_string()),
             EvaluationResult::String("b".to_string()),
             EvaluationResult::String("c".to_string()),
         ])
     );
-    assert_eq!(eval("''.toChars()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("{}.toChars()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("''.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("{}.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // toChars on non-string should be empty (or error, current impl returns Empty)
+    assert_eq!(eval("123.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // toChars on multi-item collection should error
+    assert!(eval("('a' | 'b').toChars()", &context).is_err());
 }
 
 // --- Utility Functions ---
