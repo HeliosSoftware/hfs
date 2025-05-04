@@ -228,8 +228,13 @@ impl EvaluationResult {
             | EvaluationResult::Time(_)
             | EvaluationResult::Collection(_) // Collections evaluate to Empty in boolean logic context
             | EvaluationResult::Object(_) => EvaluationResult::Empty,
-            EvaluationResult::Empty => EvaluationResult::Empty,
+            EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         }
+    }
+
+    /// Helper to check if the result is a String or Empty
+    pub fn is_string_or_empty(&self) -> bool {
+        matches!(self, EvaluationResult::String(_) | EvaluationResult::Empty)
     }
 }
 
