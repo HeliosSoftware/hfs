@@ -591,11 +591,11 @@ fn evaluate_exists_with_criteria(
     for item in items_to_check {
         // Evaluate the criteria expression with the current item as $this, propagate error
         let criteria_result = evaluate(criteria_expr, context, Some(&item))?;
-        // exists returns true if the criteria evaluates to true for *any* item
-        if criteria_result.to_boolean() {
-            return Ok(EvaluationResult::Boolean(true)); // Ensure this return is Ok()
-        }
-    }
+       // exists returns true if the criteria evaluates to true for *any* item
+       if criteria_result.to_boolean() {
+           return Ok(EvaluationResult::Boolean(true));
+       }
+   }
 
     // If no item satisfied the criteria
     Ok(EvaluationResult::Boolean(false)) // This was likely the source of E0308 at 422
@@ -1746,21 +1746,12 @@ fn call_function(
                         // More than two parts is invalid format
                         EvaluationResult::Empty
                     }
-                }
-                // Collections handled by initial check
-                EvaluationResult::Collection(items) => {
-                    // This case is now unreachable due to the initial count check,
-                    // but if it were reachable, it would need the ? operator.
-                    // For now, keep it as Empty to satisfy types.
-                    if items.len() == 1 {
-                       call_function("toQuantity", &items[0], &[])? // Add ?
-                    } else {
-                       unreachable!("Multi-item collection should have caused an error earlier")
-                    }
-                }
-                _ => EvaluationResult::Empty, // Other types cannot convert
-            }) // Close the Ok() wrapper here
-        }
+               }
+               // Collections handled by initial check
+               EvaluationResult::Collection(_) => unreachable!(),
+               _ => EvaluationResult::Empty, // Other types cannot convert
+           }) // Close the Ok() wrapper here
+       }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
             Ok(match invocation_base { // Wrap in Ok
@@ -2264,11 +2255,11 @@ fn apply_multiplicative(
                     EvaluationResult::Decimal(Decimal::from(*l) * *r)
                 }
                 // Handle empty operands
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot multiply {:?} and {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
-                ))),
-            })
+               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
+               _ => return Err(EvaluationError::TypeError(format!(
+                   "Cannot multiply {} and {}", left.type_name(), right.type_name()
+               ))),
+           })
         }
         "/" => {
             // Handle division: Always results in Decimal
@@ -2296,11 +2287,11 @@ fn apply_multiplicative(
                  // Handle empty operands
                 if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
                     Ok(EvaluationResult::Empty)
-                } else {
-                    Err(EvaluationError::TypeError(format!(
-                        "Cannot divide {:?} by {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
-                    )))
-                }
+               } else {
+                   Err(EvaluationError::TypeError(format!(
+                       "Cannot divide {} by {}", left.type_name(), right.type_name()
+                   )))
+               }
             }
         }
         "div" | "mod" => {
@@ -2314,11 +2305,11 @@ fn apply_multiplicative(
                 }
                  // Handle empty operands
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
-                _ => Err(EvaluationError::TypeError(format!( // Mixed types are invalid
-                    "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {:?} and {:?}",
-                    op, (*left).variant_name(), (*right).variant_name() // Dereference before calling
-                ))),
-            }
+               _ => Err(EvaluationError::TypeError(format!( // Mixed types are invalid
+                   "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {} and {}",
+                   op, left.type_name(), right.type_name()
+               ))),
+           }
         }
         _ => Err(EvaluationError::InvalidOperation(format!("Unknown multiplicative operator: {}", op))),
     }
@@ -2412,12 +2403,12 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                         .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add Decimal {} and String '{}'", d, s)))?
                 }
                  // Handle empty operands
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-                // Other combinations are invalid for '+'
-                _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot add {:?} and {:?}", (*left).variant_name(), (*right).variant_name() // Dereference before calling
-                ))),
-            })
+               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
+               // Other combinations are invalid for '+'
+               _ => return Err(EvaluationError::TypeError(format!(
+                   "Cannot add {} and {}", left.type_name(), right.type_name()
+               ))),
+           })
         }
         "-" => {
             // Handle numeric subtraction: Int - Int = Int, otherwise Decimal
@@ -2485,12 +2476,12 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                         .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract String '{}' from Decimal {}", s, d)))?
                 }
                  // Handle empty operands
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-                // Other combinations are invalid for '-'
-                _ => return Err(EvaluationError::TypeError(format!(
-                    "Cannot subtract {:?} from {:?}", (*right).variant_name(), (*left).variant_name() // Dereference before calling
-                ))),
-            })
+               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
+               // Other combinations are invalid for '-'
+               _ => return Err(EvaluationError::TypeError(format!(
+                   "Cannot subtract {} from {}", right.type_name(), left.type_name()
+               ))),
+           })
         }
         "&" => {
             // Handle string concatenation using '&'
@@ -2866,12 +2857,12 @@ fn check_membership(
                     EvaluationResult::String(substr) => {
                         EvaluationResult::Boolean(s.contains(substr))
                     }
-                    // Contains on string requires string argument, otherwise error
-                    _ => return Err(EvaluationError::TypeError(format!(
-                        "'contains' on String requires String argument, found {:?}", (*right).variant_name() // Dereference before calling
-                    ))),
-                },
-                // Treat single non-empty item as collection of one
+                   // Contains on string requires string argument, otherwise error
+                   _ => return Err(EvaluationError::TypeError(format!(
+                       "'contains' on String requires String argument, found {}", right.type_name()
+                   ))),
+               },
+               // Treat single non-empty item as collection of one
                 single_item => {
                      EvaluationResult::Boolean(compare_equality(single_item, "=", right).to_boolean())
                 }

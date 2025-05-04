@@ -292,6 +292,22 @@ impl EvaluationResult {
     pub fn is_string_or_empty(&self) -> bool {
         matches!(self, EvaluationResult::String(_) | EvaluationResult::Empty)
     }
+
+    /// Returns a string representation of the variant name for debugging/errors.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            EvaluationResult::Empty => "Empty",
+            EvaluationResult::Boolean(_) => "Boolean",
+            EvaluationResult::String(_) => "String",
+            EvaluationResult::Decimal(_) => "Decimal",
+            EvaluationResult::Integer(_) => "Integer",
+            EvaluationResult::Date(_) => "Date",
+            EvaluationResult::DateTime(_) => "DateTime",
+            EvaluationResult::Time(_) => "Time",
+            EvaluationResult::Collection(_) => "Collection",
+            EvaluationResult::Object(_) => "Object",
+        }
+    }
 }
 
 // --- Implementations for Rust Primitives ---
