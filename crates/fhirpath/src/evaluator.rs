@@ -275,7 +275,8 @@ fn evaluate_term(
                     let var_name = &name[1..]; // Remove the % prefix
                     if var_name == "context" {
                         // Return %context value
-                        return if context.resources.is_empty() {
+                        // Correctly wrap the entire conditional result in Ok()
+                        return Ok(if context.resources.is_empty() {
                             EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
                             convert_resource_to_result(&context.resources[0])
@@ -287,7 +288,7 @@ fn evaluate_term(
                                     .map(convert_resource_to_result)
                                     .collect(),
                             )
-                        });
+                        }); // Removed the misplaced }); here
                     } else {
                         // Return other variable value or error if undefined
                         return match context.get_variable(var_name) {
@@ -326,7 +327,7 @@ fn evaluate_term(
             // Look up external constant in the context
             // Special handling for %context
             if name == "context" {
-               Ok(if context.resources.is_empty() { // Wrap in Ok()
+               Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
                     convert_resource_to_result(&context.resources[0])
@@ -338,7 +339,7 @@ fn evaluate_term(
                             .map(convert_resource_to_result)
                             .collect(),
                     )
-                }) // Close Ok() here
+                }) // Correctly placed Ok() wrapping
             } else {
                 // Return variable value or error if undefined
                 match context.get_variable(name) {
