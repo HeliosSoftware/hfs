@@ -249,7 +249,7 @@ fn evaluate_term(
         Term::Invocation(invocation) => {
             // Explicitly handle $this first and return
             if *invocation == Invocation::This {
-                return if let Some(item) = current_item.cloned() {
+                return Ok(if let Some(item) = current_item.cloned() { // Wrap in Ok()
                     item // Return the item if Some
                 } else {
                     // Return the default context if None
@@ -266,7 +266,7 @@ fn evaluate_term(
                                 .collect(),
                         )
                     }
-                };
+                }); // Close Ok() here
             }
 
             // Handle variables (%var, %context) next and return
@@ -326,7 +326,7 @@ fn evaluate_term(
             // Look up external constant in the context
             // Special handling for %context
             if name == "context" {
-                if context.resources.is_empty() {
+               Ok(if context.resources.is_empty() { // Wrap in Ok()
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
                     convert_resource_to_result(&context.resources[0])
@@ -338,7 +338,7 @@ fn evaluate_term(
                             .map(convert_resource_to_result)
                             .collect(),
                     )
-                })
+                }) // Close Ok() here
             } else {
                 // Return variable value or error if undefined
                 match context.get_variable(name) {
