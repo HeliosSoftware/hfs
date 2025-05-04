@@ -1620,45 +1620,47 @@ fn test_function_conversion_to_time() {
 fn test_function_conversion_converts_to_time() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.convertsToTime()", &context),
+        eval("{}.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("@T10:30:00.convertsToTime()", &context),
+        eval("@T10:30:00.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'10:30:00'.convertsToTime()", &context),
+        eval("'10:30:00'.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'10:30'.convertsToTime()", &context),
+        eval("'10:30'.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'10'.convertsToTime()", &context),
+        eval("'10'.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'invalid-time'.convertsToTime()", &context),
+        eval("'invalid-time'.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("123.convertsToTime()", &context),
+        eval("123.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("true.convertsToTime()", &context),
+        eval("true.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("@2023-10-27.convertsToTime()", &context),
+        eval("@2023-10-27.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("@2023-10-27T10:30Z.convertsToTime()", &context),
+        eval("@2023-10-27T10:30Z.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
+     // Test multi-item collection - should error
+    assert!(eval("(@T10 | @T11).convertsToTime()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#toquantity--quantity
