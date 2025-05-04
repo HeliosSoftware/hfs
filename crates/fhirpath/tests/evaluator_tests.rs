@@ -344,31 +344,31 @@ fn test_function_existence_subset_of() {
 fn test_function_existence_superset_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.supersetOf({})", &context),
+        eval("{}.supersetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf({})", &context),
+        eval("(1 | 2).supersetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf(1)", &context), // Use | syntax (or single item)
+        eval("(1 | 2).supersetOf(1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf(1 | 2)", &context), // Use | syntax
+        eval("(1 | 2).supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).supersetOf(1 | 2 | 3)", &context), // Use | syntax
+        eval("(1 | 2).supersetOf(1 | 2 | 3)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("{}.supersetOf(1 | 2)", &context), // Use | syntax
+        eval("{}.supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(1).supersetOf(1 | 2)", &context), // Use | syntax
+        eval("(1).supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
 }
