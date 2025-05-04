@@ -1827,46 +1827,50 @@ fn test_function_string_index_of() {
 fn test_function_string_substring() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.substring(0)", &context),
+        eval("'abcdefg'.substring(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abcdefg".to_string())
     );
     assert_eq!(
-        eval("'abcdefg'.substring(3)", &context),
+        eval("'abcdefg'.substring(3)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("defg".to_string())
     );
     assert_eq!(
-        eval("'abcdefg'.substring(1, 2)", &context),
+        eval("'abcdefg'.substring(1, 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("bc".to_string())
     );
     assert_eq!(
-        eval("'abcdefg'.substring(6, 2)", &context),
+        eval("'abcdefg'.substring(6, 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("g".to_string())
     );
     assert_eq!(
-        eval("'abcdefg'.substring(7, 1)", &context),
+        eval("'abcdefg'.substring(7, 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string()) // Spec: Start out of bounds returns empty string
     ); // Start out of bounds
+    // Negative start index should error
+    assert!(eval("'abcdefg'.substring(-1, 1)", &context).is_err());
     assert_eq!(
-        eval("'abcdefg'.substring(-1, 1)", &context),
-        EvaluationResult::Empty
-    ); // Start out of bounds
-    assert_eq!(
-        eval("'abcdefg'.substring(3, 0)", &context),
+        eval("'abcdefg'.substring(3, 0)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     ); // Zero length
     assert_eq!(
-        eval("'abcdefg'.substring(3, -1)", &context),
+        eval("'abcdefg'.substring(3, -1)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     ); // Negative length
     assert_eq!(
-        eval("''.substring(0)", &context),
+        eval("''.substring(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.substring(0)", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.substring(0)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("'abc'.substring({})", &context),
+        eval("'abc'.substring({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').substring(0)", &context).is_err());
+    assert!(eval("'abc'.substring((0 | 1))", &context).is_err());
+    // Test invalid argument types - should error
+    assert!(eval("'abc'.substring('a')", &context).is_err());
+    assert!(eval("'abc'.substring(0, 'b')", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#startswithprefix--string--boolean
