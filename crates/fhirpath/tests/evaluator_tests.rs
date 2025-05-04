@@ -1406,37 +1406,39 @@ fn test_function_conversion_converts_to_string() {
 #[test]
 fn test_function_conversion_to_date() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("@2023-10-27.toDate()", &context),
+        eval("@2023-10-27.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10-27".to_string())
     );
     assert_eq!(
-        eval("@2023-10-27T10:30:00Z.toDate()", &context),
+        eval("@2023-10-27T10:30:00Z.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10-27".to_string())
     ); // DateTime to Date
     assert_eq!(
-        eval("'2023-10-27'.toDate()", &context),
+        eval("'2023-10-27'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10-27".to_string())
     ); // String to Date
     assert_eq!(
-        eval("'2023-10'.toDate()", &context),
+        eval("'2023-10'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10".to_string())
     ); // Partial date string
     assert_eq!(
-        eval("'2023'.toDate()", &context),
+        eval("'2023'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023".to_string())
     ); // Partial date string
     assert_eq!(
-        eval("'2023-10-27T10:30:00Z'.toDate()", &context),
+        eval("'2023-10-27T10:30:00Z'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10-27".to_string())
     ); // DateTime string to Date
     assert_eq!(
-        eval("'invalid-date'.toDate()", &context),
+        eval("'invalid-date'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    assert_eq!(eval("123.toDate()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("true.toDate()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("123.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("true.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    // Test multi-item collection - should error
+    assert!(eval("(@2023 | @2024).toDate()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstodate--boolean
