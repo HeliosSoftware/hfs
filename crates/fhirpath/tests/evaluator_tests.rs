@@ -620,24 +620,24 @@ fn test_function_filtering_of_type() {
 #[test]
 fn test_function_subsetting_indexer() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}[0]", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}[0]", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("(10 | 20 | 30)[0]", &context),
+        eval("(10 | 20 | 30)[0]", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
     );
     assert_eq!(
-        eval("(10 | 20 | 30)[1]", &context),
+        eval("(10 | 20 | 30)[1]", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(20)
     );
     assert_eq!(
-        eval("(10 | 20 | 30)[2]", &context),
+        eval("(10 | 20 | 30)[2]", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(30)
     );
-    assert_eq!(eval("(10 | 20 | 30)[3]", &context), EvaluationResult::Empty); // Index out of bounds
-    assert_eq!(
-        eval("(10 | 20 | 30)[-1]", &context),
-        EvaluationResult::Empty
-    ); // Index out of bounds
+    assert_eq!(eval("(10 | 20 | 30)[3]", &context).unwrap(), EvaluationResult::Empty); // Index out of bounds -> Empty, Add unwrap
+    // Negative index should error
+    assert!(eval("(10 | 20 | 30)[-1]", &context).is_err());
+    // Non-integer index should error
+    assert!(eval("(10 | 20 | 30)['a']", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#single--collection
