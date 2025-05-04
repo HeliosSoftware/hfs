@@ -920,16 +920,16 @@ fn test_function_combining_union() {
 fn test_function_combining_combine() {
     // Note: Order not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.combine({})", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.combine({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
 
-    let r1 = eval("(1 | 2).combine({})", &context);
+    let r1 = eval("(1 | 2).combine({})", &context).unwrap(); // Add unwrap
     assert!(matches!(&r1, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(v) = r1 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Use valid syntax (1 | 2) instead of {1 | 2}
-    let r2 = eval("{}.combine(1 | 2)", &context);
+    let r2 = eval("{}.combine(1 | 2)", &context).unwrap(); // Add unwrap
     assert!(matches!(&r2, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(v) = r2 {
         assert_eq!(v.len(), 2); /* Check items if needed */
@@ -937,7 +937,7 @@ fn test_function_combining_combine() {
 
     // Order not guaranteed, check contents, duplicates preserved
     // Use valid syntax (2 | 3 | 4) instead of {2 | 3 | 4}
-    let result = eval("(1 | 2 | 3).combine(2 | 3 | 4)", &context);
+    let result = eval("(1 | 2 | 3).combine(2 | 3 | 4)", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
@@ -952,7 +952,7 @@ fn test_function_combining_combine() {
         panic!("Expected collection result from combine");
     }
     // Use valid syntax (1 | 3 | 1) instead of {1 | 3 | 1}
-    let result = eval("(1 | 2 | 1).combine(1 | 3 | 1)", &context);
+    let result = eval("(1 | 2 | 1).combine(1 | 3 | 1)", &context).unwrap(); // Add unwrap
     if let EvaluationResult::Collection(items) = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
