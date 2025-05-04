@@ -1927,42 +1927,45 @@ fn test_function_string_starts_with() {
 fn test_function_string_ends_with() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.endsWith('efg')", &context),
+        eval("'abcdefg'.endsWith('efg')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.endsWith('fg')", &context),
+        eval("'abcdefg'.endsWith('fg')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.endsWith('g')", &context),
+        eval("'abcdefg'.endsWith('g')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.endsWith('ef')", &context),
+        eval("'abcdefg'.endsWith('ef')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'abcdefg'.endsWith('abcdefg')", &context),
+        eval("'abcdefg'.endsWith('abcdefg')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.endsWith('')", &context),
+        eval("'abcdefg'.endsWith('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("''.endsWith('a')", &context),
+        eval("''.endsWith('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("''.endsWith('')", &context),
+        eval("''.endsWith('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.endsWith('a')", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.endsWith('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("'abc'.endsWith({})", &context),
+        eval("'abc'.endsWith({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').endsWith('a')", &context).is_err());
+    assert!(eval("'abc'.endsWith(('a' | 'b'))", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#containssubstring--string--boolean
