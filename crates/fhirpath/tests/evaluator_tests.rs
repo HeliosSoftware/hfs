@@ -31,75 +31,75 @@ fn collection(items: Vec<EvaluationResult>) -> EvaluationResult {
 fn test_expression_literals() {
     let context = EvaluationContext::new_empty();
     // Boolean
-    assert_eq!(eval("true", &context), EvaluationResult::Boolean(true));
-    assert_eq!(eval("false", &context), EvaluationResult::Boolean(false));
+    assert_eq!(eval("true", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(eval("false", &context).unwrap(), EvaluationResult::Boolean(false));
     // String
     assert_eq!(
-        eval("'hello'", &context),
+        eval("'hello'", &context).unwrap(),
         EvaluationResult::String("hello".to_string())
     );
     assert_eq!(
-        eval("'urn:oid:1.2.3'", &context),
+        eval("'urn:oid:1.2.3'", &context).unwrap(),
         EvaluationResult::String("urn:oid:1.2.3".to_string())
     );
     // Integer - Should now be parsed as Integer
-    assert_eq!(eval("123", &context), EvaluationResult::Integer(123));
-    assert_eq!(eval("0", &context), EvaluationResult::Integer(0));
-    assert_eq!(eval("-5", &context), EvaluationResult::Integer(-5));
+    assert_eq!(eval("123", &context).unwrap(), EvaluationResult::Integer(123));
+    assert_eq!(eval("0", &context).unwrap(), EvaluationResult::Integer(0));
+    assert_eq!(eval("-5", &context).unwrap(), EvaluationResult::Integer(-5));
     // Decimal - Requires a decimal point
     assert_eq!(
-        eval("123.45", &context),
+        eval("123.45", &context).unwrap(),
         EvaluationResult::Decimal(dec!(123.45)) // Use Decimal
     );
-    assert_eq!(eval("0.0", &context), EvaluationResult::Decimal(dec!(0.0)));
+    assert_eq!(eval("0.0", &context).unwrap(), EvaluationResult::Decimal(dec!(0.0)));
     // Date
     assert_eq!(
-        eval("@2015-02-04", &context),
+        eval("@2015-02-04", &context).unwrap(),
         EvaluationResult::Date("2015-02-04".to_string())
     );
     assert_eq!(
-        eval("@2015-02", &context),
+        eval("@2015-02", &context).unwrap(),
         EvaluationResult::Date("2015-02".to_string())
     ); // Test partial date parsing
     assert_eq!(
-        eval("@2015", &context),
+        eval("@2015", &context).unwrap(),
         EvaluationResult::Date("2015".to_string())
     ); // Test partial date parsing
     // DateTime - Use eval directly
     assert_eq!(
-        eval("@2015-02-04T14:34:28+09:00", &context),
+        eval("@2015-02-04T14:34:28+09:00", &context).unwrap(),
         EvaluationResult::DateTime("2015-02-04T14:34:28+09:00".to_string())
     );
     assert_eq!(
-        eval("@2015-02-04T14:34:28Z", &context),
+        eval("@2015-02-04T14:34:28Z", &context).unwrap(),
         EvaluationResult::DateTime("2015-02-04T14:34:28Z".to_string())
     );
     // Time - Use eval directly
     assert_eq!(
-        eval("@T14:34:28", &context),
+        eval("@T14:34:28", &context).unwrap(),
         EvaluationResult::Time("14:34:28".to_string())
     );
     assert_eq!(
-        eval("@T14:30", &context),
+        eval("@T14:30", &context).unwrap(),
         EvaluationResult::Time("14:30".to_string())
     );
     // Quantity - Parser returns Decimal or Integer based on number format
     assert_eq!(
-        eval("10 'mg'", &context),     // 10 is parsed as Integer
+        eval("10 'mg'", &context).unwrap(),     // 10 is parsed as Integer
         EvaluationResult::Integer(10)  // Evaluator ignores unit for now
     );
     assert_eq!(
-        eval("4.5 'km'", &context),           // 4.5 is parsed as Number (Decimal)
+        eval("4.5 'km'", &context).unwrap(),           // 4.5 is parsed as Number (Decimal)
         EvaluationResult::Decimal(dec!(4.5))  // Evaluator ignores unit for now
     );
     // Quantity with date/time unit - Parser returns Decimal or Integer
     assert_eq!(
-        eval("100 days", &context),     // 100 is parsed as Integer
+        eval("100 days", &context).unwrap(),     // 100 is parsed as Integer
         EvaluationResult::Integer(100)  // Evaluator ignores unit for now
     );
 
     // Empty Collection (Null literal)
-    assert_eq!(eval("{}", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}", &context).unwrap(), EvaluationResult::Empty);
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#singleton-evaluation-of-collections
