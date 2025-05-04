@@ -1765,7 +1765,7 @@ fn call_function(
                     }
                 }
                 _ => EvaluationResult::Empty, // Other types cannot convert
-            }
+            }) // Close the Ok() wrapper here
         }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
