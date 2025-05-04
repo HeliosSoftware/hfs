@@ -3243,7 +3243,8 @@ fn test_resource_simple_field_access() {
         eval("id", &context),
         EvaluationResult::String("p1".to_string())
     );
-    assert_eq!(eval("active", &context), EvaluationResult::Boolean(true));
+    // Access the primitive value of 'active' since it has an id
+    assert_eq!(eval("active.value", &context), EvaluationResult::Boolean(true));
     // birthDate is Element<String>, so it evaluates to String
     assert_eq!(
         eval("birthDate", &context),
@@ -3280,9 +3281,10 @@ fn test_resource_nested_field_access() {
     let name_given = eval("name.given", &context);
     assert!(matches!(name_given, EvaluationResult::Collection(_)));
     if let EvaluationResult::Collection(items) = name_given {
-        assert_eq!(items.len(), 4); // John, Middle, Johnny, Jane
+        assert_eq!(items.len(), 4); // John, Middle (Object), Johnny, Jane
         assert!(items.contains(&EvaluationResult::String("John".to_string())));
-        assert!(items.contains(&EvaluationResult::String("Middle".to_string()))); // Add Middle
+        // Check for the Object representation of "Middle"
+        assert!(items.iter().any(|item| matches!(item, EvaluationResult::Object(map) if map.get("value") == Some(&EvaluationResult::String("Middle".to_string())) && map.get("id") == Some(&EvaluationResult::String("given2-id".to_string())) )));
         assert!(items.contains(&EvaluationResult::String("Johnny".to_string())));
         assert!(items.contains(&EvaluationResult::String("Jane".to_string())));
     }
