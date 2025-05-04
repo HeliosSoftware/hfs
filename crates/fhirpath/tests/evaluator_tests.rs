@@ -282,25 +282,27 @@ fn test_function_existence_all_false() {
 fn test_function_existence_any_false() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.anyFalse()", &context),
+        eval("{}.anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("(false).anyFalse()", &context),
+        eval("(false).anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(false | false).anyFalse()", &context),
+        eval("(false | false).anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(true | false).anyFalse()", &context),
+        eval("(true | false).anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(true | true).anyFalse()", &context),
+        eval("(true | true).anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
+     // Test with non-boolean - should error
+    assert!(eval("(true | 1).anyFalse()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#subsetofother--collection--boolean
