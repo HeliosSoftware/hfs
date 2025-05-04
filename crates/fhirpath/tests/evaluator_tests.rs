@@ -1878,45 +1878,48 @@ fn test_function_string_substring() {
 fn test_function_string_starts_with() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("'abcdefg'.startsWith('abc')", &context),
+        eval("'abcdefg'.startsWith('abc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.startsWith('ab')", &context),
+        eval("'abcdefg'.startsWith('ab')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.startsWith('a')", &context),
+        eval("'abcdefg'.startsWith('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.startsWith('bc')", &context),
+        eval("'abcdefg'.startsWith('bc')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'abcdefg'.startsWith('abcdefg')", &context),
+        eval("'abcdefg'.startsWith('abcdefg')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("'abcdefg'.startsWith('')", &context),
+        eval("'abcdefg'.startsWith('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("''.startsWith('a')", &context),
+        eval("''.startsWith('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("''.startsWith('')", &context),
+        eval("''.startsWith('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("{}.startsWith('a')", &context),
+        eval("{}.startsWith('a')", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
     assert_eq!(
-        eval("'abc'.startsWith({})", &context),
+        eval("'abc'.startsWith({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
+    // Test multi-item collection - should error
+    assert!(eval("('a' | 'b').startsWith('a')", &context).is_err());
+    assert!(eval("'abc'.startsWith(('a' | 'b'))", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#endswithsuffix--string--boolean
