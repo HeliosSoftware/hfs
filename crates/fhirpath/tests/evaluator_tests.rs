@@ -143,28 +143,28 @@ fn test_function_existence_empty() {
 fn test_function_existence_exists() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
-        eval("{}.exists()", &context),
+        eval("{}.exists()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("'test'.exists()", &context),
+        eval("'test'.exists()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2).exists()", &context),
+        eval("(1 | 2).exists()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     // With criteria
     assert_eq!(
-        eval("(1 | 2 | 3).exists($this > 2)", &context),
+        eval("(1 | 2 | 3).exists($this > 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
-        eval("(1 | 2 | 3).exists($this > 5)", &context),
+        eval("(1 | 2 | 3).exists($this > 5)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
     assert_eq!(
-        eval("{}.exists($this > 5)", &context),
+        eval("{}.exists($this > 5)", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
 }
