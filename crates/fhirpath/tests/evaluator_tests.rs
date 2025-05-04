@@ -978,33 +978,33 @@ fn test_function_conversion_iif() {
     let context = EvaluationContext::new_empty();
     // Requires expression passing
     assert_eq!(
-        eval("iif(true, 'a', 'b')", &context),
+        eval("iif(true, 'a', 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
     );
     assert_eq!(
-        eval("iif(false, 'a', 'b')", &context),
+        eval("iif(false, 'a', 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("b".to_string())
     );
     assert_eq!(
-        eval("iif({}, 'a', 'b')", &context),
+        eval("iif({}, 'a', 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("b".to_string())
     ); // Empty condition is false
     assert_eq!(
-        eval("iif(true, 'a')", &context),
+        eval("iif(true, 'a')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
     ); // Omitted otherwise
-    assert_eq!(eval("iif(false, 'a')", &context), EvaluationResult::Empty); // Omitted otherwise
-    assert_eq!(eval("iif({}, 'a')", &context), EvaluationResult::Empty); // Omitted otherwise
+    assert_eq!(eval("iif(false, 'a')", &context).unwrap(), EvaluationResult::Empty); // Omitted otherwise, Add unwrap
+    assert_eq!(eval("iif({}, 'a')", &context).unwrap(), EvaluationResult::Empty); // Omitted otherwise, Add unwrap
     // Test collection results
     assert_eq!(
-        eval("iif(true, (1|2), (3|4))", &context),
+        eval("iif(true, (1|2), (3|4))", &context).unwrap(), // Add unwrap
         collection(vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
         ])
     );
     assert_eq!(
-        eval("iif(false, (1|2), (3|4))", &context),
+        eval("iif(false, (1|2), (3|4))", &context).unwrap(), // Add unwrap
         collection(vec![
             EvaluationResult::Integer(3),
             EvaluationResult::Integer(4)
