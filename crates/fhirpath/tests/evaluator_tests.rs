@@ -3250,9 +3250,14 @@ fn test_resource_simple_field_access() {
         eval("birthDate.value", &context),
         EvaluationResult::String("1980-05-15".to_string())
     );
-    // Accessing the choice type field 'deceased' should yield the primitive boolean,
-    // because the underlying Boolean element only has a value and no id/extension.
-    assert_eq!(eval("deceased", &context), EvaluationResult::Boolean(false));
+    // Accessing the choice type field 'deceased' yields an Object because Element always returns Object now.
+    let deceased_result = eval("deceased", &context);
+    assert!(matches!(deceased_result, EvaluationResult::Object(_)), "Expected deceased to be an Object, got {:?}", deceased_result);
+    if let EvaluationResult::Object(fields) = deceased_result {
+         assert_eq!(fields.get("value"), Some(&EvaluationResult::Boolean(false)), "Deceased object value mismatch");
+         assert!(fields.get("id").is_none(), "Deceased object should not have id");
+         assert!(fields.get("extension").is_none(), "Deceased object should not have extension");
+    }
     // Accessing a specific choice type name like 'deceasedBoolean' is not standard FHIRPath
     // for member access on the resource itself. It should return Empty.
     assert_eq!(eval("deceasedBoolean", &context), EvaluationResult::Empty);

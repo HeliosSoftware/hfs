@@ -836,17 +836,7 @@ where
             return EvaluationResult::Empty;
         }
 
-        // If only value is present, return the primitive result directly
-        if self.id.is_none() && self.extension.is_none() {
-            if let Some(v) = &self.value {
-                return v.into_evaluation_result();
-            } else {
-                // This case should be caught by the first check, but defensively return Empty
-                return EvaluationResult::Empty;
-            }
-        }
-
-        // Otherwise, construct an Object
+        // Always construct an Object if id, extension, OR value is present.
         let mut map = std::collections::HashMap::new();
         if let Some(id) = &self.id {
             map.insert("id".to_string(), EvaluationResult::String(id.clone()));
@@ -881,18 +871,7 @@ where
             return EvaluationResult::Empty;
         }
 
-        // If only value is present, return the primitive result directly
-        if self.id.is_none() && self.extension.is_none() {
-             if let Some(precise_decimal) = &self.value {
-                if let Some(decimal_val) = precise_decimal.value() {
-                    return EvaluationResult::Decimal(decimal_val);
-                }
-            }
-            // If value is None or PreciseDecimal holds None, return Empty
-            return EvaluationResult::Empty;
-        }
-
-        // Otherwise, construct an Object
+        // Always construct an Object if id, extension, OR value is present.
         let mut map = std::collections::HashMap::new();
         if let Some(id) = &self.id {
             map.insert("id".to_string(), EvaluationResult::String(id.clone()));
