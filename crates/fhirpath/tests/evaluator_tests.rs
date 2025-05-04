@@ -3333,7 +3333,7 @@ fn test_resource_nested_field_access() {
     // let bday_ext = eval("birthDate.extension", &context);
     // assert!(
     //     matches!(bday_ext, EvaluationResult::Collection(_)),
-        "Expected Collection for birthDate.extension, got {:?}",
+    //     "Expected Collection for birthDate.extension, got {:?}", // This message belongs inside the assert!
     //     bday_ext
     // );
     // if let EvaluationResult::Collection(exts) = bday_ext {
