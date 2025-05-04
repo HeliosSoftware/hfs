@@ -2685,19 +2685,23 @@ fn check_membership(
                 single_item => compare_equality(left, "=", single_item).to_boolean(),
             };
 
-            EvaluationResult::Boolean(is_in)
+            Ok(EvaluationResult::Boolean(is_in))
         }
         "contains" => {
             // Spec: X contains {} -> {}
             if right == &EvaluationResult::Empty {
-                return EvaluationResult::Empty;
+                return Ok(EvaluationResult::Empty);
             }
-            // Spec: {} contains X -> false
+            // Spec: {} contains X -> false (where X is not empty)
             if left == &EvaluationResult::Empty {
-                return EvaluationResult::Boolean(false);
+                return Ok(EvaluationResult::Boolean(false));
+            }
+            // Check for multi-item right operand (error)
+            if right.count() > 1 {
+                 return Err(EvaluationError::SingletonEvaluationError("'contains' operator requires singleton right operand".to_string()));
             }
             // Proceed with check if both operands are non-empty
-            match left {
+            Ok(match left { // Wrap result in Ok
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
                     let contains = items
@@ -2710,14 +2714,17 @@ fn check_membership(
                     EvaluationResult::String(substr) => {
                         EvaluationResult::Boolean(s.contains(substr))
                     }
-                    _ => EvaluationResult::Boolean(false), // Contains on string requires string argument
+                    // Contains on string requires string argument, otherwise error
+                    _ => return Err(EvaluationError::TypeError(format!(
+                        "'contains' on String requires String argument, found {:?}", right.variant_name()
+                    ))),
                 },
                 // Treat single non-empty item as collection of one
                 single_item => {
                      EvaluationResult::Boolean(compare_equality(single_item, "=", right).to_boolean())
                 }
-            }
+            })
         }
-        _ => EvaluationResult::Empty, // Unknown operator
+        _ => Err(EvaluationError::InvalidOperation(format!("Unknown membership operator: {}", op))),
     }
 }
