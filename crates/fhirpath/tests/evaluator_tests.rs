@@ -1580,37 +1580,39 @@ fn test_function_conversion_converts_to_date_time() {
 #[test]
 fn test_function_conversion_to_time() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("{}.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("@T10:30:00.toTime()", &context),
+        eval("@T10:30:00.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Time("10:30:00".to_string())
     );
     assert_eq!(
-        eval("'10:30:00'.toTime()", &context),
+        eval("'10:30:00'.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Time("10:30:00".to_string())
     ); // String to Time
     assert_eq!(
-        eval("'10:30'.toTime()", &context),
+        eval("'10:30'.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Time("10:30".to_string())
     ); // Partial time string
     assert_eq!(
-        eval("'10'.toTime()", &context),
+        eval("'10'.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Time("10".to_string())
     ); // Partial time string
     assert_eq!(
-        eval("'invalid-time'.toTime()", &context),
+        eval("'invalid-time'.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    assert_eq!(eval("123.toTime()", &context), EvaluationResult::Empty);
-    assert_eq!(eval("true.toTime()", &context), EvaluationResult::Empty);
+    assert_eq!(eval("123.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(eval("true.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
-        eval("@2023-10-27.toTime()", &context),
+        eval("@2023-10-27.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Date cannot convert
     assert_eq!(
-        eval("@2023-10-27T10:30Z.toTime()", &context),
+        eval("@2023-10-27T10:30Z.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // DateTime cannot convert
+    // Test multi-item collection - should error
+    assert!(eval("(@T10 | @T11).toTime()", &context).is_err());
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstotime--boolean
