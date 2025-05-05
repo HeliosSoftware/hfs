@@ -5,12 +5,12 @@ use fhir::FhirResource;
 use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
 use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
-use fhirpath_support::EvaluationResult;
+use fhirpath_support::{EvaluationError, EvaluationResult};
 // use rust_decimal::Decimal; // Removed unused import
 use rust_decimal_macros::dec;
 
 // Helper function to parse and evaluate
-fn eval(input: &str, context: &EvaluationContext) -> EvaluationResult {
+fn eval(input: &str, context: &EvaluationContext) -> Result<EvaluationResult, EvaluationError> {
     let expr = parser().parse(input).unwrap_or_else(|e| {
         panic!("Parser error for input '{}': {:?}", input, e);
     });
@@ -31,8 +31,14 @@ fn collection(items: Vec<EvaluationResult>) -> EvaluationResult {
 fn test_expression_literals() {
     let context = EvaluationContext::new_empty();
     // Boolean
-    assert_eq!(eval("true", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("false", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("true", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("false", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
     // String
     assert_eq!(
         eval("'hello'", &context).unwrap(),
@@ -43,7 +49,10 @@ fn test_expression_literals() {
         EvaluationResult::String("urn:oid:1.2.3".to_string())
     );
     // Integer - Should now be parsed as Integer
-    assert_eq!(eval("123", &context).unwrap(), EvaluationResult::Integer(123));
+    assert_eq!(
+        eval("123", &context).unwrap(),
+        EvaluationResult::Integer(123)
+    );
     assert_eq!(eval("0", &context).unwrap(), EvaluationResult::Integer(0));
     assert_eq!(eval("-5", &context).unwrap(), EvaluationResult::Integer(-5));
     // Decimal - Requires a decimal point
@@ -51,7 +60,10 @@ fn test_expression_literals() {
         eval("123.45", &context).unwrap(),
         EvaluationResult::Decimal(dec!(123.45)) // Use Decimal
     );
-    assert_eq!(eval("0.0", &context).unwrap(), EvaluationResult::Decimal(dec!(0.0)));
+    assert_eq!(
+        eval("0.0", &context).unwrap(),
+        EvaluationResult::Decimal(dec!(0.0))
+    );
     // Date
     assert_eq!(
         eval("@2015-02-04", &context).unwrap(),
@@ -85,17 +97,17 @@ fn test_expression_literals() {
     );
     // Quantity - Parser returns Decimal or Integer based on number format
     assert_eq!(
-        eval("10 'mg'", &context).unwrap(),     // 10 is parsed as Integer
-        EvaluationResult::Integer(10)  // Evaluator ignores unit for now
+        eval("10 'mg'", &context).unwrap(), // 10 is parsed as Integer
+        EvaluationResult::Integer(10)       // Evaluator ignores unit for now
     );
     assert_eq!(
-        eval("4.5 'km'", &context).unwrap(),           // 4.5 is parsed as Number (Decimal)
+        eval("4.5 'km'", &context).unwrap(), // 4.5 is parsed as Number (Decimal)
         EvaluationResult::Decimal(dec!(4.5))  // Evaluator ignores unit for now
     );
     // Quantity with date/time unit - Parser returns Decimal or Integer
     assert_eq!(
-        eval("100 days", &context).unwrap(),     // 100 is parsed as Integer
-        EvaluationResult::Integer(100)  // Evaluator ignores unit for now
+        eval("100 days", &context).unwrap(), // 100 is parsed as Integer
+        EvaluationResult::Integer(100)       // Evaluator ignores unit for now
     );
 
     // Empty Collection (Null literal)
@@ -112,7 +124,10 @@ fn test_expression_singleton_evaluation() {
         EvaluationResult::String("hello".to_string())
     );
     // Empty collection evaluates to empty
-    assert_eq!(eval("({}).first()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("({}).first()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Multiple items cause error
     // Example: Using '+' which requires singletons
     assert!(eval("(1 | 2) + 3", &context).is_err());
@@ -276,7 +291,7 @@ fn test_function_existence_all_false() {
         eval("(true | true).allFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-     // Test with non-boolean - should error
+    // Test with non-boolean - should error
     assert!(eval("(false | 1).allFalse()", &context).is_err());
 }
 
@@ -304,7 +319,7 @@ fn test_function_existence_any_false() {
         eval("(true | true).anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-     // Test with non-boolean - should error
+    // Test with non-boolean - should error
     assert!(eval("(true | 1).anyFalse()", &context).is_err());
 }
 
@@ -380,7 +395,10 @@ fn test_function_existence_superset_of() {
 #[test]
 fn test_function_existence_count() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.count()", &context).unwrap(), EvaluationResult::Integer(0)); // Add unwrap
+    assert_eq!(
+        eval("{}.count()", &context).unwrap(),
+        EvaluationResult::Integer(0)
+    ); // Add unwrap
     assert_eq!(
         eval("'test'.count()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
@@ -400,7 +418,10 @@ fn test_function_existence_count() {
 #[test]
 fn test_function_existence_distinct() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.distinct()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.distinct()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(1).distinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(1)
@@ -636,7 +657,10 @@ fn test_function_subsetting_indexer() {
         eval("(10 | 20 | 30)[2]", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(30)
     );
-    assert_eq!(eval("(10 | 20 | 30)[3]", &context).unwrap(), EvaluationResult::Empty); // Index out of bounds -> Empty, Add unwrap
+    assert_eq!(
+        eval("(10 | 20 | 30)[3]", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Index out of bounds -> Empty, Add unwrap
     // Negative index should error
     assert!(eval("(10 | 20 | 30)[-1]", &context).is_err());
     // Non-integer index should error
@@ -647,7 +671,10 @@ fn test_function_subsetting_indexer() {
 #[test]
 fn test_function_subsetting_single() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.single()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.single()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(10).single()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
@@ -660,7 +687,10 @@ fn test_function_subsetting_single() {
 #[test]
 fn test_function_subsetting_first() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.first()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.first()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(10).first()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(10)
@@ -675,8 +705,14 @@ fn test_function_subsetting_first() {
 #[test]
 fn test_function_subsetting_last() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.last()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("(10).last()", &context).unwrap(), EvaluationResult::Integer(10)); // Add unwrap
+    assert_eq!(
+        eval("{}.last()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("(10).last()", &context).unwrap(),
+        EvaluationResult::Integer(10)
+    ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).last()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(30)
@@ -687,8 +723,14 @@ fn test_function_subsetting_last() {
 #[test]
 fn test_function_subsetting_tail() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.tail()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("(10).tail()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.tail()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("(10).tail()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).tail()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
@@ -702,7 +744,10 @@ fn test_function_subsetting_tail() {
 #[test]
 fn test_function_subsetting_skip() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.skip(1)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.skip(1)", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).skip(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection(vec![
@@ -743,7 +788,10 @@ fn test_function_subsetting_skip() {
 #[test]
 fn test_function_subsetting_take() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.take(1)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.take(1)", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).take(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -794,7 +842,10 @@ fn test_function_subsetting_take() {
 fn test_function_subsetting_intersect() {
     // Note: HashSet used internally, order is not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.intersect({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.intersect({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(1 | 2 | 3).intersect({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -823,14 +874,21 @@ fn test_function_subsetting_intersect() {
     // intersect -> (1)
     let result = eval("(1 | 2 | 1).intersect(1 | 3 | 1)", &context).unwrap(); // Add unwrap
     // Check if the result is the single integer 1, handling normalization
-    assert_eq!(result, EvaluationResult::Integer(1), "Intersect result mismatch");
+    assert_eq!(
+        result,
+        EvaluationResult::Integer(1),
+        "Intersect result mismatch"
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#excludeother-collection--collection
 #[test]
 fn test_function_subsetting_exclude() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.exclude({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.exclude({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("(1 | 2 | 3).exclude({})", &context).unwrap(), // Add unwrap
         // Expect collection result
@@ -861,8 +919,7 @@ fn test_function_subsetting_exclude() {
         // Expect collection result based on distinct input
         collection(vec![
             EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3)
-            // The second '2' is lost because the input collection becomes distinct
+            EvaluationResult::Integer(3) // The second '2' is lost because the input collection becomes distinct
         ])
     );
 }
@@ -873,7 +930,10 @@ fn test_function_subsetting_exclude() {
 fn test_function_combining_union() {
     // Note: HashSet used internally, order is not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.union({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.union({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
 
     let r1 = eval("(1 | 2).union({})", &context).unwrap(); // Add unwrap
     assert!(matches!(&r1, EvaluationResult::Collection(_)));
@@ -923,7 +983,10 @@ fn test_function_combining_union() {
 fn test_function_combining_combine() {
     // Note: Order not guaranteed in output
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.combine({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.combine({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
 
     let r1 = eval("(1 | 2).combine({})", &context).unwrap(); // Add unwrap
     assert!(matches!(&r1, EvaluationResult::Collection(_)));
@@ -996,8 +1059,14 @@ fn test_function_conversion_iif() {
         eval("iif(true, 'a')", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
     ); // Omitted otherwise
-    assert_eq!(eval("iif(false, 'a')", &context).unwrap(), EvaluationResult::Empty); // Omitted otherwise, Add unwrap
-    assert_eq!(eval("iif({}, 'a')", &context).unwrap(), EvaluationResult::Empty); // Omitted otherwise, Add unwrap
+    assert_eq!(
+        eval("iif(false, 'a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Omitted otherwise, Add unwrap
+    assert_eq!(
+        eval("iif({}, 'a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Omitted otherwise, Add unwrap
     // Test collection results
     assert_eq!(
         eval("iif(true, (1|2), (3|4))", &context).unwrap(), // Add unwrap
@@ -1021,7 +1090,10 @@ fn test_function_conversion_iif() {
 #[test]
 fn test_function_conversion_to_boolean() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toBoolean()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("true.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
@@ -1082,9 +1154,18 @@ fn test_function_conversion_to_boolean() {
         eval("'0.0'.toBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("2.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid integer, Add unwrap
-    assert_eq!(eval("2.5.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid decimal, Add unwrap
-    assert_eq!(eval("'abc'.toBoolean()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
+    assert_eq!(
+        eval("2.toBoolean()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Invalid integer, Add unwrap
+    assert_eq!(
+        eval("2.5.toBoolean()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Invalid decimal, Add unwrap
+    assert_eq!(
+        eval("'abc'.toBoolean()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Invalid string, Add unwrap
     // Test multi-item collection - should error
     assert!(eval("(true | false).toBoolean()", &context).is_err());
 }
@@ -1141,7 +1222,10 @@ fn test_function_conversion_converts_to_boolean() {
 #[test]
 fn test_function_conversion_to_integer() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toInteger()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toInteger()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("123.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(123)
@@ -1169,13 +1253,16 @@ fn test_function_conversion_to_integer() {
     // Decimal conversion to Integer (truncates) - FHIRPath spec says Empty if not integer representable
     assert_eq!(
         eval("123.45.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Per spec
+        EvaluationResult::Empty                        // Per spec
     );
     assert_eq!(
         eval("123.0.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Per spec (even if whole number)
+        EvaluationResult::Empty                       // Per spec (even if whole number)
     );
-    assert_eq!(eval("'abc'.toInteger()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
+    assert_eq!(
+        eval("'abc'.toInteger()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Invalid string, Add unwrap
     assert_eq!(
         eval("'123.45'.toInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1207,7 +1294,7 @@ fn test_function_conversion_converts_to_integer() {
     // Decimal conversion check
     assert_eq!(
         eval("123.45.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false) // Per spec
+        EvaluationResult::Boolean(false)                       // Per spec
     );
     assert_eq!(
         eval("123.0.convertsToInteger()", &context).unwrap(), // Add unwrap
@@ -1225,40 +1312,46 @@ fn test_function_conversion_converts_to_integer() {
 #[test]
 fn test_function_conversion_to_decimal() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toDecimal()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toDecimal()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("123.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.0)) // Integer to Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(123.0))      // Integer to Decimal (explicit .0)
     );
     assert_eq!(
         eval("123.45.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.45)) // Decimal to Decimal
+        EvaluationResult::Decimal(dec!(123.45))        // Decimal to Decimal
     );
     assert_eq!(
         eval("'456.78'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(456.78)) // String to Decimal
+        EvaluationResult::Decimal(dec!(456.78))          // String to Decimal
     );
     assert_eq!(
         eval("'+12.3'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(12.3)) // String with sign
+        EvaluationResult::Decimal(dec!(12.3))           // String with sign
     );
     assert_eq!(
         eval("'-45.6'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(-45.6)) // String with sign
+        EvaluationResult::Decimal(dec!(-45.6))          // String with sign
     );
     assert_eq!(
         eval("'789'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(789.0)) // Integer string -> Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(789.0))        // Integer string -> Decimal (explicit .0)
     );
     assert_eq!(
         eval("true.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.0)) // Boolean to Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(1.0))         // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
         eval("false.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(0.0)) // Boolean to Decimal (explicit .0)
+        EvaluationResult::Decimal(dec!(0.0))          // Boolean to Decimal (explicit .0)
     );
-    assert_eq!(eval("'abc'.toDecimal()", &context).unwrap(), EvaluationResult::Empty); // Invalid string, Add unwrap
+    assert_eq!(
+        eval("'abc'.toDecimal()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Invalid string, Add unwrap
     // Test multi-item collection - should error
     assert!(eval("(1.0 | 2.0).toDecimal()", &context).is_err());
 }
@@ -1299,7 +1392,10 @@ fn test_function_conversion_converts_to_decimal() {
 #[test]
 fn test_function_conversion_to_string() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toString()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toString()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("'abc'.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("abc".to_string())
@@ -1409,7 +1505,10 @@ fn test_function_conversion_converts_to_string() {
 #[test]
 fn test_function_conversion_to_date() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toDate()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("@2023-10-27.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Date("2023-10-27".to_string())
@@ -1438,8 +1537,14 @@ fn test_function_conversion_to_date() {
         eval("'invalid-date'.toDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    assert_eq!(eval("123.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("true.toDate()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("123.toDate()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("true.toDate()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item collection - should error
     assert!(eval("(@2023 | @2024).toDate()", &context).is_err());
 }
@@ -1496,7 +1601,10 @@ fn test_function_conversion_converts_to_date() {
 #[test]
 fn test_function_conversion_to_date_time() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toDateTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toDateTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.toDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::DateTime("2023-10-27T10:30:00Z".to_string())
@@ -1525,8 +1633,14 @@ fn test_function_conversion_to_date_time() {
         eval("'invalid-datetime'.toDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    assert_eq!(eval("123.toDateTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("true.toDateTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("123.toDateTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("true.toDateTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item collection - should error
     assert!(eval("(@2023 | @2024).toDateTime()", &context).is_err());
 }
@@ -1583,7 +1697,10 @@ fn test_function_conversion_converts_to_date_time() {
 #[test]
 fn test_function_conversion_to_time() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("@T10:30:00.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Time("10:30:00".to_string())
@@ -1604,8 +1721,14 @@ fn test_function_conversion_to_time() {
         eval("'invalid-time'.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     );
-    assert_eq!(eval("123.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("true.toTime()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("123.toTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("true.toTime()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("@2023-10-27.toTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1662,7 +1785,7 @@ fn test_function_conversion_converts_to_time() {
         eval("@2023-10-27T10:30Z.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-     // Test multi-item collection - should error
+    // Test multi-item collection - should error
     assert!(eval("(@T10 | @T11).convertsToTime()", &context).is_err());
 }
 
@@ -1670,20 +1793,23 @@ fn test_function_conversion_converts_to_time() {
 #[test]
 fn test_function_conversion_to_quantity() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("{}.toQuantity()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.toQuantity()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Boolean to Quantity
     assert_eq!(
         eval("true.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.0)) // Spec implies conversion to Decimal 1.0 '1'
+        EvaluationResult::Decimal(dec!(1.0))          // Spec implies conversion to Decimal 1.0 '1'
     );
     assert_eq!(
         eval("false.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(0.0)) // Spec implies conversion to Decimal 0.0 '1'
+        EvaluationResult::Decimal(dec!(0.0))           // Spec implies conversion to Decimal 0.0 '1'
     );
     // Integer to Quantity
     assert_eq!(
         eval("123.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.0)) // Spec implies conversion to Decimal 123.0 '1'
+        EvaluationResult::Decimal(dec!(123.0))       // Spec implies conversion to Decimal 123.0 '1'
     );
     // Decimal to Quantity
     assert_eq!(
@@ -1693,15 +1819,15 @@ fn test_function_conversion_to_quantity() {
     // String to Quantity (parses number and unit)
     assert_eq!(
         eval("'5.5 mg'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(5.5)) // Evaluator currently ignores unit
+        EvaluationResult::Decimal(dec!(5.5))              // Evaluator currently ignores unit
     );
     assert_eq!(
         eval("'100'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0)) // Evaluator currently ignores unit
+        EvaluationResult::Decimal(dec!(100.0))         // Evaluator currently ignores unit
     );
     assert_eq!(
         eval("'100 days'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0)) // String with valid time unit
+        EvaluationResult::Decimal(dec!(100.0))              // String with valid time unit
     );
     assert_eq!(
         eval("'invalid'.toQuantity()", &context).unwrap(), // Add unwrap
@@ -1722,7 +1848,7 @@ fn test_function_conversion_to_quantity() {
     );
     assert_eq!(
         eval("100 days.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0)) // Expect Decimal conversion
+        EvaluationResult::Decimal(dec!(100.0))            // Expect Decimal conversion
     );
     // Test multi-item collection - should error
     assert!(eval("(1 | 2).toQuantity()", &context).is_err());
@@ -1762,15 +1888,15 @@ fn test_function_conversion_converts_to_quantity() {
     );
     assert_eq!(
         eval("'invalid'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false) // Not a number
+        EvaluationResult::Boolean(false)                           // Not a number
     );
     assert_eq!(
         eval("'5.5 invalid-unit'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false) // Invalid unit part
+        EvaluationResult::Boolean(false)                                    // Invalid unit part
     );
     assert_eq!(
         eval("'5.5 mg extra'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false) // Too many parts
+        EvaluationResult::Boolean(false)                                // Too many parts
     );
     // Quantity literal conversion (these use the Quantity literal parser, not string conversion)
     assert_eq!(
@@ -1818,8 +1944,14 @@ fn test_function_string_index_of() {
         eval("''.indexOf('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(0)
     );
-    assert_eq!(eval("{}.indexOf('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("'abc'.indexOf({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.indexOf('a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("'abc'.indexOf({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item collection - should error
     assert!(eval("('a' | 'b').indexOf('a')", &context).is_err());
     assert!(eval("'abc'.indexOf(('a' | 'b'))", &context).is_err());
@@ -1863,7 +1995,10 @@ fn test_function_string_substring() {
         eval("''.substring(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.substring(0)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.substring(0)", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("'abc'.substring({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1961,7 +2096,10 @@ fn test_function_string_ends_with() {
         eval("''.endsWith('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.endsWith('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.endsWith('a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("'abc'.endsWith({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -2007,7 +2145,10 @@ fn test_function_string_contains() {
         eval("''.contains('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.contains('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.contains('a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(
         eval("'abc'.contains({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -2037,7 +2178,10 @@ fn test_function_string_upper() {
         eval("''.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.upper()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.upper()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item collection - should error
     assert!(eval("('a' | 'b').upper()", &context).is_err());
     // Test non-string input - should error
@@ -2064,7 +2208,10 @@ fn test_function_string_lower() {
         eval("''.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("".to_string())
     );
-    assert_eq!(eval("{}.lower()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.lower()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item collection - should error
     assert!(eval("('A' | 'B').lower()", &context).is_err());
     // Test non-string input - should error
@@ -2180,8 +2327,14 @@ fn test_function_string_matches() {
         eval("''.matches('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    assert_eq!(eval("{}.matches('a')", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("'abc'.matches({})", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{}.matches('a')", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("'abc'.matches({})", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Invalid regex should error
     assert!(eval("'abc'.matches('[')", &context).is_err());
     // Test multi-item collection - should error
@@ -2255,10 +2408,19 @@ fn test_function_string_length() {
         eval("'abcdefg'.length()", &context).unwrap(), // Add unwrap
         EvaluationResult::Integer(7)
     );
-    assert_eq!(eval("''.length()", &context).unwrap(), EvaluationResult::Integer(0)); // Add unwrap
-    assert_eq!(eval("{}.length()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("''.length()", &context).unwrap(),
+        EvaluationResult::Integer(0)
+    ); // Add unwrap
+    assert_eq!(
+        eval("{}.length()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Length on non-string should be empty (or error depending on strictness, current impl returns Empty)
-    assert_eq!(eval("123.length()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("123.length()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Length on multi-item collection should error
     assert!(eval("('a' | 'b').length()", &context).is_err());
 }
@@ -2275,8 +2437,14 @@ fn test_function_string_to_chars() {
             EvaluationResult::String("c".to_string()),
         ])
     );
-    assert_eq!(eval("''.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("{}.toChars()", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("''.toChars()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("{}.toChars()", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // toChars on non-string should error
     assert!(eval("123.toChars()", &context).is_err());
     // toChars on multi-item collection should error
@@ -2625,7 +2793,10 @@ fn test_operator_types_is() {
 #[test]
 fn test_operator_types_as() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("1 as Integer", &context).unwrap(), EvaluationResult::Integer(1)); // Add unwrap
+    assert_eq!(
+        eval("1 as Integer", &context).unwrap(),
+        EvaluationResult::Integer(1)
+    ); // Add unwrap
     assert_eq!(
         eval("'a' as String", &context).unwrap(), // Add unwrap
         EvaluationResult::String("a".to_string())
@@ -2634,11 +2805,26 @@ fn test_operator_types_as() {
         eval("1.0 as Decimal", &context).unwrap(), // Add unwrap
         EvaluationResult::Decimal(dec!(1.0))
     ); // 'as' Decimal
-    assert_eq!(eval("1 as String", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("'a' as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("1 as Decimal", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("1.0 as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("{} as Integer", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("1 as String", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("'a' as Integer", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("1 as Decimal", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("1.0 as Integer", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("{} as Integer", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test 'System' namespace explicitly
     assert_eq!(
         eval("1 as System.Integer", &context).unwrap(), // Add unwrap
@@ -2705,8 +2891,14 @@ fn test_operator_collections_in() {
         eval("'c' in ('a' | 'b')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("1 in {}", &context).unwrap(), EvaluationResult::Boolean(false)); // Add unwrap
-    assert_eq!(eval("{} in (1 | 2)", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("1 in {}", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    ); // Add unwrap
+    assert_eq!(
+        eval("{} in (1 | 2)", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     assert_eq!(eval("{} in {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     // Test multi-item left operand - should error
     assert!(eval("(1 | 2) in (1 | 2 | 3)", &context).is_err());
@@ -2740,7 +2932,10 @@ fn test_operator_collections_contains() {
         eval("(1 | 2) contains {}", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Contains empty item
-    assert_eq!(eval("{} contains {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("{} contains {}", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
     // Test multi-item right operand - should error
     assert!(eval("(1 | 2 | 3) contains (1 | 2)", &context).is_err());
 }
@@ -3338,7 +3533,10 @@ fn test_resource_simple_field_access() {
         EvaluationResult::String("p1".to_string())
     );
     // Accessing 'active' should now return the primitive boolean directly
-    assert_eq!(eval("active", &context).unwrap(), EvaluationResult::Boolean(true)); // Add unwrap
+    assert_eq!(
+        eval("active", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Add unwrap
     // Accessing 'birthDate' should now return the primitive string directly
     assert_eq!(
         eval("birthDate", &context).unwrap(), // Add unwrap
@@ -3346,7 +3544,10 @@ fn test_resource_simple_field_access() {
     );
     // Evaluate the context first to check the object structure directly
     let context_result = eval("%context", &context).unwrap(); // Add unwrap
-    eprintln!("Debug [test_resource_simple_field_access]: %context result: {:?}", context_result);
+    eprintln!(
+        "Debug [test_resource_simple_field_access]: %context result: {:?}",
+        context_result
+    );
     if let EvaluationResult::Object(patient_obj) = context_result {
         // Check the 'deceased' field within the evaluated object map
         assert_eq!(
@@ -3358,9 +3559,18 @@ fn test_resource_simple_field_access() {
         panic!("%context did not evaluate to an Object");
     }
     // Accessing non-existent fields should still return Empty for now
-    assert_eq!(eval("deceasedBoolean", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("deceasedDateTime", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
-    assert_eq!(eval("nonExistentField", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
+    assert_eq!(
+        eval("deceasedBoolean", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("deceasedDateTime", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
+    assert_eq!(
+        eval("nonExistentField", &context).unwrap(),
+        EvaluationResult::Empty
+    ); // Add unwrap
 }
 
 #[test]
@@ -3454,12 +3664,16 @@ fn test_resource_filtering_and_projection() {
 
     // Where on a list field
     let official_name = eval("name.where(use = 'official')", &context).unwrap(); // Add unwrap
-    assert!(matches!(official_name, EvaluationResult::Object(_)), "Expected Object for official name, got {:?}", official_name); // Should return the HumanName object
+    assert!(
+        matches!(official_name, EvaluationResult::Object(_)),
+        "Expected Object for official name, got {:?}",
+        official_name
+    ); // Should return the HumanName object
 
     // Select from the filtered list
     assert_eq!(
         eval("name.where(use = 'official').family", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("Doe".to_string()) // Expect primitive string
+        EvaluationResult::String("Doe".to_string())                     // Expect primitive string
     );
     // .given returns a collection of primitive strings
     assert_eq!(
@@ -3513,7 +3727,11 @@ fn test_resource_oftype() {
     let context = EvaluationContext::new(resources);
 
     let patients = eval("%context.ofType(Patient)", &context).unwrap(); // Add unwrap
-    assert!(matches!(patients, EvaluationResult::Object(_)), "Expected Object for Patient, got {:?}", patients); // Only one patient
+    assert!(
+        matches!(patients, EvaluationResult::Object(_)),
+        "Expected Object for Patient, got {:?}",
+        patients
+    ); // Only one patient
     if let EvaluationResult::Object(fields) = patients {
         assert_eq!(
             fields.get("resourceType"),
@@ -3527,7 +3745,11 @@ fn test_resource_oftype() {
     }
 
     let observations = eval("%context.ofType(Observation)", &context).unwrap(); // Add unwrap
-    assert!(matches!(observations, EvaluationResult::Object(_)), "Expected Object for Observation, got {:?}", observations); // Only one observation
+    assert!(
+        matches!(observations, EvaluationResult::Object(_)),
+        "Expected Object for Observation, got {:?}",
+        observations
+    ); // Only one observation
     if let EvaluationResult::Object(fields) = observations {
         assert_eq!(
             fields.get("resourceType"),
@@ -3553,23 +3775,28 @@ fn test_arithmetic_operations() {
 
     // --- Success Cases ---
     let success_cases = vec![
-        ("1 + 2", EvaluationResult::Integer(3)),         // Addition -> Integer
-        ("5 - 3", EvaluationResult::Integer(2)),         // Subtraction -> Integer
-        ("2 * 3", EvaluationResult::Integer(6)),         // Integer Multiplication -> Integer
+        ("1 + 2", EvaluationResult::Integer(3)), // Addition -> Integer
+        ("5 - 3", EvaluationResult::Integer(2)), // Subtraction -> Integer
+        ("2 * 3", EvaluationResult::Integer(6)), // Integer Multiplication -> Integer
         ("6 / 2", EvaluationResult::Decimal(dec!(3.0))), // Division -> Decimal
         ("7 / 2", EvaluationResult::Decimal(dec!(3.5))), // Division -> Decimal
-        ("7 div 2", EvaluationResult::Integer(3)),       // Integer div -> Integer
-        ("7 mod 2", EvaluationResult::Integer(1)),       // Integer mod -> Integer
+        ("7 div 2", EvaluationResult::Integer(3)), // Integer div -> Integer
+        ("7 mod 2", EvaluationResult::Integer(1)), // Integer mod -> Integer
         ("5.5 + 2.1", EvaluationResult::Decimal(dec!(7.6))), // Decimal Add -> Decimal
         ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))), // Decimal Sub -> Decimal
         ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))), // Decimal Mult -> Decimal
         ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))), // Decimal Div -> Decimal
-        ("5.5 div 2.1", EvaluationResult::Integer(2)),   // Decimal div -> Integer
+        ("5.5 div 2.1", EvaluationResult::Integer(2)), // Decimal div -> Integer
         ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // Decimal mod -> Decimal
     ];
 
     for (input, expected) in success_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // --- Error Cases ---
@@ -3596,20 +3823,25 @@ fn test_arithmetic_operations() {
     ];
 
     for input in error_cases {
-        assert!(eval(input, &context).is_err(), "Expected error for input: {}", input);
+        assert!(
+            eval(input, &context).is_err(),
+            "Expected error for input: {}",
+            input
+        );
     }
 
     // --- Empty Propagation Cases ---
     let empty_cases = vec![
-        "1 + {}", "{} + 1",
-        "1 - {}", "{} - 1",
-        "1 * {}", "{} * 1",
-        "1 / {}", "{} / 1",
-        "1 div {}", "{} div 1",
-        "1 mod {}", "{} mod 1",
+        "1 + {}", "{} + 1", "1 - {}", "{} - 1", "1 * {}", "{} * 1", "1 / {}", "{} / 1", "1 div {}",
+        "{} div 1", "1 mod {}", "{} mod 1",
     ];
     for input in empty_cases {
-         assert_eq!(eval(input, &context).unwrap(), EvaluationResult::Empty, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            EvaluationResult::Empty,
+            "Failed for input: {}",
+            input
+        );
     }
 }
 
@@ -3651,7 +3883,12 @@ fn test_boolean_operations() {
     let context = EvaluationContext::new_empty();
 
     for (input, expected) in test_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // Test type errors (should error)
@@ -3689,45 +3926,74 @@ fn test_comparison_operations() {
     ];
 
     for (input, expected) in success_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // --- Error Cases (Comparing collections or incompatible types) ---
     let error_cases = vec![
         "(1 | 2) < 3", // Collection comparison should error
         "1 < (2 | 3)",
-        "1 < 'a'",     // Incompatible types
+        "1 < 'a'", // Incompatible types
         "'a' > true",
         "@2023 = @T10:00", // Incompatible date/time types
     ];
     for input in error_cases {
-        assert!(eval(input, &context).is_err(), "Expected error for input: {}", input);
+        assert!(
+            eval(input, &context).is_err(),
+            "Expected error for input: {}",
+            input
+        );
     }
 
     // --- Empty Propagation Cases ---
     let empty_cases = vec![
-        "1 < {}", "{} < 1",
-        "1 <= {}", "{} <= 1",
-        "1 > {}", "{} > 1",
-        "1 >= {}", "{} >= 1",
+        "1 < {}", "{} < 1", "1 <= {}", "{} <= 1", "1 > {}", "{} > 1", "1 >= {}", "{} >= 1",
         "1 = {}", "{} = 1", // = with empty -> empty
         "1 != {}", "{} != 1", // != with empty -> empty
         "1 ~ {}", "{} ~ 1", // ~ with empty -> false (handled by assert_eq below)
-        "1 !~ {}", "{} !~ 1", // !~ with empty -> true (handled by assert_eq below)
-        "{} = {}", // = with empty -> empty
+        "1 !~ {}", "{} !~ 1",  // !~ with empty -> true (handled by assert_eq below)
+        "{} = {}",  // = with empty -> empty
         "{} != {}", // != with empty -> empty
     ];
-     for input in empty_cases {
-         assert_eq!(eval(input, &context).unwrap(), EvaluationResult::Empty, "Failed for input: {}", input);
+    for input in empty_cases {
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            EvaluationResult::Empty,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // Specific checks for ~ and !~ with empty
-    assert_eq!(eval("1 ~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("{} ~ 1", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("{} ~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 !~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("{} !~ 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("{} !~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("1 ~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("{} ~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("{} ~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 !~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("{} !~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("{} !~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
 }
 
 #[test]
@@ -3750,12 +4016,19 @@ fn test_variable_access() {
     ];
 
     for (input, expected) in success_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // --- Error Case (Undefined Variable) ---
-    assert!(eval("%address", &context).is_err(), "Expected error for undefined variable %address");
-
+    assert!(
+        eval("%address", &context).is_err(),
+        "Expected error for undefined variable %address"
+    );
 }
 
 #[test]
@@ -3781,28 +4054,26 @@ fn test_string_operations() {
             EvaluationResult::Boolean(true),
         ),
         // Test contains with non-string argument (should return false or empty, current impl returns false)
-        (
-            "'abc'.contains(1)",
-            EvaluationResult::Boolean(false),
-        ),
+        ("'abc'.contains(1)", EvaluationResult::Boolean(false)),
         // Test contains with empty argument (should return empty)
-        (
-            "'abc'.contains({})",
-            EvaluationResult::Empty,
-        ),
+        ("'abc'.contains({})", EvaluationResult::Empty),
         // Test contains on empty string
         (
             "{}.contains('a')",
             EvaluationResult::Empty, // Spec: {} contains X -> false, but function call on {} -> {}
         ),
-
     ];
 
     for (input, expected) in test_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
-     // Test multi-item errors for contains function
+    // Test multi-item errors for contains function
     assert!(eval("('a' | 'b').contains('a')", &context).is_err());
     assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
 }
@@ -3825,18 +4096,29 @@ fn test_functions() {
         // String functions
         ("'Hello'.count()", EvaluationResult::Integer(1)),
         ("'Hello'.length()", EvaluationResult::Integer(5)),
-        ("'Hello, World!'.contains('World')", EvaluationResult::Boolean(true)),
-        ("'Hello, World!'.contains('Goodbye')", EvaluationResult::Boolean(false)),
+        (
+            "'Hello, World!'.contains('World')",
+            EvaluationResult::Boolean(true),
+        ),
+        (
+            "'Hello, World!'.contains('Goodbye')",
+            EvaluationResult::Boolean(false),
+        ),
     ];
 
     for (input, expected) in success_cases {
-        assert_eq!(eval(input, &context).unwrap(), expected, "Failed for input: {}", input);
+        assert_eq!(
+            eval(input, &context).unwrap(),
+            expected,
+            "Failed for input: {}",
+            input
+        );
     }
 
     // Test error cases for functions requiring singletons
     assert!(eval("(1 | 2).length()", &context).is_err());
     assert!(eval("(1 | 2).contains(1)", &context).is_err()); // Base is collection, arg is singleton - should error? No, contains works on collections.
-                                                              // Let's test contains where arg is collection
+    // Let's test contains where arg is collection
     assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
 }
 
