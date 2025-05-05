@@ -4249,7 +4249,7 @@ fn test_string_operations() {
         // ("'abc'.contains(1)", EvaluationResult::Boolean(false)), // Old expectation
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string ({} contains X -> false) - Corrected expectation
+        // Test contains on empty string ({} contains X -> false) - Corrected expectation again
         ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 

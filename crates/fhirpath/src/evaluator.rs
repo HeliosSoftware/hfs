@@ -299,13 +299,14 @@ pub fn evaluate(
                 EvaluationResult::Empty => {
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
-                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
-                     // Ensure right operand resolved to Boolean or Empty
-                    if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                    // Check type *before* logical conversion
+                    if !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
                          return Err(EvaluationError::TypeError(format!(
-                            "Invalid type for 'implies' right operand: {}", right_bool.type_name()
+                            "Operator 'implies' requires Boolean right operand when left is Empty, found {}",
+                            right_eval.type_name()
                         )));
                     }
+                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
                     match right_bool {
                         EvaluationResult::Boolean(true) => Ok(EvaluationResult::Boolean(true)), // {} implies true -> true
                         _ => Ok(EvaluationResult::Empty), // {} implies (false | {}) -> {}
@@ -314,13 +315,14 @@ pub fn evaluate(
                 EvaluationResult::Boolean(true) => {
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
-                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
-                     // Ensure right operand resolved to Boolean or Empty
-                    if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                    // Check type *before* logical conversion
+                    if !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
                          return Err(EvaluationError::TypeError(format!(
-                            "Invalid type for 'implies' right operand: {}", right_bool.type_name()
+                            "Operator 'implies' requires Boolean right operand when left is True, found {}",
+                            right_eval.type_name()
                         )));
                     }
+                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
                     Ok(right_bool) // true implies X -> X (Boolean or Empty)
                 }
                  // This case should be unreachable if to_boolean_for_logic works correctly
@@ -1066,6 +1068,13 @@ fn call_function(
         }
         "contains" => {
             // Function call version
+            // Check for singleton base *if it's not a string* FIRST
+            if !matches!(invocation_base, EvaluationResult::String(_)) && invocation_base.count() > 1 {
+                 return Err(EvaluationError::SingletonEvaluationError(
+                    "contains function requires singleton input collection (or string)".to_string(),
+                ));
+            }
+
             // Check if the invocation_base contains the argument
             if args.len() != 1 {
                 return Err(EvaluationError::InvalidArity(
@@ -1074,12 +1083,6 @@ fn call_function(
             }
             let arg = &args[0];
 
-            // Check for singleton base *if it's not a string*
-            if !matches!(invocation_base, EvaluationResult::String(_)) && invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError(
-                    "contains function requires singleton input collection (or string)".to_string(),
-                ));
-            }
 
             // Spec: X contains {} -> {}
             if arg == &EvaluationResult::Empty {
