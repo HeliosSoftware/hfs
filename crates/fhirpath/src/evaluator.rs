@@ -2061,10 +2061,12 @@ fn call_function(
                     } else if parts.len() == 2 {
                         // Value and unit parts, check both value and unit validity
                         let value_parses = parts[0].parse::<Decimal>().is_ok();
-                        let unit_is_valid = is_valid_fhirpath_quantity_unit(parts[1].trim_matches('\'')); // Check unit without quotes
+                        // Unit part needs trimming AND validation
+                        let unit_str = parts[1].trim_matches('\'');
+                        let unit_is_valid = !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
                         value_parses && unit_is_valid
                     } else {
-                        // More than two parts is invalid
+                        // More than two parts is invalid format for quantity string
                         false
                     }
                 }), // Close the EvaluationResult::Boolean wrapper
@@ -2567,7 +2569,8 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     // For now, assume any non-empty string without whitespace that doesn't start with a digit
     // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
     // A real implementation would need a proper UCUM validator.
-    true
+    // For now, only allow known time units or '1'. Full UCUM is complex.
+    unit == "1" || TIME_UNITS.contains(&unit)
 }
 
 /// Evaluates an indexer expression
