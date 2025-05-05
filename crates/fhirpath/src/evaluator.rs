@@ -2052,21 +2052,21 @@ fn call_function(
                     // Wrap the entire block
                     // Check if the string represents a valid quantity format
                     let parts: Vec<&str> = s.split_whitespace().collect();
-                    if parts.is_empty() {
-                        false // Empty string is not convertible
-                    } else if parts.len() == 1 {
-                        // Only a value part, check if it parses as Decimal
-                        // An integer/decimal string alone IS convertible to Quantity (unit '1')
-                        parts[0].parse::<Decimal>().is_ok()
-                    } else if parts.len() == 2 {
-                        // Value and unit parts, check both value and unit validity
-                        let value_parses = parts[0].parse::<Decimal>().is_ok();
-                        // Unit part needs trimming AND validation
-                        let unit_str = parts[1].trim_matches('\'');
-                        let unit_is_valid = !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
-                        value_parses && unit_is_valid
-                    } else {
-                        // More than two parts is invalid format for quantity string
+                    match parts.len() {
+                        1 => {
+                            // Single part: Must be parseable as a number (int or decimal)
+                            // 'invalid' should fail here.
+                            parts[0].parse::<Decimal>().is_ok()
+                        }
+                        2 => {
+                            // Two parts: Value must parse AND unit must be valid
+                            let value_parses = parts[0].parse::<Decimal>().is_ok();
+                            let unit_str = parts[1].trim_matches('\'');
+                            // Unit must be non-empty AND pass validation
+                            let unit_is_valid = !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
+                            value_parses && unit_is_valid
+                        }
+                        // 0 or >2 parts are not convertible
                         false
                     }
                 }), // Close the EvaluationResult::Boolean wrapper
@@ -2566,10 +2566,12 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
         return false;
     }
 
-    // For now, assume any non-empty string without whitespace that doesn't start with a digit
-    // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
-    // A real implementation would need a proper UCUM validator.
-    true // Revert to the more permissive check for now
+    // For now, only allow known time units or '1'. Full UCUM is complex.
+    const TIME_UNITS: &[&str] = &[
+        "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+    ];
+    unit == "1" || TIME_UNITS.contains(&unit)
 }
 
 /// Evaluates an indexer expression
