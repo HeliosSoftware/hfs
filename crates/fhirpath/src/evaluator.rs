@@ -1589,13 +1589,8 @@ fn call_function(
                         _ => EvaluationResult::Empty, // Other strings are not convertible
                     }
                 }
-                // Collections: Convert single item, multiple items -> Empty
-                EvaluationResult::Collection(items) => {
-                    if items.len() == 1 {
-                        // This case is now unreachable due to the initial count check
-                        unreachable!("Multi-item collection should have caused an error earlier")
-                    }
-                }
+                // Collections handled by initial check
+                EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
