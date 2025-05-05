@@ -1491,14 +1491,11 @@ fn test_function_conversion_converts_to_string() {
         eval("5 'mg'.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
-    // Object/Collection are not convertible
-    assert_eq!(
-        eval("(1|2).convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
-    );
-    // Need object test once available
+    // Object/Collection are not convertible according to the function's logic,
+    // but the function should error if the input is a multi-item collection.
     // Test multi-item collection - should error
-    assert!(eval("(1 | 2).convertsToString()", &context).is_err()); // Corrected test case
+    assert!(eval("(1 | 2).convertsToString()", &context).is_err());
+    // Need object test once available
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#todate--date
@@ -4057,7 +4054,7 @@ fn test_string_operations() {
         ("'abc'.contains(1)", EvaluationResult::Boolean(false)),
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string ({} contains X -> false)
+        // Test contains on empty string ({} contains X -> false) - Corrected expectation
         ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 
@@ -4071,7 +4068,9 @@ fn test_string_operations() {
     }
 
     // Test multi-item errors for contains function
+    // Base collection must be singleton (unless string)
     assert!(eval("('a' | 'b').contains('a')", &context).is_err());
+    // Argument must be singleton
     assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
 }
 

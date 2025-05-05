@@ -149,9 +149,26 @@ pub fn evaluate(
             check_membership(&left_result, op, &right_result)
         }
         Expression::And(left, right) => {
-            // Evaluate left, handle potential error
+            // Evaluate operands first
             let left_eval = evaluate(left, context, current_item)?;
-            let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
+            let right_eval = evaluate(right, context, current_item)?;
+
+            // Check types *before* logical conversion
+            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) ||
+               !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                // Allow Empty for 3-valued logic, but reject other types
+                if !matches!(left_eval, EvaluationResult::Empty) && !matches!(right_eval, EvaluationResult::Empty) {
+                     return Err(EvaluationError::TypeError(format!(
+                        "Operator 'and' requires Boolean operands, found {} and {}",
+                        left_eval.type_name(), right_eval.type_name()
+                    )));
+                }
+            }
+
+            // Convert to boolean for logic AFTER type check
+            let left_bool = left_eval.to_boolean_for_logic()?;
+            let right_bool = right_eval.to_boolean_for_logic()?;
+
 
             match left_bool {
                 EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(false)), // false and X -> false
@@ -1030,6 +1047,13 @@ fn call_function(
                 ));
             }
             let arg = &args[0];
+
+            // Check for singleton base *if it's not a string*
+            if !matches!(invocation_base, EvaluationResult::String(_)) && invocation_base.count() > 1 {
+                 return Err(EvaluationError::SingletonEvaluationError(
+                    "contains function requires singleton input collection (or string)".to_string(),
+                ));
+            }
 
             // Spec: X contains {} -> {}
             if arg == &EvaluationResult::Empty {
@@ -3190,8 +3214,12 @@ fn compare_equality(
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }
-                // Any other combination is false (incompatible types)
-                _ => EvaluationResult::Boolean(false),
+                // Any other combination is an error for '='
+                _ => return Err(EvaluationError::TypeError(format!(
+                        "Cannot compare {} and {} using '='",
+                        left.type_name(),
+                        right.type_name()
+                    ))),
             }) // This parenthesis now correctly closes the Ok() started above
         }
         "!=" => {
