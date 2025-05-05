@@ -315,7 +315,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("hour"), text::keyword("minute"), text::keyword("second"), text::keyword("millisecond"),
         text::keyword("years"), text::keyword("months"), text::keyword("weeks"), text::keyword("days"),
         text::keyword("hours"), text::keyword("minutes"), text::keyword("seconds"), text::keyword("milliseconds"),
-    )).map(|s: &str| s.to_string()); // Explicitly type closure parameter
+    )).map(|s| s.to_string()); // Remove explicit type annotation
 
     let unit_string_literal = just('\'')
         .ignore_then(
@@ -327,9 +327,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then_ignore(just('\''));
 
     let unit = choice((
-        unit_keyword,
-        unit_string_literal,
-    )).padded(); // Unit parser itself can be padded
+        unit_keyword.boxed(), // Box the keyword parser
+        unit_string_literal.boxed(), // Box the string literal parser
+    ))
+    .padded(); // Unit parser itself can be padded
 
 
     // Define integer/number parsers specifically for quantity, without consuming trailing whitespace.
