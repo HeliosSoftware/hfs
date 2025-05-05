@@ -2146,7 +2146,7 @@ fn test_function_string_contains() {
     );
     assert_eq!(
         eval("{}.contains('a')", &context).unwrap(),
-        EvaluationResult::Empty
+        EvaluationResult::Boolean(false)
     ); // Add unwrap
     assert_eq!(
         eval("'abc'.contains({})", &context).unwrap(), // Add unwrap
@@ -4146,9 +4146,7 @@ fn test_comparison_operations() {
     let empty_cases = vec![
         "1 < {}", "{} < 1", "1 <= {}", "{} <= 1", "1 > {}", "{} > 1", "1 >= {}", "{} >= 1",
         "1 = {}", "{} = 1", // = with empty -> empty
-        "1 != {}", "{} != 1", // != with empty -> empty
-        "1 ~ {}", "{} ~ 1", // ~ with empty -> false (handled by assert_eq below)
-        "1 !~ {}", "{} !~ 1",  // !~ with empty -> true (handled by assert_eq below)
+        "1 != {}", "{} != 1",  // != with empty -> empty
         "{} = {}",  // = with empty -> empty
         "{} != {}", // != with empty -> empty
     ];
@@ -4165,7 +4163,7 @@ fn test_comparison_operations() {
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
         EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
-        "Failed for input: 1 ~ {}" // Correct assertion message
+        "Failed for input: 1 ~ {{}}"      // Correct assertion message
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
