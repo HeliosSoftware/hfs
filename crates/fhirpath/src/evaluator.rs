@@ -57,7 +57,11 @@ impl EvaluationContext {
 }
 
 /// Applies decimal-only multiplicative operators (div, mod)
-fn apply_decimal_multiplicative(left: Decimal, op: &str, right: Decimal) -> Result<EvaluationResult, EvaluationError> {
+fn apply_decimal_multiplicative(
+    left: Decimal,
+    op: &str,
+    right: Decimal,
+) -> Result<EvaluationResult, EvaluationError> {
     if right.is_zero() {
         return Err(EvaluationError::DivisionByZero); // Return error
     }
@@ -75,7 +79,10 @@ fn apply_decimal_multiplicative(left: Decimal, op: &str, right: Decimal) -> Resu
             // Decimal mod Decimal -> Decimal
             Ok(EvaluationResult::Decimal(left % right))
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown decimal multiplicative operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown decimal multiplicative operator: {}",
+            op
+        ))),
     }
 }
 
@@ -163,7 +170,9 @@ pub fn evaluate(
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
                     Ok(right_bool) // true and X -> X (where X is Boolean or Empty)
                 }
-                _ => Err(EvaluationError::TypeError("Invalid type for 'and' operand".to_string())), // Should not happen
+                _ => Err(EvaluationError::TypeError(
+                    "Invalid type for 'and' operand".to_string(),
+                )), // Should not happen
             }
         }
         Expression::Or(left, op, right) => {
@@ -177,18 +186,37 @@ pub fn evaluate(
 
             if op == "or" {
                 match (&left_bool, &right_bool) {
-                    (EvaluationResult::Boolean(true), _) | (_, EvaluationResult::Boolean(true)) => Ok(EvaluationResult::Boolean(true)),
-                    (EvaluationResult::Empty, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
-                    (EvaluationResult::Empty, EvaluationResult::Boolean(false)) => Ok(EvaluationResult::Empty),
-                    (EvaluationResult::Boolean(false), EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
-                    (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => Ok(EvaluationResult::Boolean(false)),
-                    _ => Err(EvaluationError::TypeError("Invalid type for 'or' operand".to_string())), // Should not happen
+                    (EvaluationResult::Boolean(true), _) | (_, EvaluationResult::Boolean(true)) => {
+                        Ok(EvaluationResult::Boolean(true))
+                    }
+                    (EvaluationResult::Empty, EvaluationResult::Empty) => {
+                        Ok(EvaluationResult::Empty)
+                    }
+                    (EvaluationResult::Empty, EvaluationResult::Boolean(false)) => {
+                        Ok(EvaluationResult::Empty)
+                    }
+                    (EvaluationResult::Boolean(false), EvaluationResult::Empty) => {
+                        Ok(EvaluationResult::Empty)
+                    }
+                    (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => {
+                        Ok(EvaluationResult::Boolean(false))
+                    }
+                    _ => Err(EvaluationError::TypeError(
+                        "Invalid type for 'or' operand".to_string(),
+                    )), // Should not happen
                 }
-            } else { // xor
+            } else {
+                // xor
                 match (&left_bool, &right_bool) {
-                    (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
-                    (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => Ok(EvaluationResult::Boolean(l != r)),
-                    _ => Err(EvaluationError::TypeError("Invalid type for 'xor' operand".to_string())), // Should not happen
+                    (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                        Ok(EvaluationResult::Empty)
+                    }
+                    (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
+                        Ok(EvaluationResult::Boolean(l != r))
+                    }
+                    _ => Err(EvaluationError::TypeError(
+                        "Invalid type for 'xor' operand".to_string(),
+                    )), // Should not happen
                 }
             }
         }
@@ -214,7 +242,9 @@ pub fn evaluate(
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
                     Ok(right_bool) // true implies X -> X (Boolean or Empty)
                 }
-                 _ => Err(EvaluationError::TypeError("Invalid type for 'implies' operand".to_string())), // Should not happen
+                _ => Err(EvaluationError::TypeError(
+                    "Invalid type for 'implies' operand".to_string(),
+                )), // Should not happen
             }
         }
         Expression::Lambda(_, _) => {
@@ -237,7 +267,6 @@ fn normalize_collection_result(mut items: Vec<EvaluationResult>) -> EvaluationRe
         EvaluationResult::Collection(items)
     }
 }
-
 
 /// Evaluates a term in the given context, potentially with a specific item as context ($this).
 fn evaluate_term(
@@ -293,7 +322,9 @@ fn evaluate_term(
                         // Return other variable value or error if undefined
                         return match context.get_variable(var_name) {
                             Some(value) => Ok(EvaluationResult::String(value.clone())),
-                            None => Err(EvaluationError::UndefinedVariable(format!("%{}", var_name))),
+                            None => {
+                                Err(EvaluationError::UndefinedVariable(format!("%{}", var_name)))
+                            }
                         };
                     }
                 }
@@ -327,7 +358,7 @@ fn evaluate_term(
             // Look up external constant in the context
             // Special handling for %context
             if name == "context" {
-               Ok(if context.resources.is_empty() {
+                Ok(if context.resources.is_empty() {
                     EvaluationResult::Empty
                 } else if context.resources.len() == 1 {
                     convert_resource_to_result(&context.resources[0])
@@ -419,18 +450,27 @@ fn evaluate_invocation(
             // Special handling for boolean literals that might be parsed as identifiers
             if name == "true" && matches!(invocation_base, EvaluationResult::Empty) {
                 // Only if base is empty context
-                return EvaluationResult::Boolean(true);
+                return Ok(EvaluationResult::Boolean(true));
             } else if name == "false" && matches!(invocation_base, EvaluationResult::Empty) {
-                return EvaluationResult::Boolean(false);
+                return Ok(EvaluationResult::Boolean(false));
             }
 
             // Access a member of the invocation_base
             match invocation_base {
                 EvaluationResult::Object(obj) => {
                     // Add debug print for member access
-                    eprintln!("Debug [evaluate_invocation]: Accessing member '{}' on object: {:?}", name, obj);
-                    let result = obj.get(name.as_str()).cloned().unwrap_or(EvaluationResult::Empty);
-                    eprintln!("Debug [evaluate_invocation]: Member access result: {:?}", result);
+                    eprintln!(
+                        "Debug [evaluate_invocation]: Accessing member '{}' on object: {:?}",
+                        name, obj
+                    );
+                    let result = obj
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or(EvaluationResult::Empty);
+                    eprintln!(
+                        "Debug [evaluate_invocation]: Member access result: {:?}",
+                        result
+                    );
                     Ok(result) // Wrap in Ok
                 }
                 EvaluationResult::Collection(items) => {
@@ -438,7 +478,8 @@ fn evaluate_invocation(
                     let mut results = Vec::new();
                     for item in items {
                         // Recursively call member access on each item, propagating errors
-                        match evaluate_invocation(item, &Invocation::Member(name.clone()), context) {
+                        match evaluate_invocation(item, &Invocation::Member(name.clone()), context)
+                        {
                             Ok(EvaluationResult::Empty) => {} // Skip empty results
                             Ok(res) => results.push(res),
                             Err(e) => return Err(e), // Propagate error immediately
@@ -522,7 +563,8 @@ fn evaluate_invocation(
                     let otherwise_result_expr = args_exprs.get(2); // Optional third argument
 
                     // Evaluate the condition expression, handle potential error
-                    let condition_result = evaluate(condition_expr, context, Some(invocation_base))?;
+                    let condition_result =
+                        evaluate(condition_expr, context, Some(invocation_base))?;
                     let condition_bool = condition_result.to_boolean_for_logic()?; // Use logic conversion
 
                     if matches!(condition_bool, EvaluationResult::Boolean(true)) {
@@ -621,9 +663,12 @@ fn evaluate_where(
         match criteria_result {
             EvaluationResult::Boolean(true) => filtered_items.push(item.clone()),
             EvaluationResult::Boolean(false) | EvaluationResult::Empty => {} // Ignore false/empty
-            other => return Err(EvaluationError::TypeError(format!(
-                "where criteria evaluated to non-boolean: {:?}", other
-            ))),
+            other => {
+                return Err(EvaluationError::TypeError(format!(
+                    "where criteria evaluated to non-boolean: {:?}",
+                    other
+                )));
+            }
         }
     }
 
@@ -686,11 +731,16 @@ fn evaluate_all_with_criteria(
         let criteria_result = evaluate(criteria_expr, context, Some(&item))?;
         // Check if criteria is boolean, otherwise error
         match criteria_result {
-             EvaluationResult::Boolean(false) | EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(false)), // False or empty means not all are true
-             EvaluationResult::Boolean(true) => {} // Continue checking
-             other => return Err(EvaluationError::TypeError(format!(
-                 "all criteria evaluated to non-boolean: {:?}", other
-             ))),
+            EvaluationResult::Boolean(false) | EvaluationResult::Empty => {
+                return Ok(EvaluationResult::Boolean(false));
+            } // False or empty means not all are true
+            EvaluationResult::Boolean(true) => {} // Continue checking
+            other => {
+                return Err(EvaluationError::TypeError(format!(
+                    "all criteria evaluated to non-boolean: {:?}",
+                    other
+                )));
+            }
         }
     }
 
@@ -757,15 +807,19 @@ fn call_function(
     match name {
         "count" => {
             // Returns the number of items in the collection, including duplicates
-            Ok(match invocation_base { // Wrap result in Ok
-                EvaluationResult::Collection(items) => EvaluationResult::Integer(items.len() as i64),
+            Ok(match invocation_base {
+                // Wrap result in Ok
+                EvaluationResult::Collection(items) => {
+                    EvaluationResult::Integer(items.len() as i64)
+                }
                 EvaluationResult::Empty => EvaluationResult::Integer(0),
                 _ => EvaluationResult::Integer(1), // Single item counts as 1
             })
         }
         "empty" => {
             // Returns true if the collection is empty (0 items)
-            Ok(match invocation_base { // Wrap result in Ok
+            Ok(match invocation_base {
+                // Wrap result in Ok
                 // Use invocation_base, not context
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
@@ -775,7 +829,8 @@ fn call_function(
         "exists" => {
             // This handles exists() without criteria.
             // exists(criteria) is handled in evaluate_invocation.
-            Ok(match invocation_base { // Wrap result in Ok
+            Ok(match invocation_base {
+                // Wrap result in Ok
                 EvaluationResult::Empty => EvaluationResult::Boolean(false),
                 EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
                 _ => EvaluationResult::Boolean(true), // Single non-empty item exists
@@ -784,13 +839,14 @@ fn call_function(
         "all" => {
             // This handles all() without criteria.
             // all(criteria) is handled in evaluate_invocation.
-            Ok(match invocation_base { // Wrap result in Ok
+            Ok(match invocation_base {
+                // Wrap result in Ok
                 EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
                 EvaluationResult::Collection(items) => {
                     // Check if all items evaluate to true
                     // Wrap the boolean result
                     EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean()))
-                },
+                }
                 single_item => EvaluationResult::Boolean(single_item.to_boolean()), // Check single item
             })
         }
@@ -807,9 +863,15 @@ fn call_function(
             for item in items {
                 match item {
                     EvaluationResult::Boolean(true) => continue,
-                    EvaluationResult::Boolean(false) | EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(false)),
+                    EvaluationResult::Boolean(false) | EvaluationResult::Empty => {
+                        return Ok(EvaluationResult::Boolean(false));
+                    }
                     // If any item is not boolean, it's an error according to spec (implicitly)
-                    _ => return Err(EvaluationError::TypeError("allTrue expects a collection of Booleans".to_string())),
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "allTrue expects a collection of Booleans".to_string(),
+                        ));
+                    }
                 }
             }
             Ok(EvaluationResult::Boolean(true))
@@ -825,11 +887,15 @@ fn call_function(
                 return Ok(EvaluationResult::Boolean(false));
             }
             for item in items {
-                 match item {
+                match item {
                     EvaluationResult::Boolean(true) => return Ok(EvaluationResult::Boolean(true)),
                     EvaluationResult::Boolean(false) | EvaluationResult::Empty => continue,
                     // If any item is not boolean, it's an error according to spec (implicitly)
-                    _ => return Err(EvaluationError::TypeError("anyTrue expects a collection of Booleans".to_string())),
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "anyTrue expects a collection of Booleans".to_string(),
+                        ));
+                    }
                 }
             }
             Ok(EvaluationResult::Boolean(false)) // No true item found
@@ -845,11 +911,17 @@ fn call_function(
                 return Ok(EvaluationResult::Boolean(true));
             }
             for item in items {
-                 match item {
+                match item {
                     EvaluationResult::Boolean(false) => continue,
-                    EvaluationResult::Boolean(true) | EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(false)),
+                    EvaluationResult::Boolean(true) | EvaluationResult::Empty => {
+                        return Ok(EvaluationResult::Boolean(false));
+                    }
                     // If any item is not boolean, it's an error according to spec (implicitly)
-                    _ => return Err(EvaluationError::TypeError("allFalse expects a collection of Booleans".to_string())),
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "allFalse expects a collection of Booleans".to_string(),
+                        ));
+                    }
                 }
             }
             Ok(EvaluationResult::Boolean(true))
@@ -865,36 +937,47 @@ fn call_function(
                 return Ok(EvaluationResult::Boolean(false));
             }
             for item in items {
-                 match item {
+                match item {
                     EvaluationResult::Boolean(false) => return Ok(EvaluationResult::Boolean(true)),
                     EvaluationResult::Boolean(true) | EvaluationResult::Empty => continue,
                     // If any item is not boolean, it's an error according to spec (implicitly)
-                    _ => return Err(EvaluationError::TypeError("anyFalse expects a collection of Booleans".to_string())),
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "anyFalse expects a collection of Booleans".to_string(),
+                        ));
+                    }
                 }
             }
             Ok(EvaluationResult::Boolean(false)) // No false item found
         }
         "first" => {
             // Returns the first item in the collection
-            Ok(if let EvaluationResult::Collection(items) = invocation_base { // Wrap in Ok
-                items.first().cloned().unwrap_or(EvaluationResult::Empty)
-            } else {
-                // A single item is returned as is (unless it's Empty)
-                invocation_base.clone()
-            })
+            Ok(
+                if let EvaluationResult::Collection(items) = invocation_base {
+                    // Wrap in Ok
+                    items.first().cloned().unwrap_or(EvaluationResult::Empty)
+                } else {
+                    // A single item is returned as is (unless it's Empty)
+                    invocation_base.clone()
+                },
+            )
         }
         "last" => {
             // Returns the last item in the collection
-            Ok(if let EvaluationResult::Collection(items) = invocation_base { // Wrap in Ok
-                items.last().cloned().unwrap_or(EvaluationResult::Empty)
-            } else {
-                // A single item is returned as is (unless it's Empty)
-                invocation_base.clone()
-            })
+            Ok(
+                if let EvaluationResult::Collection(items) = invocation_base {
+                    // Wrap in Ok
+                    items.last().cloned().unwrap_or(EvaluationResult::Empty)
+                } else {
+                    // A single item is returned as is (unless it's Empty)
+                    invocation_base.clone()
+                },
+            )
         }
         "not" => {
             // Logical negation
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                 EvaluationResult::Empty => EvaluationResult::Empty, // not({}) is {}
                 // Other types are implicitly converted to boolean first
@@ -905,7 +988,9 @@ fn call_function(
             // Function call version
             // Check if the invocation_base contains the argument
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'contains' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'contains' expects 1 argument".to_string(),
+                ));
             }
             let arg = &args[0];
 
@@ -919,10 +1004,13 @@ fn call_function(
             }
             // Check for multi-item argument (error)
             if arg.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError("contains argument must be a singleton".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "contains argument must be a singleton".to_string(),
+                ));
             }
 
-            Ok(match invocation_base { // Wrap result in Ok
+            Ok(match invocation_base {
+                // Wrap result in Ok
                 EvaluationResult::String(s) => {
                     // String contains substring
                     if let EvaluationResult::String(substr) = arg {
@@ -942,9 +1030,7 @@ fn call_function(
                 // contains on single non-collection/non-string item
                 single_item => {
                     // Treat as single-item collection: check if the item equals the argument
-                    EvaluationResult::Boolean(
-                        compare_equality(single_item, "=", arg).to_boolean(),
-                    )
+                    EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
                 }
             })
         }
@@ -973,7 +1059,11 @@ fn call_function(
         }
         "subsetOf" => {
             // Checks if the invocation collection is a subset of the argument collection
-            if args.len() != 1 { return Err(EvaluationError::InvalidArity("Function 'subsetOf' expects 1 argument".to_string())); }
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'subsetOf' expects 1 argument".to_string(),
+                ));
+            }
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
@@ -984,7 +1074,7 @@ fn call_function(
             let other_items = match other_collection {
                 EvaluationResult::Collection(items) => items,
                 EvaluationResult::Empty => &[][..], // Empty slice
-                single => &[single.clone()][..], // Treat single item as slice
+                single => &[single.clone()][..],    // Treat single item as slice
             };
 
             // Use HashSet for efficient lookup in the 'other' collection
@@ -996,7 +1086,11 @@ fn call_function(
         }
         "supersetOf" => {
             // Checks if the invocation collection is a superset of the argument collection
-            if args.len() != 1 { return Err(EvaluationError::InvalidArity("Function 'supersetOf' expects 1 argument".to_string())); }
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'supersetOf' expects 1 argument".to_string(),
+                ));
+            }
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
@@ -1021,9 +1115,12 @@ fn call_function(
             // Converts the input to Decimal according to FHIRPath rules
             // Check for singleton
             if invocation_base.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError("toDecimal requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toDecimal requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => {
                     EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
@@ -1046,9 +1143,12 @@ fn call_function(
             // Converts the input to Integer according to FHIRPath rules
             // Check for singleton
             if invocation_base.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError("toInteger requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toInteger requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => EvaluationResult::Integer(if *b { 1 } else { 0 }),
                 EvaluationResult::Integer(i) => EvaluationResult::Integer(*i),
@@ -1094,7 +1194,9 @@ fn call_function(
         "skip" => {
             // Returns the collection with the first 'num' items removed
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'skip' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'skip' expects 1 argument".to_string(),
+                ));
             }
             let num_to_skip = match &args[0] {
                 EvaluationResult::Integer(i) => {
@@ -1104,7 +1206,11 @@ fn call_function(
                 EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
                 }
-                _ => return Err(EvaluationError::InvalidArgument("skip argument must be a non-negative integer".to_string())),
+                _ => {
+                    return Err(EvaluationError::InvalidArgument(
+                        "skip argument must be a non-negative integer".to_string(),
+                    ));
+                }
             };
 
             let items = match invocation_base {
@@ -1113,7 +1219,8 @@ fn call_function(
                 single_item => vec![single_item.clone()], // Treat single item as collection
             };
 
-            Ok(if num_to_skip >= items.len() { // Wrap in Ok
+            Ok(if num_to_skip >= items.len() {
+                // Wrap in Ok
                 EvaluationResult::Empty
             } else {
                 let skipped_items = items[num_to_skip..].to_vec();
@@ -1123,26 +1230,31 @@ fn call_function(
         }
         "tail" => {
             // Returns the collection with all items except the first
-            Ok(if let EvaluationResult::Collection(items) = invocation_base { // Wrap in Ok
-                if items.len() > 1 {
-                    // Create a new Vec containing elements from the second one onwards
-                    EvaluationResult::Collection(items[1..].to_vec())
-                } else {
-                    // Empty or single-item collection results in empty
+            Ok(
+                if let EvaluationResult::Collection(items) = invocation_base {
+                    // Wrap in Ok
+                    if items.len() > 1 {
+                        // Create a new Vec containing elements from the second one onwards
+                        EvaluationResult::Collection(items[1..].to_vec())
+                    } else {
+                        // Empty or single-item collection results in empty
+                        EvaluationResult::Empty
+                    }
+                } else if invocation_base == &EvaluationResult::Empty {
+                    // Tail on Empty results in Empty
                     EvaluationResult::Empty
-                }
-            } else if invocation_base == &EvaluationResult::Empty {
-                // Tail on Empty results in Empty
-                EvaluationResult::Empty
-            } else {
-                // Tail on a single non-collection item results in empty
-                EvaluationResult::Empty
-            })
+                } else {
+                    // Tail on a single non-collection item results in empty
+                    EvaluationResult::Empty
+                },
+            )
         }
         "take" => {
             // Returns the first 'num' items from the collection
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'take' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'take' expects 1 argument".to_string(),
+                ));
             }
             let num_to_take = match &args[0] {
                 EvaluationResult::Integer(i) => {
@@ -1152,7 +1264,11 @@ fn call_function(
                 EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
                     d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
                 }
-                 _ => return Err(EvaluationError::InvalidArgument("take argument must be a non-negative integer".to_string())),
+                _ => {
+                    return Err(EvaluationError::InvalidArgument(
+                        "take argument must be a non-negative integer".to_string(),
+                    ));
+                }
             };
 
             if num_to_take == 0 {
@@ -1173,7 +1289,9 @@ fn call_function(
         "intersect" => {
             // Returns the intersection of two collections (items present in both, order not guaranteed)
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'intersect' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'intersect' expects 1 argument".to_string(),
+                ));
             }
             let other_collection = &args[0];
 
@@ -1220,7 +1338,9 @@ fn call_function(
         "exclude" => {
             // Returns items in invocation_base that are NOT in the argument collection (preserves order and duplicates)
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'exclude' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'exclude' expects 1 argument".to_string(),
+                ));
             }
             let other_collection = &args[0];
 
@@ -1263,7 +1383,9 @@ fn call_function(
         "union" => {
             // Returns the union of two collections (distinct items from both, order not guaranteed)
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'union' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'union' expects 1 argument".to_string(),
+                ));
             }
             let other_collection = &args[0];
 
@@ -1304,7 +1426,9 @@ fn call_function(
         "combine" => {
             // Returns a collection containing all items from both collections, including duplicates, preserving order
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'combine' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'combine' expects 1 argument".to_string(),
+                ));
             }
             let other_collection = &args[0];
 
@@ -1339,7 +1463,8 @@ fn call_function(
                     } else {
                         // Error if multiple items
                         Err(EvaluationError::SingletonEvaluationError(format!(
-                            "single() requires a singleton collection, found {} items", items.len()
+                            "single() requires a singleton collection, found {} items",
+                            items.len()
                         )))
                     }
                 }
@@ -1351,9 +1476,12 @@ fn call_function(
             // Checks if the input can be converted to Decimal
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToDecimal requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToDecimal requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1373,9 +1501,12 @@ fn call_function(
             // Checks if the input can be converted to Integer
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToInteger requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToInteger requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1398,9 +1529,12 @@ fn call_function(
             // Checks if the input can be converted to Boolean
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToBoolean requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToBoolean requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1425,9 +1559,12 @@ fn call_function(
             // Converts the input to Boolean according to FHIRPath rules
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toBoolean requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toBoolean requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(*b),
                 EvaluationResult::Integer(i) => match i {
@@ -1467,9 +1604,12 @@ fn call_function(
             // Checks if the input can be converted to String
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToString requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToString requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1489,9 +1629,12 @@ fn call_function(
             // Converts the input to its string representation using the helper
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toString requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toString requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty, // toString on empty is empty
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1503,9 +1646,12 @@ fn call_function(
             // Converts the input to Date according to FHIRPath rules
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toDate requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toDate requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Date(d) => EvaluationResult::Date(d.clone()),
                 EvaluationResult::DateTime(dt) => {
@@ -1552,9 +1698,12 @@ fn call_function(
             // Checks if the input can be converted to Date
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToDate requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToDate requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1574,9 +1723,12 @@ fn call_function(
             // Converts the input to DateTime according to FHIRPath rules
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toDateTime requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toDateTime requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::DateTime(dt) => EvaluationResult::DateTime(dt.clone()),
                 EvaluationResult::Date(d) => EvaluationResult::DateTime(d.clone()), // Date becomes DateTime (no time part)
@@ -1600,9 +1752,12 @@ fn call_function(
             // Checks if the input can be converted to DateTime
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToDateTime requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToDateTime requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1622,9 +1777,12 @@ fn call_function(
             // Converts the input to Time according to FHIRPath rules
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toTime requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toTime requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Time(t) => EvaluationResult::Time(t.clone()),
                 EvaluationResult::String(s) => {
@@ -1666,9 +1824,12 @@ fn call_function(
             // Checks if the input can be converted to Time
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("convertsToTime requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToTime requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1707,9 +1868,12 @@ fn call_function(
             // The result is just the numeric value (Decimal or Integer) as unit handling is complex
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toQuantity requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toQuantity requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => {
                     EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
@@ -1746,15 +1910,16 @@ fn call_function(
                         // More than two parts is invalid format
                         EvaluationResult::Empty
                     }
-               }
-               // Collections handled by initial check
-               EvaluationResult::Collection(_) => unreachable!(),
-               _ => EvaluationResult::Empty, // Other types cannot convert
-           }) // Close the Ok() wrapper here
-       }
+                }
+                // Collections handled by initial check
+                EvaluationResult::Collection(_) => unreachable!(),
+                _ => EvaluationResult::Empty, // Other types cannot convert
+            }) // Close the Ok() wrapper here
+        }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
@@ -1787,30 +1952,44 @@ fn call_function(
             // Returns the length of a string
             // Check for singleton first
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("length requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "length requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
                 EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
-                _ => return Err(EvaluationError::TypeError("length() requires a String input".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "length() requires a String input".to_string(),
+                    ));
+                }
             })
         }
         "indexOf" => {
             // Returns the 0-based index of the first occurrence of the substring
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'indexOf' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'indexOf' expects 1 argument".to_string(),
+                ));
             }
             // Check for singleton base
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("indexOf requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "indexOf requires a singleton input".to_string(),
+                ));
             }
             // Check for singleton argument
             if args[0].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("indexOf requires a singleton argument".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "indexOf requires a singleton argument".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0]) {
+                // Wrap in Ok
                 (EvaluationResult::String(s), EvaluationResult::String(substring)) => {
                     match s.find(substring) {
                         Some(index) => EvaluationResult::Integer(index as i64),
@@ -1821,33 +2000,48 @@ fn call_function(
                 (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
                 (EvaluationResult::Empty, _) => EvaluationResult::Empty,
                 // Invalid types
-                _ => return Err(EvaluationError::TypeError("indexOf requires String input and argument".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "indexOf requires String input and argument".to_string(),
+                    ));
+                }
             })
         }
         "substring" => {
             // Returns a part of the string
             if args.is_empty() || args.len() > 2 {
-                 return Err(EvaluationError::InvalidArity("Function 'substring' expects 1 or 2 arguments".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'substring' expects 1 or 2 arguments".to_string(),
+                ));
             }
             // Check for singleton base
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("substring requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "substring requires a singleton input".to_string(),
+                ));
             }
             // Check for singleton arguments
             if args[0].count() > 1 || args.get(1).map_or(false, |a| a.count() > 1) {
-                 return Err(EvaluationError::SingletonEvaluationError("substring requires singleton arguments".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "substring requires singleton arguments".to_string(),
+                ));
             }
 
             let start_index_res = &args[0];
             let length_res_opt = args.get(1);
 
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::String(s) => {
                     let start_index = match start_index_res {
                         EvaluationResult::Integer(i) if *i >= 0 => *i as usize,
                         // Handle empty start index
                         EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
-                        _ => return Err(EvaluationError::InvalidArgument("substring start index must be a non-negative integer".to_string())),
+                        _ => {
+                            return Err(EvaluationError::InvalidArgument(
+                                "substring start index must be a non-negative integer".to_string(),
+                            ));
+                        }
                     };
 
                     // If start index is out of bounds (>= length), return empty string
@@ -1868,7 +2062,11 @@ fn call_function(
                             // Handle empty length argument (treat as if not provided)
                             EvaluationResult::Empty => s.chars().count() - start_index, // Length to end of string
                             // Any other type for length is invalid
-                            _ => return Err(EvaluationError::InvalidArgument("substring length must be an integer".to_string())),
+                            _ => {
+                                return Err(EvaluationError::InvalidArgument(
+                                    "substring length must be an integer".to_string(),
+                                ));
+                            }
                         };
 
                         let result: String = s.chars().skip(start_index).take(length).collect();
@@ -1882,116 +2080,177 @@ fn call_function(
                 EvaluationResult::Empty => EvaluationResult::Empty, // Substring on empty is empty
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
-                _ => return Err(EvaluationError::TypeError("substring requires a String input".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "substring requires a String input".to_string(),
+                    ));
+                }
             })
         }
         "startsWith" => {
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'startsWith' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'startsWith' expects 1 argument".to_string(),
+                ));
             }
-             // Check for singleton base and arg
+            // Check for singleton base and arg
             if invocation_base.count() > 1 || args[0].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("startsWith requires singleton input and argument".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "startsWith requires singleton input and argument".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0]) {
+                // Wrap in Ok
                 (EvaluationResult::String(s), EvaluationResult::String(prefix)) => {
                     EvaluationResult::Boolean(s.starts_with(prefix))
                 }
                 // Handle empty cases
                 (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
                 (EvaluationResult::Empty, _) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("startsWith requires String input and argument".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "startsWith requires String input and argument".to_string(),
+                    ));
+                }
             })
         }
         "endsWith" => {
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'endsWith' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'endsWith' expects 1 argument".to_string(),
+                ));
             }
-             // Check for singleton base and arg
+            // Check for singleton base and arg
             if invocation_base.count() > 1 || args[0].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("endsWith requires singleton input and argument".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "endsWith requires singleton input and argument".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0]) {
+                // Wrap in Ok
                 (EvaluationResult::String(s), EvaluationResult::String(suffix)) => {
                     EvaluationResult::Boolean(s.ends_with(suffix))
                 }
-                 // Handle empty cases
+                // Handle empty cases
                 (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
                 (EvaluationResult::Empty, _) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("endsWith requires String input and argument".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "endsWith requires String input and argument".to_string(),
+                    ));
+                }
             })
         }
         "upper" => {
-             // Check for singleton base
+            // Check for singleton base
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("upper requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "upper requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::String(s.to_uppercase()),
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("upper requires a String input".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "upper requires a String input".to_string(),
+                    ));
+                }
             })
         }
         "lower" => {
-             // Check for singleton base
+            // Check for singleton base
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("lower requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "lower requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::String(s.to_lowercase()),
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("lower requires a String input".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "lower requires a String input".to_string(),
+                    ));
+                }
             })
         }
         "replace" => {
             if args.len() != 2 {
-                 return Err(EvaluationError::InvalidArity("Function 'replace' expects 2 arguments".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'replace' expects 2 arguments".to_string(),
+                ));
             }
-             // Check for singleton base and args
+            // Check for singleton base and args
             if invocation_base.count() > 1 || args[0].count() > 1 || args[1].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("replace requires singleton input and arguments".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "replace requires singleton input and arguments".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0], &args[1]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0], &args[1]) {
+                // Wrap in Ok
                 (
                     EvaluationResult::String(s),
                     EvaluationResult::String(pattern),
                     EvaluationResult::String(substitution),
                 ) => EvaluationResult::String(s.replace(pattern, substitution)),
-                 // Handle empty cases
-                (EvaluationResult::Empty, _, _) | (_, EvaluationResult::Empty, _) | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("replace requires String input and arguments".to_string())),
+                // Handle empty cases
+                (EvaluationResult::Empty, _, _)
+                | (_, EvaluationResult::Empty, _)
+                | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "replace requires String input and arguments".to_string(),
+                    ));
+                }
             })
         }
         "matches" => {
             if args.len() != 1 {
-                 return Err(EvaluationError::InvalidArity("Function 'matches' expects 1 argument".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'matches' expects 1 argument".to_string(),
+                ));
             }
-             // Check for singleton base and arg
+            // Check for singleton base and arg
             if invocation_base.count() > 1 || args[0].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("matches requires singleton input and argument".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "matches requires singleton input and argument".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0]) {
+                // Wrap in Ok
                 (EvaluationResult::String(s), EvaluationResult::String(regex_pattern)) => {
                     match Regex::new(regex_pattern) {
                         Ok(re) => EvaluationResult::Boolean(re.is_match(s)),
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())), // Return Err
                     }
                 }
-                 // Handle empty cases
+                // Handle empty cases
                 (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
                 (EvaluationResult::Empty, _) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("matches requires String input and argument".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "matches requires String input and argument".to_string(),
+                    ));
+                }
             })
         }
         "replaceMatches" => {
             if args.len() != 2 {
-                 return Err(EvaluationError::InvalidArity("Function 'replaceMatches' expects 2 arguments".to_string()));
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'replaceMatches' expects 2 arguments".to_string(),
+                ));
             }
-             // Check for singleton base and args
+            // Check for singleton base and args
             if invocation_base.count() > 1 || args[0].count() > 1 || args[1].count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("replaceMatches requires singleton input and arguments".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "replaceMatches requires singleton input and arguments".to_string(),
+                ));
             }
-            Ok(match (invocation_base, &args[0], &args[1]) { // Wrap in Ok
+            Ok(match (invocation_base, &args[0], &args[1]) {
+                // Wrap in Ok
                 (
                     EvaluationResult::String(s),
                     EvaluationResult::String(regex_pattern),
@@ -2004,17 +2263,26 @@ fn call_function(
                         Err(e) => return Err(EvaluationError::InvalidRegex(e.to_string())), // Return Err
                     }
                 }
-                 // Handle empty cases
-                (EvaluationResult::Empty, _, _) | (_, EvaluationResult::Empty, _) | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
-                _ => return Err(EvaluationError::TypeError("replaceMatches requires String input and arguments".to_string())),
+                // Handle empty cases
+                (EvaluationResult::Empty, _, _)
+                | (_, EvaluationResult::Empty, _)
+                | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "replaceMatches requires String input and arguments".to_string(),
+                    ));
+                }
             })
         }
         "toChars" => {
-             // Check for singleton base
+            // Check for singleton base
             if invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("toChars requires a singleton input".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toChars requires a singleton input".to_string(),
+                ));
             }
-            Ok(match invocation_base { // Wrap in Ok
+            Ok(match invocation_base {
+                // Wrap in Ok
                 EvaluationResult::String(s) => {
                     if s.is_empty() {
                         EvaluationResult::Empty
@@ -2027,16 +2295,22 @@ fn call_function(
                     }
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                 // Collections handled by initial check
+                // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
-                _ => return Err(EvaluationError::TypeError("toChars requires a String input".to_string())),
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        "toChars requires a String input".to_string(),
+                    ));
+                }
             })
         }
         "now" => {
             // Returns the current DateTime
             let now = Local::now();
             // Format according to FHIRPath spec (ISO 8601 with timezone offset)
-            Ok(EvaluationResult::DateTime(now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)))
+            Ok(EvaluationResult::DateTime(
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ))
         }
         "today" => {
             // Returns the current Date
@@ -2176,7 +2450,10 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
 }
 
 /// Evaluates an indexer expression
-fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> Result<EvaluationResult, EvaluationError> {
+fn evaluate_indexer(
+    collection: &EvaluationResult,
+    index: &EvaluationResult,
+) -> Result<EvaluationResult, EvaluationError> {
     // Get the index as an integer, ensuring it's non-negative
     let idx_opt: Option<usize> = match index {
         EvaluationResult::Integer(i) => {
@@ -2199,11 +2476,17 @@ fn evaluate_indexer(collection: &EvaluationResult, index: &EvaluationResult) -> 
 
     let idx = match idx_opt {
         Some(i) => i,
-        None => return Err(EvaluationError::InvalidIndex(format!("Invalid index value: {:?}", index))),
+        None => {
+            return Err(EvaluationError::InvalidIndex(format!(
+                "Invalid index value: {:?}",
+                index
+            )));
+        }
     };
 
     // Access the item at the given index
-    Ok(match collection { // Wrap result in Ok
+    Ok(match collection {
+        // Wrap result in Ok
         EvaluationResult::Collection(items) => {
             items.get(idx).cloned().unwrap_or(EvaluationResult::Empty)
         }
@@ -2218,14 +2501,18 @@ fn apply_polarity(op: char, value: &EvaluationResult) -> Result<EvaluationResult
         '+' => Ok(value.clone()), // Unary plus doesn't change the value
         '-' => {
             // Negate numeric values
-            Ok(match value { // Wrap result in Ok
+            Ok(match value {
+                // Wrap result in Ok
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(-*d),
                 EvaluationResult::Integer(i) => EvaluationResult::Integer(-*i),
                 // Polarity on non-numeric or empty returns empty
                 _ => EvaluationResult::Empty,
             })
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown polarity operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown polarity operator: {}",
+            op
+        ))),
     }
 }
 
@@ -2238,7 +2525,8 @@ fn apply_multiplicative(
     match op {
         "*" => {
             // Handle multiplication: Int * Int = Int, otherwise Decimal
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
                     // Check for potential overflow before multiplying
                     l.checked_mul(*r)
@@ -2255,11 +2543,17 @@ fn apply_multiplicative(
                     EvaluationResult::Decimal(Decimal::from(*l) * *r)
                 }
                 // Handle empty operands
-               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-               _ => return Err(EvaluationError::TypeError(format!(
-                   "Cannot multiply {} and {}", left.type_name(), right.type_name()
-               ))),
-           })
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    EvaluationResult::Empty
+                }
+                _ => {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot multiply {} and {}",
+                        left.type_name(),
+                        right.type_name()
+                    )));
+                }
+            })
         }
         "/" => {
             // Handle division: Always results in Decimal
@@ -2284,14 +2578,16 @@ fn apply_multiplicative(
                         .ok_or(EvaluationError::ArithmeticOverflow) // Return error on overflow
                 }
             } else {
-                 // Handle empty operands
+                // Handle empty operands
                 if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
                     Ok(EvaluationResult::Empty)
-               } else {
-                   Err(EvaluationError::TypeError(format!(
-                       "Cannot divide {} by {}", left.type_name(), right.type_name()
-                   )))
-               }
+                } else {
+                    Err(EvaluationError::TypeError(format!(
+                        "Cannot divide {} by {}",
+                        left.type_name(),
+                        right.type_name()
+                    )))
+                }
             }
         }
         "div" | "mod" => {
@@ -2303,39 +2599,59 @@ fn apply_multiplicative(
                 (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => {
                     apply_decimal_multiplicative(*l, op, *r) // Returns Result
                 }
-                 // Handle empty operands
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => Ok(EvaluationResult::Empty),
-               _ => Err(EvaluationError::TypeError(format!( // Mixed types are invalid
-                   "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {} and {}",
-                   op, left.type_name(), right.type_name()
-               ))),
-           }
+                // Handle empty operands
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    Ok(EvaluationResult::Empty)
+                }
+                _ => Err(EvaluationError::TypeError(format!(
+                    // Mixed types are invalid
+                    "Operator '{}' requires operands of the same numeric type (Integer or Decimal), found {} and {}",
+                    op,
+                    left.type_name(),
+                    right.type_name()
+                ))),
+            }
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown multiplicative operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown multiplicative operator: {}",
+            op
+        ))),
     }
 }
 
 /// Applies integer-only multiplicative operators (div, mod)
-fn apply_integer_multiplicative(left: i64, op: &str, right: i64) -> Result<EvaluationResult, EvaluationError> {
+fn apply_integer_multiplicative(
+    left: i64,
+    op: &str,
+    right: i64,
+) -> Result<EvaluationResult, EvaluationError> {
     if right == 0 {
         return Err(EvaluationError::DivisionByZero); // Return error
     }
     match op {
         "div" => Ok(EvaluationResult::Integer(left / right)), // Integer division
         "mod" => Ok(EvaluationResult::Integer(left % right)), // Integer modulo
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown integer multiplicative operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown integer multiplicative operator: {}",
+            op
+        ))),
     }
 }
 
 /// Applies an additive operator to two values
-fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -> Result<EvaluationResult, EvaluationError> {
+fn apply_additive(
+    left: &EvaluationResult,
+    op: &str,
+    right: &EvaluationResult,
+) -> Result<EvaluationResult, EvaluationError> {
     // The variables left_dec and right_dec were removed as they were unused.
     // The logic below handles type checking and promotion directly.
 
     match op {
         "+" => {
             // Handle numeric addition: Int + Int = Int, otherwise Decimal
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
                     // Check for potential overflow before adding
                     l.checked_add(*r)
@@ -2360,31 +2676,42 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
-                        s_int.checked_add(*i)
-                             .map(EvaluationResult::Integer)
-                             .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
+                        s_int
+                            .checked_add(*i)
+                            .map(EvaluationResult::Integer)
+                            .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(d + Decimal::from(*i)))
                             // If string cannot be parsed as number, it's a type error for '+'
-                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add String '{}' and Integer {}", s, i)))?
+                            .ok_or_else(|| {
+                                EvaluationError::TypeError(format!(
+                                    "Cannot add String '{}' and Integer {}",
+                                    s, i
+                                ))
+                            })?
                     }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
-                         i.checked_add(s_int)
-                          .map(EvaluationResult::Integer)
-                          .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
+                        i.checked_add(s_int)
+                            .map(EvaluationResult::Integer)
+                            .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(Decimal::from(*i) + d))
                             // If string cannot be parsed as number, it's a type error for '+'
-                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add Integer {} and String '{}'", i, s)))?
+                            .ok_or_else(|| {
+                                EvaluationError::TypeError(format!(
+                                    "Cannot add Integer {} and String '{}'",
+                                    i, s
+                                ))
+                            })?
                     }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
@@ -2393,26 +2720,43 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd + *d))
                         // If string cannot be parsed as number, it's a type error for '+'
-                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add String '{}' and Decimal {}", s, d)))?
+                        .ok_or_else(|| {
+                            EvaluationError::TypeError(format!(
+                                "Cannot add String '{}' and Decimal {}",
+                                s, d
+                            ))
+                        })?
                 }
                 (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(*d + sd))
                         // If string cannot be parsed as number, it's a type error for '+'
-                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot add Decimal {} and String '{}'", d, s)))?
+                        .ok_or_else(|| {
+                            EvaluationError::TypeError(format!(
+                                "Cannot add Decimal {} and String '{}'",
+                                d, s
+                            ))
+                        })?
                 }
-                 // Handle empty operands
-               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-               // Other combinations are invalid for '+'
-               _ => return Err(EvaluationError::TypeError(format!(
-                   "Cannot add {} and {}", left.type_name(), right.type_name()
-               ))),
-           })
+                // Handle empty operands
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    EvaluationResult::Empty
+                }
+                // Other combinations are invalid for '+'
+                _ => {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot add {} and {}",
+                        left.type_name(),
+                        right.type_name()
+                    )));
+                }
+            })
         }
         "-" => {
             // Handle numeric subtraction: Int - Int = Int, otherwise Decimal
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
                     // Check for potential overflow before subtracting
                     l.checked_sub(*r)
@@ -2433,31 +2777,42 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
-                        s_int.checked_sub(*i)
-                             .map(EvaluationResult::Integer)
-                             .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
+                        s_int
+                            .checked_sub(*i)
+                            .map(EvaluationResult::Integer)
+                            .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(d - Decimal::from(*i)))
                             // If string cannot be parsed as number, it's a type error for '-'
-                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract Integer {} from String '{}'", i, s)))?
+                            .ok_or_else(|| {
+                                EvaluationError::TypeError(format!(
+                                    "Cannot subtract Integer {} from String '{}'",
+                                    i, s
+                                ))
+                            })?
                     }
                 }
                 (EvaluationResult::Integer(i), EvaluationResult::String(s)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
-                         i.checked_sub(s_int)
-                          .map(EvaluationResult::Integer)
-                          .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
+                        i.checked_sub(s_int)
+                            .map(EvaluationResult::Integer)
+                            .ok_or(EvaluationError::ArithmeticOverflow)? // Handle potential overflow
                     } else {
                         // If not integer, try parsing as Decimal
                         s.parse::<Decimal>()
                             .ok()
                             .map(|d| EvaluationResult::Decimal(Decimal::from(*i) - d))
                             // If string cannot be parsed as number, it's a type error for '-'
-                            .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract String '{}' from Integer {}", s, i)))?
+                            .ok_or_else(|| {
+                                EvaluationError::TypeError(format!(
+                                    "Cannot subtract String '{}' from Integer {}",
+                                    s, i
+                                ))
+                            })?
                     }
                 }
                 (EvaluationResult::String(s), EvaluationResult::Decimal(d)) => {
@@ -2465,23 +2820,39 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(sd - *d))
-                         // If string cannot be parsed as number, it's a type error for '-'
-                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract Decimal {} from String '{}'", d, s)))?
+                        // If string cannot be parsed as number, it's a type error for '-'
+                        .ok_or_else(|| {
+                            EvaluationError::TypeError(format!(
+                                "Cannot subtract Decimal {} from String '{}'",
+                                d, s
+                            ))
+                        })?
                 }
                 (EvaluationResult::Decimal(d), EvaluationResult::String(s)) => {
                     s.parse::<Decimal>()
                         .ok()
                         .map(|sd| EvaluationResult::Decimal(*d - sd))
-                         // If string cannot be parsed as number, it's a type error for '-'
-                        .ok_or_else(|| EvaluationError::TypeError(format!("Cannot subtract String '{}' from Decimal {}", s, d)))?
+                        // If string cannot be parsed as number, it's a type error for '-'
+                        .ok_or_else(|| {
+                            EvaluationError::TypeError(format!(
+                                "Cannot subtract String '{}' from Decimal {}",
+                                s, d
+                            ))
+                        })?
                 }
-                 // Handle empty operands
-               (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Empty,
-               // Other combinations are invalid for '-'
-               _ => return Err(EvaluationError::TypeError(format!(
-                   "Cannot subtract {} from {}", right.type_name(), left.type_name()
-               ))),
-           })
+                // Handle empty operands
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    EvaluationResult::Empty
+                }
+                // Other combinations are invalid for '-'
+                _ => {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot subtract {} from {}",
+                        right.type_name(),
+                        left.type_name()
+                    )));
+                }
+            })
         }
         "&" => {
             // Handle string concatenation using '&'
@@ -2490,12 +2861,18 @@ fn apply_additive(left: &EvaluationResult, op: &str, right: &EvaluationResult) -
                 _ => left.to_string_value(), // Convert left to string
             };
             let right_str = match right {
-                 EvaluationResult::Empty => "".to_string(),
+                EvaluationResult::Empty => "".to_string(),
                 _ => right.to_string_value(), // Convert right to string
             };
-            Ok(EvaluationResult::String(format!("{}{}", left_str, right_str)))
+            Ok(EvaluationResult::String(format!(
+                "{}{}",
+                left_str, right_str
+            )))
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown additive operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown additive operator: {}",
+            op
+        ))),
     }
 }
 
@@ -2511,7 +2888,7 @@ fn apply_type_operation(
             // Correctly extract the base type name, ignoring the namespace if present
             let base_type_name = match type_spec {
                 TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name, // e.g., System.Integer -> Integer
-                TypeSpecifier::QualifiedIdentifier(name, None) => name,             // e.g., Integer -> Integer
+                TypeSpecifier::QualifiedIdentifier(name, None) => name, // e.g., Integer -> Integer
             };
 
             // Check if the identifier resolves to a valid type
@@ -2521,11 +2898,12 @@ fn apply_type_operation(
             // Handle singleton evaluation: 'is' errors on multi-item collections
             if value.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
-                    "'is' operator requires a singleton input".to_string()
+                    "'is' operator requires a singleton input".to_string(),
                 ));
             }
 
-            let is_type = match (base_type_name.as_str(), value) { // Compare using base_type_name
+            let is_type = match (base_type_name.as_str(), value) {
+                // Compare using base_type_name
                 (_, EvaluationResult::Empty) => false, // Empty is not of any type
                 // Collections handled by initial check
                 (_, EvaluationResult::Collection(_)) => unreachable!(),
@@ -2547,21 +2925,22 @@ fn apply_type_operation(
             // Correctly extract the base type name as &str
             let base_type_name: &str = match type_spec {
                 TypeSpecifier::QualifiedIdentifier(_ns_or_name, Some(name)) => name.as_str(), // Prefix unused var with _
-                TypeSpecifier::QualifiedIdentifier(name, None) => name.as_str(),             // Use .as_str()
+                TypeSpecifier::QualifiedIdentifier(name, None) => name.as_str(), // Use .as_str()
             };
 
-             // Check if the identifier resolves to a valid type
+            // Check if the identifier resolves to a valid type
             // TODO: Need access to model info here to validate type_spec.
             // For now, assume it's valid if parsed.
 
             // Handle singleton evaluation: 'as' errors on multi-item collections
             if value.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
-                    "'as' operator requires a singleton input".to_string()
+                    "'as' operator requires a singleton input".to_string(),
                 ));
             }
 
-            Ok(match (base_type_name, value) { // Match on &str
+            Ok(match (base_type_name, value) {
+                // Match on &str
                 (_, EvaluationResult::Empty) => EvaluationResult::Empty, // 'as' on empty is empty
                 // Collections handled by initial check
                 (_, EvaluationResult::Collection(_)) => unreachable!(),
@@ -2578,12 +2957,16 @@ fn apply_type_operation(
                 _ => EvaluationResult::Empty,
             })
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown type operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown type operator: {}",
+            op
+        ))),
     }
 }
 
 /// Combines two collections into a union
-fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> EvaluationResult { // Returns EvaluationResult, not Result
+fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> EvaluationResult {
+    // Returns EvaluationResult, not Result
     let left_items = match left {
         EvaluationResult::Collection(items) => items.clone(),
         EvaluationResult::Empty => vec![],
@@ -2629,7 +3012,8 @@ fn compare_inequality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> EvaluationResult { // Returns EvaluationResult, not Result
+) -> EvaluationResult {
+    // Returns EvaluationResult, not Result
     // Handle empty operands: comparison with empty returns empty
     if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
         return EvaluationResult::Empty;
@@ -2679,7 +3063,8 @@ fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> EvaluationResult { // Returns EvaluationResult, not Result
+) -> EvaluationResult {
+    // Returns EvaluationResult, not Result
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();
@@ -2700,9 +3085,10 @@ fn compare_equality(
                         EvaluationResult::Boolean(false)
                     } else {
                         // Compare element by element using '=' recursively
-                        let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
-                            compare_equality(li, "=", ri).to_boolean()
-                        });
+                        let all_equal = l_items
+                            .iter()
+                            .zip(r_items.iter())
+                            .all(|(li, ri)| compare_equality(li, "=", ri).to_boolean());
                         EvaluationResult::Boolean(all_equal)
                     }
                 }
@@ -2711,16 +3097,36 @@ fn compare_equality(
                     EvaluationResult::Boolean(false)
                 }
                 // Primitive/Empty comparison
-                (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
-                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => EvaluationResult::Boolean(*l == Decimal::from(*r)),
-                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => EvaluationResult::Boolean(Decimal::from(*l) == *r),
-                (EvaluationResult::Date(l), EvaluationResult::Date(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => EvaluationResult::Boolean(l == r),
-                (EvaluationResult::Time(l), EvaluationResult::Time(r)) => EvaluationResult::Boolean(l == r),
+                (EvaluationResult::Empty, EvaluationResult::Empty) => {
+                    EvaluationResult::Boolean(true)
+                }
+                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::String(l), EvaluationResult::String(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+                    EvaluationResult::Boolean(*l == Decimal::from(*r))
+                }
+                (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+                    EvaluationResult::Boolean(Decimal::from(*l) == *r)
+                }
+                (EvaluationResult::Date(l), EvaluationResult::Date(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
+                (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
+                    EvaluationResult::Boolean(l == r)
+                }
                 // Any other combination (including one being Empty) is false
                 _ => EvaluationResult::Boolean(false),
             }
@@ -2743,8 +3149,12 @@ fn compare_equality(
             // Equivalence: Order doesn't matter, duplicates DO matter.
             match (left, right) {
                 // Handle Empty cases specifically for '~'
-                (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(true),
-                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(false), // Empty is only equivalent to Empty
+                (EvaluationResult::Empty, EvaluationResult::Empty) => {
+                    EvaluationResult::Boolean(true)
+                }
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    EvaluationResult::Boolean(false)
+                } // Empty is only equivalent to Empty
                 // String equivalence (normalized)
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
@@ -2762,9 +3172,10 @@ fn compare_equality(
                         r_sorted.sort();
 
                         // Compare sorted collections element-wise using '~' recursively
-                        let all_equivalent = l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
-                            compare_equality(li, "~", ri).to_boolean()
-                        });
+                        let all_equivalent = l_sorted
+                            .iter()
+                            .zip(r_sorted.iter())
+                            .all(|(li, ri)| compare_equality(li, "~", ri).to_boolean());
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
@@ -2780,18 +3191,22 @@ fn compare_equality(
             // Non-equivalence: Negation of '~'
             // Handle empty cases specifically for '!~'
             match (left, right) {
-                 (EvaluationResult::Empty, EvaluationResult::Empty) => EvaluationResult::Boolean(false), // Empty is equivalent to Empty
-                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => EvaluationResult::Boolean(true), // Empty is not equivalent to non-empty
-                 // For non-empty operands, negate the result of '~'
-                 _ => {
-                     let equiv_result = compare_equality(left, "~", right);
-                     match equiv_result {
-                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                         // If '~' somehow returned Empty for non-empty operands, propagate Empty
-                         EvaluationResult::Empty => EvaluationResult::Empty,
-                         _ => EvaluationResult::Empty, // Should not happen
-                     }
-                 }
+                (EvaluationResult::Empty, EvaluationResult::Empty) => {
+                    EvaluationResult::Boolean(false)
+                } // Empty is equivalent to Empty
+                (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
+                    EvaluationResult::Boolean(true)
+                } // Empty is not equivalent to non-empty
+                // For non-empty operands, negate the result of '~'
+                _ => {
+                    let equiv_result = compare_equality(left, "~", right);
+                    match equiv_result {
+                        EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
+                        // If '~' somehow returned Empty for non-empty operands, propagate Empty
+                        EvaluationResult::Empty => EvaluationResult::Empty,
+                        _ => EvaluationResult::Empty, // Should not happen
+                    }
+                }
             }
         }
         _ => EvaluationResult::Empty, // Unknown operator
@@ -2817,7 +3232,9 @@ fn check_membership(
             }
             // Check for multi-item left operand (error)
             if left.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError("'in' operator requires singleton left operand".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "'in' operator requires singleton left operand".to_string(),
+                ));
             }
             // Proceed with check if both are non-empty (operands are not Empty)
             let is_in = match right {
@@ -2841,10 +3258,13 @@ fn check_membership(
             }
             // Check for multi-item right operand (error)
             if right.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError("'contains' operator requires singleton right operand".to_string()));
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "'contains' operator requires singleton right operand".to_string(),
+                ));
             }
             // Proceed with check if both operands are non-empty
-            Ok(match left { // Wrap result in Ok
+            Ok(match left {
+                // Wrap result in Ok
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
                     let contains = items
@@ -2857,17 +3277,23 @@ fn check_membership(
                     EvaluationResult::String(substr) => {
                         EvaluationResult::Boolean(s.contains(substr))
                     }
-                   // Contains on string requires string argument, otherwise error
-                   _ => return Err(EvaluationError::TypeError(format!(
-                       "'contains' on String requires String argument, found {}", right.type_name()
-                   ))),
-               },
-               // Treat single non-empty item as collection of one
-                single_item => {
-                     EvaluationResult::Boolean(compare_equality(single_item, "=", right).to_boolean())
-                }
+                    // Contains on string requires string argument, otherwise error
+                    _ => {
+                        return Err(EvaluationError::TypeError(format!(
+                            "'contains' on String requires String argument, found {}",
+                            right.type_name()
+                        )));
+                    }
+                },
+                // Treat single non-empty item as collection of one
+                single_item => EvaluationResult::Boolean(
+                    compare_equality(single_item, "=", right).to_boolean(),
+                ),
             })
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown membership operator: {}", op))),
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown membership operator: {}",
+            op
+        ))),
     }
 }
