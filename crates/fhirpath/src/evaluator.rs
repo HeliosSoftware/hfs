@@ -3240,7 +3240,7 @@ fn compare_equality(
                 }
                 // Any other combination is false (incompatible types)
                 _ => EvaluationResult::Boolean(false),
-            })
+            }) // Close the Ok() wrapper for the '=' match
         }
         "!=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
