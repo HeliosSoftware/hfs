@@ -133,8 +133,8 @@ pub fn evaluate(
         Expression::Inequality(left, op, right) => {
             let left_result = evaluate(left, context, current_item)?; // Use ?
             let right_result = evaluate(right, context, current_item)?; // Use ?
-            // Comparison returns Empty on type mismatch or empty operand, not error
-            Ok(compare_inequality(&left_result, op, &right_result))
+            // compare_inequality now returns Result, so just call it directly
+            compare_inequality(&left_result, op, &right_result)
         }
         Expression::Equality(left, op, right) => {
             let left_result = evaluate(left, context, current_item)?; // Use ?
@@ -1660,6 +1660,9 @@ fn call_function(
                 | EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
+                // Add cases for Empty and Collection to satisfy exhaustiveness check
+                EvaluationResult::Empty => EvaluationResult::Empty, // Already handled above, but needed for match
+                EvaluationResult::Collection(_) => unreachable!(), // Already handled by singleton check
             })
         }
         "toString" => {
