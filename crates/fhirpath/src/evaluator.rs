@@ -1103,26 +1103,22 @@ fn call_function(
                 ));
             }
 
+            // Match only on invocation_base
             Ok(match invocation_base {
-                // Wrap result in Ok
                 EvaluationResult::String(s) => {
-                    // String contains substring
+                    // String contains substring: Check the type of arg here
                     if let EvaluationResult::String(substr) = arg {
                         EvaluationResult::Boolean(s.contains(substr))
                     } else {
-                        // Argument is not String (and not Empty) -> Error
+                        // Argument is not String (and not Empty, checked earlier) -> Error
                         return Err(EvaluationError::TypeError(format!(
                             "contains function on String requires String argument, found {}",
                             arg.type_name()
                         )));
                     }
                 }
-                // String contains substring
-                (EvaluationResult::String(s), EvaluationResult::String(substr)) => {
-                    EvaluationResult::Boolean(s.contains(substr))
-                }
-                // Collection contains item (using equality)
-                (EvaluationResult::Collection(items), _) => {
+                EvaluationResult::Collection(items) => {
+                    // Collection contains item (using equality)
                     // Use map_or to handle potential error from compare_equality
                     let contains = items
                         .iter()
@@ -1130,19 +1126,12 @@ fn call_function(
                     EvaluationResult::Boolean(contains)
                 }
                 // Contains on single non-collection/non-string item
-                (single_item, _) => {
-                    // Check if types are compatible for contains (e.g., string requires string arg)
-                    if matches!(single_item, EvaluationResult::String(_)) && !matches!(arg, EvaluationResult::String(_)) {
-                         return Err(EvaluationError::TypeError(format!(
-                            "contains function on String requires String argument, found {}",
-                            arg.type_name()
-                        )));
-                    }
+                single_item => {
                     // Treat as single-item collection: check if the item equals the argument
                     // Use map_or to handle potential error from compare_equality
                     EvaluationResult::Boolean(compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()))
                 }
-            })
+            }) // Close Ok wrapping the match
         }
         "isDistinct" => {
             // Returns true if all items in the collection are distinct (based on equality)
