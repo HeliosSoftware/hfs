@@ -175,8 +175,13 @@ pub fn evaluate(
                 EvaluationResult::Empty => {
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
-                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
-                    match right_bool {
+                    let _right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
+                    // The actual value of right_bool doesn't matter here per 3-valued logic table:
+                    // {} and false -> false
+                    // {} and true -> {}
+                    // {} and {} -> {}
+                    // So we only need to check if right_eval converted to false
+                    match right_eval.to_boolean_for_logic()? { // Re-evaluate for the match
                         EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(false)), // {} and false -> false
                         _ => Ok(EvaluationResult::Empty), // {} and (true | {}) -> {}
                     }
@@ -207,12 +212,27 @@ pub fn evaluate(
 
             // Evaluate right, handle potential error
             let right_eval = evaluate(right, context, current_item)?;
+
+            // Check types *before* logical conversion
+            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) ||
+               !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                // Allow Empty for 3-valued logic, but reject other types
+                if !matches!(left_eval, EvaluationResult::Empty) && !matches!(right_eval, EvaluationResult::Empty) {
+                     return Err(EvaluationError::TypeError(format!(
+                        "Operator '{}' requires Boolean operands, found {} and {}",
+                        op, left_eval.type_name(), right_eval.type_name()
+                    )));
+                }
+            }
+
+            // Convert to boolean for logic AFTER type check
+            let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
             let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
 
-            // Ensure both operands resolved to Boolean or Empty
+            // Ensure both operands resolved to Boolean or Empty (redundant after above check, but safe)
             if !matches!(left_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                 return Err(EvaluationError::TypeError(format!(
-                    "Invalid type for '{}' left operand: {}", op, left_bool.type_name()
+                 return Err(EvaluationError::TypeError(format!( // Should be unreachable
+                    "Invalid type for '{}' left operand after conversion: {}", op, left_bool.type_name()
                 )));
             }
              if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
@@ -1077,8 +1097,11 @@ fn call_function(
                     if let EvaluationResult::String(substr) = arg {
                         EvaluationResult::Boolean(s.contains(substr))
                     } else {
-                        // Argument is not String (and not Empty) -> false
-                        EvaluationResult::Boolean(false)
+                        // Argument is not String (and not Empty) -> Error
+                        return Err(EvaluationError::TypeError(format!(
+                            "contains function on String requires String argument, found {}",
+                            arg.type_name()
+                        )));
                     }
                 }
                 EvaluationResult::Collection(items) => {

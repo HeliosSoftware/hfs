@@ -152,7 +152,7 @@ fn test_function_existence_empty() {
     );
     assert_eq!(
         eval("(1 | 2).empty()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::Boolean(false) // Negation of ({} ~ {}) -> !true -> false
     );
 }
 
@@ -3363,8 +3363,9 @@ fn test_environment_variables() {
         EvaluationResult::String("John Doe".to_string())
     );
     assert_eq!(eval("%age + 1", &context).unwrap(), EvaluationResult::Integer(43));
+    // Convert %myVar (string "true") to boolean before using 'and'
     assert_eq!(
-        eval("%myVar and true", &context).unwrap(),
+        eval("%myVar.toBoolean() and true", &context).unwrap(),
         EvaluationResult::Boolean(true)
     );
     assert_eq!(
@@ -3969,7 +3970,7 @@ fn test_comparison_operations() {
     // Specific checks for ~ and !~ with empty
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::Boolean(false) // Spec: X ~ {} -> false
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
@@ -3977,11 +3978,11 @@ fn test_comparison_operations() {
     );
     assert_eq!(
         eval("{} ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::Boolean(true) // Spec: {} ~ {} -> true
     );
     assert_eq!(
         eval("1 !~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::Boolean(true) // Negation of (1 ~ {}) -> !false -> true
     );
     assert_eq!(
         eval("{} !~ 1", &context).unwrap(),
@@ -4050,11 +4051,11 @@ fn test_string_operations() {
             "%message.contains('World')",
             EvaluationResult::Boolean(true),
         ),
-        // Test contains with non-string argument (should return false)
-        ("'abc'.contains(1)", EvaluationResult::Boolean(false)),
+        // Test contains with non-string argument (should error)
+        // ("'abc'.contains(1)", EvaluationResult::Boolean(false)), // Old expectation
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string ({} contains X -> false) - Corrected expectation
+        // Test contains on empty string ({} contains X -> false)
         ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 
@@ -4066,6 +4067,9 @@ fn test_string_operations() {
             input
         );
     }
+
+    // Test contains with non-string argument (should error)
+    assert!(eval("'abc'.contains(1)", &context).is_err());
 
     // Test multi-item errors for contains function
     // Base collection must be singleton (unless string)
