@@ -311,11 +311,23 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Unit parser - now parses keywords or a string literal directly into a String
     let unit_keyword = choice((
-        text::keyword("year"), text::keyword("month"), text::keyword("week"), text::keyword("day"),
-        text::keyword("hour"), text::keyword("minute"), text::keyword("second"), text::keyword("millisecond"),
-        text::keyword("years"), text::keyword("months"), text::keyword("weeks"), text::keyword("days"),
-        text::keyword("hours"), text::keyword("minutes"), text::keyword("seconds"), text::keyword("milliseconds"),
-    )).map(|s| s.to_string()); // Remove explicit type annotation
+        text::keyword("year").to("year".to_string()), // Use .to() to return the string
+        text::keyword("month").to("month".to_string()),
+        text::keyword("week").to("week".to_string()),
+        text::keyword("day").to("day".to_string()),
+        text::keyword("hour").to("hour".to_string()),
+        text::keyword("minute").to("minute".to_string()),
+        text::keyword("second").to("second".to_string()),
+        text::keyword("millisecond").to("millisecond".to_string()),
+        text::keyword("years").to("years".to_string()),
+        text::keyword("months").to("months".to_string()),
+        text::keyword("weeks").to("weeks".to_string()),
+        text::keyword("days").to("days".to_string()),
+        text::keyword("hours").to("hours".to_string()),
+        text::keyword("minutes").to("minutes".to_string()),
+        text::keyword("seconds").to("seconds".to_string()),
+        text::keyword("milliseconds").to("milliseconds".to_string()),
+    ));
 
     let unit_string_literal = just('\'')
         .ignore_then(
@@ -327,9 +339,10 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         .then_ignore(just('\''));
 
     let unit = choice((
-        unit_keyword.boxed(), // Box the keyword parser
-        unit_string_literal.boxed(), // Box the string literal parser
+        unit_keyword, // No need to box individual choices if we box the result
+        unit_string_literal,
     ))
+    .boxed() // Box the result of the choice
     .padded(); // Unit parser itself can be padded
 
 

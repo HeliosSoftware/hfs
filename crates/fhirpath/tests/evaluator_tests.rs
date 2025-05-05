@@ -95,19 +95,19 @@ fn test_expression_literals() {
         eval("@T14:30", &context).unwrap(),
         EvaluationResult::Time("14:30".to_string())
     );
-    // Quantity - Parser returns Decimal or Integer based on number format
+    // Quantity - Should now parse and evaluate as Quantity
     assert_eq!(
-        eval("10 'mg'", &context).unwrap(), // 10 is parsed as Integer
-        EvaluationResult::Integer(10)       // Evaluator ignores unit for now
+        eval("10 'mg'", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(10), "mg".to_string())
     );
     assert_eq!(
-        eval("4.5 'km'", &context).unwrap(), // 4.5 is parsed as Number (Decimal)
-        EvaluationResult::Decimal(dec!(4.5))  // Evaluator ignores unit for now
+        eval("4.5 'km'", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(4.5), "km".to_string())
     );
-    // Quantity with date/time unit - Parser returns Decimal or Integer
+    // Quantity with date/time unit
     assert_eq!(
-        eval("100 days", &context).unwrap(), // 100 is parsed as Integer
-        EvaluationResult::Integer(100)       // Evaluator ignores unit for now
+        eval("100 days", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(100), "days".to_string())
     );
 
     // Empty Collection (Null literal)
@@ -1431,14 +1431,14 @@ fn test_function_conversion_to_string() {
         eval("@2023-10-27T10:30Z.toString()", &context).unwrap(), // Add unwrap
         EvaluationResult::String("2023-10-27T10:30Z".to_string())  // Expect output without seconds
     );
-    // Quantity to string (evaluator returns Decimal or Integer, ignoring unit)
+    // Quantity to string
     assert_eq!(
-        eval("5.5 'mg'.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("5.5".to_string())
+        eval("5.5 'mg'.toString()", &context).unwrap(),
+        EvaluationResult::String("5.5 'mg'".to_string()) // Expect "value 'unit'"
     );
     assert_eq!(
-        eval("5 'mg'.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("5".to_string())
+        eval("100 days.toString()", &context).unwrap(),
+        EvaluationResult::String("100 'days'".to_string()) // Expect "value 'unit'"
     );
     // Collection to string - should error per spec
     assert!(eval("(1|2).toString()", &context).is_err());
@@ -1798,35 +1798,35 @@ fn test_function_conversion_to_quantity() {
     ); // Add unwrap
     // Boolean to Quantity
     assert_eq!(
-        eval("true.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.0))          // Spec implies conversion to Decimal 1.0 '1'
+        eval("true.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(1.0), "1".to_string()) // Expect Quantity 1.0 '1'
     );
     assert_eq!(
-        eval("false.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(0.0))           // Spec implies conversion to Decimal 0.0 '1'
+        eval("false.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(0.0), "1".to_string()) // Expect Quantity 0.0 '1'
     );
     // Integer to Quantity
     assert_eq!(
-        eval("123.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.0))       // Spec implies conversion to Decimal 123.0 '1'
+        eval("123.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(123), "1".to_string()) // Expect Quantity 123 '1'
     );
     // Decimal to Quantity
     assert_eq!(
-        eval("123.45.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.45)) // Spec implies conversion to Decimal 123.45 '1'
+        eval("123.45.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(123.45), "1".to_string()) // Expect Quantity 123.45 '1'
     );
     // String to Quantity (parses number and unit)
     assert_eq!(
-        eval("'5.5 mg'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(5.5))              // Evaluator currently ignores unit
+        eval("'5.5 mg'.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(5.5), "mg".to_string()) // Expect Quantity
     );
     assert_eq!(
-        eval("'100'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0))         // Evaluator currently ignores unit
+        eval("'100'.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(100), "1".to_string()) // Expect Quantity with unit '1'
     );
     assert_eq!(
-        eval("'100 days'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0))              // String with valid time unit
+        eval("'100 days'.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(100), "days".to_string()) // Expect Quantity
     );
     assert_eq!(
         eval("'invalid'.toQuantity()", &context).unwrap(), // Add unwrap
@@ -1840,14 +1840,14 @@ fn test_function_conversion_to_quantity() {
         eval("'5.5 mg extra'.toQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
     ); // Too many parts
-    // Quantity literal to Quantity (should just return the numeric part)
+    // Quantity literal to Quantity (should return the quantity itself)
     assert_eq!(
-        eval("5.5 'mg'.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(5.5))
+        eval("5.5 'mg'.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(5.5), "mg".to_string())
     );
     assert_eq!(
-        eval("100 days.toQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(100.0))            // Expect Decimal conversion
+        eval("100 days.toQuantity()", &context).unwrap(),
+        EvaluationResult::Quantity(dec!(100), "days".to_string())
     );
     // Test multi-item collection - should error
     assert!(eval("(1 | 2).toQuantity()", &context).is_err());
@@ -2144,10 +2144,11 @@ fn test_function_string_contains() {
         eval("''.contains('')", &context).unwrap(), // Add unwrap
         EvaluationResult::Boolean(true)
     );
+    // Spec: {} contains X -> false (where X is not empty)
     assert_eq!(
         eval("{}.contains('a')", &context).unwrap(),
-        EvaluationResult::Boolean(false)
-    ); // Add unwrap
+        EvaluationResult::Boolean(false) // This remains false per spec
+    );
     assert_eq!(
         eval("'abc'.contains({})", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -3297,10 +3298,10 @@ fn test_operator_math_divide() {
         eval("5.0 / 2.0", &context).unwrap(),
         EvaluationResult::Decimal(dec!(2.5))
     ); // Decimal / Decimal -> Decimal
-    // Divide by zero - Expect error
-    assert!(eval("5 / 0", &context).is_err()); // Integer / 0
-    assert!(eval("5.0 / 0", &context).is_err());
-    assert!(eval("5 / 0.0", &context).is_err());
+    // Divide by zero - Expect Empty
+    assert_eq!(eval("5 / 0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(eval("5.0 / 0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(eval("5 / 0.0", &context).unwrap(), EvaluationResult::Empty);
     // Empty propagation
     assert_eq!(eval("6 / {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} / 2", &context).unwrap(), EvaluationResult::Empty);
@@ -3396,11 +3397,11 @@ fn test_operator_math_div() {
         EvaluationResult::Integer(-2)
     );
     // Mixed types for div -> Error
-    assert!(eval("5.5 div 2", &context).is_err());
-    assert!(eval("5 div 2.1", &context).is_err());
-    // Divide by zero -> Error
-    assert!(eval("5 div 0", &context).is_err()); // Integer div 0
-    assert!(eval("5.0 div 0.0", &context).is_err()); // Decimal div 0.0
+    assert!(eval("5.5 div 2", &context).is_err()); // Mixed types still error
+    assert!(eval("5 div 2.1", &context).is_err()); // Mixed types still error
+    // Divide by zero -> Empty
+    assert_eq!(eval("5 div 0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(eval("5.0 div 0.0", &context).unwrap(), EvaluationResult::Empty);
     // Empty propagation
     assert_eq!(eval("5 div {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} div 2", &context).unwrap(), EvaluationResult::Empty);
@@ -3432,11 +3433,11 @@ fn test_operator_math_mod() {
         EvaluationResult::Decimal(dec!(-1.3)) // Result has sign of dividend
     );
     // Mixed types for mod -> Error
-    assert!(eval("5.5 mod 2", &context).is_err());
-    assert!(eval("5 mod 2.1", &context).is_err());
-    // Modulo zero -> Error
-    assert!(eval("5 mod 0", &context).is_err()); // Integer mod 0
-    assert!(eval("5.0 mod 0.0", &context).is_err()); // Decimal mod 0.0
+    assert!(eval("5.5 mod 2", &context).is_err()); // Mixed types still error
+    assert!(eval("5 mod 2.1", &context).is_err()); // Mixed types still error
+    // Modulo zero -> Empty
+    assert_eq!(eval("5 mod 0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(eval("5.0 mod 0.0", &context).unwrap(), EvaluationResult::Empty);
     // Empty propagation
     assert_eq!(eval("5 mod {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} mod 2", &context).unwrap(), EvaluationResult::Empty);
@@ -3999,10 +4000,14 @@ fn test_arithmetic_operations() {
         "5 / 0",
         "5.0 / 0",
         "5 div 0",
-        "5.0 div 0.0", // Changed to 0.0 for Decimal div
-        "5 mod 0",
-        "5.0 mod 0.0", // Changed to 0.0 for Decimal mod
-        // Type Mismatches
+        // Division by zero -> Empty (no longer error)
+        // "5 / 0",
+        // "5.0 / 0",
+        // "5 div 0",
+        // "5.0 div 0.0",
+        // "5 mod 0",
+        // "5.0 mod 0.0",
+        // Type Mismatches (still error)
         "1 + 'a'",
         "'a' + 1",
         "1 * 'a'",
@@ -4248,8 +4253,8 @@ fn test_string_operations() {
         // ("'abc'.contains(1)", EvaluationResult::Boolean(false)), // Old expectation
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string ({} contains X -> false) - Corrected expectation again
-        ("{}.contains('a')", EvaluationResult::Boolean(false)), // Spec: {} contains X -> false
+        // Test contains on empty string ({} contains X -> false)
+        ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 
     for (input, expected) in test_cases {
