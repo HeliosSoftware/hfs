@@ -4165,7 +4165,7 @@ fn test_comparison_operations() {
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
         EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
-        "Failed for input: 1 ~ {{}}"      // Correct assertion message
+        "Failed for input: 1 ~ {}" // Correct assertion message
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
