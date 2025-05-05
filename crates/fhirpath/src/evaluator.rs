@@ -1987,10 +1987,11 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => {
-                    EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
-                } // Convert to 1.0 or 0.0
-                EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)), // Convert to Decimal with '1' unit implicitly
-                EvaluationResult::Decimal(d) => EvaluationResult::Quantity(*d, "1".to_string()), // Convert to Quantity with '1' unit
+                    // Convert Boolean to Quantity 1.0 '1' or 0.0 '1'
+                    EvaluationResult::Quantity(if *b { Decimal::ONE } else { Decimal::ZERO }, "1".to_string())
+                }
+                EvaluationResult::Integer(i) => EvaluationResult::Quantity(Decimal::from(*i), "1".to_string()), // Convert Integer to Quantity with '1' unit
+                EvaluationResult::Decimal(d) => EvaluationResult::Quantity(*d, "1".to_string()), // Convert Decimal to Quantity with '1' unit
                 EvaluationResult::Quantity(val, unit) => EvaluationResult::Quantity(*val, unit.clone()), // Quantity to Quantity
                 EvaluationResult::String(s) => {
                     // Attempt to parse as "value unit" or just "value"
@@ -2052,12 +2053,13 @@ fn call_function(
                     // Check if the string represents a valid quantity format
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.is_empty() {
-                        false // Empty string
+                        false // Empty string is not convertible
                     } else if parts.len() == 1 {
                         // Only a value part, check if it parses as Decimal
+                        // An integer/decimal string alone IS convertible to Quantity (unit '1')
                         parts[0].parse::<Decimal>().is_ok()
                     } else if parts.len() == 2 {
-                        // Value and unit parts, check both
+                        // Value and unit parts, check both value and unit validity
                         let value_parses = parts[0].parse::<Decimal>().is_ok();
                         let unit_is_valid = is_valid_fhirpath_quantity_unit(parts[1].trim_matches('\'')); // Check unit without quotes
                         value_parses && unit_is_valid

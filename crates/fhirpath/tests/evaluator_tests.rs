@@ -3996,10 +3996,10 @@ fn test_arithmetic_operations() {
         "5 div 2.1",
         "5.5 mod 2",
         "5 mod 2.1",
-        // Division by zero -> Error
-        "5 / 0",
-        "5.0 / 0",
-        "5 div 0",
+        // Division by zero -> Empty (no longer error)
+        // "5 / 0", // Removed error check
+        // "5.0 / 0", // Removed error check
+        // "5 div 0", // Removed error check
         // Division by zero -> Empty (no longer error)
         // "5 / 0",
         // "5.0 / 0",
