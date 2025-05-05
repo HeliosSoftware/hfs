@@ -152,7 +152,7 @@ fn test_function_existence_empty() {
     );
     assert_eq!(
         eval("(1 | 2).empty()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false) // Negation of ({} ~ {}) -> !true -> false
+        EvaluationResult::Boolean(false)            // Negation of ({} ~ {}) -> !true -> false
     );
 }
 
@@ -605,7 +605,8 @@ fn test_function_filtering_of_type() {
         "Expected Object, got {:?}",
         result_patient
     );
-    if let EvaluationResult::Object(fields) = result_patient { // Now result_patient is EvaluationResult
+    if let EvaluationResult::Object(fields) = result_patient {
+        // Now result_patient is EvaluationResult
         assert_eq!(
             fields.get("id"), // Patient.id has no extensions, should be primitive String
             Some(&EvaluationResult::String("p1".to_string()))
@@ -621,7 +622,8 @@ fn test_function_filtering_of_type() {
         "Expected Object, got {:?}",
         result_obs
     );
-    if let EvaluationResult::Object(fields) = result_obs { // Now result_obs is EvaluationResult
+    if let EvaluationResult::Object(fields) = result_obs {
+        // Now result_obs is EvaluationResult
         assert_eq!(
             fields.get("id"),
             Some(&EvaluationResult::String("o1".to_string()))
@@ -2498,16 +2500,34 @@ fn test_function_utility_today() {
 fn test_operator_equality_equals() {
     let context = EvaluationContext::new_empty();
     // Primitives
-    assert_eq!(eval("1 = 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 = 2", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 = 1.0", &context).unwrap(), EvaluationResult::Boolean(true)); // Integer vs Decimal equality
-    assert_eq!(eval("1.0 = 1", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal vs Integer equality
-    assert_eq!(eval("1.0 = 1.0", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal vs Decimal
+    assert_eq!(
+        eval("1 = 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 = 2", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 = 1.0", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Integer vs Decimal equality
+    assert_eq!(
+        eval("1.0 = 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal vs Integer equality
+    assert_eq!(
+        eval("1.0 = 1.0", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 = 2.0", &context).unwrap(),
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("'a' = 'a'", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(
+        eval("'a' = 'a'", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
     assert_eq!(
         eval("'a' = 'b'", &context).unwrap(),
         EvaluationResult::Boolean(false)
@@ -2566,17 +2586,38 @@ fn test_operator_equality_equals() {
 fn test_operator_equality_equivalent() {
     let context = EvaluationContext::new_empty();
     // Primitives
-    assert_eq!(eval("1 ~ 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 ~ 2", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 ~ 1.0", &context).unwrap(), EvaluationResult::Boolean(true)); // Integer vs Decimal equivalence
-    assert_eq!(eval("1.0 ~ 1", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal vs Integer equivalence
-    assert_eq!(eval("1.0 ~ 1.0", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal vs Decimal
+    assert_eq!(
+        eval("1 ~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 ~ 2", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 ~ 1.0", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Integer vs Decimal equivalence
+    assert_eq!(
+        eval("1.0 ~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal vs Integer equivalence
+    assert_eq!(
+        eval("1.0 ~ 1.0", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 ~ 2.0", &context).unwrap(),
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("'a' ~ 'a'", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("'a' ~ 'A'", &context).unwrap(), EvaluationResult::Boolean(true)); // Case-insensitive
+    assert_eq!(
+        eval("'a' ~ 'a'", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("'a' ~ 'A'", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Case-insensitive
     assert_eq!(
         eval("'a' ~ 'b'", &context).unwrap(),
         EvaluationResult::Boolean(false)
@@ -2632,17 +2673,32 @@ fn test_operator_equality_equivalent() {
         EvaluationResult::Boolean(true)
     );
     // Empty comparison - Corrected based on spec for '~'
-    assert_eq!(eval("{} ~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 ~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("{} ~ 1", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("{} ~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 ~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("{} ~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#-not-equals
 #[test]
 fn test_operator_equality_not_equals() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("1 != 2", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 != 1", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("1 != 2", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 != 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
     assert_eq!(
         eval("(1|2) != (1|3)", &context).unwrap(),
         EvaluationResult::Boolean(true)
@@ -2661,8 +2717,14 @@ fn test_operator_equality_not_equals() {
 #[test]
 fn test_operator_equality_not_equivalent() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("1 !~ 2", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 !~ 1", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("1 !~ 2", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 !~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
     assert_eq!(
         eval("'a' !~ 'A'", &context).unwrap(),
         EvaluationResult::Boolean(false)
@@ -2676,9 +2738,18 @@ fn test_operator_equality_not_equivalent() {
         EvaluationResult::Boolean(false)
     );
     // Empty comparison - Corrected based on spec for '!~'
-    assert_eq!(eval("{} !~ {}", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 !~ {}", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("{} !~ 1", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(
+        eval("{} !~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 !~ {}", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("{} !~ 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
 }
 
 // --- Comparison ---
@@ -2687,20 +2758,59 @@ fn test_operator_equality_not_equivalent() {
 fn test_operator_comparison() {
     let context = EvaluationContext::new_empty();
     // >, <, >=, <=
-    assert_eq!(eval("2 > 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 > 1", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 > 2", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 < 2", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 < 1", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("2 < 1", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 >= 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("2 >= 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 >= 2", &context).unwrap(), EvaluationResult::Boolean(false));
-    assert_eq!(eval("1 <= 1", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1 <= 2", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("2 <= 1", &context).unwrap(), EvaluationResult::Boolean(false));
+    assert_eq!(
+        eval("2 > 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 > 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 > 2", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 < 2", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 < 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("2 < 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 >= 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("2 >= 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 >= 2", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
+    assert_eq!(
+        eval("1 <= 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1 <= 2", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("2 <= 1", &context).unwrap(),
+        EvaluationResult::Boolean(false)
+    );
     // String comparison
-    assert_eq!(eval("'b' > 'a'", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(
+        eval("'b' > 'a'", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
     assert_eq!(
         eval("'a' > 'a'", &context).unwrap(),
         EvaluationResult::Boolean(false)
@@ -2709,13 +2819,31 @@ fn test_operator_comparison() {
         eval("'a' > 'b'", &context).unwrap(),
         EvaluationResult::Boolean(false)
     );
-    assert_eq!(eval("'a' < 'b'", &context).unwrap(), EvaluationResult::Boolean(true));
+    assert_eq!(
+        eval("'a' < 'b'", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
     // Implicit conversion
-    assert_eq!(eval("2 > 1.5", &context).unwrap(), EvaluationResult::Boolean(true));
-    assert_eq!(eval("1.5 < 2", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal < Integer
-    assert_eq!(eval("2 > 1.5", &context).unwrap(), EvaluationResult::Boolean(true)); // Integer > Decimal
-    assert_eq!(eval("1 <= 1.0", &context).unwrap(), EvaluationResult::Boolean(true)); // Integer <= Decimal
-    assert_eq!(eval("1.0 >= 1", &context).unwrap(), EvaluationResult::Boolean(true)); // Decimal >= Integer
+    assert_eq!(
+        eval("2 > 1.5", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    );
+    assert_eq!(
+        eval("1.5 < 2", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal < Integer
+    assert_eq!(
+        eval("2 > 1.5", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Integer > Decimal
+    assert_eq!(
+        eval("1 <= 1.0", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Integer <= Decimal
+    assert_eq!(
+        eval("1.0 >= 1", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // Decimal >= Integer
     // Empty propagation
     assert_eq!(eval("1 > {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} > 1", &context).unwrap(), EvaluationResult::Empty);
@@ -2956,8 +3084,14 @@ fn test_operator_boolean_and() {
         EvaluationResult::Boolean(false)
     );
     // Empty propagation
-    assert_eq!(eval("true and {}", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} and true", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("true and {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} and true", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("false and {}", &context).unwrap(),
         EvaluationResult::Boolean(false)
@@ -2966,7 +3100,10 @@ fn test_operator_boolean_and() {
         eval("{} and false", &context).unwrap(),
         EvaluationResult::Boolean(false)
     ); // Table shows false.
-    assert_eq!(eval("{} and {}", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{} and {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#or
@@ -2998,8 +3135,14 @@ fn test_operator_boolean_or() {
         eval("{} or true", &context).unwrap(),
         EvaluationResult::Boolean(true)
     ); // Table shows true.
-    assert_eq!(eval("false or {}", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} or false", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("false or {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} or false", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     assert_eq!(eval("{} or {}", &context).unwrap(), EvaluationResult::Empty);
 }
 
@@ -3024,11 +3167,26 @@ fn test_operator_boolean_xor() {
         EvaluationResult::Boolean(false)
     );
     // Empty propagation
-    assert_eq!(eval("true xor {}", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} xor true", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("false xor {}", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} xor false", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} xor {}", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("true xor {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} xor true", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("false xor {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} xor false", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} xor {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#implies
@@ -3052,7 +3210,10 @@ fn test_operator_boolean_implies() {
         EvaluationResult::Boolean(true)
     );
     // Empty propagation
-    assert_eq!(eval("true implies {}", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("true implies {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     assert_eq!(
         eval("{} implies true", &context).unwrap(),
         EvaluationResult::Boolean(true)
@@ -3061,8 +3222,14 @@ fn test_operator_boolean_implies() {
         eval("false implies {}", &context).unwrap(),
         EvaluationResult::Boolean(true)
     ); // Short circuit
-    assert_eq!(eval("{} implies false", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("{} implies {}", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("{} implies false", &context).unwrap(),
+        EvaluationResult::Empty
+    );
+    assert_eq!(
+        eval("{} implies {}", &context).unwrap(),
+        EvaluationResult::Empty
+    );
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#not--boolean (Function, but often used like operator)
@@ -3207,11 +3374,23 @@ fn test_operator_math_subtract() {
 #[test]
 fn test_operator_math_div() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("5 div 2", &context).unwrap(), EvaluationResult::Integer(2)); // Integer div Integer -> Integer
-    assert_eq!(eval("6 div 2", &context).unwrap(), EvaluationResult::Integer(3));
-    assert_eq!(eval("-5 div 2", &context).unwrap(), EvaluationResult::Integer(-2));
+    assert_eq!(
+        eval("5 div 2", &context).unwrap(),
+        EvaluationResult::Integer(2)
+    ); // Integer div Integer -> Integer
+    assert_eq!(
+        eval("6 div 2", &context).unwrap(),
+        EvaluationResult::Integer(3)
+    );
+    assert_eq!(
+        eval("-5 div 2", &context).unwrap(),
+        EvaluationResult::Integer(-2)
+    );
     // Decimal div Decimal -> Integer (truncates)
-    assert_eq!(eval("5.5 div 2.1", &context).unwrap(), EvaluationResult::Integer(2));
+    assert_eq!(
+        eval("5.5 div 2.1", &context).unwrap(),
+        EvaluationResult::Integer(2)
+    );
     assert_eq!(
         eval("-5.5 div 2.1", &context).unwrap(),
         EvaluationResult::Integer(-2)
@@ -3231,9 +3410,18 @@ fn test_operator_math_div() {
 #[test]
 fn test_operator_math_mod() {
     let context = EvaluationContext::new_empty();
-    assert_eq!(eval("5 mod 2", &context).unwrap(), EvaluationResult::Integer(1)); // Integer mod Integer -> Integer
-    assert_eq!(eval("6 mod 2", &context).unwrap(), EvaluationResult::Integer(0));
-    assert_eq!(eval("-5 mod 2", &context).unwrap(), EvaluationResult::Integer(-1)); // Result has sign of dividend
+    assert_eq!(
+        eval("5 mod 2", &context).unwrap(),
+        EvaluationResult::Integer(1)
+    ); // Integer mod Integer -> Integer
+    assert_eq!(
+        eval("6 mod 2", &context).unwrap(),
+        EvaluationResult::Integer(0)
+    );
+    assert_eq!(
+        eval("-5 mod 2", &context).unwrap(),
+        EvaluationResult::Integer(-1)
+    ); // Result has sign of dividend
     // Decimal mod Decimal -> Decimal
     assert_eq!(
         eval("5.5 mod 2.1", &context).unwrap(),
@@ -3311,7 +3499,10 @@ fn test_operator_precedence() {
         EvaluationResult::Decimal(dec!(25.0))
     );
     // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
-    assert_eq!(eval("10 div 3 * 2", &context).unwrap(), EvaluationResult::Integer(6));
+    assert_eq!(
+        eval("10 div 3 * 2", &context).unwrap(),
+        EvaluationResult::Integer(6)
+    );
     // (10 mod 3) + 1 = 1 + 1 = 2 (mod -> Integer, then Integer + Integer -> Integer)
     assert_eq!(
         eval("10 mod 3 + 1", &context).unwrap(),
@@ -3362,7 +3553,10 @@ fn test_environment_variables() {
         eval("%name", &context).unwrap(),
         EvaluationResult::String("John Doe".to_string())
     );
-    assert_eq!(eval("%age + 1", &context).unwrap(), EvaluationResult::Integer(43));
+    assert_eq!(
+        eval("%age + 1", &context).unwrap(),
+        EvaluationResult::Integer(43)
+    );
     // Convert %myVar (string "true") to boolean before using 'and'
     assert_eq!(
         eval("%myVar.toBoolean() and true", &context).unwrap(),
@@ -3932,10 +4126,10 @@ fn test_comparison_operations() {
     // --- Error Cases (Comparing collections or incompatible types) ---
     // These assertions are now correct as the implementation returns errors
     let error_cases = vec![
-        "(1 | 2) < 3", // Collection vs Singleton
-        "1 < (2 | 3)", // Singleton vs Collection
+        "(1 | 2) < 3",       // Collection vs Singleton
+        "1 < (2 | 3)",       // Singleton vs Collection
         "(1 | 2) < (3 | 4)", // Collection vs Collection
-        "1 < 'a'", // Incompatible types
+        "1 < 'a'",           // Incompatible types
         "'a' > true",
         "@2023 = @T10:00", // Incompatible date/time types for '='
         "@2023 < @T10:00", // Incompatible date/time types for '<'
@@ -3970,8 +4164,7 @@ fn test_comparison_operations() {
     // Specific checks for ~ and !~ with empty
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
-        "Failed for input: 1 ~ {}" // Remove the placeholder {}
+        EvaluationResult::Boolean(false) // Spec: X ~ {} -> false
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
@@ -4119,7 +4312,10 @@ fn test_functions() {
     // Test error cases for functions requiring singletons
     assert!(eval("(1 | 2).length()", &context).is_err());
     // Test contains: base can be collection, arg must be singleton
-    assert_eq!(eval("(1 | 2).contains(1)", &context).unwrap(), EvaluationResult::Boolean(true)); // This is valid
+    assert_eq!(
+        eval("(1 | 2).contains(1)", &context).unwrap(),
+        EvaluationResult::Boolean(true)
+    ); // This is valid
     assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err()); // Arg cannot be collection
 }
 
