@@ -1114,8 +1114,12 @@ fn call_function(
                         )));
                     }
                 }
-                EvaluationResult::Collection(items) => {
-                    // Collection contains item (using equality)
+                // String contains substring
+                (EvaluationResult::String(s), EvaluationResult::String(substr)) => {
+                    EvaluationResult::Boolean(s.contains(substr))
+                }
+                // Collection contains item (using equality)
+                (EvaluationResult::Collection(items), _) => {
                     // Use map_or to handle potential error from compare_equality
                     let contains = items
                         .iter()

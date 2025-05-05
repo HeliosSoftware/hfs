@@ -304,6 +304,7 @@ impl EvaluationResult {
             | EvaluationResult::Date(_)
             | EvaluationResult::DateTime(_)
             | EvaluationResult::Time(_)
+            | EvaluationResult::Quantity(_, _) // Quantity evaluates to Empty in boolean logic
             | EvaluationResult::Object(_) => Ok(EvaluationResult::Empty),
             EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         }
