@@ -1908,7 +1908,7 @@ fn test_function_conversion_converts_to_quantity() {
         EvaluationResult::Boolean(true)
     );
     // Test multi-item collection - should error
-    assert!(eval("(1 | 2).convertsToQuantity()", &context).is_err());
+    assert!(eval("(1 | 2).convertsToQuantity()", &context).is_err()); // This assertion is now correct
 }
 
 // --- String Manipulation ---
@@ -2416,11 +2416,8 @@ fn test_function_string_length() {
         eval("{}.length()", &context).unwrap(),
         EvaluationResult::Empty
     ); // Add unwrap
-    // Length on non-string should be empty (or error depending on strictness, current impl returns Empty)
-    assert_eq!(
-        eval("123.length()", &context).unwrap(),
-        EvaluationResult::Empty
-    ); // Add unwrap
+    // Length on non-string should error
+    assert!(eval("123.length()", &context).is_err());
     // Length on multi-item collection should error
     assert!(eval("('a' | 'b').length()", &context).is_err());
 }
@@ -3891,7 +3888,7 @@ fn test_boolean_operations() {
         );
     }
 
-    // Test type errors (should error)
+    // Test type errors (should error) - These assertions are now correct
     assert!(eval("1 and true", &context).is_err());
     assert!(eval("true and 'a'", &context).is_err());
     assert!(eval("1 or true", &context).is_err());
@@ -3935,12 +3932,15 @@ fn test_comparison_operations() {
     }
 
     // --- Error Cases (Comparing collections or incompatible types) ---
+    // These assertions are now correct as the implementation returns errors
     let error_cases = vec![
-        "(1 | 2) < 3", // Collection comparison should error
-        "1 < (2 | 3)",
+        "(1 | 2) < 3", // Collection vs Singleton
+        "1 < (2 | 3)", // Singleton vs Collection
+        "(1 | 2) < (3 | 4)", // Collection vs Collection
         "1 < 'a'", // Incompatible types
         "'a' > true",
-        "@2023 = @T10:00", // Incompatible date/time types
+        "@2023 = @T10:00", // Incompatible date/time types for '='
+        "@2023 < @T10:00", // Incompatible date/time types for '<'
     ];
     for input in error_cases {
         assert!(
@@ -4114,9 +4114,9 @@ fn test_functions() {
 
     // Test error cases for functions requiring singletons
     assert!(eval("(1 | 2).length()", &context).is_err());
-    assert!(eval("(1 | 2).contains(1)", &context).is_err()); // Base is collection, arg is singleton - should error? No, contains works on collections.
-    // Let's test contains where arg is collection
-    assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err());
+    // Test contains: base can be collection, arg must be singleton
+    assert_eq!(eval("(1 | 2).contains(1)", &context).unwrap(), EvaluationResult::Boolean(true)); // This is valid
+    assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err()); // Arg cannot be collection
 }
 
 #[test]

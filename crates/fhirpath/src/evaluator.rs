@@ -168,11 +168,19 @@ pub fn evaluate(
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
-                    Ok(right_bool) // true and X -> X (where X is Boolean or Empty)
+                    // Check if right_bool is actually Boolean or Empty
+                    if matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                         Ok(right_bool) // true and X -> X (where X is Boolean or Empty)
+                    } else {
+                         Err(EvaluationError::TypeError(format!(
+                            "Invalid type for 'and' right operand: {}", right_bool.type_name()
+                        )))
+                    }
                 }
-                _ => Err(EvaluationError::TypeError(
-                    "Invalid type for 'and' operand".to_string(),
-                )), // Should not happen
+                 // This case should be unreachable if to_boolean_for_logic works correctly
+                _ => Err(EvaluationError::TypeError(format!(
+                    "Invalid type for 'and' left operand: {}", left_bool.type_name()
+                ))),
             }
         }
         Expression::Or(left, op, right) => {
@@ -183,6 +191,19 @@ pub fn evaluate(
             // Evaluate right, handle potential error
             let right_eval = evaluate(right, context, current_item)?;
             let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
+
+            // Ensure both operands resolved to Boolean or Empty
+            if !matches!(left_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                 return Err(EvaluationError::TypeError(format!(
+                    "Invalid type for '{}' left operand: {}", op, left_bool.type_name()
+                )));
+            }
+             if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                 return Err(EvaluationError::TypeError(format!(
+                    "Invalid type for '{}' right operand: {}", op, right_bool.type_name()
+                )));
+            }
+
 
             if op == "or" {
                 match (&left_bool, &right_bool) {
@@ -201,12 +222,10 @@ pub fn evaluate(
                     (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => {
                         Ok(EvaluationResult::Boolean(false))
                     }
-                    _ => Err(EvaluationError::TypeError(
-                        "Invalid type for 'or' operand".to_string(),
-                    )), // Should not happen
+                     // Cases involving Empty handled above, this should not be reached with invalid types
+                    _ => unreachable!("Invalid types should have been caught earlier for 'or'"),
                 }
-            } else {
-                // xor
+            } else { // xor
                 match (&left_bool, &right_bool) {
                     (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                         Ok(EvaluationResult::Empty)
@@ -214,9 +233,8 @@ pub fn evaluate(
                     (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                         Ok(EvaluationResult::Boolean(l != r))
                     }
-                    _ => Err(EvaluationError::TypeError(
-                        "Invalid type for 'xor' operand".to_string(),
-                    )), // Should not happen
+                     // Cases involving Empty handled above, this should not be reached with invalid types
+                    _ => unreachable!("Invalid types should have been caught earlier for 'xor'"),
                 }
             }
         }
@@ -225,12 +243,26 @@ pub fn evaluate(
             let left_eval = evaluate(left, context, current_item)?;
             let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
 
+             // Ensure left operand resolved to Boolean or Empty
+            if !matches!(left_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                 return Err(EvaluationError::TypeError(format!(
+                    "Invalid type for 'implies' left operand: {}", left_bool.type_name()
+                )));
+            }
+
+
             match left_bool {
                 EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(true)), // false implies X -> true
                 EvaluationResult::Empty => {
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
+                     // Ensure right operand resolved to Boolean or Empty
+                    if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                         return Err(EvaluationError::TypeError(format!(
+                            "Invalid type for 'implies' right operand: {}", right_bool.type_name()
+                        )));
+                    }
                     match right_bool {
                         EvaluationResult::Boolean(true) => Ok(EvaluationResult::Boolean(true)), // {} implies true -> true
                         _ => Ok(EvaluationResult::Empty), // {} implies (false | {}) -> {}
@@ -240,11 +272,16 @@ pub fn evaluate(
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
+                     // Ensure right operand resolved to Boolean or Empty
+                    if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                         return Err(EvaluationError::TypeError(format!(
+                            "Invalid type for 'implies' right operand: {}", right_bool.type_name()
+                        )));
+                    }
                     Ok(right_bool) // true implies X -> X (Boolean or Empty)
                 }
-                _ => Err(EvaluationError::TypeError(
-                    "Invalid type for 'implies' operand".to_string(),
-                )), // Should not happen
+                 // This case should be unreachable if to_boolean_for_logic works correctly
+                 _ => unreachable!("Invalid type for 'implies' left operand should have been caught"),
             }
         }
         Expression::Lambda(_, _) => {
@@ -1603,12 +1640,13 @@ fn call_function(
                     "convertsToString requires a singleton input".to_string(),
                 ));
             }
+            // Handle Empty case explicitly after singleton check
+            if invocation_base == &EvaluationResult::Empty {
+                 return Ok(EvaluationResult::Empty);
+            }
+            // Now we know it's a non-empty singleton
             Ok(match invocation_base {
-                // Wrap in Ok
-                EvaluationResult::Empty => EvaluationResult::Empty, // Empty input -> Empty result
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                // Check convertibility for single items (most primitives can be)
+                 // Check convertibility for single items (most primitives can be)
                 EvaluationResult::Boolean(_)
                 | EvaluationResult::String(_)
                 | EvaluationResult::Integer(_)
@@ -1913,12 +1951,19 @@ fn call_function(
         }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
+            // Check for singleton first
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToQuantity requires a singleton input".to_string(),
+                ));
+            }
+             // Handle Empty case explicitly after singleton check
+            if invocation_base == &EvaluationResult::Empty {
+                 return Ok(EvaluationResult::Empty);
+            }
+            // Now we know it's a non-empty singleton
             Ok(match invocation_base {
-                // Wrap in Ok
-                EvaluationResult::Empty => EvaluationResult::Empty,
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
+                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::String(s) => EvaluationResult::Boolean({
@@ -3035,31 +3080,105 @@ fn compare_inequality(
         (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
         // Time comparison
         (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
-        // Incomparable types
-        _ => None,
+        // Incomparable types - Return error instead of None/Empty
+        _ => {
+            return Err(EvaluationError::TypeError(format!(
+                "Cannot compare {} and {}",
+                left.type_name(),
+                right.type_name()
+            )));
+        }
     };
 
-    if let Some(ordering) = compare_result {
-        let result = match op {
-            "<" => ordering.is_lt(),
-            "<=" => ordering.is_le(),
-            ">" => ordering.is_gt(),
-            ">=" => ordering.is_ge(),
-            _ => false, // Should not happen
-        };
-        EvaluationResult::Boolean(result)
-    } else {
-        EvaluationResult::Empty // Incomparable types result in Empty
-    }
+    // compare_result is now guaranteed to be Some(Ordering) if we reach here
+    let ordering = compare_result.unwrap(); // Safe to unwrap
+
+    let result = match op {
+        "<" => ordering.is_lt(),
+        "<=" => ordering.is_le(),
+        ">" => ordering.is_gt(),
+        ">=" => ordering.is_ge(),
+        _ => false, // Should not happen
+    };
+    Ok(EvaluationResult::Boolean(result)) // Return Ok result
 }
 
-/// Compares two values for equality
+/// Compares two values for inequality - Returns Result now
+fn compare_inequality(
+    left: &EvaluationResult,
+    op: &str,
+    right: &EvaluationResult,
+) -> Result<EvaluationResult, EvaluationError> { // Changed return type
+    // Handle empty operands: comparison with empty returns empty
+    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+        return Ok(EvaluationResult::Empty); // Return Ok(Empty)
+    }
+
+    // Check for collection vs singleton comparison (error)
+    if left.is_collection() != right.is_collection() {
+        return Err(EvaluationError::TypeError(format!(
+            "Cannot compare {} and {}",
+            left.type_name(),
+            right.type_name()
+        )));
+    }
+    // If both are collections, comparison is not defined (error)
+    if left.is_collection() { // && right.is_collection() implicitly
+         return Err(EvaluationError::TypeError(format!(
+            "Cannot compare collections using '{}'", op
+        )));
+    }
+
+    // Promote Integer to Decimal for mixed comparisons
+    let compare_result = match (left, right) {
+        // Both Decimal
+        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => Some(l.cmp(r)),
+        // Both Integer
+        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => Some(l.cmp(r)),
+        // Mixed Decimal/Integer
+        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
+            Some(l.cmp(&Decimal::from(*r)))
+        }
+        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
+            Some(Decimal::from(*l).cmp(r))
+        }
+        // String comparison
+        (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
+        // Date comparison
+        (EvaluationResult::Date(l), EvaluationResult::Date(r)) => Some(l.cmp(r)),
+        // DateTime comparison
+        (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
+        // Time comparison
+        (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
+        // Incomparable types - Return error instead of None/Empty
+        _ => {
+            return Err(EvaluationError::TypeError(format!(
+                "Cannot compare {} and {}",
+                left.type_name(),
+                right.type_name()
+            )));
+        }
+    };
+
+    // compare_result is now guaranteed to be Some(Ordering) if we reach here
+    let ordering = compare_result.unwrap(); // Safe to unwrap
+
+    let result = match op {
+        "<" => ordering.is_lt(),
+        "<=" => ordering.is_le(),
+        ">" => ordering.is_gt(),
+        ">=" => ordering.is_ge(),
+        _ => false, // Should not happen
+    };
+    Ok(EvaluationResult::Boolean(result)) // Return Ok result
+}
+
+/// Compares two values for equality - Returns Result now
 fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> EvaluationResult {
-    // Returns EvaluationResult, not Result
+) -> Result<EvaluationResult, EvaluationError> { // Changed return type
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();
@@ -3122,27 +3241,27 @@ fn compare_equality(
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }
-                // Any other combination (including one being Empty) is false
+                // Any other combination is false (incompatible types)
                 _ => EvaluationResult::Boolean(false),
-            }
+            })
         }
         "!=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
             if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-                return EvaluationResult::Empty;
+                return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
             // Strict inequality: Negation of '='
-            let eq_result = compare_equality(left, "=", right);
-            match eq_result {
+            let eq_result = compare_equality(left, "=", right)?; // Propagate error
+            Ok(match eq_result { // Wrap result in Ok
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                 // If '=' returned Empty (due to empty operand), '!=' also returns Empty
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 _ => EvaluationResult::Empty, // Should not happen otherwise
-            }
+            })
         }
         "~" => {
             // Equivalence: Order doesn't matter, duplicates DO matter.
-            match (left, right) {
+            Ok(match (left, right) { // Wrap result in Ok
                 // Handle Empty cases specifically for '~'
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
@@ -3170,7 +3289,7 @@ fn compare_equality(
                         let all_equivalent = l_sorted
                             .iter()
                             .zip(r_sorted.iter())
-                            .all(|(li, ri)| compare_equality(li, "~", ri).to_boolean());
+                            .all(|(li, ri)| compare_equality(li, "~", ri).map_or(false, |r| r.to_boolean())); // Handle potential error
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
@@ -3179,13 +3298,13 @@ fn compare_equality(
                     EvaluationResult::Boolean(false)
                 }
                 // Primitive equivalence falls back to strict equality ('=')
-                _ => compare_equality(left, "=", right),
-            }
+                _ => compare_equality(left, "=", right)?, // Propagate error
+            })
         }
         "!~" => {
             // Non-equivalence: Negation of '~'
             // Handle empty cases specifically for '!~'
-            match (left, right) {
+            Ok(match (left, right) { // Wrap result in Ok
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
                 } // Empty is equivalent to Empty
@@ -3194,7 +3313,7 @@ fn compare_equality(
                 } // Empty is not equivalent to non-empty
                 // For non-empty operands, negate the result of '~'
                 _ => {
-                    let equiv_result = compare_equality(left, "~", right);
+                    let equiv_result = compare_equality(left, "~", right)?; // Propagate error
                     match equiv_result {
                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                         // If '~' somehow returned Empty for non-empty operands, propagate Empty
@@ -3202,9 +3321,9 @@ fn compare_equality(
                         _ => EvaluationResult::Empty, // Should not happen
                     }
                 }
-            }
+            })
         }
-        _ => EvaluationResult::Empty, // Unknown operator
+        _ => Err(EvaluationError::InvalidOperation(format!("Unknown equality operator: {}", op))), // Return error
     }
 }
 
