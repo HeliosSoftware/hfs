@@ -4250,7 +4250,7 @@ fn test_string_operations() {
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
         // Test contains on empty string ({} contains X -> false) - Corrected expectation again
-        ("{}.contains('a')", EvaluationResult::Boolean(false)),
+        ("{}.contains('a')", EvaluationResult::Boolean(false)), // Spec: {} contains X -> false
     ];
 
     for (input, expected) in test_cases {
@@ -4312,10 +4312,7 @@ fn test_functions() {
     // Test error cases for functions requiring singletons
     assert!(eval("(1 | 2).length()", &context).is_err());
     // Test contains: base can be collection, arg must be singleton
-    assert_eq!(
-        eval("(1 | 2).contains(1)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
-    ); // This is valid
+    assert!(eval("('a' | 'b').contains('a')", &context).is_err()); // Base cannot be multi-item collection (unless string)
     assert!(eval("'abc'.contains(('a' | 'b'))", &context).is_err()); // Arg cannot be collection
 }
 
