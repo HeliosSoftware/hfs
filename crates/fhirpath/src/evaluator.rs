@@ -691,7 +691,10 @@ fn evaluate_invocation(
             // For now, we return Empty as this requires tracking the original collection
             Ok(EvaluationResult::Empty)
         }
-    }
+    };
+    // Add tracing for invocation end
+    // eprintln!("Result for invocation {:?}: {:?}", invocation, result);
+    result // Return the result
 }
 
 // --- Helper functions for lambda evaluation ---
