@@ -3974,7 +3974,7 @@ fn test_comparison_operations() {
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::Boolean(false) // Spec: {} ~ X -> false
     );
     assert_eq!(
         eval("{} ~ {}", &context).unwrap(),
@@ -3986,7 +3986,7 @@ fn test_comparison_operations() {
     );
     assert_eq!(
         eval("{} !~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::Boolean(true) // Negation of ({} ~ 1) -> !false -> true
     );
     assert_eq!(
         eval("{} !~ {}", &context).unwrap(),
