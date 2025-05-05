@@ -3971,7 +3971,7 @@ fn test_comparison_operations() {
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
         EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
-        "Failed for input: 1 ~ {}" // Remove the placeholder again
+        "Failed for input: 1 ~ {}" // Final attempt to remove placeholder
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
