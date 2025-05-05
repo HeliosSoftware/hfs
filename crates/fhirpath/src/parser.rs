@@ -315,7 +315,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         text::keyword("hour"), text::keyword("minute"), text::keyword("second"), text::keyword("millisecond"),
         text::keyword("years"), text::keyword("months"), text::keyword("weeks"), text::keyword("days"),
         text::keyword("hours"), text::keyword("minutes"), text::keyword("seconds"), text::keyword("milliseconds"),
-    )).map(|s| s.to_string()); // Convert keyword &str to String
+    )).map(|s: &str| s.to_string()); // Explicitly type closure parameter
 
     let unit_string_literal = just('\'')
         .ignore_then(
