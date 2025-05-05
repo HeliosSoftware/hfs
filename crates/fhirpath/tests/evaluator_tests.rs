@@ -3970,7 +3970,8 @@ fn test_comparison_operations() {
     // Specific checks for ~ and !~ with empty
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false) // Spec: X ~ {} -> false
+        EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
+        "Failed for input: 1 ~ {}" // Add assertion message
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
@@ -4055,7 +4056,7 @@ fn test_string_operations() {
         // ("'abc'.contains(1)", EvaluationResult::Boolean(false)), // Old expectation
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string ({} contains X -> false)
+        // Test contains on empty string ({} contains X -> false) - Corrected expectation
         ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 
