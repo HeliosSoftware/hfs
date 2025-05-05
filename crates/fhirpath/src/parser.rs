@@ -678,9 +678,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
             .foldl(|left, (_, right)| Expression::Implies(Box::new(left), Box::new(right)));
 
         // The final expression parser is the one with the lowest precedence
-        implies
-    };
-    // Add tracing for expression evaluation end
-    // eprintln!("Result for expr {:?}: {:?}", expr, result);
-    result // Return the result
+        implies // This is now the return value of the closure
+    }) // Close the recursive closure here
+    .then_ignore(end()) // Ensure the entire input is consumed after the expression
 }
