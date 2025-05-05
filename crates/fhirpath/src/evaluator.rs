@@ -139,8 +139,8 @@ pub fn evaluate(
         Expression::Equality(left, op, right) => {
             let left_result = evaluate(left, context, current_item)?; // Use ?
             let right_result = evaluate(right, context, current_item)?; // Use ?
-            // Equality returns Empty on empty operand, not error
-            Ok(compare_equality(&left_result, op, &right_result))
+            // compare_equality now returns Result, so just call it directly
+            compare_equality(&left_result, op, &right_result)
         }
         Expression::Membership(left, op, right) => {
             let left_result = evaluate(left, context, current_item)?; // Use ?
@@ -1059,15 +1059,17 @@ fn call_function(
                 }
                 EvaluationResult::Collection(items) => {
                     // Collection contains item (using equality)
+                    // Use map_or to handle potential error from compare_equality
                     let contains = items
                         .iter()
-                        .any(|item| compare_equality(item, "=", arg).to_boolean());
+                        .any(|item| compare_equality(item, "=", arg).map_or(false, |r| r.to_boolean()));
                     EvaluationResult::Boolean(contains)
                 }
                 // contains on single non-collection/non-string item
                 single_item => {
                     // Treat as single-item collection: check if the item equals the argument
-                    EvaluationResult::Boolean(compare_equality(single_item, "=", arg).to_boolean())
+                    // Use map_or to handle potential error from compare_equality
+                    EvaluationResult::Boolean(compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()))
                 }
             })
         }
@@ -1085,8 +1087,8 @@ fn call_function(
 
             for i in 0..items.len() {
                 for j in (i + 1)..items.len() {
-                    // Use compare_equality to check for duplicates
-                    if compare_equality(&items[i], "=", &items[j]).to_boolean() {
+                    // Use compare_equality, handle potential error, default to false if error
+                    if compare_equality(&items[i], "=", &items[j]).map_or(false, |r| r.to_boolean()) {
                         return Ok(EvaluationResult::Boolean(false)); // Found a duplicate
                     }
                 }
@@ -1356,9 +1358,10 @@ fn call_function(
 
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
+                // Use map_or to handle potential error from compare_equality
                 let exists_in_right = right_items
                     .iter()
-                    .any(|right_item| compare_equality(left_item, "=", right_item).to_boolean());
+                    .any(|right_item| compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean()));
 
                 if exists_in_right {
                     // Attempt to insert the item into the HashSet.
@@ -1404,9 +1407,10 @@ fn call_function(
             let mut result_items = Vec::new();
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
+                // Use map_or to handle potential error from compare_equality
                 let exists_in_right = right_items
                     .iter()
-                    .any(|right_item| compare_equality(left_item, "=", right_item).to_boolean());
+                    .any(|right_item| compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean()));
 
                 // Keep the item if it does NOT exist in the right collection
                 if !exists_in_right {
@@ -3047,61 +3051,6 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
     }
 }
 
-/// Compares two values for inequality
-fn compare_inequality(
-    left: &EvaluationResult,
-    op: &str,
-    right: &EvaluationResult,
-) -> EvaluationResult {
-    // Returns EvaluationResult, not Result
-    // Handle empty operands: comparison with empty returns empty
-    if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-        return EvaluationResult::Empty;
-    }
-
-    // Promote Integer to Decimal for mixed comparisons
-    let compare_result = match (left, right) {
-        // Both Decimal
-        (EvaluationResult::Decimal(l), EvaluationResult::Decimal(r)) => Some(l.cmp(r)),
-        // Both Integer
-        (EvaluationResult::Integer(l), EvaluationResult::Integer(r)) => Some(l.cmp(r)),
-        // Mixed Decimal/Integer
-        (EvaluationResult::Decimal(l), EvaluationResult::Integer(r)) => {
-            Some(l.cmp(&Decimal::from(*r)))
-        }
-        (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
-            Some(Decimal::from(*l).cmp(r))
-        }
-        // String comparison
-        (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
-        // Date comparison
-        (EvaluationResult::Date(l), EvaluationResult::Date(r)) => Some(l.cmp(r)),
-        // DateTime comparison
-        (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
-        // Time comparison
-        (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
-        // Incomparable types - Return error instead of None/Empty
-        _ => {
-            return Err(EvaluationError::TypeError(format!(
-                "Cannot compare {} and {}",
-                left.type_name(),
-                right.type_name()
-            )));
-        }
-    };
-
-    // compare_result is now guaranteed to be Some(Ordering) if we reach here
-    let ordering = compare_result.unwrap(); // Safe to unwrap
-
-    let result = match op {
-        "<" => ordering.is_lt(),
-        "<=" => ordering.is_le(),
-        ">" => ordering.is_gt(),
-        ">=" => ordering.is_ge(),
-        _ => false, // Should not happen
-    };
-    Ok(EvaluationResult::Boolean(result)) // Return Ok result
-}
 
 /// Compares two values for inequality - Returns Result now
 fn compare_inequality(
@@ -3351,9 +3300,11 @@ fn check_membership(
             let is_in = match right {
                 EvaluationResult::Collection(items) => items
                     .iter()
-                    .any(|item| compare_equality(left, "=", item).to_boolean()),
+                    // Use map_or to handle potential error from compare_equality
+                    .any(|item| compare_equality(left, "=", item).map_or(false, |r| r.to_boolean())),
                 // If right is a single non-empty item, compare directly
-                single_item => compare_equality(left, "=", single_item).to_boolean(),
+                // Use map_or to handle potential error from compare_equality
+                single_item => compare_equality(left, "=", single_item).map_or(false, |r| r.to_boolean()),
             };
 
             Ok(EvaluationResult::Boolean(is_in))
@@ -3378,9 +3329,10 @@ fn check_membership(
                 // Wrap result in Ok
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
+                    // Use map_or to handle potential error from compare_equality
                     let contains = items
                         .iter()
-                        .any(|item| compare_equality(item, "=", right).to_boolean());
+                        .any(|item| compare_equality(item, "=", right).map_or(false, |r| r.to_boolean()));
                     EvaluationResult::Boolean(contains)
                 }
                 // For strings, check if the string contains the substring
@@ -3397,8 +3349,9 @@ fn check_membership(
                     }
                 },
                 // Treat single non-empty item as collection of one
+                // Use map_or to handle potential error from compare_equality
                 single_item => EvaluationResult::Boolean(
-                    compare_equality(single_item, "=", right).to_boolean(),
+                    compare_equality(single_item, "=", right).map_or(false, |r| r.to_boolean()),
                 ),
             })
         }
