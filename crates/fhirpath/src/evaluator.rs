@@ -2067,7 +2067,7 @@ fn call_function(
                             value_parses && unit_is_valid
                         }
                         // 0 or >2 parts are not convertible
-                        false
+                        _ => false, // Add default arm
                     }
                 }), // Close the EvaluationResult::Boolean wrapper
                 _ => EvaluationResult::Boolean(false),
@@ -2524,7 +2524,7 @@ fn call_function(
 
 /// Checks if a string is a valid FHIRPath quantity unit (UCUM or time-based).
 /// Note: This is a simplified check. A full UCUM validator is complex.
-fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
+fn is_valid_fhirpath_quantity_unit(_unit: &str) -> bool { // Prefix unit with underscore
     // For now, assume any non-empty string without whitespace that doesn't start with a digit
     // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
     // A real implementation would need a proper UCUM validator.
