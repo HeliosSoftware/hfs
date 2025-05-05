@@ -236,8 +236,8 @@ pub fn evaluate(
                 )));
             }
              if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                 return Err(EvaluationError::TypeError(format!(
-                    "Invalid type for '{}' right operand: {}", op, right_bool.type_name()
+                 return Err(EvaluationError::TypeError(format!( // Should be unreachable
+                    "Invalid type for '{}' right operand after conversion: {}", op, right_bool.type_name()
                 )));
             }
 
