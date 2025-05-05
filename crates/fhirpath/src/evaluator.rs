@@ -3190,10 +3190,10 @@ fn compare_equality(
         "=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
             if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-                return EvaluationResult::Empty;
+                return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
             // Strict equality: Order and duplicates matter for collections
-            match (left, right) {
+            Ok(match (left, right) { // Wrap result in Ok
                 (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
                     if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
@@ -3240,7 +3240,7 @@ fn compare_equality(
                 }
                 // Any other combination is false (incompatible types)
                 _ => EvaluationResult::Boolean(false),
-            }) // Close the Ok() wrapper for the '=' match
+            }) // This parenthesis now correctly closes the Ok() started above
         }
         "!=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
