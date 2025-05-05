@@ -2055,7 +2055,7 @@ fn call_function(
                     match parts.len() {
                         1 => {
                             // Single part: Must be parseable as a number (int or decimal)
-                            // 'invalid' should fail here.
+                            // 'invalid' should fail here because parse returns Err.
                             parts[0].parse::<Decimal>().is_ok()
                         }
                         2 => {
@@ -2067,9 +2067,10 @@ fn call_function(
                             value_parses && unit_is_valid
                         }
                         // 0 or >2 parts are not convertible
-                        _ => false, // Add default arm
+                        _ => false,
                     }
                 }), // Close the EvaluationResult::Boolean wrapper
+                // Other types are not convertible
                 _ => EvaluationResult::Boolean(false),
             })
         }
@@ -2524,11 +2525,39 @@ fn call_function(
 
 /// Checks if a string is a valid FHIRPath quantity unit (UCUM or time-based).
 /// Note: This is a simplified check. A full UCUM validator is complex.
-fn is_valid_fhirpath_quantity_unit(_unit: &str) -> bool { // Prefix unit with underscore
-    // For now, assume any non-empty string without whitespace that doesn't start with a digit
-    // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
+fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool { // Remove underscore
+    // Allow known time-based units
+    const TIME_UNITS: &[&str] = &[
+        "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+    ];
+    if TIME_UNITS.contains(&unit) {
+        return true;
+    }
+
+    // Basic check for UCUM units (non-empty, no whitespace, doesn't start with digit unless '1')
+    // This is NOT a full UCUM validation.
+    if unit.is_empty() {
+        return false; // Empty string is not a valid unit
+    }
+    // Check for whitespace
+    if unit.chars().any(|c| c.is_whitespace()) {
+        return false; // UCUM units generally don't contain whitespace
+    }
+    // Allow '1' as the default unit.
+    if unit == "1" {
+        return true;
+    }
+    // Check if it starts with a digit (generally not allowed after checking '1')
+    if unit.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // For now, assume other non-empty strings without whitespace that don't start with a digit
+    // are potentially valid UCUM units for parsing purposes.
     // A real implementation would need a proper UCUM validator.
-    true // Revert to the more permissive check for now
+    // Let's make this slightly stricter: disallow common punctuation that's unlikely in simple UCUM
+    !unit.contains(|c: char| !c.is_ascii_alphanumeric() && !"[]{}/.%".contains(c))
 }
 
 /// Evaluates an indexer expression
