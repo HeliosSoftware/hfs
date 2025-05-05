@@ -1,4 +1,4 @@
-- resourceType needs assistance
+- FHIRPath - test against test files
 - Test to see if invalid attributes are allowed/disallowed?
 - R6 tests need help - Integer64 issues in comparison because we download them each time, so might need an exclusion list for R6
 - Search for SLM TODO - need to change the others I think

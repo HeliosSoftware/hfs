@@ -19,4 +19,5 @@ chrono = { version = "0.4", features = ["serde"] } # For date/time parsing and f
 rust_decimal = { version = "1.35", features = ["serde-with-float", "macros"] }
 rust_decimal_macros = "1.35"
 regex = "1" # For string matches/replaceMatches functions
+serde_json = "1.0"
 

@@ -6,3 +6,5 @@ yarn.lock
 crates/fhir_gen/resources/R6
 crates/fhir/tests/data/R6
 .idea
+
+**/.claude/settings.local.json

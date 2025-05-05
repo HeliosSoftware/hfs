@@ -1,12 +1,9 @@
 use chumsky::Parser;
-// Removed duplicate Parser import
-// use chumsky::Parser; // Removed duplicate
 use fhir::FhirResource;
 use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
 use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
 use fhirpath_support::{EvaluationError, EvaluationResult};
-// use rust_decimal::Decimal; // Removed unused import
 use rust_decimal_macros::dec;
 
 // Helper function to parse and evaluate
@@ -3401,7 +3398,10 @@ fn test_operator_math_div() {
     assert!(eval("5 div 2.1", &context).is_err()); // Mixed types still error
     // Divide by zero -> Empty
     assert_eq!(eval("5 div 0", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("5.0 div 0.0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("5.0 div 0.0", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     // Empty propagation
     assert_eq!(eval("5 div {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} div 2", &context).unwrap(), EvaluationResult::Empty);
@@ -3437,7 +3437,10 @@ fn test_operator_math_mod() {
     assert!(eval("5 mod 2.1", &context).is_err()); // Mixed types still error
     // Modulo zero -> Empty
     assert_eq!(eval("5 mod 0", &context).unwrap(), EvaluationResult::Empty);
-    assert_eq!(eval("5.0 mod 0.0", &context).unwrap(), EvaluationResult::Empty);
+    assert_eq!(
+        eval("5.0 mod 0.0", &context).unwrap(),
+        EvaluationResult::Empty
+    );
     // Empty propagation
     assert_eq!(eval("5 mod {}", &context).unwrap(), EvaluationResult::Empty);
     assert_eq!(eval("{} mod 2", &context).unwrap(), EvaluationResult::Empty);
