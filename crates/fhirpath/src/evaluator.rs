@@ -1727,7 +1727,8 @@ fn call_function(
                 | EvaluationResult::Decimal(_)
                 | EvaluationResult::Date(_)
                 | EvaluationResult::DateTime(_)
-                | EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
+                | EvaluationResult::Time(_)
+                | EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Add Quantity case
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
                 // Add cases for Empty and Collection to satisfy exhaustiveness check
