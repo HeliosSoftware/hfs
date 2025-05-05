@@ -189,12 +189,12 @@ pub fn evaluate(
                 EvaluationResult::Boolean(true) => {
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
-                    let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
-                    // Check if right_bool is actually Boolean or Empty
-                    if matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                         Ok(right_bool) // true and X -> X (where X is Boolean or Empty)
+                    let right_bool_result = right_eval.to_boolean_for_logic()?; // Propagate error
+                    // Check if right_bool_result is actually Boolean or Empty
+                    if matches!(right_bool_result, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+                         Ok(right_bool_result) // true and X -> X (where X is Boolean or Empty)
                     } else {
-                         Err(EvaluationError::TypeError(format!(
+                         Err(EvaluationError::TypeError(format!( // Should be unreachable if type check is correct
                             "Invalid type for 'and' right operand: {}", right_bool.type_name()
                         )))
                     }
@@ -226,11 +226,14 @@ pub fn evaluate(
             }
 
             // Convert to boolean for logic AFTER type check
-            let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
+            let _left_bool = left_eval.to_boolean_for_logic()?; // Propagate error (prefix to silence warning)
             let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
 
+            // Re-evaluate left_bool for the match to ensure it's used correctly
+            let left_bool_match = left_eval.to_boolean_for_logic()?;
+
             // Ensure both operands resolved to Boolean or Empty (redundant after above check, but safe)
-            if !matches!(left_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+            if !matches!(left_bool_match, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
                  return Err(EvaluationError::TypeError(format!( // Should be unreachable
                     "Invalid type for '{}' left operand after conversion: {}", op, left_bool.type_name()
                 )));
@@ -243,7 +246,8 @@ pub fn evaluate(
 
 
             if op == "or" {
-                match (&left_bool, &right_bool) {
+                // Use the re-evaluated left_bool_match here
+                match (&left_bool_match, &right_bool) {
                     (EvaluationResult::Boolean(true), _) | (_, EvaluationResult::Boolean(true)) => {
                         Ok(EvaluationResult::Boolean(true))
                     }
@@ -263,7 +267,8 @@ pub fn evaluate(
                     _ => unreachable!("Invalid types should have been caught earlier for 'or'"),
                 }
             } else { // xor
-                match (&left_bool, &right_bool) {
+                 // Use the re-evaluated left_bool_match here
+                match (&left_bool_match, &right_bool) {
                     (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                         Ok(EvaluationResult::Empty)
                     }
@@ -280,10 +285,11 @@ pub fn evaluate(
             let left_eval = evaluate(left, context, current_item)?;
             let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
 
-             // Ensure left operand resolved to Boolean or Empty
-            if !matches!(left_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+            // Check type *before* logical conversion
+            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
                  return Err(EvaluationError::TypeError(format!(
-                    "Invalid type for 'implies' left operand: {}", left_bool.type_name()
+                    "Operator 'implies' requires Boolean left operand, found {}",
+                    left_eval.type_name()
                 )));
             }
 
