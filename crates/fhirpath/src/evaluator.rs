@@ -591,11 +591,11 @@ fn evaluate_exists_with_criteria(
     for item in items_to_check {
         // Evaluate the criteria expression with the current item as $this, propagate error
         let criteria_result = evaluate(criteria_expr, context, Some(&item))?;
-       // exists returns true if the criteria evaluates to true for *any* item
-       if criteria_result.to_boolean() {
-           return Ok(EvaluationResult::Boolean(true));
-       }
-   }
+        // exists returns true if the criteria evaluates to true for *any* item
+        if criteria_result.to_boolean() {
+            return Ok(EvaluationResult::Boolean(true)); // Ensure this return is Ok()
+        }
+    }
 
     // If no item satisfied the criteria
     Ok(EvaluationResult::Boolean(false)) // This was likely the source of E0308 at 422
