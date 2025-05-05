@@ -20,7 +20,7 @@ pub enum Literal {
     Date(String),
     DateTime(String, Option<(String, Option<String>)>),
     Time(String),
-    Quantity(Decimal, Option<Unit>), // Changed from f64 to Decimal
+    Quantity(Decimal, String), // Store unit as String
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,46 +64,7 @@ pub enum Invocation {
     Total,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Unit {
-    DateTimePrecision(DateTimePrecision),
-    PluralDateTimePrecision(PluralDateTimePrecision),
-    UCUM(String),
-}
-
-impl fmt::Display for Unit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Unit::DateTimePrecision(p) => write!(f, "{:?}", p).map(|_| ()),
-            Unit::PluralDateTimePrecision(p) => write!(f, "{:?}", p).map(|_| ()),
-            Unit::UCUM(s) => write!(f, "{}", s),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DateTimePrecision {
-    Year,
-    Month,
-    Week,
-    Day,
-    Hour,
-    Minute,
-    Second,
-    Millisecond,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PluralDateTimePrecision {
-    Years,
-    Months,
-    Weeks,
-    Days,
-    Hours,
-    Minutes,
-    Seconds,
-    Milliseconds,
-}
+// Removed Unit, DateTimePrecision, PluralDateTimePrecision enums
 
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -125,8 +86,7 @@ impl fmt::Display for Literal {
                 Ok(())
             }
             Literal::Time(t) => write!(f, "@T{}", t),
-            Literal::Quantity(d, Some(u)) => write!(f, "{} '{}'", d, u), // Use Decimal's Display
-            Literal::Quantity(d, None) => write!(f, "{}", d), // Use Decimal's Display
+            Literal::Quantity(d, u) => write!(f, "{} '{}'", d, u), // Use Decimal's Display and unit string
         }
     }
 }
@@ -349,44 +309,28 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         })
         .boxed();
 
-    // Date time precision units
-    let date_time_precision = choice((
-        text::keyword("year").to(DateTimePrecision::Year),
-        text::keyword("month").to(DateTimePrecision::Month),
-        text::keyword("week").to(DateTimePrecision::Week),
-        text::keyword("day").to(DateTimePrecision::Day),
-        text::keyword("hour").to(DateTimePrecision::Hour),
-        text::keyword("minute").to(DateTimePrecision::Minute),
-        text::keyword("second").to(DateTimePrecision::Second),
-        text::keyword("millisecond").to(DateTimePrecision::Millisecond),
-    ));
+    // Unit parser - now parses keywords or a string literal directly into a String
+    let unit_keyword = choice((
+        text::keyword("year"), text::keyword("month"), text::keyword("week"), text::keyword("day"),
+        text::keyword("hour"), text::keyword("minute"), text::keyword("second"), text::keyword("millisecond"),
+        text::keyword("years"), text::keyword("months"), text::keyword("weeks"), text::keyword("days"),
+        text::keyword("hours"), text::keyword("minutes"), text::keyword("seconds"), text::keyword("milliseconds"),
+    )).map(|s| s.to_string()); // Convert keyword &str to String
 
-    // Plural date time precision units
-    let plural_date_time_precision = choice((
-        text::keyword("years").to(PluralDateTimePrecision::Years),
-        text::keyword("months").to(PluralDateTimePrecision::Months),
-        text::keyword("weeks").to(PluralDateTimePrecision::Weeks),
-        text::keyword("days").to(PluralDateTimePrecision::Days),
-        text::keyword("hours").to(PluralDateTimePrecision::Hours),
-        text::keyword("minutes").to(PluralDateTimePrecision::Minutes),
-        text::keyword("seconds").to(PluralDateTimePrecision::Seconds),
-        text::keyword("milliseconds").to(PluralDateTimePrecision::Milliseconds),
-    ));
+    let unit_string_literal = just('\'')
+        .ignore_then(
+            none_of("\\\'")
+                .or(esc.clone()) // Use the existing escape parser
+                .repeated()
+                .collect::<String>(),
+        )
+        .then_ignore(just('\''));
 
-    // Unit parser - can be a date time precision, plural date time precision, or a string (UCUM syntax)
     let unit = choice((
-        date_time_precision.map(Unit::DateTimePrecision),
-        plural_date_time_precision.map(Unit::PluralDateTimePrecision),
-        string.clone().map(|s| {
-            if let Literal::String(str_val) = s {
-                Unit::UCUM(str_val)
-            } else {
-                // This shouldn't happen due to the parser structure
-                Unit::UCUM("".to_string())
-            }
-        }),
-    ))
-    .padded(); // Unit parser itself can be padded
+        unit_keyword,
+        unit_string_literal,
+    )).padded(); // Unit parser itself can be padded
+
 
     // Define integer/number parsers specifically for quantity, without consuming trailing whitespace.
     let integer_for_quantity = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
@@ -413,17 +357,15 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let quantity = choice((
             // Try integer quantity first
             integer_for_quantity
-                .then_ignore(text::whitespace().at_least(1))
-                .then(unit.clone())
-                .map(|(i, u)| Literal::Quantity(Decimal::from(i), Some(u))),
+                .then_ignore(text::whitespace().at_least(1)) // Require whitespace
+                .then(unit.clone()) // Parse the unit string
+                .map(|(i, u_str)| Literal::Quantity(Decimal::from(i), u_str)), // Create Literal::Quantity with Decimal and String unit
             // Then try decimal quantity
             number_for_quantity
-                .then_ignore(text::whitespace().at_least(1))
-                .then(unit.clone())
-                .map(|(d, u)| Literal::Quantity(d, Some(u))),
+                .then_ignore(text::whitespace().at_least(1)) // Require whitespace
+                .then(unit.clone()) // Parse the unit string
+                .map(|(d, u_str)| Literal::Quantity(d, u_str)), // Create Literal::Quantity with Decimal and String unit
         ));
-        // Note: No .map() or match needed here as the inner maps handle Literal creation.
-        // The outer choice directly produces Literal::Quantity or fails.
 
 
     // Removed unused emit_error helper function
@@ -737,6 +679,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
         // The final expression parser is the one with the lowest precedence
         implies
-    })
-    .then_ignore(end())
+    };
+    // Add tracing for expression evaluation end
+    // eprintln!("Result for expr {:?}: {:?}", expr, result);
+    result // Return the result
 }

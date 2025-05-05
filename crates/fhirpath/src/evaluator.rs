@@ -63,7 +63,8 @@ fn apply_decimal_multiplicative(
     right: Decimal,
 ) -> Result<EvaluationResult, EvaluationError> {
     if right.is_zero() {
-        return Err(EvaluationError::DivisionByZero); // Return error
+        // Spec: Division by zero returns empty
+        return Ok(EvaluationResult::Empty);
     }
     match op {
         "div" => {
@@ -92,7 +93,9 @@ pub fn evaluate(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
-    match expr {
+    // Add tracing for expression evaluation start
+    // eprintln!("Evaluating expr: {:?}", expr);
+    let result = match expr {
         Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left, invocation) => {
             // Evaluate the left side first, passing the current item context
@@ -335,7 +338,10 @@ pub fn evaluate(
             // Return Ok(Empty) as it's not an error, just not evaluated yet.
             Ok(EvaluationResult::Empty)
         }
-    }
+    };
+    // Add tracing for invocation end
+    // eprintln!("Result for invocation {:?}: {:?}", invocation, result);
+    result // Return the result
 }
 
 /// Normalizes a vector of results according to FHIRPath singleton evaluation rules.
@@ -356,7 +362,9 @@ fn evaluate_term(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
-    match term {
+    // Add tracing for term evaluation start
+    // eprintln!("Evaluating term: {:?} with current_item: {:?}", term, current_item);
+    let result = match term {
         Term::Invocation(invocation) => {
             // Explicitly handle $this first and return
             if *invocation == Invocation::This {
@@ -462,7 +470,10 @@ fn evaluate_term(
             }
         }
         Term::Parenthesized(expr) => evaluate(expr, context, current_item), // Propagate Result
-    }
+    };
+    // Add tracing for term evaluation end
+    // eprintln!("Result for term {:?}: {:?}", term, result);
+    result // Return the result
 }
 
 /// Converts a FHIR resource to an EvaluationResult by calling the trait method directly.
@@ -504,19 +515,7 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
             }
         }
         Literal::Time(t) => EvaluationResult::Time(t.clone()),
-        Literal::Quantity(n, _) => {
-            // For now, we ignore the unit.
-            // Return Integer if the Decimal represents a whole number and fits in i64,
-            // otherwise return Decimal.
-            if n.is_integer() {
-                // Attempt to convert to i64 if it fits
-                n.to_i64()
-                    .map(EvaluationResult::Integer)
-                    .unwrap_or_else(|| EvaluationResult::Decimal(*n))
-            } else {
-                EvaluationResult::Decimal(*n)
-            }
-        }
+        Literal::Quantity(value, unit) => EvaluationResult::Quantity(*value, unit.clone()), // Create Quantity result
     }
 }
 
@@ -526,7 +525,9 @@ fn evaluate_invocation(
     invocation: &Invocation,
     context: &EvaluationContext, // The overall evaluation context (for variables etc.)
 ) -> Result<EvaluationResult, EvaluationError> {
-    match invocation {
+    // Add tracing for invocation start
+    // eprintln!("Evaluating invocation: {:?} on base: {:?}", invocation, invocation_base);
+    let result = match invocation {
         Invocation::Member(name) => {
             // Handle member access on the invocation_base
             // Special handling for boolean literals that might be parsed as identifiers
@@ -1121,8 +1122,15 @@ fn call_function(
                         .any(|item| compare_equality(item, "=", arg).map_or(false, |r| r.to_boolean()));
                     EvaluationResult::Boolean(contains)
                 }
-                // contains on single non-collection/non-string item
-                single_item => {
+                // Contains on single non-collection/non-string item
+                (single_item, _) => {
+                    // Check if types are compatible for contains (e.g., string requires string arg)
+                    if matches!(single_item, EvaluationResult::String(_)) && !matches!(arg, EvaluationResult::String(_)) {
+                         return Err(EvaluationError::TypeError(format!(
+                            "contains function on String requires String argument, found {}",
+                            arg.type_name()
+                        )));
+                    }
                     // Treat as single-item collection: check if the item equals the argument
                     // Use map_or to handle potential error from compare_equality
                     EvaluationResult::Boolean(compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()))
@@ -1228,6 +1236,8 @@ fn call_function(
                         .map(EvaluationResult::Decimal)
                         .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
                 }
+                // Quantity to Decimal (returns the value part) - Added
+                EvaluationResult::Quantity(val, _) => EvaluationResult::Decimal(*val),
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(), // This arm is unreachable due to the count check above
                 // Other types are not convertible
@@ -1255,6 +1265,14 @@ fn call_function(
                 }
                 // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
                 EvaluationResult::Decimal(_) => EvaluationResult::Empty,
+                // Quantity to Integer (returns value if integer, else empty) - Added
+                EvaluationResult::Quantity(val, _) => {
+                    if val.is_integer() {
+                        val.to_i64().map(EvaluationResult::Integer).unwrap_or(EvaluationResult::Empty)
+                    } else {
+                        EvaluationResult::Empty
+                    }
+                }
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
                 // Other types are not convertible
@@ -1735,7 +1753,7 @@ fn call_function(
                 // Collections handled by initial check
                 EvaluationResult::Collection(_) => unreachable!(),
                 // Convert single item to string
-                single_item => EvaluationResult::String(single_item.to_string_value()),
+                single_item => EvaluationResult::String(single_item.to_string_value()), // Uses updated to_string_value
             })
         }
         "toDate" => {
@@ -1975,17 +1993,18 @@ fn call_function(
                     EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
                 } // Convert to 1.0 or 0.0
                 EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)), // Convert to Decimal with '1' unit implicitly
-                EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d), // Convert to Decimal with '1' unit implicitly
+                EvaluationResult::Decimal(d) => EvaluationResult::Quantity(*d, "1".to_string()), // Convert to Quantity with '1' unit
+                EvaluationResult::Quantity(val, unit) => EvaluationResult::Quantity(*val, unit.clone()), // Quantity to Quantity
                 EvaluationResult::String(s) => {
                     // Attempt to parse as "value unit" or just "value"
                     let parts: Vec<&str> = s.split_whitespace().collect();
                     if parts.is_empty() {
                         EvaluationResult::Empty // Empty string cannot convert
                     } else if parts.len() == 1 {
-                        // Only a value part, try parsing it
+                        // Only a value part, try parsing it, assume unit '1'
                         parts[0]
                             .parse::<Decimal>()
-                            .map(EvaluationResult::Decimal)
+                            .map(|d| EvaluationResult::Quantity(d, "1".to_string()))
                             .unwrap_or(EvaluationResult::Empty)
                     } else if parts.len() == 2 {
                         // Value and unit parts
@@ -1993,9 +2012,10 @@ fn call_function(
                         let unit_part = parts[1];
                         // Try parsing the value part
                         if let Ok(decimal_value) = value_part.parse::<Decimal>() {
-                            // Check if the unit part is valid
-                            if is_valid_fhirpath_quantity_unit(unit_part) {
-                                EvaluationResult::Decimal(decimal_value)
+                            // Check if the unit part is valid (remove quotes if present)
+                            let unit_str = unit_part.trim_matches('\'');
+                            if is_valid_fhirpath_quantity_unit(unit_str) {
+                                EvaluationResult::Quantity(decimal_value, unit_str.to_string())
                             } else {
                                 EvaluationResult::Empty // Invalid unit
                             }
@@ -2029,6 +2049,7 @@ fn call_function(
                  EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Quantity is convertible
                 EvaluationResult::String(s) => EvaluationResult::Boolean({
                     // Wrap the entire block
                     // Check if the string represents a valid quantity format
@@ -2041,7 +2062,7 @@ fn call_function(
                     } else if parts.len() == 2 {
                         // Value and unit parts, check both
                         let value_parses = parts[0].parse::<Decimal>().is_ok();
-                        let unit_is_valid = is_valid_fhirpath_quantity_unit(parts[1]);
+                        let unit_is_valid = is_valid_fhirpath_quantity_unit(parts[1].trim_matches('\'')); // Check unit without quotes
                         value_parses && unit_is_valid
                     } else {
                         // More than two parts is invalid
@@ -2100,8 +2121,8 @@ fn call_function(
                     }
                 }
                 // Handle empty cases according to spec
-                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
-                (EvaluationResult::Empty, _) => EvaluationResult::Empty,
+                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty, // X.indexOf({}) -> {}
+                (EvaluationResult::Empty, _) => EvaluationResult::Empty, // {}.indexOf(X) -> {}
                 // Invalid types
                 _ => {
                     return Err(EvaluationError::TypeError(
@@ -2208,8 +2229,8 @@ fn call_function(
                     EvaluationResult::Boolean(s.starts_with(prefix))
                 }
                 // Handle empty cases
-                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
-                (EvaluationResult::Empty, _) => EvaluationResult::Empty,
+                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty, // X.startsWith({}) -> {}
+                (EvaluationResult::Empty, _) => EvaluationResult::Empty, // {}.startsWith(X) -> {}
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "startsWith requires String input and argument".to_string(),
@@ -2235,8 +2256,8 @@ fn call_function(
                     EvaluationResult::Boolean(s.ends_with(suffix))
                 }
                 // Handle empty cases
-                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
-                (EvaluationResult::Empty, _) => EvaluationResult::Empty,
+                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty, // X.endsWith({}) -> {}
+                (EvaluationResult::Empty, _) => EvaluationResult::Empty, // {}.endsWith(X) -> {}
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "endsWith requires String input and argument".to_string(),
@@ -2300,9 +2321,9 @@ fn call_function(
                     EvaluationResult::String(substitution),
                 ) => EvaluationResult::String(s.replace(pattern, substitution)),
                 // Handle empty cases
-                (EvaluationResult::Empty, _, _)
-                | (_, EvaluationResult::Empty, _)
-                | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
+                (EvaluationResult::Empty, _, _) => EvaluationResult::Empty, // {}.replace(P, S) -> {}
+                (_, EvaluationResult::Empty, _) => EvaluationResult::Empty, // S.replace({}, S) -> {}
+                (_, _, EvaluationResult::Empty) => EvaluationResult::Empty, // S.replace(P, {}) -> {}
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "replace requires String input and arguments".to_string(),
@@ -2331,8 +2352,8 @@ fn call_function(
                     }
                 }
                 // Handle empty cases
-                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty,
-                (EvaluationResult::Empty, _) => EvaluationResult::Empty,
+                (EvaluationResult::String(_), EvaluationResult::Empty) => EvaluationResult::Empty, // S.matches({}) -> {}
+                (EvaluationResult::Empty, _) => EvaluationResult::Empty, // {}.matches(R) -> {}
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "matches requires String input and argument".to_string(),
@@ -2367,9 +2388,9 @@ fn call_function(
                     }
                 }
                 // Handle empty cases
-                (EvaluationResult::Empty, _, _)
-                | (_, EvaluationResult::Empty, _)
-                | (_, _, EvaluationResult::Empty) => EvaluationResult::Empty,
+                (EvaluationResult::Empty, _, _) => EvaluationResult::Empty, // {}.replaceMatches(R, S) -> {}
+                (_, EvaluationResult::Empty, _) => EvaluationResult::Empty, // S.replaceMatches({}, S) -> {}
+                (_, _, EvaluationResult::Empty) => EvaluationResult::Empty, // S.replaceMatches(R, {}) -> {}
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "replaceMatches requires String input and arguments".to_string(),
@@ -2526,30 +2547,28 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
         return true;
     }
 
-    // Basic check for UCUM units (starts with non-digit, doesn't contain invalid chars like spaces after first char)
+    // Basic check for UCUM units (starts with non-digit, doesn't contain invalid chars like spaces)
     // This is NOT a full UCUM validation.
     if unit.is_empty() {
-        return false;
+        return false; // Empty string is not a valid unit
     }
-    let first_char = unit.chars().next().unwrap();
-    // UCUM units often start with letters or symbols like '{', '[', '(', etc.
-    // They generally don't start with digits.
-    if first_char.is_ascii_digit() {
-        return false;
+    // Check for whitespace
+    if unit.chars().any(|c| c.is_whitespace()) {
+        return false; // UCUM units generally don't contain whitespace
     }
-    // Check for invalid characters (e.g., whitespace within the unit)
-    if unit.chars().skip(1).any(|c| c.is_whitespace()) {
+    // Check if it starts with a digit (generally not allowed, though exceptions exist like '1')
+    // Allow '1' as the default unit.
+    if unit == "1" {
+        return true;
+    }
+    if unit.starts_with(|c: char| c.is_ascii_digit()) {
         return false;
     }
 
-    // Stricter check: Allow only alphanumeric, '.', '/', '{', '}', '[', ']', '(', ')', '%'
-    // This is still a simplification of full UCUM validation.
-    let is_potentially_ucum = unit.chars().all(|c| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '.' | '/' | '{' | '}' | '[' | ']' | '(' | ')' | '%')
-    });
-
-    is_potentially_ucum // Return true only if it's a time unit or passes the stricter UCUM check
+    // For now, assume any non-empty string without whitespace that doesn't start with a digit
+    // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
+    // A real implementation would need a proper UCUM validator.
+    true
 }
 
 /// Evaluates an indexer expression
@@ -2663,17 +2682,20 @@ fn apply_multiplicative(
             let left_dec = match left {
                 EvaluationResult::Decimal(d) => Some(*d),
                 EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+                EvaluationResult::Quantity(val, _) => Some(*val), // Extract value from Quantity
                 _ => None,
             };
             let right_dec = match right {
                 EvaluationResult::Decimal(d) => Some(*d),
                 EvaluationResult::Integer(i) => Some(Decimal::from(*i)),
+                EvaluationResult::Quantity(val, _) => Some(*val), // Extract value from Quantity
                 _ => None,
             };
 
             if let (Some(l), Some(r)) = (left_dec, right_dec) {
                 if r.is_zero() {
-                    Err(EvaluationError::DivisionByZero) // Return error
+                    // Spec: Division by zero returns empty
+                    Ok(EvaluationResult::Empty)
                 } else {
                     // Decimal division preserves precision
                     l.checked_div(r)
@@ -2729,7 +2751,8 @@ fn apply_integer_multiplicative(
     right: i64,
 ) -> Result<EvaluationResult, EvaluationError> {
     if right == 0 {
-        return Err(EvaluationError::DivisionByZero); // Return error
+        // Spec: Division by zero returns empty
+        return Ok(EvaluationResult::Empty);
     }
     match op {
         "div" => Ok(EvaluationResult::Integer(left / right)), // Integer division
@@ -2770,6 +2793,16 @@ fn apply_additive(
                 }
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Decimal(Decimal::from(*l) + *r)
+                }
+                // Quantity addition (requires same units) - Added
+                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                    if unit_l == unit_r {
+                        EvaluationResult::Quantity(*val_l + *val_r, unit_l.clone())
+                    } else {
+                        // Incompatible units for now, return empty
+                        // TODO: Implement UCUM conversion if needed
+                        EvaluationResult::Empty
+                    }
                 }
                 // Handle string concatenation with '+'
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
@@ -2876,7 +2909,17 @@ fn apply_additive(
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Decimal(Decimal::from(*l) - *r)
                 }
-                // Handle String - Number (attempt conversion, prioritize Integer result if possible)
+                 // Quantity subtraction (requires same units) - Added
+                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                    if unit_l == unit_r {
+                        EvaluationResult::Quantity(*val_l - *val_r, unit_l.clone())
+                    } else {
+                        // Incompatible units for now, return empty
+                        // TODO: Implement UCUM conversion if needed
+                        EvaluationResult::Empty
+                    }
+                }
+               // Handle String - Number (attempt conversion, prioritize Integer result if possible)
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
@@ -3158,6 +3201,18 @@ fn compare_inequality(
         (EvaluationResult::DateTime(l), EvaluationResult::DateTime(r)) => Some(l.cmp(r)),
         // Time comparison
         (EvaluationResult::Time(l), EvaluationResult::Time(r)) => Some(l.cmp(r)),
+        // Quantity comparison (only if units match)
+        (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+            if unit_l == unit_r {
+                Some(val_l.cmp(val_r))
+            } else {
+                // Incompatible units for comparison, return error
+                return Err(EvaluationError::TypeError(format!(
+                    "Cannot compare Quantities with different units: '{}' and '{}'",
+                    unit_l, unit_r
+                )));
+            }
+        }
         // Incomparable types - Return error instead of None/Empty
         _ => {
             return Err(EvaluationError::TypeError(format!(
@@ -3246,6 +3301,10 @@ fn compare_equality(
                 (EvaluationResult::Time(l), EvaluationResult::Time(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }
+                // Quantity equality (requires same units and equal values)
+                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                    EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
+                }
                 // Any other combination is an error for '='
                 _ => return Err(EvaluationError::TypeError(format!(
                         "Cannot compare {} and {} using '='",
@@ -3306,7 +3365,13 @@ fn compare_equality(
                 (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
                     EvaluationResult::Boolean(false)
                 }
-                // Primitive equivalence falls back to strict equality ('=')
+                // Quantity equivalence (requires same units and equivalent values)
+                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                    // For now, treat quantity equivalence same as equality
+                    EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
+                    // TODO: Implement proper UCUM equivalence if needed
+                }
+                // Primitive equivalence falls back to strict equality ('=') for other types
                 _ => compare_equality(left, "=", right)?, // Propagate error
             })
         }

@@ -20,6 +20,7 @@ pub enum EvaluationResult {
     Date(String),
     DateTime(String),
     Time(String),
+    Quantity(Decimal, String), // Added Quantity variant (value, unit)
     Collection(Vec<EvaluationResult>),
     Object(HashMap<String, EvaluationResult>),
 }
@@ -112,6 +113,17 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Time(_), _) => Ordering::Less,
             (_, EvaluationResult::Time(_)) => Ordering::Greater,
 
+            (EvaluationResult::Quantity(val_a, unit_a), EvaluationResult::Quantity(val_b, unit_b)) => {
+                // Order by value first, then by unit string
+                match val_a.cmp(val_b) {
+                    Ordering::Equal => unit_a.cmp(unit_b),
+                    other => other,
+                }
+            }
+            (EvaluationResult::Quantity(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Quantity(_, _)) => Ordering::Greater,
+
+
             (EvaluationResult::Collection(a), EvaluationResult::Collection(b)) => {
                 // Compare collections lexicographically after sorting them internally
                 // This ensures consistent ordering for sorting purposes, even if FHIRPath
@@ -173,9 +185,16 @@ impl Hash for EvaluationResult {
             EvaluationResult::Date(d) => d.hash(state),
             EvaluationResult::DateTime(dt) => dt.hash(state),
             EvaluationResult::Time(t) => t.hash(state),
+            EvaluationResult::Quantity(val, unit) => {
+                val.normalize().hash(state); // Hash normalized decimal value
+                unit.hash(state); // Hash the unit string
+            }
             EvaluationResult::Collection(items) => {
                 // Hash the length and potentially the elements (order matters for hash)
-                items.len().hash(state);
+                // Use sorted hash for collections to match Ord/PartialEq behavior for sets
+                let mut sorted_items = items.clone();
+                sorted_items.sort_unstable(); // Sort based on Ord impl
+                sorted_items.len().hash(state);
                 for item in items {
                     item.hash(state);
                 }
@@ -217,6 +236,7 @@ impl EvaluationResult {
             EvaluationResult::String(s) => !s.is_empty(),
             EvaluationResult::Decimal(d) => !d.is_zero(),
             EvaluationResult::Integer(i) => *i != 0,
+            EvaluationResult::Quantity(q, _) => !q.is_zero(), // Quantity is truthy if value is non-zero
             EvaluationResult::Collection(c) => !c.is_empty(),
             _ => true, // Other types (Date, DateTime, Time, Object) are considered truthy
         }
@@ -233,6 +253,7 @@ impl EvaluationResult {
             EvaluationResult::Date(d) => d.clone(), // Return stored string
             EvaluationResult::DateTime(dt) => dt.clone(), // Return stored string
             EvaluationResult::Time(t) => t.clone(), // Return stored string
+            EvaluationResult::Quantity(val, unit) => format!("{} '{}'", val, unit), // Format as "value 'unit'"
             EvaluationResult::Collection(c) => {
                 // toString on collection: Empty if 0 or >1 items, string of item if 1 item
                 if c.len() == 1 {
@@ -304,6 +325,7 @@ impl EvaluationResult {
             EvaluationResult::Date(_) => "Date",
             EvaluationResult::DateTime(_) => "DateTime",
             EvaluationResult::Time(_) => "Time",
+            EvaluationResult::Quantity(_, _) => "Quantity",
             EvaluationResult::Collection(_) => "Collection",
             EvaluationResult::Object(_) => "Object",
         }
