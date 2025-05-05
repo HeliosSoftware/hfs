@@ -76,7 +76,7 @@ Performance results go here...
     *   [ofType()](https://hl7.org/fhirpath/2025Jan/#oftypetype--type-specifier--collection): ✅ (Basic type check, no inheritance)
 *   [Subsetting](https://hl7.org/fhirpath/2025Jan/#subsetting)
     *   [Indexer `[]`](https://hl7.org/fhirpath/2025Jan/#-index--integer---collection): ✅
-    *   [single()](https://hl7.org/fhirpath/2025Jan/#single--collection): ✅ (Signals error via Empty)
+    *   [single()](https://hl7.org/fhirpath/2025Jan/#single--collection): ✅ (Signals error for multiple items)
     *   [first()](https://hl7.org/fhirpath/2025Jan/#first--collection): ✅
     *   [last()](https://hl7.org/fhirpath/2025Jan/#last--collection): ✅
     *   [tail()](https://hl7.org/fhirpath/2025Jan/#tail--collection): ✅
@@ -96,10 +96,10 @@ Performance results go here...
     *   [convertsToInteger()](https://hl7.org/fhirpath/2025Jan/#convertstointeger--boolean): ✅
     *   [toLong()](https://hl7.org/fhirpath/2025Jan/#tolong--long) (STU): ❌
     *   [convertsToLong()](https://hl7.org/fhirpath/2025Jan/#convertstolong--boolean) (STU): ❌
-    *   [toDate()](https://hl7.org/fhirpath/2025Jan/#todate--date): 🟡 (String to Date only)
-    *   [convertsToDate()](https://hl7.org/fhirpath/2025Jan/#convertstodate--boolean): 🟡 (String to Date only)
-    *   [toDateTime()](https://hl7.org/fhirpath/2025Jan/#todatetime--datetime): 🟡 (String to DateTime only)
-    *   [convertsToDateTime()](https://hl7.org/fhirpath/2025Jan/#convertstodatetime--boolean): 🟡 (String to DateTime only)
+    *   [toDate()](https://hl7.org/fhirpath/2025Jan/#todate--date): ✅ (Handles String/DateTime input)
+    *   [convertsToDate()](https://hl7.org/fhirpath/2025Jan/#convertstodate--boolean): ✅ (Handles String/DateTime input)
+    *   [toDateTime()](https://hl7.org/fhirpath/2025Jan/#todatetime--datetime): ✅ (Handles String/Date input)
+    *   [convertsToDateTime()](https://hl7.org/fhirpath/2025Jan/#convertstodatetime--boolean): ✅ (Handles String/Date input)
     *   [toDecimal()](https://hl7.org/fhirpath/2025Jan/#todecimal--decimal): ✅
     *   [convertsToDecimal()](https://hl7.org/fhirpath/2025Jan/#convertstodecimal--boolean): ✅
     *   [toQuantity()](https://hl7.org/fhirpath/2025Jan/#toquantityunit--string--quantity): 🟡 (Basic types, no unit conversion)
@@ -129,7 +129,7 @@ Performance results go here...
     *   [children()](https://hl7.org/fhirpath/2025Jan/#children--collection): ❌
     *   [descendants()](https://hl7.org/fhirpath/2025Jan/#descendants--collection): ❌
 *   [Utility Functions](https://hl7.org/fhirpath/2025Jan/#utility-functions)
-    *   [trace()](https://hl7.org/fhirpath/2025Jan/#tracename--string--projection-expression--collection): ✅ (Basic logging to stderr)
+    *   [trace()](https://hl7.org/fhirpath/2025Jan/#tracename--string--projection-expression--collection): ❌
     *   [now()](https://hl7.org/fhirpath/2025Jan/#now--datetime): ✅ (Uses local time, determinism TBD)
     *   [timeOfDay()](https://hl7.org/fhirpath/2025Jan/#timeofday--time): ✅ (Uses local time, determinism TBD)
     *   [today()](https://hl7.org/fhirpath/2025Jan/#today--date): ✅ (Uses local time, determinism TBD)
