@@ -4164,7 +4164,8 @@ fn test_comparison_operations() {
     // Specific checks for ~ and !~ with empty
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false) // Spec: X ~ {} -> false
+        EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
+        "Failed for input: 1 ~ {}" // Correct assertion message
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
