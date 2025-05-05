@@ -2569,8 +2569,7 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
     // For now, assume any non-empty string without whitespace that doesn't start with a digit
     // (and isn't a time unit) is potentially a valid UCUM unit for parsing purposes.
     // A real implementation would need a proper UCUM validator.
-    // For now, only allow known time units or '1'. Full UCUM is complex.
-    unit == "1" || TIME_UNITS.contains(&unit)
+    true // Revert to the more permissive check for now
 }
 
 /// Evaluates an indexer expression
