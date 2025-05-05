@@ -3202,7 +3202,7 @@ fn compare_equality(
                         let all_equal = l_items
                             .iter()
                             .zip(r_items.iter())
-                            .all(|(li, ri)| compare_equality(li, "=", ri).to_boolean());
+                            .all(|(li, ri)| compare_equality(li, "=", ri).map_or(false, |r| r.to_boolean())); // Handle potential error from recursive call
                         EvaluationResult::Boolean(all_equal)
                     }
                 }
@@ -3210,11 +3210,8 @@ fn compare_equality(
                 (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
                     EvaluationResult::Boolean(false)
                 }
-                // Primitive/Empty comparison
-                (EvaluationResult::Empty, EvaluationResult::Empty) => {
-                    EvaluationResult::Boolean(true)
-                }
-                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
+                // Primitive comparison (Empty case handled above)
+                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {

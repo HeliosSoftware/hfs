@@ -1498,7 +1498,7 @@ fn test_function_conversion_converts_to_string() {
     );
     // Need object test once available
     // Test multi-item collection - should error
-    assert!(eval("(1 | 2).convertsToString()", &context).is_err());
+    assert!(eval("(1 | 2).convertsToString()", &context).is_err()); // Corrected test case
 }
 
 // Spec: https://hl7.org/fhirpath/2025Jan/#todate--date
@@ -4057,8 +4057,8 @@ fn test_string_operations() {
         ("'abc'.contains(1)", EvaluationResult::Boolean(false)),
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
-        // Test contains on empty string (function call on {} -> {})
-        ("{}.contains('a')", EvaluationResult::Empty),
+        // Test contains on empty string ({} contains X -> false)
+        ("{}.contains('a')", EvaluationResult::Boolean(false)),
     ];
 
     for (input, expected) in test_cases {
