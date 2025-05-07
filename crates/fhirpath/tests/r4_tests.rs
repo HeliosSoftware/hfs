@@ -4,7 +4,6 @@ use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
 use roxmltree::{Document, Node};
-use rust_decimal_macros::dec;
 use serde_json;
 use std::fs::File;
 use std::io::Read;
@@ -136,14 +135,13 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
 #[test]
 fn test_truncate() {
     let context = EvaluationContext::new_empty();
-    
+
     // --- Success Cases for truncate() ---
     let truncate_cases = vec![
         // Integer inputs (should remain unchanged)
         ("5.truncate()", EvaluationResult::Integer(5)),
         ("0.truncate()", EvaluationResult::Integer(0)),
         ("(-5).truncate()", EvaluationResult::Integer(-5)),
-        
         // Decimal inputs with fractional parts
         ("5.5.truncate()", EvaluationResult::Integer(5)),
         ("5.9.truncate()", EvaluationResult::Integer(5)),
@@ -151,19 +149,21 @@ fn test_truncate() {
         ("(-5.9).truncate()", EvaluationResult::Integer(-5)),
         ("0.1.truncate()", EvaluationResult::Integer(0)),
         ("(-0.1).truncate()", EvaluationResult::Integer(0)),
-        
         // Large numbers that still fit in Integer
-        ("9223372036854775807.99.truncate()", EvaluationResult::Integer(9223372036854775807)), // max i64
-        
-        // Remove Quantity inputs for now due to parsing issues
+        (
+            "9223372036854775807.99.truncate()",
+            EvaluationResult::Integer(9223372036854775807),
+        ), // max i64
+
+           // Remove Quantity inputs for now due to parsing issues
     ];
-    
+
     // Error and edge cases
     let truncate_error_cases = vec![
         // Commenting these out temporarily to debug parsing issues
         // "'abc'.truncate()",      // Non-numeric input
         // "(1 | 2).truncate()",    // Collection input
-        "1.truncate(2)",         // Extra argument not allowed
+        "1.truncate(2)", // Extra argument not allowed
     ];
 
     // Run success cases
@@ -308,6 +308,7 @@ fn test_r4_test_suite() {
     let mut total_tests = 0;
     let mut passed_tests = 0;
     let mut skipped_tests = 0;
+    let mut failed_tests = 0; // Explicitly track failures
 
     // For each test group
     for (group_name, tests) in test_groups {
@@ -413,27 +414,36 @@ fn test_r4_test_suite() {
                     passed_tests += 1;
                 }
                 Err(e) => {
-                    // Check if error is due to unimplemented function or other expected issues
-                    if e.contains("TypeError")
+                    // Now we're treating implementation issues as failures
+                    if e.contains("Unsupported function called") {
+                        // Only these specific errors remain as skipped
+                        println!(
+                            "  SKIP: {} - '{}' - {}",
+                            test.name, test.expression, e
+                        );
+                        skipped_tests += 1;
+                    } else if e.contains("TypeError")
                         || e.contains("Empty")
                         || e.contains("doesn't match")
                         || e.contains("Boolean result")
                     {
+                        // These are implementation issues that should fail the tests
                         println!(
                             "  NOT IMPLEMENTED: {} - '{}' - {}",
                             test.name, test.expression, e
                         );
-                        skipped_tests += 1; // Count as skipped, not failed
+                        failed_tests += 1; // Count as failed, not skipped
                     } else {
                         println!("  FAIL: {} - '{}' - {}", test.name, test.expression, e);
+                        failed_tests += 1;
                     }
                 }
             }
         }
     }
 
-    // Count the actual failures
-    let failed_tests = total_tests - passed_tests - skipped_tests;
+    // failed_tests is now incremented directly in the code
+    // No need to calculate it here
 
     println!("\nTest Summary:");
     println!("  Total tests: {}", total_tests);
@@ -441,23 +451,21 @@ fn test_r4_test_suite() {
     println!("  Skipped/Not Implemented: {}", skipped_tests);
     println!("  Failed: {}", failed_tests);
 
-    // Print detailed debug info if there are failures
+    // Print detailed info about failures
     if failed_tests > 0 {
-        println!("\nWARNING: Some tests failed, but not because of unimplemented features.");
-        println!("This is expected while the FHIRPath evaluator is still being developed.");
-        println!("As the implementation matures, these failures should be addressed.");
+        println!("\nERROR: Some tests failed due to unimplemented features or bugs.");
+        println!("These failures must be addressed for a complete FHIRPath implementation.");
+        println!("See the 'NOT IMPLEMENTED' tests above for details on what needs to be fixed.");
     }
 
-    // Don't fail the test for now - we're just tracking progress
-    // assert_eq!(
-    //     failed_tests, 0,
-    //     "Some tests failed, but not because of unimplemented features"
-    // );
+    // Now we're enforcing that all tests pass or are explicitly skipped
+    // A test is only skipped if it uses a feature that's explicitly marked as not required
+    assert_eq!(
+        failed_tests, 0,
+        "Some tests failed - {} unimplemented features need to be addressed", failed_tests
+    );
 
-    // In a complete implementation, we would assert that all tests pass
-    // assert_eq!(passed_tests, total_tests - skipped_tests, "Some tests failed");
-
-    // For now, we'll just make sure we found some tests
+    // Make sure we found some tests
     assert!(total_tests > 0, "No tests found");
 }
 

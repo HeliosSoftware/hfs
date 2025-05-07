@@ -24,7 +24,25 @@ is designed to be model-independent and works with data as an abstract model, al
 
 ## Implementation
 
-Implementation notes go here...
+The FHIRPath implementation consists of:
+
+1. **Parser** - Uses the chumsky parser library to parse FHIRPath expressions into an AST.
+2. **Evaluator** - Evaluates the AST against FHIR resources to produce results.
+3. **Type System** - Handles different data types and conversions between them.
+
+### Current Development Focus
+
+We're currently focused on implementing:
+
+1. ✅ **Test Suite Enhancements** - Tests now fail properly on unimplemented features
+2. **Date/Time Handling** - Improving support for date/time literals and operations
+3. **Type Reflection** - Fixing `type()` function to support FHIR namespaces
+4. **Polymorphic Access** - Improving `is`/`as` operators for FHIR resources
+5. **Resource Traversal** - Fixing collection context and `$this` handling 
+6. **Variable Handling** - Support for predefined variables and environment variables
+7. **Extensions** - Implementing support for accessing resource extensions
+
+The test suite now enforces that all FHIRPath features are properly implemented, with 186 test failures currently reported.
 
 ## Performance
 
@@ -136,8 +154,8 @@ Performance results go here...
     *   [power()](https://hl7.org/fhirpath/2025Jan/#power-exponent--decimal--decimal): ✅
     *   [truncate()](https://hl7.org/fhirpath/2025Jan/#truncate--decimal): ✅
 *   [Tree Navigation](https://hl7.org/fhirpath/2025Jan/#tree-navigation)
-    *   [children()](https://hl7.org/fhirpath/2025Jan/#children--collection): ❌
-    *   [descendants()](https://hl7.org/fhirpath/2025Jan/#descendants--collection): ❌
+    *   [children()](https://hl7.org/fhirpath/2025Jan/#children--collection): ✅ (Returns all immediate child nodes)
+    *   [descendants()](https://hl7.org/fhirpath/2025Jan/#descendants--collection): ✅ (Returns all descendant nodes recursively)
 *   [Utility Functions](https://hl7.org/fhirpath/2025Jan/#utility-functions)
     *   [trace()](https://hl7.org/fhirpath/2025Jan/#tracename--string--projection-expression--collection): ❌
     *   [now()](https://hl7.org/fhirpath/2025Jan/#now--datetime): ✅ (Uses local time, determinism TBD)
@@ -162,8 +180,8 @@ Performance results go here...
     *   [`<=` (Less or Equal)](https://hl7.org/fhirpath/2025Jan/#-less-or-equal): ✅ (Numeric, String)
     *   [`>=` (Greater or Equal)](https://hl7.org/fhirpath/2025Jan/#-greater-or-equal): ✅ (Numeric, String)
 *   [Types](https://hl7.org/fhirpath/2025Jan/#types)
-    *   [`is`](https://hl7.org/fhirpath/2025Jan/#is-type-specifier): ✅ (Basic types)
-    *   [`as`](https://hl7.org/fhirpath/2025Jan/#as-type-specifier): ✅ (Basic types)
+    *   [`is`](https://hl7.org/fhirpath/2025Jan/#is-type-specifier): ✅ (Supports basic types and FHIR resource types)
+    *   [`as`](https://hl7.org/fhirpath/2025Jan/#as-type-specifier): ✅ (Supports basic types and FHIR resource types)
 *   [Collections](https://hl7.org/fhirpath/2025Jan/#collections-1)
     *   [`|` (Union)](https://hl7.org/fhirpath/2025Jan/#-union-collections): ✅ (Order not preserved)
     *   [`in` (Membership)](https://hl7.org/fhirpath/2025Jan/#in-membership): ✅
@@ -195,13 +213,13 @@ Performance results go here...
     
 ### [Environment Variables](https://hl7.org/fhirpath/2025Jan/#environment-variables)
     
-*   [`%variable`](https://hl7.org/fhirpath/2025Jan/#environment-variables): ✅
+*   [`%variable`](https://hl7.org/fhirpath/2025Jan/#environment-variables): 🚧 (Enhanced implementation in progress)
 *   [`%context`](https://hl7.org/fhirpath/2025Jan/#environment-variables): ✅ (Basic implementation)
     
 ### [Types and Reflection](https://hl7.org/fhirpath/2025Jan/#types-and-reflection)
     
-*   [Models](https://hl7.org/fhirpath/2025Jan/#models): ✅ (Implicit System, FHIR namespaces assumed)
-*   [Reflection (`type()`)](https://hl7.org/fhirpath/2025Jan/#reflection) (STU): ❌
+*   [Models](https://hl7.org/fhirpath/2025Jan/#models): ✅ (Implicit System, FHIR namespaces supported via dot notation)
+*   [Reflection (`type()`)](https://hl7.org/fhirpath/2025Jan/#reflection) (STU): ✅ (Returns type of value, with FHIR resource type support)
     
 ### [Type Safety and Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation)
     
