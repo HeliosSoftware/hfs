@@ -4,7 +4,7 @@ use fhir::FhirResource;
 use fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult}; // Import EvaluationError
 use regex::Regex;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use std::collections::{HashMap, HashSet};
 
 /// Context for evaluating FHIRPath expressions
@@ -157,13 +157,21 @@ pub fn evaluate(
             let right_eval = evaluate(right, context, current_item)?;
 
             // Check types *before* logical conversion
-            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) ||
-               !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+            if !matches!(
+                left_eval,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) || !matches!(
+                right_eval,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) {
                 // Allow Empty for 3-valued logic, but reject other types
-                if !matches!(left_eval, EvaluationResult::Empty) && !matches!(right_eval, EvaluationResult::Empty) {
-                     return Err(EvaluationError::TypeError(format!(
+                if !matches!(left_eval, EvaluationResult::Empty)
+                    && !matches!(right_eval, EvaluationResult::Empty)
+                {
+                    return Err(EvaluationError::TypeError(format!(
                         "Operator 'and' requires Boolean operands, found {} and {}",
-                        left_eval.type_name(), right_eval.type_name()
+                        left_eval.type_name(),
+                        right_eval.type_name()
                     )));
                 }
             }
@@ -171,7 +179,6 @@ pub fn evaluate(
             // Convert to boolean for logic AFTER type check
             let left_bool = left_eval.to_boolean_for_logic()?;
             let right_bool = right_eval.to_boolean_for_logic()?;
-
 
             match left_bool {
                 EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(false)), // false and X -> false
@@ -184,7 +191,8 @@ pub fn evaluate(
                     // {} and true -> {}
                     // {} and {} -> {}
                     // So we only need to check if right_eval converted to false
-                    match right_eval.to_boolean_for_logic()? { // Re-evaluate for the match
+                    match right_eval.to_boolean_for_logic()? {
+                        // Re-evaluate for the match
                         EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(false)), // {} and false -> false
                         _ => Ok(EvaluationResult::Empty), // {} and (true | {}) -> {}
                     }
@@ -194,17 +202,23 @@ pub fn evaluate(
                     let right_eval = evaluate(right, context, current_item)?;
                     let right_bool_result = right_eval.to_boolean_for_logic()?; // Propagate error
                     // Check if right_bool_result is actually Boolean or Empty
-                    if matches!(right_bool_result, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                         Ok(right_bool_result) // true and X -> X (where X is Boolean or Empty)
+                    if matches!(
+                        right_bool_result,
+                        EvaluationResult::Boolean(_) | EvaluationResult::Empty
+                    ) {
+                        Ok(right_bool_result) // true and X -> X (where X is Boolean or Empty)
                     } else {
-                         Err(EvaluationError::TypeError(format!( // Should be unreachable if type check is correct
-                            "Invalid type for 'and' right operand: {}", right_bool.type_name()
+                        Err(EvaluationError::TypeError(format!(
+                            // Should be unreachable if type check is correct
+                            "Invalid type for 'and' right operand: {}",
+                            right_bool.type_name()
                         )))
                     }
                 }
-                 // This case should be unreachable if to_boolean_for_logic works correctly
+                // This case should be unreachable if to_boolean_for_logic works correctly
                 _ => Err(EvaluationError::TypeError(format!(
-                    "Invalid type for 'and' left operand: {}", left_bool.type_name()
+                    "Invalid type for 'and' left operand: {}",
+                    left_bool.type_name()
                 ))),
             }
         }
@@ -217,13 +231,22 @@ pub fn evaluate(
             let right_eval = evaluate(right, context, current_item)?;
 
             // Check types *before* logical conversion
-            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) ||
-               !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
+            if !matches!(
+                left_eval,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) || !matches!(
+                right_eval,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) {
                 // Allow Empty for 3-valued logic, but reject other types
-                if !matches!(left_eval, EvaluationResult::Empty) && !matches!(right_eval, EvaluationResult::Empty) {
-                     return Err(EvaluationError::TypeError(format!(
+                if !matches!(left_eval, EvaluationResult::Empty)
+                    && !matches!(right_eval, EvaluationResult::Empty)
+                {
+                    return Err(EvaluationError::TypeError(format!(
                         "Operator '{}' requires Boolean operands, found {} and {}",
-                        op, left_eval.type_name(), right_eval.type_name()
+                        op,
+                        left_eval.type_name(),
+                        right_eval.type_name()
                     )));
                 }
             }
@@ -236,17 +259,28 @@ pub fn evaluate(
             let left_bool_match = left_eval.to_boolean_for_logic()?;
 
             // Ensure both operands resolved to Boolean or Empty (redundant after above check, but safe)
-            if !matches!(left_bool_match, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                 return Err(EvaluationError::TypeError(format!( // Should be unreachable
-                    "Invalid type for '{}' left operand after conversion: {}", op, left_bool.type_name()
+            if !matches!(
+                left_bool_match,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) {
+                return Err(EvaluationError::TypeError(format!(
+                    // Should be unreachable
+                    "Invalid type for '{}' left operand after conversion: {}",
+                    op,
+                    left_bool.type_name()
                 )));
             }
-             if !matches!(right_bool, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                 return Err(EvaluationError::TypeError(format!( // Should be unreachable
-                    "Invalid type for '{}' right operand after conversion: {}", op, right_bool.type_name()
+            if !matches!(
+                right_bool,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) {
+                return Err(EvaluationError::TypeError(format!(
+                    // Should be unreachable
+                    "Invalid type for '{}' right operand after conversion: {}",
+                    op,
+                    right_bool.type_name()
                 )));
             }
-
 
             if op == "or" {
                 // Use the re-evaluated left_bool_match here
@@ -266,11 +300,12 @@ pub fn evaluate(
                     (EvaluationResult::Boolean(false), EvaluationResult::Boolean(false)) => {
                         Ok(EvaluationResult::Boolean(false))
                     }
-                     // Cases involving Empty handled above, this should not be reached with invalid types
+                    // Cases involving Empty handled above, this should not be reached with invalid types
                     _ => unreachable!("Invalid types should have been caught earlier for 'or'"),
                 }
-            } else { // xor
-                 // Use the re-evaluated left_bool_match here
+            } else {
+                // xor
+                // Use the re-evaluated left_bool_match here
                 match (&left_bool_match, &right_bool) {
                     (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                         Ok(EvaluationResult::Empty)
@@ -278,7 +313,7 @@ pub fn evaluate(
                     (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                         Ok(EvaluationResult::Boolean(l != r))
                     }
-                     // Cases involving Empty handled above, this should not be reached with invalid types
+                    // Cases involving Empty handled above, this should not be reached with invalid types
                     _ => unreachable!("Invalid types should have been caught earlier for 'xor'"),
                 }
             }
@@ -289,13 +324,15 @@ pub fn evaluate(
             let left_bool = left_eval.to_boolean_for_logic()?; // Propagate error
 
             // Check type *before* logical conversion
-            if !matches!(left_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                 return Err(EvaluationError::TypeError(format!(
+            if !matches!(
+                left_eval,
+                EvaluationResult::Boolean(_) | EvaluationResult::Empty
+            ) {
+                return Err(EvaluationError::TypeError(format!(
                     "Operator 'implies' requires Boolean left operand, found {}",
                     left_eval.type_name()
                 )));
             }
-
 
             match left_bool {
                 EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(true)), // false implies X -> true
@@ -303,8 +340,11 @@ pub fn evaluate(
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
                     // Check type *before* logical conversion
-                    if !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                         return Err(EvaluationError::TypeError(format!(
+                    if !matches!(
+                        right_eval,
+                        EvaluationResult::Boolean(_) | EvaluationResult::Empty
+                    ) {
+                        return Err(EvaluationError::TypeError(format!(
                             "Operator 'implies' requires Boolean right operand when left is Empty, found {}",
                             right_eval.type_name()
                         )));
@@ -319,8 +359,11 @@ pub fn evaluate(
                     // Evaluate right, handle potential error
                     let right_eval = evaluate(right, context, current_item)?;
                     // Check type *before* logical conversion
-                    if !matches!(right_eval, EvaluationResult::Boolean(_) | EvaluationResult::Empty) {
-                         return Err(EvaluationError::TypeError(format!(
+                    if !matches!(
+                        right_eval,
+                        EvaluationResult::Boolean(_) | EvaluationResult::Empty
+                    ) {
+                        return Err(EvaluationError::TypeError(format!(
                             "Operator 'implies' requires Boolean right operand when left is True, found {}",
                             right_eval.type_name()
                         )));
@@ -328,8 +371,10 @@ pub fn evaluate(
                     let right_bool = right_eval.to_boolean_for_logic()?; // Propagate error
                     Ok(right_bool) // true implies X -> X (Boolean or Empty)
                 }
-                 // This case should be unreachable if to_boolean_for_logic works correctly
-                 _ => unreachable!("Invalid type for 'implies' left operand should have been caught"),
+                // This case should be unreachable if to_boolean_for_logic works correctly
+                _ => {
+                    unreachable!("Invalid type for 'implies' left operand should have been caught")
+                }
             }
         }
         Expression::Lambda(_, _) => {
@@ -1073,8 +1118,10 @@ fn call_function(
         "contains" => {
             // Function call version
             // Check for singleton base *if it's not a string* FIRST
-            if !matches!(invocation_base, EvaluationResult::String(_)) && invocation_base.count() > 1 {
-                 return Err(EvaluationError::SingletonEvaluationError(
+            if !matches!(invocation_base, EvaluationResult::String(_))
+                && invocation_base.count() > 1
+            {
+                return Err(EvaluationError::SingletonEvaluationError(
                     "contains function requires singleton input collection (or string)".to_string(),
                 ));
             }
@@ -1086,7 +1133,6 @@ fn call_function(
                 ));
             }
             let arg = &args[0];
-
 
             // Spec: X contains {} -> {}
             if arg == &EvaluationResult::Empty {
@@ -1120,16 +1166,18 @@ fn call_function(
                 EvaluationResult::Collection(items) => {
                     // Collection contains item (using equality)
                     // Use map_or to handle potential error from compare_equality
-                    let contains = items
-                        .iter()
-                        .any(|item| compare_equality(item, "=", arg).map_or(false, |r| r.to_boolean()));
+                    let contains = items.iter().any(|item| {
+                        compare_equality(item, "=", arg).map_or(false, |r| r.to_boolean())
+                    });
                     EvaluationResult::Boolean(contains)
                 }
                 // Contains on single non-collection/non-string item
                 single_item => {
                     // Treat as single-item collection: check if the item equals the argument
                     // Use map_or to handle potential error from compare_equality
-                    EvaluationResult::Boolean(compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()))
+                    EvaluationResult::Boolean(
+                        compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()),
+                    )
                 }
             }) // Close Ok wrapping the match
         }
@@ -1148,7 +1196,8 @@ fn call_function(
             for i in 0..items.len() {
                 for j in (i + 1)..items.len() {
                     // Use compare_equality, handle potential error, default to false if error
-                    if compare_equality(&items[i], "=", &items[j]).map_or(false, |r| r.to_boolean()) {
+                    if compare_equality(&items[i], "=", &items[j]).map_or(false, |r| r.to_boolean())
+                    {
                         return Ok(EvaluationResult::Boolean(false)); // Found a duplicate
                     }
                 }
@@ -1264,7 +1313,9 @@ fn call_function(
                 // Quantity to Integer (returns value if integer, else empty) - Added
                 EvaluationResult::Quantity(val, _) => {
                     if val.is_integer() {
-                        val.to_i64().map(EvaluationResult::Integer).unwrap_or(EvaluationResult::Empty)
+                        val.to_i64()
+                            .map(EvaluationResult::Integer)
+                            .unwrap_or(EvaluationResult::Empty)
                     } else {
                         EvaluationResult::Empty
                     }
@@ -1429,9 +1480,9 @@ fn call_function(
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
                 // Use map_or to handle potential error from compare_equality
-                let exists_in_right = right_items
-                    .iter()
-                    .any(|right_item| compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean()));
+                let exists_in_right = right_items.iter().any(|right_item| {
+                    compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean())
+                });
 
                 if exists_in_right {
                     // Attempt to insert the item into the HashSet.
@@ -1478,9 +1529,9 @@ fn call_function(
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
                 // Use map_or to handle potential error from compare_equality
-                let exists_in_right = right_items
-                    .iter()
-                    .any(|right_item| compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean()));
+                let exists_in_right = right_items.iter().any(|right_item| {
+                    compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean())
+                });
 
                 // Keep the item if it does NOT exist in the right collection
                 if !exists_in_right {
@@ -1716,11 +1767,11 @@ fn call_function(
             }
             // Handle Empty case explicitly after singleton check
             if invocation_base == &EvaluationResult::Empty {
-                 return Ok(EvaluationResult::Empty);
+                return Ok(EvaluationResult::Empty);
             }
             // Now we know it's a non-empty singleton
             Ok(match invocation_base {
-                 // Check convertibility for single items (most primitives can be)
+                // Check convertibility for single items (most primitives can be)
                 EvaluationResult::Boolean(_)
                 | EvaluationResult::String(_)
                 | EvaluationResult::Integer(_)
@@ -1988,11 +2039,18 @@ fn call_function(
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Boolean(b) => {
                     // Convert Boolean to Quantity 1.0 '1' or 0.0 '1'
-                    EvaluationResult::Quantity(if *b { Decimal::ONE } else { Decimal::ZERO }, "1".to_string())
+                    EvaluationResult::Quantity(
+                        if *b { Decimal::ONE } else { Decimal::ZERO },
+                        "1".to_string(),
+                    )
                 }
-                EvaluationResult::Integer(i) => EvaluationResult::Quantity(Decimal::from(*i), "1".to_string()), // Convert Integer to Quantity with '1' unit
+                EvaluationResult::Integer(i) => {
+                    EvaluationResult::Quantity(Decimal::from(*i), "1".to_string())
+                } // Convert Integer to Quantity with '1' unit
                 EvaluationResult::Decimal(d) => EvaluationResult::Quantity(*d, "1".to_string()), // Convert Decimal to Quantity with '1' unit
-                EvaluationResult::Quantity(val, unit) => EvaluationResult::Quantity(*val, unit.clone()), // Quantity to Quantity
+                EvaluationResult::Quantity(val, unit) => {
+                    EvaluationResult::Quantity(*val, unit.clone())
+                } // Quantity to Quantity
                 EvaluationResult::String(s) => {
                     // Attempt to parse as "value unit" or just "value"
                     let parts: Vec<&str> = s.split_whitespace().collect();
@@ -2038,13 +2096,13 @@ fn call_function(
                     "convertsToQuantity requires a singleton input".to_string(),
                 ));
             }
-             // Handle Empty case explicitly after singleton check
+            // Handle Empty case explicitly after singleton check
             if invocation_base == &EvaluationResult::Empty {
-                 return Ok(EvaluationResult::Empty);
+                return Ok(EvaluationResult::Empty);
             }
             // Now we know it's a non-empty singleton
             Ok(match invocation_base {
-                 EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Integer(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Decimal(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Quantity is convertible
@@ -2063,7 +2121,8 @@ fn call_function(
                             let value_parses = parts[0].parse::<Decimal>().is_ok();
                             let unit_str = parts[1].trim_matches('\'');
                             // Unit must be non-empty AND pass validation
-                            let unit_is_valid = !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
+                            let unit_is_valid =
+                                !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
                             value_parses && unit_is_valid
                         }
                         // 0 or >2 parts are not convertible
@@ -2400,6 +2459,981 @@ fn call_function(
                 }
             })
         }
+        "round" => {
+            // Implements round([precision : Integer]) : Decimal
+            // Round a decimal to the nearest whole number or to a specified precision
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "round requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Get the precision (default is 0)
+            let precision = if args.is_empty() {
+                0 // Default precision is 0 (round to nearest whole number)
+            } else if args.len() == 1 {
+                match &args[0] {
+                    EvaluationResult::Integer(p) => {
+                        if *p < 0 {
+                            return Err(EvaluationError::InvalidArgument(
+                                "round precision must be >= 0".to_string(),
+                            ));
+                        }
+                        *p as u32
+                    }
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "round precision must be an Integer".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'round' expects 0 or 1 argument".to_string(),
+                ));
+            };
+
+            // Convert input to decimal if needed and round
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Integers don't change when rounded to whole numbers
+                    if precision == 0 {
+                        Ok(EvaluationResult::Integer(*i))
+                    } else {
+                        // Convert to decimal with decimal places
+                        let decimal = Decimal::from(*i);
+                        Ok(EvaluationResult::Decimal(round_to_precision(
+                            decimal, precision,
+                        )))
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Round the decimal to the specified precision
+                    let rounded = round_to_precision(*d, precision);
+
+                    // If precision is 0 and result is a whole number, convert to Integer
+                    if precision == 0 && rounded.fract().is_zero() {
+                        if let Some(i) = rounded.to_i64() {
+                            Ok(EvaluationResult::Integer(i))
+                        } else {
+                            // Too large for i64, keep as Decimal
+                            Ok(EvaluationResult::Decimal(rounded))
+                        }
+                    } else {
+                        Ok(EvaluationResult::Decimal(rounded))
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // Round the value part of the quantity
+                    let rounded = round_to_precision(*value, precision);
+                    Ok(EvaluationResult::Quantity(rounded, unit.clone()))
+                }
+                // Try to convert other types to decimal first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            let rounded = round_to_precision(d, precision);
+                            if precision == 0 && rounded.fract().is_zero() {
+                                if let Some(i) = rounded.to_i64() {
+                                    Ok(EvaluationResult::Integer(i))
+                                } else {
+                                    Ok(EvaluationResult::Decimal(rounded))
+                                }
+                            } else {
+                                Ok(EvaluationResult::Decimal(rounded))
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot round non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "sqrt" => {
+            // Implements sqrt() : Decimal
+            // Returns the square root of the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "sqrt requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'sqrt' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Convert input to decimal if needed and calculate square root
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Check for negative value
+                    if *i < 0 {
+                        return Ok(EvaluationResult::Empty); // sqrt of negative number is empty
+                    }
+
+                    // Convert to decimal for the calculation
+                    let decimal = Decimal::from(*i);
+
+                    // Try to get the square root
+                    match sqrt_decimal(decimal) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Check for negative value
+                    if d.is_sign_negative() {
+                        return Ok(EvaluationResult::Empty); // sqrt of negative number is empty
+                    }
+
+                    // Try to get the square root
+                    match sqrt_decimal(*d) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // Check for negative value
+                    if value.is_sign_negative() {
+                        return Ok(EvaluationResult::Empty); // sqrt of negative number is empty
+                    }
+
+                    // Try to get the square root
+                    match sqrt_decimal(*value) {
+                        Ok(result) => {
+                            // For quantities, sqrt might require adjusting the unit
+                            // For now, just keep the same unit (this is a simplification)
+                            Ok(EvaluationResult::Quantity(result, unit.clone()))
+                        }
+                        Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
+                    }
+                }
+                // Try to convert other types to decimal first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Check for negative value
+                            if d.is_sign_negative() {
+                                return Ok(EvaluationResult::Empty); // sqrt of negative number is empty
+                            }
+
+                            // Try to get the square root
+                            match sqrt_decimal(d) {
+                                Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                                Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate square root of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "abs" => {
+            // Implements abs() : Decimal
+            // Returns the absolute value of the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "abs requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'abs' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Calculate absolute value based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // For Integer values, use i64::abs()
+                    // Special handling for i64::MIN to avoid overflow
+                    if *i == i64::MIN {
+                        // Use Decimal for i64::MIN to avoid overflow
+                        let decimal = Decimal::from(*i);
+                        Ok(EvaluationResult::Decimal(decimal.abs()))
+                    } else {
+                        Ok(EvaluationResult::Integer(i.abs()))
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // For Decimal values, use Decimal::abs()
+                    Ok(EvaluationResult::Decimal(d.abs()))
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, take absolute value of the numeric part only
+                    Ok(EvaluationResult::Quantity(value.abs(), unit.clone()))
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Use abs on the decimal value
+                            Ok(EvaluationResult::Decimal(d.abs()))
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate absolute value of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "ceiling" => {
+            // Implements ceiling() : Decimal
+            // Returns the smallest integer greater than or equal to the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "ceiling requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'ceiling' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Calculate ceiling based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Integer values remain unchanged since they're already whole numbers
+                    Ok(EvaluationResult::Integer(*i))
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate ceiling and decide whether to return Integer or Decimal
+                    let ceiling = d.ceil();
+
+                    // If ceiling is a whole number, convert to Integer when possible
+                    if ceiling.fract().is_zero() {
+                        if let Some(i) = ceiling.to_i64() {
+                            Ok(EvaluationResult::Integer(i))
+                        } else {
+                            // Too large for i64, keep as Decimal
+                            Ok(EvaluationResult::Decimal(ceiling))
+                        }
+                    } else {
+                        // This should not normally happen with ceiling, but just in case
+                        Ok(EvaluationResult::Decimal(ceiling))
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply ceiling to the numeric part only
+                    let ceiling = value.ceil();
+
+                    // Return a Quantity with the same unit
+                    Ok(EvaluationResult::Quantity(ceiling, unit.clone()))
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate ceiling
+                            let ceiling = d.ceil();
+
+                            // If ceiling is a whole number, convert to Integer when possible
+                            if ceiling.fract().is_zero() {
+                                if let Some(i) = ceiling.to_i64() {
+                                    Ok(EvaluationResult::Integer(i))
+                                } else {
+                                    // Too large for i64, keep as Decimal
+                                    Ok(EvaluationResult::Decimal(ceiling))
+                                }
+                            } else {
+                                // This should not normally happen with ceiling, but just in case
+                                Ok(EvaluationResult::Decimal(ceiling))
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate ceiling of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "floor" => {
+            // Implements floor() : Decimal
+            // Returns the largest integer less than or equal to the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "floor requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'floor' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Calculate floor based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Integer values remain unchanged since they're already whole numbers
+                    Ok(EvaluationResult::Integer(*i))
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate floor and decide whether to return Integer or Decimal
+                    let floor = d.floor();
+
+                    // If floor is a whole number, convert to Integer when possible
+                    if floor.fract().is_zero() {
+                        if let Some(i) = floor.to_i64() {
+                            Ok(EvaluationResult::Integer(i))
+                        } else {
+                            // Too large for i64, keep as Decimal
+                            Ok(EvaluationResult::Decimal(floor))
+                        }
+                    } else {
+                        // This should not normally happen with floor, but just in case
+                        Ok(EvaluationResult::Decimal(floor))
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply floor to the numeric part only
+                    let floor = value.floor();
+
+                    // Return a Quantity with the same unit
+                    Ok(EvaluationResult::Quantity(floor, unit.clone()))
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate floor
+                            let floor = d.floor();
+
+                            // If floor is a whole number, convert to Integer when possible
+                            if floor.fract().is_zero() {
+                                if let Some(i) = floor.to_i64() {
+                                    Ok(EvaluationResult::Integer(i))
+                                } else {
+                                    // Too large for i64, keep as Decimal
+                                    Ok(EvaluationResult::Decimal(floor))
+                                }
+                            } else {
+                                // This should not normally happen with floor, but just in case
+                                Ok(EvaluationResult::Decimal(floor))
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate floor of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "exp" => {
+            // Implements exp() : Decimal
+            // Returns e raised to the power of the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "exp requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'exp' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Helper function to calculate e^x using Decimal
+            fn exp_decimal(value: Decimal) -> Result<Decimal, &'static str> {
+                // Convert to f64 for calculation since Decimal doesn't have an exp function
+                let value_f64 = match value.to_f64() {
+                    Some(v) => v,
+                    None => return Err("Failed to convert Decimal to f64 for exp calculation"),
+                };
+
+                // Calculate e^x using f64
+                let result_f64 = value_f64.exp();
+
+                // Check for overflow or invalid result
+                if result_f64.is_infinite() || result_f64.is_nan() {
+                    return Err("Exp calculation resulted in overflow or invalid value");
+                }
+
+                // Convert back to Decimal
+                match Decimal::from_f64(result_f64) {
+                    Some(d) => Ok(d),
+                    None => Err("Failed to convert exp result back to Decimal"),
+                }
+            }
+
+            // Calculate exp based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Convert Integer to Decimal for exp calculation
+                    let decimal = Decimal::from(*i);
+
+                    // Calculate e^x
+                    match exp_decimal(decimal) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate e^x
+                    match exp_decimal(*d) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply exp to the numeric part
+                    // Note: This might not be meaningful for all units, but we'll keep it consistent
+                    match exp_decimal(*value) {
+                        Ok(result) => Ok(EvaluationResult::Quantity(result, unit.clone())),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate e^x
+                            match exp_decimal(d) {
+                                Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                                Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate exp of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "ln" => {
+            // Implements ln() : Decimal
+            // Returns the natural logarithm (base e) of the input number
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "ln requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that no arguments were provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'ln' expects 0 arguments".to_string(),
+                ));
+            }
+
+            // Helper function to calculate ln(x) using Decimal
+            fn ln_decimal(value: Decimal) -> Result<Decimal, &'static str> {
+                // Check for negative or zero input
+                if value <= Decimal::ZERO {
+                    return Err("Cannot calculate ln of a number less than or equal to zero");
+                }
+
+                // Convert to f64 for calculation since Decimal doesn't have a ln function
+                let value_f64 = match value.to_f64() {
+                    Some(v) => v,
+                    None => return Err("Failed to convert Decimal to f64 for ln calculation"),
+                };
+
+                // Calculate ln(x) using f64
+                let result_f64 = value_f64.ln();
+
+                // Check for overflow or invalid result
+                if result_f64.is_infinite() || result_f64.is_nan() {
+                    return Err("Ln calculation resulted in overflow or invalid value");
+                }
+
+                // Convert back to Decimal
+                match Decimal::from_f64(result_f64) {
+                    Some(d) => Ok(d),
+                    None => Err("Failed to convert ln result back to Decimal"),
+                }
+            }
+
+            // Calculate ln based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Convert Integer to Decimal for ln calculation
+                    let decimal = Decimal::from(*i);
+
+                    // Calculate ln(x)
+                    match ln_decimal(decimal) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate ln(x)
+                    match ln_decimal(*d) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply ln to the numeric part
+                    // Note: This might not be meaningful for all units, but we'll keep it consistent
+                    match ln_decimal(*value) {
+                        Ok(result) => Ok(EvaluationResult::Quantity(result, unit.clone())),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate ln(x)
+                            match ln_decimal(d) {
+                                Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                                Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate ln of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "log" => {
+            // Implements log(base) : Decimal
+            // Returns the logarithm of the input number using the specified base
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "log requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that exactly one argument (base) is provided
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'log' expects 1 argument (base)".to_string(),
+                ));
+            }
+
+            // Base argument should already be evaluated by this point
+            let base_arg = &args[0];
+
+            // Handle empty base argument
+            if base_arg == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Convert base to Decimal if needed
+            let base = match to_decimal(base_arg) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Err(EvaluationError::TypeError(
+                        "log base must be a numeric value".to_string(),
+                    ));
+                }
+            };
+
+            // Check that base is valid (greater than 0 and not 1)
+            if base <= Decimal::ZERO {
+                return Ok(EvaluationResult::Empty); // Base <= 0 is invalid, return Empty
+            }
+            if base == Decimal::ONE {
+                return Ok(EvaluationResult::Empty); // Base = 1 is invalid, return Empty
+            }
+
+            // Helper function to calculate log_base(x) using Decimal
+            fn log_decimal(value: Decimal, base: Decimal) -> Result<Decimal, &'static str> {
+                // Check for negative or zero input
+                if value <= Decimal::ZERO {
+                    return Err(
+                        "Cannot calculate logarithm of a number less than or equal to zero",
+                    );
+                }
+
+                // Convert to f64 for calculation
+                let value_f64 = match value.to_f64() {
+                    Some(v) => v,
+                    None => return Err("Failed to convert Decimal to f64 for log calculation"),
+                };
+
+                let base_f64 = match base.to_f64() {
+                    Some(b) => b,
+                    None => return Err("Failed to convert base to f64 for log calculation"),
+                };
+
+                // Calculate log_base(x) using the change of base formula: log_b(x) = ln(x) / ln(b)
+                let result_f64 = value_f64.ln() / base_f64.ln();
+
+                // Check for overflow or invalid result
+                if result_f64.is_infinite() || result_f64.is_nan() {
+                    return Err("Log calculation resulted in overflow or invalid value");
+                }
+
+                // Convert back to Decimal
+                match Decimal::from_f64(result_f64) {
+                    Some(d) => Ok(d),
+                    None => Err("Failed to convert log result back to Decimal"),
+                }
+            }
+
+            // Calculate log based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Convert Integer to Decimal for log calculation
+                    let decimal = Decimal::from(*i);
+
+                    // Calculate log_base(x)
+                    match log_decimal(decimal, base) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate log_base(x)
+                    match log_decimal(*d, base) {
+                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply log to the numeric part
+                    // Note: This might not be meaningful for all units, but we'll keep it consistent
+                    match log_decimal(*value, base) {
+                        Ok(result) => Ok(EvaluationResult::Quantity(result, unit.clone())),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate log_base(x)
+                            match log_decimal(d, base) {
+                                Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                                Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate log of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "power" => {
+            // Implements power(exponent) : Decimal
+            // Returns the input number raised to the power of the specified exponent
+
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "power requires a singleton input".to_string(),
+                ));
+            }
+
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Check that exactly one argument (exponent) is provided
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'power' expects 1 argument (exponent)".to_string(),
+                ));
+            }
+
+            // Get the exponent argument
+            let exponent_arg = &args[0];
+
+            // Handle empty exponent argument
+            if exponent_arg == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // Convert exponent to Decimal if needed
+            let exponent = match to_decimal(exponent_arg) {
+                Ok(e) => e,
+                Err(_) => {
+                    return Err(EvaluationError::TypeError(
+                        "power exponent must be a numeric value".to_string(),
+                    ));
+                }
+            };
+
+            // Helper function to calculate base^exponent using Decimal
+            fn power_decimal(base: Decimal, exponent: Decimal) -> Result<Decimal, &'static str> {
+                // Special case: anything^0 = 1
+                if exponent == Decimal::ZERO {
+                    return Ok(Decimal::ONE);
+                }
+
+                // Special case: 0^anything = 0 (except 0^0 = 1 handled above, and 0^negative which is an error)
+                if base.is_zero() {
+                    if exponent < Decimal::ZERO {
+                        return Err("Cannot raise zero to a negative power");
+                    }
+                    return Ok(Decimal::ZERO);
+                }
+
+                // Special case: 1^anything = 1
+                if base == Decimal::ONE {
+                    return Ok(Decimal::ONE);
+                }
+
+                // Special case: negative base with fractional exponent is not defined in real numbers
+                if base < Decimal::ZERO && exponent.fract() != Decimal::ZERO {
+                    return Err("Cannot raise negative number to fractional power");
+                }
+
+                // Special case: integer exponent - use repetitive multiplication for small exponents
+                if exponent.fract() == Decimal::ZERO
+                    && exponent >= Decimal::ZERO
+                    && exponent <= Decimal::from(100)
+                {
+                    let power_as_i64 = exponent.to_i64().unwrap_or(0);
+                    let mut result = Decimal::ONE;
+                    let mut base_power = base;
+                    let mut n = power_as_i64;
+
+                    // Use exponentiation by squaring for efficiency
+                    while n > 0 {
+                        if n % 2 == 1 {
+                            result *= base_power;
+                        }
+                        base_power *= base_power;
+                        n /= 2;
+                    }
+
+                    return Ok(result);
+                }
+
+                // For all other cases, use floating point calculation
+
+                // Convert to f64 for calculation
+                let base_f64 = match base.to_f64() {
+                    Some(b) => b,
+                    None => return Err("Failed to convert base to f64 for power calculation"),
+                };
+
+                let exponent_f64 = match exponent.to_f64() {
+                    Some(e) => e,
+                    None => return Err("Failed to convert exponent to f64 for power calculation"),
+                };
+
+                // Calculate base^exponent using f64
+                let result_f64 = base_f64.powf(exponent_f64);
+
+                // Check for overflow or invalid result
+                if result_f64.is_infinite() || result_f64.is_nan() {
+                    return Err("Power calculation resulted in overflow or invalid value");
+                }
+
+                // Convert back to Decimal
+                match Decimal::from_f64(result_f64) {
+                    Some(d) => Ok(d),
+                    None => Err("Failed to convert power result back to Decimal"),
+                }
+            }
+
+            // Calculate power based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Convert Integer to Decimal for power calculation
+                    let decimal = Decimal::from(*i);
+
+                    // Calculate base^exponent
+                    match power_decimal(decimal, exponent) {
+                        Ok(result) => {
+                            // Check if result is an integer to return the most appropriate type
+                            if result.fract() == Decimal::ZERO
+                                && result.abs() <= Decimal::from(i64::MAX)
+                            {
+                                // Result is an integer and fits in i64
+                                Ok(EvaluationResult::Integer(result.to_i64().unwrap()))
+                            } else {
+                                // Result is not an integer or doesn't fit in i64
+                                Ok(EvaluationResult::Decimal(result))
+                            }
+                        }
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Decimal(d) => {
+                    // Calculate base^exponent
+                    match power_decimal(*d, exponent) {
+                        Ok(result) => {
+                            // Check if result is an integer to return the most appropriate type
+                            if result.fract() == Decimal::ZERO
+                                && result.abs() <= Decimal::from(i64::MAX)
+                            {
+                                // Result is an integer and fits in i64
+                                Ok(EvaluationResult::Integer(result.to_i64().unwrap()))
+                            } else {
+                                // Result is not an integer or doesn't fit in i64
+                                Ok(EvaluationResult::Decimal(result))
+                            }
+                        }
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity values, apply power to the numeric part
+                    // Note: This might not be physically meaningful for many units, but we'll keep it consistent
+                    match power_decimal(*value, exponent) {
+                        Ok(result) => Ok(EvaluationResult::Quantity(result, unit.clone())),
+                        Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                    }
+                }
+                // Try to convert other types to numeric first
+                _ => {
+                    // First try to convert to decimal
+                    match to_decimal(invocation_base) {
+                        Ok(d) => {
+                            // Calculate base^exponent
+                            match power_decimal(d, exponent) {
+                                Ok(result) => {
+                                    // Check if result is an integer to return the most appropriate type
+                                    if result.fract() == Decimal::ZERO
+                                        && result.abs() <= Decimal::from(i64::MAX)
+                                    {
+                                        // Result is an integer and fits in i64
+                                        Ok(EvaluationResult::Integer(result.to_i64().unwrap()))
+                                    } else {
+                                        // Result is not an integer or doesn't fit in i64
+                                        Ok(EvaluationResult::Decimal(result))
+                                    }
+                                }
+                                Err(_) => Ok(EvaluationResult::Empty), // Return Empty on calculation error
+                            }
+                        }
+                        Err(_) => Err(EvaluationError::TypeError(
+                            "Cannot calculate power of non-numeric value".to_string(),
+                        )),
+                    }
+                }
+            }
+        }
+        "truncate" => {
+            // Implements truncate() : Decimal
+            // Returns the integer portion of the input by removing the fractional digits
+            
+            // Check for singleton input
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "truncate requires a singleton input".to_string(),
+                ));
+            }
+            
+            // Handle empty input
+            if invocation_base == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+            
+            // Check that no arguments are provided
+            if !args.is_empty() {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'truncate' does not accept any arguments".to_string(),
+                ));
+            }
+            
+            // Truncate based on the input type
+            match invocation_base {
+                EvaluationResult::Integer(i) => {
+                    // Integer has no fractional part, so return it as is
+                    Ok(EvaluationResult::Integer(*i))
+                }
+                EvaluationResult::Decimal(d) => {
+                    // For Decimal, remove the fractional part
+                    let truncated = d.trunc();
+                    
+                    // Check if result is an integer to return the most appropriate type
+                    if truncated.abs() <= Decimal::from(i64::MAX) {
+                        // Result fits in i64, return as Integer
+                        Ok(EvaluationResult::Integer(truncated.to_i64().unwrap()))
+                    } else {
+                        // Result is too large for i64, return as Decimal
+                        Ok(EvaluationResult::Decimal(truncated))
+                    }
+                }
+                EvaluationResult::Quantity(value, unit) => {
+                    // For Quantity, truncate the value but preserve the unit
+                    let truncated = value.trunc();
+                    
+                    // Return as Quantity with the same unit
+                    Ok(EvaluationResult::Quantity(truncated, unit.clone()))
+                }
+                _ => Err(EvaluationError::TypeError(
+                    "truncate can only be invoked on numeric types".to_string(),
+                )),
+            }
+        }
         "toChars" => {
             // Check for singleton base
             if invocation_base.count() > 1 {
@@ -2510,6 +3544,8 @@ fn call_function(
                 "replace",
                 "matches",
                 "replaceMatches",
+                "round",
+                "sqrt",
                 "toChars",
                 "now",
                 "today",
@@ -2523,13 +3559,108 @@ fn call_function(
     }
 }
 
+/// Rounds a decimal value to the specified number of decimal places
+fn round_to_precision(value: Decimal, precision: u32) -> Decimal {
+    // Calculate scaling factor (10^precision)
+    let mut scaling_factor = Decimal::from(1);
+    for _ in 0..precision {
+        scaling_factor *= Decimal::from(10);
+    }
+
+    // Multiply by scaling factor, round, and divide by scaling factor
+    (value * scaling_factor).round() / scaling_factor
+}
+
+/// Computes the square root of a Decimal value using the Newton-Raphson method
+fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
+    // Handle negative values
+    if value.is_sign_negative() {
+        return Err("Cannot compute square root of a negative number");
+    }
+
+    // Handle special cases
+    if value.is_zero() {
+        return Ok(Decimal::from(0));
+    }
+
+    if value == Decimal::from(1) {
+        return Ok(Decimal::from(1));
+    }
+
+    // Set an appropriate precision (more iterations for higher precision)
+    let precision = Decimal::from_str_exact("0.000000001").unwrap();
+
+    // Use Newton-Raphson method for square root approximation
+    // x(n+1) = 0.5 * (x(n) + value / x(n))
+    let mut x = value.clone();
+    let half = Decimal::from_str_exact("0.5").unwrap();
+
+    // Run iterations until we reach desired precision
+    loop {
+        let next_x = half * (x + value / x);
+
+        // Check if we've converged to our desired precision
+        if (next_x - x).abs() < precision {
+            return Ok(next_x);
+        }
+
+        x = next_x;
+    }
+}
+
+/// Attempts to convert an EvaluationResult to Decimal
+fn to_decimal(value: &EvaluationResult) -> Result<Decimal, EvaluationError> {
+    match value {
+        EvaluationResult::Decimal(d) => Ok(*d),
+        EvaluationResult::Integer(i) => Ok(Decimal::from(*i)),
+        EvaluationResult::Quantity(d, _) => Ok(*d),
+        EvaluationResult::String(s) => {
+            // Try to parse the string as a decimal
+            match s.parse::<Decimal>() {
+                Ok(d) => Ok(d),
+                Err(_) => Err(EvaluationError::TypeError(format!(
+                    "Cannot convert String '{}' to Decimal",
+                    s
+                ))),
+            }
+        }
+        EvaluationResult::Boolean(b) => {
+            // Convert boolean to 1 or 0
+            if *b {
+                Ok(Decimal::from(1))
+            } else {
+                Ok(Decimal::from(0))
+            }
+        }
+        _ => Err(EvaluationError::TypeError(format!(
+            "Cannot convert {} to Decimal",
+            value.type_name()
+        ))),
+    }
+}
+
 /// Checks if a string is a valid FHIRPath quantity unit (UCUM or time-based).
 /// Note: This is a simplified check. A full UCUM validator is complex.
-fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool { // Remove underscore
+fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
+    // Remove underscore
     // Allow known time-based units
     const TIME_UNITS: &[&str] = &[
-        "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-        "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+        "year",
+        "month",
+        "week",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+        "years",
+        "months",
+        "weeks",
+        "days",
+        "hours",
+        "minutes",
+        "seconds",
+        "milliseconds",
     ];
     if TIME_UNITS.contains(&unit) {
         return true;
@@ -2784,7 +3915,10 @@ fn apply_additive(
                     EvaluationResult::Decimal(Decimal::from(*l) + *r)
                 }
                 // Quantity addition (requires same units) - Added
-                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                (
+                    EvaluationResult::Quantity(val_l, unit_l),
+                    EvaluationResult::Quantity(val_r, unit_r),
+                ) => {
                     if unit_l == unit_r {
                         EvaluationResult::Quantity(*val_l + *val_r, unit_l.clone())
                     } else {
@@ -2898,8 +4032,11 @@ fn apply_additive(
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Decimal(Decimal::from(*l) - *r)
                 }
-                 // Quantity subtraction (requires same units) - Added
-                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                // Quantity subtraction (requires same units) - Added
+                (
+                    EvaluationResult::Quantity(val_l, unit_l),
+                    EvaluationResult::Quantity(val_r, unit_r),
+                ) => {
                     if unit_l == unit_r {
                         EvaluationResult::Quantity(*val_l - *val_r, unit_l.clone())
                     } else {
@@ -2908,7 +4045,7 @@ fn apply_additive(
                         EvaluationResult::Empty
                     }
                 }
-               // Handle String - Number (attempt conversion, prioritize Integer result if possible)
+                // Handle String - Number (attempt conversion, prioritize Integer result if possible)
                 (EvaluationResult::String(s), EvaluationResult::Integer(i)) => {
                     // Try parsing string as Integer first
                     if let Ok(s_int) = s.parse::<i64>() {
@@ -3040,8 +4177,8 @@ fn apply_type_operation(
             let is_type = match (base_type_name.as_str(), value) {
                 // Compare using base_type_name
                 (_, EvaluationResult::Empty) => false, // Empty is not of any type
-                // Collections handled by initial check
-                (_, EvaluationResult::Collection(_)) => unreachable!(),
+                // Collections should be handled by initial check, but handle anyway
+                (_, EvaluationResult::Collection(_)) => false,
                 ("Boolean", EvaluationResult::Boolean(_)) => true,
                 ("String", EvaluationResult::String(_)) => true,
                 ("Integer", EvaluationResult::Integer(_)) => true,
@@ -3077,8 +4214,8 @@ fn apply_type_operation(
             Ok(match (base_type_name, value) {
                 // Match on &str
                 (_, EvaluationResult::Empty) => EvaluationResult::Empty, // 'as' on empty is empty
-                // Collections handled by initial check
-                (_, EvaluationResult::Collection(_)) => unreachable!(),
+                // Collections should be handled by initial check, but handle anyway
+                (_, EvaluationResult::Collection(_)) => EvaluationResult::Empty,
                 // Return the value if it's already of the right type.
                 ("Boolean", EvaluationResult::Boolean(_)) => value.clone(),
                 ("String", EvaluationResult::String(_)) => value.clone(),
@@ -3142,13 +4279,13 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
     }
 }
 
-
 /// Compares two values for inequality - Returns Result now
 fn compare_inequality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> Result<EvaluationResult, EvaluationError> { // Changed return type
+) -> Result<EvaluationResult, EvaluationError> {
+    // Changed return type
     // Handle empty operands: comparison with empty returns empty
     if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
         return Ok(EvaluationResult::Empty); // Return Ok(Empty)
@@ -3163,9 +4300,11 @@ fn compare_inequality(
         )));
     }
     // If both are collections, comparison is not defined (error)
-    if left.is_collection() { // && right.is_collection() implicitly
-         return Err(EvaluationError::TypeError(format!(
-            "Cannot compare collections using '{}'", op
+    if left.is_collection() {
+        // && right.is_collection() implicitly
+        return Err(EvaluationError::TypeError(format!(
+            "Cannot compare collections using '{}'",
+            op
         )));
     }
 
@@ -3230,7 +4369,8 @@ fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
-) -> Result<EvaluationResult, EvaluationError> { // Changed return type
+) -> Result<EvaluationResult, EvaluationError> {
+    // Changed return type
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();
@@ -3245,16 +4385,16 @@ fn compare_equality(
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
             // Strict equality: Order and duplicates matter for collections
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
                     if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
                     } else {
                         // Compare element by element using '=' recursively
-                        let all_equal = l_items
-                            .iter()
-                            .zip(r_items.iter())
-                            .all(|(li, ri)| compare_equality(li, "=", ri).map_or(false, |r| r.to_boolean())); // Handle potential error from recursive call
+                        let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
+                            compare_equality(li, "=", ri).map_or(false, |r| r.to_boolean())
+                        }); // Handle potential error from recursive call
                         EvaluationResult::Boolean(all_equal)
                     }
                 }
@@ -3263,7 +4403,7 @@ fn compare_equality(
                     EvaluationResult::Boolean(false)
                 }
                 // Primitive comparison (Empty case handled above)
-                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
+                (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
@@ -3291,15 +4431,18 @@ fn compare_equality(
                     EvaluationResult::Boolean(l == r)
                 }
                 // Quantity equality (requires same units and equal values)
-                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
-                    EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
-                }
+                (
+                    EvaluationResult::Quantity(val_l, unit_l),
+                    EvaluationResult::Quantity(val_r, unit_r),
+                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
                 // Any other combination is an error for '='
-                _ => return Err(EvaluationError::TypeError(format!(
+                _ => {
+                    return Err(EvaluationError::TypeError(format!(
                         "Cannot compare {} and {} using '='",
                         left.type_name(),
                         right.type_name()
-                    ))),
+                    )));
+                }
             }) // This parenthesis now correctly closes the Ok() started above
         }
         "!=" => {
@@ -3309,7 +4452,8 @@ fn compare_equality(
             }
             // Strict inequality: Negation of '='
             let eq_result = compare_equality(left, "=", right)?; // Propagate error
-            Ok(match eq_result { // Wrap result in Ok
+            Ok(match eq_result {
+                // Wrap result in Ok
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                 // If '=' returned Empty (due to empty operand), '!=' also returns Empty
                 EvaluationResult::Empty => EvaluationResult::Empty,
@@ -3318,7 +4462,8 @@ fn compare_equality(
         }
         "~" => {
             // Equivalence: Order doesn't matter, duplicates DO matter.
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 // Handle Empty cases specifically for '~'
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
@@ -3343,10 +4488,10 @@ fn compare_equality(
                         r_sorted.sort();
 
                         // Compare sorted collections element-wise using '~' recursively
-                        let all_equivalent = l_sorted
-                            .iter()
-                            .zip(r_sorted.iter())
-                            .all(|(li, ri)| compare_equality(li, "~", ri).map_or(false, |r| r.to_boolean())); // Handle potential error
+                        let all_equivalent =
+                            l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
+                                compare_equality(li, "~", ri).map_or(false, |r| r.to_boolean())
+                            }); // Handle potential error
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
@@ -3355,7 +4500,10 @@ fn compare_equality(
                     EvaluationResult::Boolean(false)
                 }
                 // Quantity equivalence (requires same units and equivalent values)
-                (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
+                (
+                    EvaluationResult::Quantity(val_l, unit_l),
+                    EvaluationResult::Quantity(val_r, unit_r),
+                ) => {
                     // For now, treat quantity equivalence same as equality
                     EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
                     // TODO: Implement proper UCUM equivalence if needed
@@ -3367,7 +4515,8 @@ fn compare_equality(
         "!~" => {
             // Non-equivalence: Negation of '~'
             // Handle empty cases specifically for '!~'
-            Ok(match (left, right) { // Wrap result in Ok
+            Ok(match (left, right) {
+                // Wrap result in Ok
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
                 } // Empty is equivalent to Empty
@@ -3386,7 +4535,10 @@ fn compare_equality(
                 }
             })
         }
-        _ => Err(EvaluationError::InvalidOperation(format!("Unknown equality operator: {}", op))), // Return error
+        _ => Err(EvaluationError::InvalidOperation(format!(
+            "Unknown equality operator: {}",
+            op
+        ))), // Return error
     }
 }
 
@@ -3418,10 +4570,14 @@ fn check_membership(
                 EvaluationResult::Collection(items) => items
                     .iter()
                     // Use map_or to handle potential error from compare_equality
-                    .any(|item| compare_equality(left, "=", item).map_or(false, |r| r.to_boolean())),
+                    .any(|item| {
+                        compare_equality(left, "=", item).map_or(false, |r| r.to_boolean())
+                    }),
                 // If right is a single non-empty item, compare directly
                 // Use map_or to handle potential error from compare_equality
-                single_item => compare_equality(left, "=", single_item).map_or(false, |r| r.to_boolean()),
+                single_item => {
+                    compare_equality(left, "=", single_item).map_or(false, |r| r.to_boolean())
+                }
             };
 
             Ok(EvaluationResult::Boolean(is_in))
@@ -3447,9 +4603,9 @@ fn check_membership(
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
                     // Use map_or to handle potential error from compare_equality
-                    let contains = items
-                        .iter()
-                        .any(|item| compare_equality(item, "=", right).map_or(false, |r| r.to_boolean()));
+                    let contains = items.iter().any(|item| {
+                        compare_equality(item, "=", right).map_or(false, |r| r.to_boolean())
+                    });
                     EvaluationResult::Boolean(contains)
                 }
                 // For strings, check if the string contains the substring

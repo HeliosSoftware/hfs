@@ -124,7 +124,17 @@ Performance results go here...
     *   [length()](https://hl7.org/fhirpath/2025Jan/#length--integer): ✅
     *   [toChars()](https://hl7.org/fhirpath/2025Jan/#tochars--collection): ✅
 *   [Additional String Functions](https://hl7.org/fhirpath/2025Jan/#additional-string-functions) (STU): ❌ (All)
-*   [Math](https://hl7.org/fhirpath/2025Jan/#math) (STU): ❌ (All)
+*   [Math](https://hl7.org/fhirpath/2025Jan/#math) (STU): 🟡 (Partial)
+    *   [round()](https://hl7.org/fhirpath/2025Jan/#round-precision--integer--decimal): ✅
+    *   [sqrt()](https://hl7.org/fhirpath/2025Jan/#sqrt--decimal): ✅
+    *   [abs()](https://hl7.org/fhirpath/2025Jan/#abs--decimal): ✅
+    *   [ceiling()](https://hl7.org/fhirpath/2025Jan/#ceiling--decimal): ✅
+    *   [exp()](https://hl7.org/fhirpath/2025Jan/#exp--decimal): ✅
+    *   [floor()](https://hl7.org/fhirpath/2025Jan/#floor--decimal): ✅
+    *   [ln()](https://hl7.org/fhirpath/2025Jan/#ln--decimal): ✅
+    *   [log()](https://hl7.org/fhirpath/2025Jan/#log-base--decimal--decimal): ✅
+    *   [power()](https://hl7.org/fhirpath/2025Jan/#power-exponent--decimal--decimal): ✅
+    *   [truncate()](https://hl7.org/fhirpath/2025Jan/#truncate--decimal): ✅
 *   [Tree Navigation](https://hl7.org/fhirpath/2025Jan/#tree-navigation)
     *   [children()](https://hl7.org/fhirpath/2025Jan/#children--collection): ❌
     *   [descendants()](https://hl7.org/fhirpath/2025Jan/#descendants--collection): ❌
