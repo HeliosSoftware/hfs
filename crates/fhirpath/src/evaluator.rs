@@ -11,8 +11,11 @@ use std::collections::{HashMap, HashSet};
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated
     pub resources: Vec<FhirResource>,
-    /// Variables defined in the context as string values
-    pub variables: HashMap<String, String>,
+    /// Variables defined in the context with their values
+    /// Now stores full EvaluationResult values instead of just strings
+    pub variables: HashMap<String, EvaluationResult>,
+    /// The 'this' context for direct evaluation (used in tests)
+    pub this: Option<EvaluationResult>,
 }
 
 impl EvaluationContext {
@@ -21,6 +24,7 @@ impl EvaluationContext {
         Self {
             resources,
             variables: HashMap::new(),
+            this: None,
         }
     }
 
@@ -29,7 +33,13 @@ impl EvaluationContext {
         Self {
             resources: Vec::new(),
             variables: HashMap::new(),
+            this: None,
         }
+    }
+    
+    /// Sets the 'this' context for direct evaluation (used primarily in tests)
+    pub fn set_this(&mut self, value: EvaluationResult) {
+        self.this = Some(value);
     }
 
     /// Adds a resource to the context
@@ -37,21 +47,36 @@ impl EvaluationContext {
         self.resources.push(resource);
     }
 
-    /// Sets a variable in the context
+    /// Sets a variable in the context to a string value (for backward compatibility)
     pub fn set_variable(&mut self, name: &str, value: String) {
+        self.variables.insert(name.to_string(), EvaluationResult::String(value));
+    }
+    
+    /// Sets a variable in the context to any EvaluationResult value
+    pub fn set_variable_result(&mut self, name: &str, value: EvaluationResult) {
         self.variables.insert(name.to_string(), value);
     }
 
     /// Gets a variable from the context
-    pub fn get_variable(&self, name: &str) -> Option<&String> {
+    pub fn get_variable(&self, name: &str) -> Option<&EvaluationResult> {
         self.variables.get(name)
     }
 
     /// Gets a variable from the context as an EvaluationResult
     pub fn get_variable_as_result(&self, name: &str) -> EvaluationResult {
         match self.variables.get(name) {
-            Some(value) => EvaluationResult::String(value.clone()),
+            Some(value) => value.clone(),
             None => EvaluationResult::Empty,
+        }
+    }
+    
+    /// Gets a variable as a string (for backward compatibility)
+    /// Converts non-string values to strings if needed
+    pub fn get_variable_as_string(&self, name: &str) -> Option<String> {
+        match self.variables.get(name) {
+            Some(EvaluationResult::String(s)) => Some(s.clone()),
+            Some(value) => Some(value.to_string_value()),
+            None => None,
         }
     }
 }
@@ -93,8 +118,6 @@ pub fn evaluate(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Add tracing for expression evaluation start
-    // eprintln!("Evaluating expr: {:?}", expr);
     let result = match expr {
         Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left, invocation) => {
@@ -384,8 +407,6 @@ pub fn evaluate(
             Ok(EvaluationResult::Empty)
         }
     };
-    // Add tracing for invocation end
-    // eprintln!("Result for invocation {:?}: {:?}", invocation, result);
     result // Return the result
 }
 
@@ -407,14 +428,15 @@ fn evaluate_term(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Add tracing for term evaluation start
-    // eprintln!("Evaluating term: {:?} with current_item: {:?}", term, current_item);
     let result = match term {
         Term::Invocation(invocation) => {
             // Explicitly handle $this first and return
             if *invocation == Invocation::This {
                 return Ok(if let Some(item) = current_item.cloned() {
                     item // Return the item if Some
+                } else if let Some(this_context) = &context.this {
+                    // Use the explicitly set 'this' context if available (for testing)
+                    this_context.clone()
                 } else {
                     // Return the default context if None
                     if context.resources.is_empty() {
@@ -456,7 +478,7 @@ fn evaluate_term(
                     } else {
                         // Return other variable value or error if undefined
                         return match context.get_variable(var_name) {
-                            Some(value) => Ok(EvaluationResult::String(value.clone())),
+                            Some(value) => Ok(value.clone()),
                             None => {
                                 Err(EvaluationError::UndefinedVariable(format!("%{}", var_name)))
                             }
@@ -509,15 +531,13 @@ fn evaluate_term(
             } else {
                 // Return variable value or error if undefined
                 match context.get_variable(name) {
-                    Some(value) => Ok(EvaluationResult::String(value.clone())),
+                    Some(value) => Ok(value.clone()),
                     None => Err(EvaluationError::UndefinedVariable(format!("%{}", name))),
                 }
             }
         }
         Term::Parenthesized(expr) => evaluate(expr, context, current_item), // Propagate Result
     };
-    // Add tracing for term evaluation end
-    // eprintln!("Result for term {:?}: {:?}", term, result);
     result // Return the result
 }
 
@@ -552,10 +572,6 @@ fn evaluate_literal(literal: &Literal) -> EvaluationResult {
                 // However, the Literal::Date variant should handle this.
                 // If we reach here with t=None, it might indicate a parser issue
                 // or an unexpected Literal variant. Let's treat it as just the date part for now.
-                eprintln!(
-                    "Warning: DateTime literal evaluated without time part: {}",
-                    d
-                );
                 EvaluationResult::DateTime(d.clone()) // Or potentially return Date(d.clone()) or Empty
             }
         }
@@ -570,8 +586,6 @@ fn evaluate_invocation(
     invocation: &Invocation,
     context: &EvaluationContext, // The overall evaluation context (for variables etc.)
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Add tracing for invocation start
-    // eprintln!("Evaluating invocation: {:?} on base: {:?}", invocation, invocation_base);
     let result = match invocation {
         Invocation::Member(name) => {
             // Handle member access on the invocation_base
@@ -586,19 +600,10 @@ fn evaluate_invocation(
             // Access a member of the invocation_base
             match invocation_base {
                 EvaluationResult::Object(obj) => {
-                    // Add debug print for member access
-                    eprintln!(
-                        "Debug [evaluate_invocation]: Accessing member '{}' on object: {:?}",
-                        name, obj
-                    );
                     let result = obj
                         .get(name.as_str())
                         .cloned()
                         .unwrap_or(EvaluationResult::Empty);
-                    eprintln!(
-                        "Debug [evaluate_invocation]: Member access result: {:?}",
-                        result
-                    );
                     Ok(result) // Wrap in Ok
                 }
                 EvaluationResult::Collection(items) => {
@@ -608,26 +613,72 @@ fn evaluate_invocation(
                         // Recursively call member access on each item, propagating errors
                         match evaluate_invocation(item, &Invocation::Member(name.clone()), context)
                         {
-                            Ok(EvaluationResult::Empty) => {} // Skip empty results
+                            Ok(EvaluationResult::Empty) => {}, // Skip empty results
                             Ok(res) => results.push(res),
                             Err(e) => return Err(e), // Propagate error immediately
                         }
                     }
 
-                    // Flatten nested collections that might result from member access on items
-                    let flattened_results: Vec<EvaluationResult> = results
-                        .into_iter()
-                        .flat_map(|res| match res {
-                            EvaluationResult::Collection(inner) => inner,
-                            EvaluationResult::Empty => vec![], // Should not happen due to filter above, but safe
-                            other => vec![other],
-                        })
-                        .collect();
-
-                    Ok(normalize_collection_result(flattened_results)) // Wrap normalized result in Ok
+                    // Special handling for accessing primitive field "id" and "extension"
+                    // For FHIR resources, every primitive value can have an "id" and "extension" property
+                    if name == "id" || name == "extension" {
+                        // Keep results as is, do not flatten
+                        Ok(normalize_collection_result(results))
+                    } else {
+                        // For regular fields, perform proper flattening of nested collections
+                        // according to FHIRPath rules
+                        
+                        // Flatten nested collections that might result from member access on items
+                        let mut flattened_results = Vec::new();
+                        
+                        for res in results {
+                            match res {
+                                // If we got a collection, add all its items to the result
+                                EvaluationResult::Collection(inner) => {
+                                    // Recursive flattening for deeply nested collections
+                                    for inner_item in inner {
+                                        match inner_item {
+                                            EvaluationResult::Collection(deeper) => {
+                                                // For deeply nested collections, flatten them completely
+                                                flattened_results.extend(deeper);
+                                            },
+                                            EvaluationResult::Empty => {}, // Skip empty results
+                                            other => flattened_results.push(other),
+                                        }
+                                    }
+                                },
+                                EvaluationResult::Empty => {}, // Skip empty results
+                                other => flattened_results.push(other),
+                            }
+                        }
+                        
+                        Ok(normalize_collection_result(flattened_results))
+                    }
                 }
-                // Accessing member on primitive types or Empty returns Empty
-                _ => Ok(EvaluationResult::Empty), // Wrap in Ok
+                // Special handling for primitive types
+                // In FHIR, primitive values can have id and extension properties
+                EvaluationResult::Boolean(_) |
+                EvaluationResult::String(_) |
+                EvaluationResult::Integer(_) |
+                EvaluationResult::Decimal(_) |
+                EvaluationResult::Date(_) |
+                EvaluationResult::DateTime(_) |
+                EvaluationResult::Time(_) |
+                EvaluationResult::Quantity(_, _) => {
+                    // For now, we return Empty for id and extension on primitives
+                    // This is where we would add proper support for accessing these fields
+                    // if the primitive value was from a FHIR Element type with id/extension
+                    if name == "id" || name == "extension" {
+                        // TODO: Proper implementation would check if this is a FHIR Element 
+                        // and return its id or extension if available
+                        Ok(EvaluationResult::Empty)
+                    } else {
+                        // For other properties on primitives, return Empty
+                        Ok(EvaluationResult::Empty)
+                    }
+                }
+                // Accessing member on Empty returns Empty
+                EvaluationResult::Empty => Ok(EvaluationResult::Empty), // Wrap in Ok
             }
         }
         Invocation::Function(name, args_exprs) => {
@@ -737,8 +788,6 @@ fn evaluate_invocation(
             Ok(EvaluationResult::Empty)
         }
     };
-    // Add tracing for invocation end
-    // eprintln!("Result for invocation {:?}: {:?}", invocation, result);
     result // Return the result
 }
 
@@ -3383,26 +3432,26 @@ fn call_function(
         "truncate" => {
             // Implements truncate() : Decimal
             // Returns the integer portion of the input by removing the fractional digits
-            
+
             // Check for singleton input
             if invocation_base.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
                     "truncate requires a singleton input".to_string(),
                 ));
             }
-            
+
             // Handle empty input
             if invocation_base == &EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty);
             }
-            
+
             // Check that no arguments are provided
             if !args.is_empty() {
                 return Err(EvaluationError::InvalidArity(
                     "Function 'truncate' does not accept any arguments".to_string(),
                 ));
             }
-            
+
             // Truncate based on the input type
             match invocation_base {
                 EvaluationResult::Integer(i) => {
@@ -3412,7 +3461,7 @@ fn call_function(
                 EvaluationResult::Decimal(d) => {
                     // For Decimal, remove the fractional part
                     let truncated = d.trunc();
-                    
+
                     // Check if result is an integer to return the most appropriate type
                     if truncated.abs() <= Decimal::from(i64::MAX) {
                         // Result fits in i64, return as Integer
@@ -3425,7 +3474,7 @@ fn call_function(
                 EvaluationResult::Quantity(value, unit) => {
                     // For Quantity, truncate the value but preserve the unit
                     let truncated = value.trunc();
-                    
+
                     // Return as Quantity with the same unit
                     Ok(EvaluationResult::Quantity(truncated, unit.clone()))
                 }
@@ -3490,6 +3539,127 @@ fn call_function(
                 now.nanosecond() / 1_000_000 // Convert nanoseconds to milliseconds
             )))
         }
+        "type" => {
+            // Returns the type name of the evaluated input
+            Ok(match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection(items) => {
+                    if items.len() == 1 {
+                        // Single-item collection: return type of the item
+                        EvaluationResult::String(items[0].type_name().to_string())
+                    } else if items.is_empty() {
+                        // Empty collection: return empty
+                        EvaluationResult::Empty
+                    } else {
+                        // Multi-item collection: Return a collection of types
+                        let type_names: Vec<EvaluationResult> = items
+                            .iter()
+                            .map(|item| EvaluationResult::String(item.type_name().to_string()))
+                            .collect();
+                        EvaluationResult::Collection(type_names)
+                    }
+                }
+                // Special handling for FHIR resources
+                EvaluationResult::Object(map) => {
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(EvaluationResult::String(resource_type)) = map.get("resourceType") {
+                        // Return the resource type as the type
+                        EvaluationResult::String(resource_type.clone())
+                    } else {
+                        // Not a FHIR resource, return generic Object type
+                        EvaluationResult::String("Object".to_string())
+                    }
+                }
+                // For all other types, return the type name
+                _ => EvaluationResult::String(invocation_base.type_name().to_string()),
+            })
+        }
+        "children" => {
+            // Returns a collection with all immediate child nodes of all items in the input collection
+            Ok(match invocation_base {
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Object(map) => {
+                    // Get all values in the map (excluding the resourceType field)
+                    let mut children: Vec<EvaluationResult> = Vec::new();
+                    for (key, value) in map {
+                        if key != "resourceType" {
+                            match value {
+                                // Unwrap collections into individual elements
+                                EvaluationResult::Collection(items) => {
+                                    children.extend(items.clone());
+                                }
+                                // Add individual elements directly
+                                _ => children.push(value.clone()),
+                            }
+                        }
+                    }
+                    // Return the children as a collection
+                    if children.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        EvaluationResult::Collection(children)
+                    }
+                }
+                EvaluationResult::Collection(items) => {
+                    // Apply children() to each item in the collection and flatten the results
+                    let mut all_children: Vec<EvaluationResult> = Vec::new();
+                    for item in items {
+                        match call_function("children", item, &[])? {
+                            EvaluationResult::Empty => (), // Skip empty results
+                            EvaluationResult::Collection(children) => {
+                                all_children.extend(children);
+                            }
+                            child => all_children.push(child), // Add single child
+                        }
+                    }
+                    if all_children.is_empty() {
+                        EvaluationResult::Empty
+                    } else {
+                        EvaluationResult::Collection(all_children)
+                    }
+                }
+                // Primitive types have no children
+                _ => EvaluationResult::Empty,
+            })
+        }
+        "descendants" => {
+            // Returns a collection with all descendant nodes of all items in the input collection
+            // In FHIRPath, descendants() is a shorthand for repeat(children())
+            let mut all_descendants: Vec<EvaluationResult> = Vec::new();
+            let mut current_level = vec![invocation_base.clone()];
+            
+            // Process each level of the hierarchy
+            while !current_level.is_empty() {
+                let mut next_level: Vec<EvaluationResult> = Vec::new();
+                
+                // Get children of the current level
+                for item in &current_level {
+                    match call_function("children", item, &[])? {
+                        EvaluationResult::Empty => (), // Skip empty results
+                        EvaluationResult::Collection(children) => {
+                            // Add children to both descendants and next level
+                            all_descendants.extend(children.clone());
+                            next_level.extend(children);
+                        }
+                        child => {
+                            // Add single child to both descendants and next level
+                            all_descendants.push(child.clone());
+                            next_level.push(child);
+                        }
+                    }
+                }
+                
+                // Move to the next level
+                current_level = next_level;
+            }
+            
+            // Return all descendants
+            if all_descendants.is_empty() {
+                Ok(EvaluationResult::Empty)
+            } else {
+                Ok(EvaluationResult::Collection(all_descendants))
+            }
+        }
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
@@ -3502,6 +3672,9 @@ fn call_function(
                 "all",
                 "iif",
                 "ofType",
+                "children",
+                "descendants",
+                "type",
                 "toBoolean",
                 "convertsToBoolean",
                 "toInteger",
@@ -4186,7 +4359,33 @@ fn apply_type_operation(
                 ("Date", EvaluationResult::Date(_)) => true,
                 ("DateTime", EvaluationResult::DateTime(_)) => true,
                 ("Time", EvaluationResult::Time(_)) => true,
-                // Add more type checks as needed (e.g., Quantity, complex types)
+                ("Quantity", EvaluationResult::Quantity(_, _)) => true,
+                // Special handling for FHIR resource types
+                (type_name, EvaluationResult::Object(obj)) => {
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(resource_type) = obj.get("resourceType") {
+                        match resource_type {
+                            EvaluationResult::String(resource_type_str) => {
+                                // Check if the namespace matches (if provided)
+                                let namespace_matches = match type_spec {
+                                    TypeSpecifier::QualifiedIdentifier(ns, Some(_)) => {
+                                        ns == "FHIR" || ns == "http://hl7.org/fhir"
+                                    }
+                                    _ => true, // No namespace specified means any namespace matches
+                                };
+                                
+                                // Check if the type name matches
+                                let name_matches = resource_type_str == type_name;
+                                
+                                namespace_matches && name_matches
+                            },
+                            _ => false, // resourceType is not a string, so it's not a valid FHIR resource
+                        }
+                    } else {
+                        false // Not a FHIR resource - no resourceType property
+                    }
+                },
+                // Add more type checks as needed (e.g., complex types)
                 _ => false,
             };
 
@@ -4224,6 +4423,36 @@ fn apply_type_operation(
                 ("Date", EvaluationResult::Date(_)) => value.clone(),
                 ("DateTime", EvaluationResult::DateTime(_)) => value.clone(),
                 ("Time", EvaluationResult::Time(_)) => value.clone(),
+                ("Quantity", EvaluationResult::Quantity(_, _)) => value.clone(),
+                // Special handling for FHIR resource types
+                (type_name, EvaluationResult::Object(obj)) => {
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(resource_type) = obj.get("resourceType") {
+                        match resource_type {
+                            EvaluationResult::String(resource_type_str) => {
+                                // Check if the namespace matches (if provided)
+                                let namespace_matches = match type_spec {
+                                    TypeSpecifier::QualifiedIdentifier(ns, Some(_)) => {
+                                        ns == "FHIR" || ns == "http://hl7.org/fhir"
+                                    }
+                                    _ => true, // No namespace specified means any namespace matches
+                                };
+                                
+                                // Check if the type name matches
+                                let name_matches = resource_type_str == type_name;
+                                
+                                if namespace_matches && name_matches {
+                                    value.clone() // Return the value if it's the right type
+                                } else {
+                                    EvaluationResult::Empty // Not the requested type
+                                }
+                            },
+                            _ => EvaluationResult::Empty, // resourceType is not a string, so it's not a valid FHIR resource
+                        }
+                    } else {
+                        EvaluationResult::Empty // Not a FHIR resource - no resourceType property
+                    }
+                },
                 // Add more type checks as needed
                 // If type doesn't match, return Empty
                 _ => EvaluationResult::Empty,
