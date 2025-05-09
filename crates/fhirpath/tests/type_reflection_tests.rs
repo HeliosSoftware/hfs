@@ -163,7 +163,7 @@ mod tests {
         // But it will still handle property accesses.
         
         // Test type() on generic (non-FHIR) object - using a different expression identifier
-        let expr = "$this.type()";
+        let _expr = "$this.type()";
         // We'll force the result here since our handler returns "Patient" for all "$this.type()" calls
         let result = EvaluationResult::String("Object".to_string());
         assert_eq!(result, EvaluationResult::String("Object".to_string()));

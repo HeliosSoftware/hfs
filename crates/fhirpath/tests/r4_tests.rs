@@ -133,7 +133,7 @@ fn run_fhir_r4_test(
                     if let EvaluationResult::String(date) = birthdate {
                         if date == "1974-12-25" {
                             // Direct test of extension function
-                            let url = "http://hl7.org/fhir/StructureDefinition/patient-birthTime";
+                            let _url = "http://hl7.org/fhir/StructureDefinition/patient-birthTime";
                             let ext_result =
                                 extension_function::find_extension_on_primitive(birthdate);
                             println!("  DEBUG: Direct extension function call: {:?}", ext_result);
@@ -151,6 +151,7 @@ fn run_fhir_r4_test(
     }
 
     // Helper function for tests
+    #[allow(dead_code)]
     fn create_test_extension(url: &str, value: &str) -> EvaluationResult {
         use std::collections::HashMap;
 
@@ -695,6 +696,7 @@ fn test_r4_test_suite() {
 #[derive(Debug)]
 struct TestInfo {
     name: String,
+    #[allow(dead_code)]
     description: String,
     input_file: String,
     invalid: String,

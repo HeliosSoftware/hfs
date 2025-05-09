@@ -87,9 +87,9 @@ mod tests {
 
     // Mock simplified versions of evaluate for testing purposes
     fn mock_evaluate_add(
-        expr: &Expression,
+        _expr: &Expression,
         context: &EvaluationContext,
-        item: Option<&EvaluationResult>,
+        _item: Option<&EvaluationResult>,
     ) -> Result<EvaluationResult, EvaluationError> {
         // Get the required variables from context
         let this = context
@@ -109,9 +109,9 @@ mod tests {
     }
 
     fn mock_evaluate_min(
-        expr: &Expression,
+        _expr: &Expression,
         context: &EvaluationContext,
-        item: Option<&EvaluationResult>,
+        _item: Option<&EvaluationResult>,
     ) -> Result<EvaluationResult, EvaluationError> {
         // Get the required variables from context
         let this = context
@@ -140,9 +140,9 @@ mod tests {
     }
 
     fn mock_evaluate_max(
-        expr: &Expression,
+        _expr: &Expression,
         context: &EvaluationContext,
-        item: Option<&EvaluationResult>,
+        _item: Option<&EvaluationResult>,
     ) -> Result<EvaluationResult, EvaluationError> {
         // Get the required variables from context
         let this = context
@@ -212,7 +212,7 @@ mod tests {
         let start_idx = 0;
 
         // Iterate through the items
-        for (idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
+        for (_idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
             // Create a new context with special variables
             let mut agg_context = EvaluationContext::new_empty();
 
@@ -256,7 +256,7 @@ mod tests {
         let mut total = items_to_aggregate[0].clone();
 
         // Iterate through the remaining items
-        for (idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
+        for (_idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
             // Create a new context with special variables
             let mut agg_context = EvaluationContext::new_empty();
 
@@ -303,7 +303,7 @@ mod tests {
         let mut total = items_to_aggregate[0].clone();
 
         // Iterate through the remaining items
-        for (idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
+        for (_idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
             // Create a new context with special variables
             let mut agg_context = EvaluationContext::new_empty();
 
