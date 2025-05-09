@@ -36,7 +36,7 @@ impl EvaluationContext {
             this: None,
         }
     }
-
+    
     /// Sets the 'this' context for direct evaluation (used primarily in tests)
     pub fn set_this(&mut self, value: EvaluationResult) {
         self.this = Some(value);
@@ -49,10 +49,9 @@ impl EvaluationContext {
 
     /// Sets a variable in the context to a string value (for backward compatibility)
     pub fn set_variable(&mut self, name: &str, value: String) {
-        self.variables
-            .insert(name.to_string(), EvaluationResult::String(value));
+        self.variables.insert(name.to_string(), EvaluationResult::String(value));
     }
-
+    
     /// Sets a variable in the context to any EvaluationResult value
     pub fn set_variable_result(&mut self, name: &str, value: EvaluationResult) {
         self.variables.insert(name.to_string(), value);
@@ -70,7 +69,7 @@ impl EvaluationContext {
             None => EvaluationResult::Empty,
         }
     }
-
+    
     /// Gets a variable as a string (for backward compatibility)
     /// Converts non-string values to strings if needed
     pub fn get_variable_as_string(&self, name: &str) -> Option<String> {
@@ -123,55 +122,55 @@ pub fn evaluate(
         Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left, invocation) => {
             // Evaluate the left side first, passing the current item context
-            let left_result = evaluate(left, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
             // Pass the evaluated left side result and the original context for invocation
             evaluate_invocation(&left_result, invocation, context)
         }
         Expression::Indexer(left, index) => {
-            let left_result = evaluate(left, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
             // Index expression doesn't depend on $this, evaluate normally
-            let index_result = evaluate(index, context, None)?;
+            let index_result = evaluate(index, context, None)?; // Use ?
             evaluate_indexer(&left_result, &index_result)
         }
         Expression::Polarity(op, expr) => {
-            let result = evaluate(expr, context, current_item)?;
+            let result = evaluate(expr, context, current_item)?; // Use ?
             apply_polarity(*op, &result)
         }
         Expression::Multiplicative(left, op, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             apply_multiplicative(&left_result, op, &right_result)
         }
         Expression::Additive(left, op, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             apply_additive(&left_result, op, &right_result)
         }
         Expression::Type(left, op, type_spec) => {
-            let result = evaluate(left, context, current_item)?;
+            let result = evaluate(left, context, current_item)?; // Use ?
             apply_type_operation(&result, op, type_spec)
         }
         Expression::Union(left, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             // Union itself doesn't typically error, just returns combined set
             Ok(union_collections(&left_result, &right_result))
         }
         Expression::Inequality(left, op, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             // compare_inequality now returns Result, so just call it directly
             compare_inequality(&left_result, op, &right_result)
         }
         Expression::Equality(left, op, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             // compare_equality now returns Result, so just call it directly
             compare_equality(&left_result, op, &right_result)
         }
         Expression::Membership(left, op, right) => {
-            let left_result = evaluate(left, context, current_item)?;
-            let right_result = evaluate(right, context, current_item)?;
+            let left_result = evaluate(left, context, current_item)?; // Use ?
+            let right_result = evaluate(right, context, current_item)?; // Use ?
             // Membership returns Empty on empty operand or errors on multi-item left
             check_membership(&left_result, op, &right_result)
         }
@@ -425,14 +424,14 @@ fn normalize_collection_result(mut items: Vec<EvaluationResult>) -> EvaluationRe
 
 /// Flattens a collection and all nested collections recursively according to FHIRPath rules.
 /// This function ensures that collections are properly flattened at all levels.
-///
+/// 
 /// For example, a collection containing [Collection([1, 2]), Collection([3, 4])] becomes [1, 2, 3, 4].
-///
+/// 
 /// FHIRPath rules for member access state that when accessing a member of a collection,
 /// the result should be a flattened collection of all member values.
 fn flatten_collections_recursive(result: EvaluationResult) -> Vec<EvaluationResult> {
     let mut flattened = Vec::new();
-
+    
     match result {
         EvaluationResult::Collection(items) => {
             // For each item in the collection, recursively flatten it
@@ -440,16 +439,16 @@ fn flatten_collections_recursive(result: EvaluationResult) -> Vec<EvaluationResu
                 let nested_flattened = flatten_collections_recursive(item);
                 flattened.extend(nested_flattened);
             }
-        }
+        },
         EvaluationResult::Empty => {
             // Skip empty results as per FHIRPath rules
-        }
+        },
         other => {
             // Add non-collection, non-empty items directly
             flattened.push(other);
         }
     }
-
+    
     flattened
 }
 
@@ -631,20 +630,11 @@ fn evaluate_invocation(
             // Access a member of the invocation_base
             match invocation_base {
                 EvaluationResult::Object(obj) => {
-                    // Try direct access first
-                    if let Some(result) = obj.get(name.as_str()) {
-                        return Ok(result.clone()); // Direct access succeeded
-                    }
-
-                    // Try polymorphic access for FHIR choice elements
-                    if let Some(result) =
-                        crate::polymorphic_access::access_polymorphic_element(obj, name.as_str())
-                    {
-                        return Ok(result); // Return polymorphic result
-                    }
-
-                    // Fallback to empty if not found
-                    Ok(EvaluationResult::Empty)
+                    let result = obj
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or(EvaluationResult::Empty);
+                    Ok(result) // Wrap in Ok
                 }
                 EvaluationResult::Collection(items) => {
                     // For collections, apply member access to each item and collect results
@@ -653,7 +643,7 @@ fn evaluate_invocation(
                         // Recursively call member access on each item, propagating errors
                         match evaluate_invocation(item, &Invocation::Member(name.clone()), context)
                         {
-                            Ok(EvaluationResult::Empty) => {} // Skip empty results
+                            Ok(EvaluationResult::Empty) => {}, // Skip empty results
                             Ok(res) => results.push(res),
                             Err(e) => return Err(e), // Propagate error immediately
                         }
@@ -667,32 +657,32 @@ fn evaluate_invocation(
                     } else {
                         // For regular fields, perform proper flattening of nested collections
                         // according to FHIRPath rules
-
+                        
                         // Create a collection result from individual results
                         let collection_result = EvaluationResult::Collection(results);
-
+                        
                         // Use our recursive flattening function to flatten everything properly
                         let flattened_results = flatten_collections_recursive(collection_result);
-
+                        
                         // Normalize the flattened results
                         Ok(normalize_collection_result(flattened_results))
                     }
                 }
                 // Special handling for primitive types
                 // In FHIR, primitive values can have id and extension properties
-                EvaluationResult::Boolean(_)
-                | EvaluationResult::String(_)
-                | EvaluationResult::Integer(_)
-                | EvaluationResult::Decimal(_)
-                | EvaluationResult::Date(_)
-                | EvaluationResult::DateTime(_)
-                | EvaluationResult::Time(_)
-                | EvaluationResult::Quantity(_, _) => {
+                EvaluationResult::Boolean(_) |
+                EvaluationResult::String(_) |
+                EvaluationResult::Integer(_) |
+                EvaluationResult::Decimal(_) |
+                EvaluationResult::Date(_) |
+                EvaluationResult::DateTime(_) |
+                EvaluationResult::Time(_) |
+                EvaluationResult::Quantity(_, _) => {
                     // For now, we return Empty for id and extension on primitives
                     // This is where we would add proper support for accessing these fields
                     // if the primitive value was from a FHIR Element type with id/extension
                     if name == "id" || name == "extension" {
-                        // TODO: Proper implementation would check if this is a FHIR Element
+                        // TODO: Proper implementation would check if this is a FHIR Element 
                         // and return its id or extension if available
                         Ok(EvaluationResult::Empty)
                     } else {
@@ -726,47 +716,22 @@ fn evaluate_invocation(
                 }
                 "ofType" if args_exprs.len() == 1 => {
                     let type_spec_opt = match &args_exprs[0] {
-                        // Handle literal string like 'Integer'
-                        Expression::Term(Term::Literal(Literal::String(type_name))) => {
-                            // Check if the type name contains a namespace qualifier
-                            if type_name.contains('.') {
-                                // Split into namespace and type
-                                let parts: Vec<&str> = type_name.split('.').collect();
-                                if parts.len() >= 2 {
-                                    let namespace = parts[0].to_string();
-                                    let type_part = parts[1].to_string();
-                                    Some(TypeSpecifier::QualifiedIdentifier(
-                                        namespace,
-                                        Some(type_part),
-                                    ))
-                                } else {
-                                    // Default when split doesn't give enough parts
-                                    Some(TypeSpecifier::QualifiedIdentifier(
-                                        type_name.clone(),
-                                        None,
-                                    ))
-                                }
-                            } else {
-                                // No namespace in the type name
-                                Some(TypeSpecifier::QualifiedIdentifier(type_name.clone(), None))
-                            }
-                        }
-                        // Handle simple identifier like Integer (without quotes)
+                        // Handle simple identifier like 'Integer'
                         Expression::Term(Term::Invocation(Invocation::Member(type_name))) => {
                             Some(TypeSpecifier::QualifiedIdentifier(type_name.clone(), None))
                         }
-                        // Handle qualified identifier like System.Integer
+                        // Handle qualified identifier like 'System.Integer'
+                        // The parser seems to produce Invocation(base, member) for this
                         Expression::Invocation(base_expr, Invocation::Member(member_name)) => {
                             // Check if the base is a simple member invocation (like 'System')
                             if let Expression::Term(Term::Invocation(Invocation::Member(
                                 base_name,
                             ))) = &**base_expr
                             {
-                                // Create a properly qualified identifier with namespace and type name separated
-                                Some(TypeSpecifier::QualifiedIdentifier(
-                                    base_name.clone(),
-                                    Some(member_name.clone()),
-                                ))
+                                // Reconstruct the qualified name: "System.Integer"
+                                // For now, store the full name as the identifier. evaluate_of_type will handle it.
+                                let full_name = format!("{}.{}", base_name, member_name);
+                                Some(TypeSpecifier::QualifiedIdentifier(full_name, None))
                             } else {
                                 None // Unexpected structure for qualified identifier base
                             }
@@ -775,8 +740,7 @@ fn evaluate_invocation(
                     };
 
                     if let Some(type_spec) = type_spec_opt {
-                        // Use the resource_type module to handle ofType
-                        crate::resource_type::of_type(invocation_base, &type_spec)
+                        Ok(evaluate_of_type(invocation_base, &type_spec)) // Wrap in Ok
                     } else {
                         Err(EvaluationError::InvalidArgument(format!(
                             "Invalid type specifier argument for ofType: {:?}",
@@ -813,16 +777,12 @@ fn evaluate_invocation(
                     // Get the projection expression from args_exprs
                     let projection_expr = &args_exprs[0];
                     // Call the repeat_function implementation
-                    crate::repeat_function::repeat_function(
-                        invocation_base,
-                        projection_expr,
-                        context,
-                    )
+                    crate::repeat_function::repeat_function(invocation_base, projection_expr, context)
                 }
                 "aggregate" if !args_exprs.is_empty() => {
                     // Get the aggregator expression
                     let aggregator_expr = &args_exprs[0];
-
+                    
                     // Get the init value if provided (second argument)
                     let init_value = if args_exprs.len() > 1 {
                         // Evaluate the init value expression
@@ -830,57 +790,33 @@ fn evaluate_invocation(
                     } else {
                         None
                     };
-
+                    
                     // Call the aggregate_function implementation
                     match init_value {
-                        Some(init) => crate::aggregate_function::aggregate_function(
-                            invocation_base,
-                            aggregator_expr,
-                            Some(&init),
-                            context,
-                        ),
-                        None => crate::aggregate_function::aggregate_function(
-                            invocation_base,
-                            aggregator_expr,
-                            None,
-                            context,
-                        ),
+                        Some(init) => crate::aggregate_function::aggregate_function(invocation_base, aggregator_expr, Some(&init), context),
+                        None => crate::aggregate_function::aggregate_function(invocation_base, aggregator_expr, None, context)
                     }
                 }
-                "trace" => {
-                    // Check if there are arguments - trace() requires at least a name
-                    if args_exprs.is_empty() {
-                        return Err(EvaluationError::InvalidArity(
-                            "trace() function requires at least a name parameter".to_string(),
-                        ));
-                    }
-
-                    // Continue with regular trace function handling
+                "trace" if !args_exprs.is_empty() => {
                     // Get the name parameter (required)
                     let name = match evaluate(&args_exprs[0], context, None)? {
                         EvaluationResult::String(name_str) => name_str,
                         _ => {
                             return Err(EvaluationError::TypeError(
-                                "trace() function requires a string name as first argument"
-                                    .to_string(),
+                                "trace() function requires a string name as first argument".to_string()
                             ));
                         }
                     };
-
+                    
                     // Get the optional projection expression
                     let projection_expr = if args_exprs.len() > 1 {
                         Some(&args_exprs[1])
                     } else {
                         None
                     };
-
+                    
                     // Call the trace_function implementation
-                    crate::trace_function::trace_function(
-                        invocation_base,
-                        &name,
-                        projection_expr,
-                        context,
-                    )
+                    crate::trace_function::trace_function(invocation_base, &name, projection_expr, context)
                 }
                 // Add other functions taking lambdas here (e.g., any)
                 _ => {
@@ -977,17 +913,17 @@ fn evaluate_where(
     // Handle nested collections in the filtered results
     if !filtered_items.is_empty() {
         // Check if any filtered items are collections themselves
-        let has_nested_collections = filtered_items
-            .iter()
-            .any(|item| matches!(item, EvaluationResult::Collection(_)));
-
+        let has_nested_collections = filtered_items.iter().any(|item| {
+            matches!(item, EvaluationResult::Collection(_))
+        });
+        
         if has_nested_collections {
             // Create a collection from all filtered items
             let collection_result = EvaluationResult::Collection(filtered_items);
-
+            
             // Properly flatten all nested collections
             let flattened_results = flatten_collections_recursive(collection_result);
-
+            
             // Return normalized result
             return Ok(normalize_collection_result(flattened_results));
         }
@@ -1013,17 +949,17 @@ fn evaluate_select(
     for item in items_to_project {
         // Evaluate projection, propagate error
         let projection_result = evaluate(projection_expr, context, Some(&item))?;
-
+        
         // Add the result to our collection of projected items
         projected_items.push(projection_result);
     }
 
     // Create a collection from all the projected results
     let collection_result = EvaluationResult::Collection(projected_items);
-
+    
     // Properly flatten all nested collections
     let flattened_results = flatten_collections_recursive(collection_result);
-
+    
     // Return Empty or Collection, apply normalization
     Ok(normalize_collection_result(flattened_results))
 }
@@ -1068,6 +1004,56 @@ fn evaluate_all_with_criteria(
     Ok(EvaluationResult::Boolean(true))
 }
 
+/// Evaluates the 'ofType' function.
+fn evaluate_of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> EvaluationResult {
+    let items_to_filter = match collection {
+        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Empty => vec![],
+        single_item => vec![single_item.clone()],
+    };
+
+    let target_type_name = match type_spec {
+        // The name might now be "System.Integer" or just "Integer"
+        TypeSpecifier::QualifiedIdentifier(name, _namespace) => {
+            // If the name contains '.', take the part after the last dot.
+            // This handles both "System.Integer" -> "Integer" and "Integer" -> "Integer".
+            name.split('.').last().unwrap_or(name.as_str())
+        }
+    };
+
+    let mut filtered_items = Vec::new();
+    for item in items_to_filter {
+        let matches = match (target_type_name, &item) {
+            ("Boolean", EvaluationResult::Boolean(_)) => true,
+            ("String", EvaluationResult::String(_)) => true,
+            ("Integer", EvaluationResult::Integer(_)) => true,
+            ("Decimal", EvaluationResult::Decimal(_)) => true,
+            ("Date", EvaluationResult::Date(_)) => true,
+            ("DateTime", EvaluationResult::DateTime(_)) => true,
+            ("Time", EvaluationResult::Time(_)) => true,
+            // Handle complex FHIR types by checking resourceType
+            (fhir_type, EvaluationResult::Object(fields)) => {
+                if let Some(EvaluationResult::String(rt)) = fields.get("resourceType") {
+                    rt == fhir_type
+                } else {
+                    false // Object has no resourceType field
+                }
+            }
+            // Add checks for other FHIR primitive types if needed (e.g., Quantity, Code)
+            // These might require inspecting the structure more deeply if not directly mapped
+            // to EvaluationResult variants. For now, basic types and resourceType check.
+            _ => false, // Type mismatch
+        };
+
+        if matches {
+            filtered_items.push(item.clone());
+        }
+    }
+
+    // Return Empty or Collection, apply normalization
+    normalize_collection_result(filtered_items)
+}
+
 /// Calls a standard FHIRPath function (that doesn't take a lambda).
 fn call_function(
     name: &str,
@@ -1079,26 +1065,24 @@ fn call_function(
         "conformsTo" => {
             // Check that we have exactly one argument (the profile URL)
             if args.len() != 1 {
-                return Err(EvaluationError::InvalidArity(format!(
-                    "Function 'conformsTo' expects 1 argument, got {}",
-                    args.len()
-                )));
+                return Err(EvaluationError::InvalidArity(
+                    format!("Function 'conformsTo' expects 1 argument, got {}", args.len())
+                ));
             }
-
+            
             // Get the profile URL from the argument
             let profile_url = match &args[0] {
                 EvaluationResult::String(url) => url,
                 _ => {
-                    return Err(EvaluationError::TypeError(format!(
-                        "conformsTo() function requires a string URL argument, got {}",
-                        args[0].type_name()
-                    )));
+                    return Err(EvaluationError::TypeError(
+                        format!("conformsTo() function requires a string URL argument, got {}", args[0].type_name())
+                    ));
                 }
             };
-
+            
             // For FHIR resources, we should check if the resource conforms to the provided profile
             // Currently we'll implement a basic check that just verifies if the URL is a known FHIR URL
-
+            
             if let EvaluationResult::Object(obj) = invocation_base {
                 // Check if this is a FHIR resource with matching resourceType
                 if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
@@ -1114,43 +1098,148 @@ fn call_function(
                             }
                         }
                     }
-
+                    
                     // Special case for URL "http://trash" that should always return false
                     if profile_url == "http://trash" {
                         return Ok(EvaluationResult::Boolean(false));
                     }
-
+                    
                     // For unknown profiles, we return false by default
                     // A full implementation would check the profile definitions
                     // and validate the resource against them
                     return Ok(EvaluationResult::Boolean(false));
                 }
             }
-
+            
             // If the base is not a FHIR resource, return false
             Ok(EvaluationResult::Boolean(false))
-        }
-
+        },
+        
         // Handle the .is() method form - delegates to resource_type.rs
         "is" => {
-            // Special case handling for testType5 and testType6 test cases
-            if let EvaluationResult::Boolean(true) = invocation_base {
-                if let Some(EvaluationResult::String(type_name)) = args.get(0) {
-                    if type_name == "Boolean" || type_name == "System.Boolean" {
-                        return Ok(EvaluationResult::Boolean(true));
-                    }
-                }
+            // Check that we have exactly one argument (the type to check)
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    format!("Function 'is' expects 1 argument, got {}", args.len())
+                ));
             }
             
-            // General case - delegate to fix_type_operators
-            crate::fix_type_operators::fix_is_function(invocation_base, args)
+            // Get the type specifier from the argument
+            let type_specifier = match &args[0] {
+                EvaluationResult::String(type_name) => {
+                    // Convert the string argument to a TypeSpecifier
+                    // Here we need to check if the type name contains a dot (namespace separator)
+                    if type_name.contains('.') {
+                        // Extract namespace and type parts
+                        let parts: Vec<&str> = type_name.split('.').collect();
+                        if parts.len() >= 2 {
+                            let namespace = parts[0].to_string();
+                            let type_part = parts[1].to_string();
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(namespace, Some(type_part))
+                        } else {
+                            // Default when split doesn't give enough parts
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                        }
+                    } else {
+                        // No namespace in the type name
+                        crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                    }
+                },
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        format!("is() function requires a string type name, got {}", args[0].type_name())
+                    ));
+                }
+            };
+            
+            // Call is_of_type from resource_type.rs to perform the check
+            match crate::resource_type::is_of_type(invocation_base, &type_specifier) {
+                Ok(result) => Ok(EvaluationResult::Boolean(result)),
+                Err(e) => Err(e),
+            }
         },
-
+        
         // Handle the .ofType() method - delegates to resource_type.rs
-        "ofType" => crate::fix_type_operators::fix_of_type_function(invocation_base, args),
-
+        "ofType" => {
+            // Check that we have exactly one argument (the type to filter by)
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    format!("Function 'ofType' expects 1 argument, got {}", args.len())
+                ));
+            }
+            
+            // Get the type specifier from the argument
+            let type_specifier = match &args[0] {
+                EvaluationResult::String(type_name) => {
+                    // Convert the string argument to a TypeSpecifier
+                    // Handle qualified type names with namespaces
+                    if type_name.contains('.') {
+                        // Extract namespace and type parts
+                        let parts: Vec<&str> = type_name.split('.').collect();
+                        if parts.len() >= 2 {
+                            let namespace = parts[0].to_string();
+                            let type_part = parts[1].to_string();
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(namespace, Some(type_part))
+                        } else {
+                            // Default when split doesn't give enough parts
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                        }
+                    } else {
+                        // No namespace in the type name
+                        crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                    }
+                },
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        format!("ofType() function requires a string type name, got {}", args[0].type_name())
+                    ));
+                }
+            };
+            
+            // Call of_type from resource_type.rs to perform the filtering
+            crate::resource_type::of_type(invocation_base, &type_specifier)
+        },
+        
         // Handle the .as() method form - delegates to resource_type.rs
-        "as" => crate::fix_type_operators::fix_as_function(invocation_base, args),
+        "as" => {
+            // Check that we have exactly one argument (the type to cast to)
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(
+                    format!("Function 'as' expects 1 argument, got {}", args.len())
+                ));
+            }
+            
+            // Get the type specifier from the argument
+            let type_specifier = match &args[0] {
+                EvaluationResult::String(type_name) => {
+                    // Convert the string argument to a TypeSpecifier
+                    // Handle qualified type names with namespaces
+                    if type_name.contains('.') {
+                        // Extract namespace and type parts
+                        let parts: Vec<&str> = type_name.split('.').collect();
+                        if parts.len() >= 2 {
+                            let namespace = parts[0].to_string();
+                            let type_part = parts[1].to_string();
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(namespace, Some(type_part))
+                        } else {
+                            // Default when split doesn't give enough parts
+                            crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                        }
+                    } else {
+                        // No namespace in the type name
+                        crate::parser::TypeSpecifier::QualifiedIdentifier(type_name.clone(), None)
+                    }
+                },
+                _ => {
+                    return Err(EvaluationError::TypeError(
+                        format!("as() function requires a string type name, got {}", args[0].type_name())
+                    ));
+                }
+            };
+            
+            // Call as_type from resource_type.rs to perform the cast
+            crate::resource_type::as_type(invocation_base, &type_specifier)
+        },
         "count" => {
             // Returns the number of items in the collection, including duplicates
             Ok(match invocation_base {
@@ -1165,8 +1254,7 @@ fn call_function(
         "type" => {
             // Returns type information for the input
             // This delegates to the type_function implementation
-            // For r4_tests.rs tests, we need to return the full object to allow property access
-            crate::type_function::type_function(invocation_base, args, true)
+            crate::type_function::type_function_full(invocation_base, args)
         }
         "empty" => {
             // Returns true if the collection is empty (0 items)
@@ -3764,11 +3852,11 @@ fn call_function(
             // In FHIRPath, descendants() is a shorthand for repeat(children())
             let mut all_descendants: Vec<EvaluationResult> = Vec::new();
             let mut current_level = vec![invocation_base.clone()];
-
+            
             // Process each level of the hierarchy
             while !current_level.is_empty() {
                 let mut next_level: Vec<EvaluationResult> = Vec::new();
-
+                
                 // Get children of the current level
                 for item in &current_level {
                     match call_function("children", item, &[])? {
@@ -3785,21 +3873,17 @@ fn call_function(
                         }
                     }
                 }
-
+                
                 // Move to the next level
                 current_level = next_level;
             }
-
+            
             // Return all descendants
             if all_descendants.is_empty() {
                 Ok(EvaluationResult::Empty)
             } else {
                 Ok(EvaluationResult::Collection(all_descendants))
             }
-        }
-        "extension" => {
-            // Delegate to the extension_function module
-            crate::extension_function::extension_function(invocation_base, args)
         }
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
@@ -3819,7 +3903,6 @@ fn call_function(
                 "children",
                 "descendants",
                 "type",
-                "extension",
                 "toBoolean",
                 "convertsToBoolean",
                 "toInteger",
@@ -4474,6 +4557,20 @@ fn apply_type_operation(
 ) -> Result<EvaluationResult, EvaluationError> {
     match op {
         "is" => {
+            // Extract the namespace and name from the type specifier
+            let (namespace, type_name) = match type_spec {
+                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => {
+                    // Qualified name: System.Integer or FHIR.Patient
+                    (Some(ns_or_name.as_str()), name.as_str())
+                },
+                TypeSpecifier::QualifiedIdentifier(name, None) => {
+                    // Unqualified name: Integer or Patient
+                    // Determine the appropriate default namespace
+                    let default_ns = crate::fhir_type_hierarchy::determine_type_namespace(name);
+                    (Some(default_ns), name.as_str())
+                },
+            };
+
             // Handle singleton evaluation: 'is' errors on multi-item collections
             if value.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -4481,11 +4578,160 @@ fn apply_type_operation(
                 ));
             }
 
-            // Call is_of_type from resource_type.rs
-            let is_result = crate::resource_type::is_of_type(value, type_spec)?;
-            Ok(EvaluationResult::Boolean(is_result))
+            let is_type = match value {
+                // Empty is not of any type
+                EvaluationResult::Empty => false,
+                
+                // Collections should be handled by initial check, but handle anyway
+                EvaluationResult::Collection(_) => false,
+                
+                // Handle primitive types - first handle System namespace
+                EvaluationResult::Boolean(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Boolean") || 
+                                      type_name.eq_ignore_ascii_case("boolean");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("boolean"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::String(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("String") || 
+                                      type_name.eq_ignore_ascii_case("string");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("string"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Integer(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Integer") || 
+                                      type_name.eq_ignore_ascii_case("integer");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("integer"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Decimal(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Decimal") || 
+                                      type_name.eq_ignore_ascii_case("decimal");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("decimal"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Date(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Date") || 
+                                      type_name.eq_ignore_ascii_case("date");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("date"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::DateTime(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("DateTime") || 
+                                      type_name.eq_ignore_ascii_case("dateTime");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("dateTime"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Time(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Time") || 
+                                      type_name.eq_ignore_ascii_case("time");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("time"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Quantity(_, _) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Quantity") || 
+                                      type_name.eq_ignore_ascii_case("quantity");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true);
+                    matches_type && matches_ns
+                },
+                
+                // Special handling for FHIR objects and resources
+                EvaluationResult::Object(obj) => {
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(resource_type) = obj.get("resourceType") {
+                        if let EvaluationResult::String(resource_type_str) = resource_type {
+                            // Check if looking for a specific resource type
+                            let type_matches = type_name.eq_ignore_ascii_case(resource_type_str);
+                            
+                            // Check if the type is a parent type like Resource or DomainResource
+                            let type_is_parent = crate::fhir_type_hierarchy::is_derived_from(
+                                resource_type_str, type_name
+                            );
+                            
+                            // For resource types, we always require the FHIR namespace
+                            let namespace_matches = namespace.map(|ns| {
+                                ns.eq_ignore_ascii_case("FHIR") || 
+                                ns.eq_ignore_ascii_case("http://hl7.org/fhir")
+                            }).unwrap_or(true);
+                            
+                            (type_matches || type_is_parent) && namespace_matches
+                        } else {
+                            false
+                        }
+                    } else {
+                        // This could be a FHIR primitive type (boolean, string, etc.)
+                        // Let's do a more generic check
+                        
+                        // Check for FHIR primitive types with .value
+                        if obj.contains_key("value") {
+                            // This is likely a FHIR primitive
+                            if let Some(value) = obj.get("value") {
+                                match value {
+                                    EvaluationResult::Boolean(_) => 
+                                        type_name.eq_ignore_ascii_case("boolean"),
+                                    EvaluationResult::String(_) => 
+                                        type_name.eq_ignore_ascii_case("string"),
+                                    EvaluationResult::Integer(_) => 
+                                        type_name.eq_ignore_ascii_case("integer"),
+                                    EvaluationResult::Decimal(_) => 
+                                        type_name.eq_ignore_ascii_case("decimal"),
+                                    EvaluationResult::Date(_) => 
+                                        type_name.eq_ignore_ascii_case("date"),
+                                    EvaluationResult::DateTime(_) => 
+                                        type_name.eq_ignore_ascii_case("dateTime"),
+                                    EvaluationResult::Time(_) => 
+                                        type_name.eq_ignore_ascii_case("time"),
+                                    _ => false
+                                }
+                            } else {
+                                false
+                            }
+                        } else if type_name.eq_ignore_ascii_case("Quantity") && 
+                                 obj.contains_key("value") && 
+                                 obj.contains_key("unit") {
+                            // This is a FHIR Quantity
+                            true
+                        } else {
+                            // Check for FHIR complex types
+                            let is_complex_type = crate::fhir_type_hierarchy::is_fhir_complex_type(type_name);
+                            if is_complex_type {
+                                // Hard to determine if an object is specifically a HumanName, Address, etc.
+                                // without custom code for each type - for now, return false
+                                // This would require more comprehensive property checking
+                                false
+                            } else {
+                                // Not a recognized type
+                                false
+                            }
+                        }
+                    }
+                },
+            };
+
+            Ok(EvaluationResult::Boolean(is_type))
         }
         "as" => {
+            // Extract the namespace and name from the type specifier
+            let (namespace, type_name) = match type_spec {
+                TypeSpecifier::QualifiedIdentifier(ns_or_name, Some(name)) => {
+                    // Qualified name: System.Integer or FHIR.Patient
+                    (Some(ns_or_name.as_str()), name.as_str())
+                },
+                TypeSpecifier::QualifiedIdentifier(name, None) => {
+                    // Unqualified name: Integer or Patient
+                    // Determine the appropriate default namespace
+                    let default_ns = crate::fhir_type_hierarchy::determine_type_namespace(name);
+                    (Some(default_ns), name.as_str())
+                },
+            };
+
             // Handle singleton evaluation: 'as' errors on multi-item collections
             if value.count() > 1 {
                 return Err(EvaluationError::SingletonEvaluationError(
@@ -4493,13 +4739,188 @@ fn apply_type_operation(
                 ));
             }
 
-            // Call as_type from resource_type.rs
-            crate::resource_type::as_type(value, type_spec)
-        }
-        "ofType" => {
-            // ofType should work on collections and does not need singleton check
-            // Call of_type from resource_type.rs
-            crate::resource_type::of_type(value, type_spec)
+            // First check if the value is of the specified type using our 'is' logic
+            // We'll reuse the same logic that we use for 'is', but instead of returning
+            // a boolean result, we'll return the value or Empty
+            let is_type = match value {
+                // Empty is not of any type, so return Empty
+                EvaluationResult::Empty => false,
+                
+                // Collections should be handled by initial check, but handle anyway
+                EvaluationResult::Collection(_) => false,
+                
+                // Handle primitive types
+                EvaluationResult::Boolean(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Boolean") || 
+                                      type_name.eq_ignore_ascii_case("boolean");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("boolean"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::String(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("String") || 
+                                      type_name.eq_ignore_ascii_case("string");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("string"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Integer(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Integer") || 
+                                      type_name.eq_ignore_ascii_case("integer");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("integer"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Decimal(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Decimal") || 
+                                      type_name.eq_ignore_ascii_case("decimal");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("decimal"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Date(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Date") || 
+                                      type_name.eq_ignore_ascii_case("date");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("date"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::DateTime(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("DateTime") || 
+                                      type_name.eq_ignore_ascii_case("dateTime");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("dateTime"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Time(_) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Time") || 
+                                      type_name.eq_ignore_ascii_case("time");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true) ||
+                                    type_name.eq_ignore_ascii_case("time"); // FHIR lowercase primitive
+                    matches_type && matches_ns
+                },
+                EvaluationResult::Quantity(_, _) => {
+                    let matches_type = type_name.eq_ignore_ascii_case("Quantity") || 
+                                      type_name.eq_ignore_ascii_case("quantity");
+                    let matches_ns = namespace.map(|ns| ns.eq_ignore_ascii_case("System")).unwrap_or(true);
+                    matches_type && matches_ns
+                },
+                
+                // Special handling for FHIR objects and resources
+                EvaluationResult::Object(obj) => {
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(resource_type) = obj.get("resourceType") {
+                        if let EvaluationResult::String(resource_type_str) = resource_type {
+                            // Check if looking for a specific resource type
+                            let type_matches = type_name.eq_ignore_ascii_case(resource_type_str);
+                            
+                            // Check if the type is a parent type like Resource or DomainResource
+                            let type_is_parent = crate::fhir_type_hierarchy::is_derived_from(
+                                resource_type_str, type_name
+                            );
+                            
+                            // For resource types, we always require the FHIR namespace
+                            let namespace_matches = namespace.map(|ns| {
+                                ns.eq_ignore_ascii_case("FHIR") || 
+                                ns.eq_ignore_ascii_case("http://hl7.org/fhir")
+                            }).unwrap_or(true);
+                            
+                            (type_matches || type_is_parent) && namespace_matches
+                        } else {
+                            false
+                        }
+                    } else {
+                        // This could be a FHIR primitive type or complex type
+                        
+                        // Check for FHIR primitive types with .value
+                        if obj.contains_key("value") {
+                            if let Some(value) = obj.get("value") {
+                                match value {
+                                    EvaluationResult::Boolean(_) => 
+                                        type_name.eq_ignore_ascii_case("boolean"),
+                                    EvaluationResult::String(_) => 
+                                        type_name.eq_ignore_ascii_case("string"),
+                                    EvaluationResult::Integer(_) => 
+                                        type_name.eq_ignore_ascii_case("integer"),
+                                    EvaluationResult::Decimal(_) => 
+                                        type_name.eq_ignore_ascii_case("decimal"),
+                                    EvaluationResult::Date(_) => 
+                                        type_name.eq_ignore_ascii_case("date"),
+                                    EvaluationResult::DateTime(_) => 
+                                        type_name.eq_ignore_ascii_case("dateTime"),
+                                    EvaluationResult::Time(_) => 
+                                        type_name.eq_ignore_ascii_case("time"),
+                                    _ => false
+                                }
+                            } else {
+                                false
+                            }
+                        } else if type_name.eq_ignore_ascii_case("Quantity") && 
+                                 obj.contains_key("value") && 
+                                 obj.contains_key("unit") {
+                            // This is a FHIR Quantity
+                            true
+                        } else {
+                            // Check for FHIR complex types
+                            let is_complex_type = crate::fhir_type_hierarchy::is_fhir_complex_type(type_name);
+                            if is_complex_type {
+                                // Hard to determine if an object is specifically a HumanName, Address, etc.
+                                // For now, do a heuristic check based on property presence
+                                match type_name.to_lowercase().as_str() {
+                                    "humanname" => obj.contains_key("given") || obj.contains_key("family"),
+                                    "address" => obj.contains_key("city") || obj.contains_key("postalCode"),
+                                    "contactpoint" => obj.contains_key("system") || obj.contains_key("value"),
+                                    "period" => obj.contains_key("start") || obj.contains_key("end"),
+                                    "codeableconcept" => obj.contains_key("coding") || obj.contains_key("text"),
+                                    "coding" => obj.contains_key("system") || obj.contains_key("code"),
+                                    _ => false
+                                }
+                            } else {
+                                // Not a recognized type
+                                false
+                            }
+                        }
+                    }
+                },
+            };
+            
+            // If the value is of the specified type, return it, otherwise return Empty
+            Ok(if is_type {
+                value.clone()
+            } else {
+                EvaluationResult::Empty
+            })
+                    // Check if this is a FHIR resource by looking for resourceType property
+                    if let Some(resource_type) = obj.get("resourceType") {
+                        match resource_type {
+                            EvaluationResult::String(resource_type_str) => {
+                                // Check if the namespace matches (if provided)
+                                let namespace_matches = match type_spec {
+                                    TypeSpecifier::QualifiedIdentifier(ns, Some(_)) => {
+                                        ns == "FHIR" || ns == "http://hl7.org/fhir"
+                                    }
+                                    _ => true, // No namespace specified means any namespace matches
+                                };
+                                
+                                // Check if the type name matches
+                                let name_matches = resource_type_str == type_name;
+                                
+                                if namespace_matches && name_matches {
+                                    value.clone() // Return the value if it's the right type
+                                } else {
+                                    EvaluationResult::Empty // Not the requested type
+                                }
+                            },
+                            _ => EvaluationResult::Empty, // resourceType is not a string, so it's not a valid FHIR resource
+                        }
+                    } else {
+                        EvaluationResult::Empty // Not a FHIR resource - no resourceType property
+                    }
+                },
+                // Add more type checks as needed
+                // If type doesn't match, return Empty
+                _ => EvaluationResult::Empty,
+            })
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown type operator: {}",
@@ -4701,12 +5122,9 @@ fn compare_equality(
                     EvaluationResult::Boolean(Decimal::from(*l) == *r)
                 }
                 // Handle all date/time comparisons with our new helper function
-                (left, right)
-                    if crate::datetime_impl::compare_date_time_values(left, right).is_some() =>
-                {
+                (left, right) if crate::datetime_impl::compare_date_time_values(left, right).is_some() => {
                     // Use the ordering result to determine equality
-                    let ordering =
-                        crate::datetime_impl::compare_date_time_values(left, right).unwrap();
+                    let ordering = crate::datetime_impl::compare_date_time_values(left, right).unwrap();
                     EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal)
                 }
                 // Quantity equality (requires same units and equal values)

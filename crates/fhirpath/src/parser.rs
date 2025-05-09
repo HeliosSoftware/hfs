@@ -44,6 +44,11 @@ pub enum Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeSpecifier {
+    // First String is namespace (or type if Option is None)
+    // Option<String> is the type name when namespace is provided
+    // Example: FHIR.Patient -> QualifiedIdentifier("FHIR", Some("Patient"))
+    // Example: Boolean -> QualifiedIdentifier("Boolean", None) 
+    // Example: System.Boolean -> This should be properly parsed as QualifiedIdentifier("System", Some("Boolean"))
     QualifiedIdentifier(String, Option<String>),
 }
 
@@ -475,19 +480,61 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     ));
 
     // Qualified identifier (for type specifiers)
-    // Handles both `Identifier` and `Identifier.Identifier`
-    let qualified_identifier = identifier.clone()
-        .then(just('.').ignore_then(identifier.clone()).or_not())
-        .map(|(first_part, second_part_opt)| {
-            // If second_part exists, first_part is namespace, second_part is name.
-            // If second_part is None, first_part is the name, namespace is None.
-            match second_part_opt {
-                Some(name) => TypeSpecifier::QualifiedIdentifier(first_part, Some(name)),
-                None => TypeSpecifier::QualifiedIdentifier(first_part, None),
-            }
-        })
+    // Handles all these patterns:
+    // - Single identifier: Boolean, Patient, etc.
+    // - Namespace.Type: System.Boolean, FHIR.Patient
+    // - Backtick quoted: `System`.`Boolean`, FHIR.`Patient`
+    let qualified_identifier = {
+        // First try to handle explicit namespace.type pattern
+        let explicit_namespace_type = identifier.clone()
+            .then(just('.').ignore_then(identifier.clone()))
+            .map(|(namespace, type_name)| {
+                // Clean both parts (removing backticks if present)
+                let clean_ns = clean_backtick_identifier(&namespace);
+                let clean_type = clean_backtick_identifier(&type_name);
+                TypeSpecifier::QualifiedIdentifier(clean_ns, Some(clean_type))
+            });
+        
+        // Then handle standalone identifiers (which might themselves contain dots)
+        let standalone_type = identifier.clone()
+            .map(|id| {
+                let clean_id = clean_backtick_identifier(&id);
+                
+                // Check if this identifier already contains dots (like "System.Boolean")
+                if clean_id.contains('.') {
+                    // This might be a pre-qualified identifier typed directly
+                    // Split at the last dot to get namespace and type
+                    if let Some(last_dot_pos) = clean_id.rfind('.') {
+                        let namespace = clean_id[..last_dot_pos].to_string();
+                        let type_name = clean_id[last_dot_pos+1..].to_string();
+                        TypeSpecifier::QualifiedIdentifier(namespace, Some(type_name))
+                    } else {
+                        // Shouldn't happen if contains('.') returned true, but just in case
+                        TypeSpecifier::QualifiedIdentifier(clean_id, None)
+                    }
+                } else {
+                    // Simple unqualified type name
+                    TypeSpecifier::QualifiedIdentifier(clean_id, None)
+                }
+            });
+        
+        // Try explicit namespace.type first, then fallback to standalone identifier
+        choice((
+            explicit_namespace_type.boxed(),
+            standalone_type.boxed(),
+        ))
         .padded()
-        .boxed();
+        .boxed()
+    };
+        
+    // Helper function to remove backticks from identifiers if present
+    fn clean_backtick_identifier(id: &str) -> String {
+        if id.starts_with('`') && id.ends_with('`') && id.len() >= 3 {
+            id[1..id.len()-1].to_string()
+        } else {
+            id.to_string()
+        }
+    }
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')

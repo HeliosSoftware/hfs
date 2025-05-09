@@ -1,0 +1,180 @@
+  NOT IMPLEMENTED: testPatientHasBirthDate - 'birthDate' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got String("1974-12-25") (String)
+  NOT IMPLEMENTED: testSimpleBackTick1 - '`Patient`.name.`given`' - Expected 5 results, got 1: [String("Peter"), String("James"), String("Jim"), String("Peter"), String("James")] vs [Empty]
+  NOT IMPLEMENTED: testSimpleWithContext - 'Patient.name.given' - Expected 5 results, got 1: [String("Peter"), String("James"), String("Jim"), String("Peter"), String("James")] vs [Empty]
+  NOT IMPLEMENTED: testPolymorphismA - 'Observation.value.unit' - Result type 0 doesn't match: expected String("lbs") (String), got Empty (Empty)
+  NOT IMPLEMENTED: testPolymorphismIsA - 'Observation.value.is(Quantity)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testPolymorphismIsA - 'Observation.value is Quantity' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testPolymorphismIsB - 'Observation.value.is(Period).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testPolymorphismAsA - 'Observation.value.as(Quantity).unit' - Evaluation error: TypeError("as() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testPolymorphismAsAFunction - '(Observation.value as Quantity).unit' - Result type 0 doesn't match: expected String("lbs") (String), got Empty (Empty)
+  NOT IMPLEMENTED: testPolymorphismAsBFunction - 'Observation.value.as(Period).start' - Evaluation error: TypeError("as() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testDollarThis2 - 'Patient.name.given.where(substring($this.length()-3) = 'ter')' - Expected 2 results, got 1: [String("Peter"), String("Peter")] vs [Empty]
+  NOT IMPLEMENTED: testDollarOrderAllowed - 'Patient.name.skip(1).given' - Expected 3 results, got 1: [String("Jim"), String("Peter"), String("James")] vs [Empty]
+  NOT IMPLEMENTED: testLiteralTrue - 'Patient.name.exists() = true' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralFalse - 'Patient.name.empty() = false' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralString - 'Patient.name.given.first() = 'Peter'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLiteralDateYear - '@2015.is(Date)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateMonth - '@2015-02.is(Date)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateDay - '@2015-02-04.is(Date)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeYear - '@2015T.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeMonth - '@2015-02T.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeDay - '@2015-02-04T.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeHour - '@2015-02-04T14.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeMinute - '@2015-02-04T14:34.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeSecond - '@2015-02-04T14:34:28.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeMillisecond - '@2015-02-04T14:34:28.123.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeUTC - '@2015-02-04T14:34:28Z.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralDateTimeTimezoneOffset - '@2015-02-04T14:34:28+10:00.is(DateTime)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralTimeHour - '@T14.is(Time)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralTimeMinute - '@T14:34.is(Time)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralTimeSecond - '@T14:34:28.is(Time)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralTimeMillisecond - '@T14:34:28.123.is(Time)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testLiteralIntegerEqual - 'Patient.name.given.count() = 5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testPolarityPrecedence - '-Patient.name.given.count() = -5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralIntegerCountNotEqual - 'Patient.name.given.count() != 0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralDecimalGreaterThanNonZeroTrue - 'Observation.value.value > 180.0' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLiteralDecimalGreaterThanZeroTrue - 'Observation.value.value > 0.0' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLiteralDecimalGreaterThanIntegerTrue - 'Observation.value.value > 0' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLiteralDecimalLessThanInteger - 'Observation.value.value < 190' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateEqual - 'Patient.birthDate = @1974-12-25' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualTimezoneOffsetBefore - 'Patient.birthDate != @1974-12-25T12:34:00-10:00' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualTimezoneOffsetAfter - 'Patient.birthDate != @1974-12-25T12:34:00+10:00' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualUTC - 'Patient.birthDate != @1974-12-25T12:34:00Z' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualTimeSecond - 'Patient.birthDate != @T12:14:15' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualTimeMinute - 'Patient.birthDate != @T12:14' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateNotEqualToday - 'Patient.birthDate < today()' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testDateTimeGreaterThanDate - 'now() > Patient.birthDate' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLiteralDateTimeTZGreater - '@2017-11-05T01:30:00.0-04:00 > @2017-11-05T01:15:00.0-05:00' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testLiteralDateTimeTZLess - '@2017-11-05T01:30:00.0-04:00 < @2017-11-05T01:15:00.0-05:00' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralDateTimeTZEqualTrue - '@2017-11-05T01:30:00.0-04:00 = @2017-11-05T00:30:00.0-05:00' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testLiteralUnicode - 'Patient.name.given.first() = 'P\u0065ter'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testCollectionNotEmpty - 'Patient.name.given.empty().not()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testExpressions - 'Patient.name.select(given | family).distinct()' - Expected 5 results, got 1: [String("Peter"), String("James"), String("Chalmers"), String("Jim"), String("Windsor")] vs [Empty]
+  NOT IMPLEMENTED: testExpressionsEqual - 'Patient.name.given.count() = 1 + 4' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testNotEmpty - 'Patient.name.empty().not()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testIntegerLiteralIsInteger - '1.is(Integer)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testIntegerLiteralIsSystemInteger - '1.is(System.Integer)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringLiteralIsNotInteger - ''1'.is(Integer).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testBooleanLiteralIsNotInteger - 'true.is(Integer).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testDateIsNotInteger - '@2013-04-05.is(Integer).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testIntegerLiteralIsNotDecimal - '1.is(Decimal).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testDecimalLiteralIsDecimal - '1.0.is(Decimal)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringIntegerLiteralIsNotDecimal - ''1'.is(Decimal).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringDecimalLiteralIsNotDecimal - ''1.0'.is(Decimal).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testBooleanLiteralIsNotDecimal - 'true.is(Decimal).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testIntegerLiteralIsNotQuantity - '1.is(Quantity).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testDecimalLiteralIsNotQuantity - '1.0.is(System.Quantity).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringIntegerLiteralIsNotQuantity - ''1'.is(System.Quantity).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringQuantityWeekConvertsToQuantityFalse - ''1 wk'.convertsToQuantity().not()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testStringDecimalLiteralIsNotSystemQuantity - ''1.0'.is(System.Quantity).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testBooleanLiteralIsNotSystemQuantity - 'true.is(System.Quantity).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testStringQuantityDayLiteralToQuantity - ''1 day'.toQuantity() = 1 '{day}'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testIntegerLiteralIsNotString - '1.is(String).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testQuantityLiteralWeekToString - '1 week.toString()' - String result 0 doesn't match: expected "1 '{week}'", got "1 'week'"
+  NOT IMPLEMENTED: testAllTrue2 - 'Patient.name.select(period.exists()).allTrue()' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testAllTrue4 - 'Patient.name.all(period.exists())' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testSubSetOf2 - 'Patient.name.subsetOf($this.name.first()).not()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testSuperSetOf2 - 'Patient.name.supersetOf($this.name.first())' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity1 - '4.0000 'g' = 4000.0 'mg'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity2 - '4 'g' ~ 4000 'mg'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity4 - '4 'g' ~ 4040 'mg'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity5 - '7 days = 1 week' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity6 - '7 days = 1 'wk'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testQuantity7 - '6 days < 1 week' - Evaluation error: TypeError("Cannot compare Quantities with different units: 'days' and 'week'")
+  NOT IMPLEMENTED: testQuantity8 - '8 days > 1 week' - Evaluation error: TypeError("Cannot compare Quantities with different units: 'days' and 'week'")
+  NOT IMPLEMENTED: testQuantity9 - '2.0 'cm' * 2.0 'm' = 0.040 'm2'' - Evaluation error: TypeError("Cannot multiply Quantity and Quantity")
+  NOT IMPLEMENTED: testQuantity10 - '4.0 'g' / 2.0 'm' = 2 'g/m'' - Evaluation error: TypeError("Cannot compare Decimal and Quantity using '='")
+  NOT IMPLEMENTED: testQuantity11 - '1.0 'm' / 1.0 'm' = 1 '1'' - Evaluation error: TypeError("Cannot compare Decimal and Quantity using '='")
+  NOT IMPLEMENTED: testDistinct3 - 'Questionnaire.descendants().linkId.select(substring(0,1)).isDistinct().not()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testDistinct5 - 'Questionnaire.descendants().linkId.distinct().count()' - Integer result 0 doesn't match: expected 10, got 0
+  NOT IMPLEMENTED: testDistinct6 - 'Questionnaire.descendants().linkId.select(substring(0,1)).distinct().count()' - Integer result 0 doesn't match: expected 2, got 0
+  NOT IMPLEMENTED: testCount1 - 'Patient.name.count()' - Integer result 0 doesn't match: expected 3, got 0
+  NOT IMPLEMENTED: testCount2 - 'Patient.name.count() = 3' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testCount3 - 'Patient.name.first().count()' - Integer result 0 doesn't match: expected 1, got 0
+  NOT IMPLEMENTED: testCount4 - 'Patient.name.first().count() = 1' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testWhere1 - 'Patient.name.count() = 3' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testWhere2 - 'Patient.name.where(given = 'Jim').count() = 1' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testWhere4 - 'Patient.name.where($this.given = 'Jim').count() = 1' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testSelect1 - 'Patient.name.select(given).count() = 5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testSelect2 - 'Patient.name.select(given | family).count() = 7 ' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testRepeat1 - 'ValueSet.expansion.repeat(contains).count() = 10' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testRepeat2 - 'Questionnaire.repeat(item).code.count() = 11' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testRepeat3 - 'Questionnaire.descendants().code.count() = 23' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testRepeat4 - 'Questionnaire.children().code.count() = 2' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testAggregate1 - '(1|2|3|4|5|6|7|8|9).aggregate($this+$total, 0) = 45' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testAggregate2 - '(1|2|3|4|5|6|7|8|9).aggregate($this+$total, 2) = 47' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testAggregate3 - '(1|2|3|4|5|6|7|8|9).aggregate(iif($total.empty(), $this, iif($this < $total, $this, $total))) = 1' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testAggregate4 - '(1|2|3|4|5|6|7|8|9).aggregate(iif($total.empty(), $this, iif($this > $total, $this, $total))) = 9' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testIndexer1 - 'Patient.name[0].given = 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testIndexer2 - 'Patient.name[1].given = 'Jim'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testSingle1 - 'Patient.name.first().single().exists()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testFirstLast1 - 'Patient.name.first().given = 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testFirstLast2 - 'Patient.name.last().given = 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testTail2 - 'Patient.name.tail().given = 'Jim' | 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testSkip3 - 'Patient.name.skip(1).given.trace('test') = 'Jim' | 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testTake3 - 'Patient.name.take(1).given = 'Peter' | 'James'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testTake4 - 'Patient.name.take(2).given = 'Peter' | 'James' | 'Jim'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testTake5 - 'Patient.name.take(3).given.count() = 5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testTake6 - 'Patient.name.take(4).given.count() = 5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testIif1 - 'iif(Patient.name.exists(), 'named', 'unnamed') = 'named'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testIif2 - 'iif(Patient.name.empty(), 'unnamed', 'named') = 'named'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testSubstring4 - ''12345'.substring(25).empty()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testTrace1 - 'name.given.trace('test').count() = 5' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testTrace2 - 'name.trace('test', given).count() = 3' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testToday1 - 'Patient.birthDate < today()' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testNow1 - 'Patient.birthDate < now()' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testEquality19 - '@2012-04-15 = @2012-04-15T10:00:00' - Evaluation error: TypeError("Cannot compare Date and DateTime using '='")
+  NOT IMPLEMENTED: testEquality21 - '@2012-04-15T15:30:31 = @2012-04-15T15:30:31.0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquality24 - '@2012-04-15T15:00:00+02:00 = @2012-04-15T16:00:00+03:00' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquality25 - 'name = name' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquality26 - 'name.take(2) = name.take(2).first() | name.take(2).last()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquality28 - 'Observation.value = 185 '[lb_av]'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testNEquality13 - '@2012-04-15 != @2012-04-15T10:00:00' - Evaluation error: TypeError("Cannot compare Date and DateTime using '='")
+  NOT IMPLEMENTED: testNEquality15 - '@2012-04-15T15:30:31 != @2012-04-15T15:30:31.0' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testNEquality18 - '@2012-04-15T15:00:00+02:00 != @2012-04-15T16:00:00+03:00' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testNEquality19 - 'name != name' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testNEquality20 - 'name.take(2) != name.take(2).first() | name.take(2).last()' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testNEquality24 - 'Observation.value != 185 'kg'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testEquivalent11 - '1.2 / 1.8 ~ 0.67' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquivalent16 - '@2012-04-15 ~ @2012-04-15T10:00:00' - Evaluation error: TypeError("Cannot compare Date and DateTime using '='")
+  NOT IMPLEMENTED: testEquivalent17 - '@2012-04-15T15:30:31 ~ @2012-04-15T15:30:31.0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquivalent19 - 'name ~ name' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testEquivalent22 - 'Observation.value ~ 185 '[lb_av]'' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testNotEquivalent16 - '@2012-04-15 !~ @2012-04-15T10:00:00' - Evaluation error: TypeError("Cannot compare Date and DateTime using '='")
+  NOT IMPLEMENTED: testNotEquivalent17 - '@2012-04-15T15:30:31 !~ @2012-04-15T15:30:31.0' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testLessThan22 - 'Observation.value < 200 '[lb_av]'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testLessThan26 - '@2018-03-01T10:30:00 < @2018-03-01T10:30:00.0' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testLessThan27 - '@T10:30:00 < @T10:30:00.0' - Boolean result 0 doesn't match: expected false, got true
+  NOT IMPLEMENTED: testLessOrEqual22 - 'Observation.value <= 200 '[lb_av]'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testGreatorOrEqual22 - 'Observation.value >= 100 '[lb_av]'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testGreatorOrEqual26 - '@2018-03-01T10:30:00 >= @2018-03-01T10:30:00.0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testGreatorOrEqual27 - '@T10:30:00 >= @T10:30:00.0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testGreaterThan22 - 'Observation.value > 100 '[lb_av]'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testMinus4 - ''a'-'b' = 'ab'' - Evaluation error: TypeError("Cannot subtract String from String")
+  NOT IMPLEMENTED: testDivide5 - '1.2 / 1.8 = 0.66666667' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testSqrt1 - '81.sqrt() = 9.0' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testAbs3 - '(-5.5 'mg').abs() = 5.5 'mg'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testPrecedence3 - '1 > 2 is Boolean' - Evaluation error: TypeError("Cannot compare Integer and Boolean")
+  NOT IMPLEMENTED: testPrecedence4 - '1 | 1 is Integer' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testExtension1 - 'Patient.birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').exists()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testExtension2 - 'Patient.birthDate.extension(%`ext-patient-birthTime`).exists()' - Boolean result 0 doesn't match: expected true, got false
+  NOT IMPLEMENTED: testType5 - 'true.is(Boolean)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType6 - 'true.is(System.Boolean)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType9 - 'Patient.active.type().namespace = 'FHIR'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testType10 - 'Patient.active.type().name = 'boolean'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testType11 - 'Patient.active.is(boolean)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType12 - 'Patient.active.is(Boolean).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType13 - 'Patient.active.is(FHIR.boolean)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType14 - 'Patient.active.is(System.Boolean).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType15 - 'Patient.type().namespace = 'FHIR'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testType16 - 'Patient.type().name = 'Patient'' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testType17 - 'Patient.is(Patient)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType18 - 'Patient.is(FHIR.Patient)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType19 - 'Patient.is(FHIR.`Patient`)' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType20 - 'Patient.ofType(Patient).type().name' - Result type 0 doesn't match: expected String("Patient") (String), got Empty (Empty)
+  NOT IMPLEMENTED: testType21 - 'Patient.ofType(FHIR.Patient).type().name' - Result type 0 doesn't match: expected String("Patient") (String), got Empty (Empty)
+  NOT IMPLEMENTED: testType22 - 'Patient.is(System.Patient).not()' - Evaluation error: TypeError("is() function requires a string type name, got Empty")
+  NOT IMPLEMENTED: testType23 - 'Patient.ofType(FHIR.`Patient`).type().name' - Result type 0 doesn't match: expected String("Patient") (String), got Empty (Empty)
+  NOT IMPLEMENTED: testConformsTo - 'conformsTo('http://hl7.org/fhir/StructureDefinition/Patient')' - Result type 0 doesn't match: expected Boolean(true) (Boolean), got Empty (Empty)
+  NOT IMPLEMENTED: testConformsTo - 'conformsTo('http://hl7.org/fhir/StructureDefinition/Person')' - Result type 0 doesn't match: expected Boolean(false) (Boolean), got Empty (Empty)
+See the 'NOT IMPLEMENTED' tests above for details on what needs to be fixed.

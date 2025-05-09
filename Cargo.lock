@@ -558,6 +558,7 @@ dependencies = [
  "chumsky",
  "fhir",
  "fhirpath_support",
+ "once_cell",
  "regex",
  "roxmltree",
  "rust_decimal",
