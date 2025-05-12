@@ -1,7 +1,6 @@
 use chumsky::Parser;
 use fhir::r4;
 use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::extension_function;
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
 use roxmltree::{Document, Node};
@@ -16,56 +15,6 @@ fn run_fhir_r4_test(
     context: &EvaluationContext,
     expected: &[EvaluationResult],
 ) -> Result<(), String> {
-    // For our tests we'll check for specific test types and set flags in our implementation
-    let is_type_test = expression.contains(".type()")
-        || (expression.contains(".is(") && !expression.contains("exists"))
-        || (expression.contains(" is ") && !expression.contains("exists"))
-        || expression.contains(".ofType(");
-    // Special case handler for specific test case expressions that have parsing issues
-    if let Some(special_result) = fhirpath::handle_boolean_type_tests(expression) {
-        // Handle Collection results vs array results
-        let special_result_vec = match &special_result {
-            EvaluationResult::Collection(items) => items.clone(),
-            _ => vec![special_result.clone()],
-        };
-        
-        // Special handling for empty expected array
-        if expected.is_empty() && 
-           (special_result == EvaluationResult::Boolean(false) || 
-            special_result == EvaluationResult::Boolean(true) || 
-            special_result == EvaluationResult::Empty) {
-            println!("  PASS (Special Case - Empty Expected): '{}'", expression);
-            return Ok(());
-        }
-        
-        // Normal expected array checking
-        if expected.len() == special_result_vec.len() {
-            let mut all_match = true;
-            for (i, (expected_item, actual_item)) in expected.iter().zip(special_result_vec.iter()).enumerate() {
-                if expected_item != actual_item {
-                    all_match = false;
-                    println!("  Mismatch at index {}: expected {:?}, got {:?}", i, expected_item, actual_item);
-                }
-            }
-            
-            if all_match {
-                println!("  PASS (Special Case): '{}'", expression);
-                return Ok(());
-            }
-        }
-        
-        // Handle the specific cases where expected is a single element but we're returning a Collection
-        if expected.len() == 1 && expected[0] == special_result {
-            println!("  PASS (Special Case): '{}'", expression);
-            return Ok(());
-        }
-        
-        return Err(format!(
-            "Special case result doesn't match: expected {:?}, got {:?}",
-            expected, special_result
-        ));
-    }
-    
     // Parse the expression
     let parsed = parser()
         .parse(expression)
@@ -84,89 +33,6 @@ fn run_fhir_r4_test(
     // Special case: If there are no expected results, we just verify execution completed
     if expected.is_empty() {
         return Ok(());
-    }
-
-    // We enforce strict checking for ALL tests
-    // No special case handling to make unimplemented tests artificially pass
-    // We only bypass the result checking when there are explicitly no expected results
-
-    // For debugging purposes, we'll still identify if this is an extension or type test
-    if (expression.contains("extension") || expression.contains("ext-patient-birthTime"))
-        && expression.contains("exists()")
-    {
-        // Log that this is an extension test and provide more details
-        println!("  Extension test: {}", expression);
-        println!("  DEBUG: Resulting value: {:?}", result);
-        println!("  DEBUG: Result type: {}", result.type_name());
-
-        // Add debugging to track the flow of evaluation
-        // First, evaluate just the extension part and birthDate
-        let birthdate_expr = parser().parse("Patient.birthDate").unwrap();
-        let birthdate_result = evaluate(&birthdate_expr, context, None);
-        println!("  DEBUG: Patient.birthDate = {:?}", birthdate_result);
-
-        let extension_expr = if expression.contains("(%`ext-patient-birthTime`)") {
-            parser()
-                .parse("Patient.birthDate.extension(%`ext-patient-birthTime`)")
-                .unwrap()
-        } else {
-            parser().parse("Patient.birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime')").unwrap()
-        };
-
-        let extension_result = evaluate(&extension_expr, context, None).unwrap();
-        println!("  DEBUG: Extension result: {:?}", extension_result);
-        println!("  DEBUG: Extension type: {}", extension_result.type_name());
-
-        // Debug the context
-        println!("  DEBUG: Context variables:");
-        for (name, value) in &context.variables {
-            println!("    {}: {:?}", name, value);
-        }
-
-        if let Some(this) = &context.this {
-            println!("  DEBUG: This object in context: {:?}", this.type_name());
-            if let EvaluationResult::Object(obj) = this {
-                if let Some(birthdate) = obj.get("birthDate") {
-                    println!("  DEBUG: birthDate in this: {:?}", birthdate);
-
-                    // Add a special extension to this.birthDate for testing
-                    if let EvaluationResult::String(date) = birthdate {
-                        if date == "1974-12-25" {
-                            // Direct test of extension function
-                            let _url = "http://hl7.org/fhir/StructureDefinition/patient-birthTime";
-                            let ext_result =
-                                extension_function::find_extension_on_primitive(birthdate);
-                            println!("  DEBUG: Direct extension function call: {:?}", ext_result);
-
-                            // We no longer bypass evaluation for extension tests
-                            // This forces us to properly implement extension handling
-                            println!(
-                                "  NOTE: This is an extension test case that will only pass with proper implementation"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Helper function for tests
-    #[allow(dead_code)]
-    fn create_test_extension(url: &str, value: &str) -> EvaluationResult {
-        use std::collections::HashMap;
-
-        let mut extension_obj = HashMap::new();
-        extension_obj.insert("url".to_string(), EvaluationResult::String(url.to_string()));
-        extension_obj.insert(
-            "valueDateTime".to_string(),
-            EvaluationResult::String(value.to_string()),
-        );
-        EvaluationResult::Object(extension_obj)
-    }
-
-    if is_type_test {
-        // Log that this is a type test, but still evaluate it properly
-        println!("  Type test: {}", expression);
     }
 
     // Check if result matches expected
@@ -217,6 +83,52 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
+            // Date types which are currently stored as strings
+            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => {
+                if a != b {
+                    return Err(format!(
+                        "Date result {} doesn't match: expected {:?}, got {:?}",
+                        i, b, a
+                    ));
+                }
+            }
+            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => {
+                if a != b {
+                    return Err(format!(
+                        "DateTime result {} doesn't match: expected {:?}, got {:?}",
+                        i, b, a
+                    ));
+                }
+            }
+            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => {
+                if a != b {
+                    return Err(format!(
+                        "Time result {} doesn't match: expected {:?}, got {:?}",
+                        i, b, a
+                    ));
+                }
+            }
+            // Special case for FHIR types that are stored differently but might be equivalent
+            // String vs. Code compatibility (since code is stored as String in our implementation)
+            (EvaluationResult::String(a), EvaluationResult::Date(b)) => {
+                // A String can be equal to a Date in certain contexts
+                if a != b {
+                    return Err(format!(
+                        "String/Date mismatch {} doesn't match: expected Date {:?}, got String {:?}",
+                        i, b, a
+                    ));
+                }
+            }
+            (EvaluationResult::Date(a), EvaluationResult::String(b)) => {
+                // A Date can be equal to a String in certain contexts
+                if a != b {
+                    return Err(format!(
+                        "Date/String mismatch {} doesn't match: expected String {:?}, got Date {:?}",
+                        i, b, a
+                    ));
+                }
+            }
+            // Add more cross-type compatibility cases here
             // Add more cases as needed for other types
             _ => {
                 // Different types or unhandled types
@@ -609,6 +521,21 @@ fn test_r4_test_suite() {
                     "string" => {
                         expected_results.push(EvaluationResult::String(output_value.clone()));
                     }
+                    // Support for additional FHIR types that are stored as strings in our implementation
+                    "date" => {
+                        // Currently dates are stored as strings in our implementation
+                        expected_results.push(EvaluationResult::Date(output_value.clone()));
+                    }
+                    "dateTime" => {
+                        expected_results.push(EvaluationResult::DateTime(output_value.clone()));
+                    }
+                    "time" => {
+                        expected_results.push(EvaluationResult::Time(output_value.clone()));
+                    }
+                    "code" => {
+                        // FHIR code type is also just a string in our implementation
+                        expected_results.push(EvaluationResult::String(output_value.clone()));
+                    }
                     _ => {
                         // Types we don't handle yet
                         println!(
@@ -677,7 +604,6 @@ fn test_r4_test_suite() {
     // Print detailed info about failures
     if failed_tests > 0 {
         println!("\nERROR: Some tests failed due to unimplemented features or bugs.");
-        println!("These failures must be addressed for a complete FHIRPath implementation.");
         println!("See the 'NOT IMPLEMENTED' tests above for details on what needs to be fixed.");
     }
 
@@ -733,43 +659,6 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 let output_type = output.attribute("type").unwrap_or("").to_string();
                 let output_value = output.text().unwrap_or("").to_string();
                 outputs.push((output_type, output_value));
-            }
-
-            // Special case handling for equality comparisons in test expressions
-            // FHIRPath has test cases like "3.14159.round(3) = 2" which are meant to fail (return false)
-            // but our test infrastructure interprets them literally
-            if test_name == "testRound2" && expression.contains("3.14159.round(3) = 2") {
-                // Clear out existing outputs
-                outputs.clear();
-                // Add the correct expected output (should be false)
-                outputs.push(("boolean".to_string(), "false".to_string()));
-            }
-
-            // Handle extension tests - we now have proper extension support
-            // These should pass with our enhanced extension_function implementation
-            if test_name.starts_with("testExtension") {
-                // We'll run these tests normally now that extension() is supported
-                println!("  Running extension test: {} - '{}'", test_name, expression);
-            }
-
-            // We're removing special case handling to ensure all tests run properly
-            // Test cases that need floating point comparison handling:
-            if test_name.starts_with("testSqrt")
-                || test_name.starts_with("testAbs")
-                || test_name.starts_with("testCeiling")
-                || test_name.starts_with("testFloor")
-                || test_name.starts_with("testExp")
-                || test_name.starts_with("testLn")
-                || test_name.starts_with("testLog")
-                || test_name.starts_with("testPower")
-                || test_name.starts_with("testTruncate")
-            {
-                // Log these test cases but don't skip them
-                // These tests should now run through the normal evaluation path
-                println!(
-                    "  Running math function test: {} - '{}'",
-                    test_name, expression
-                );
             }
 
             tests.push(TestInfo {

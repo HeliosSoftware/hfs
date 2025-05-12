@@ -995,7 +995,7 @@
   
   <group name="testRound">
 		<test name="testRound1" inputfile="patient-example.json"><expression>1.round() = 1</expression><output type="boolean">true</output></test>
-		<test name="testRound2" inputfile="patient-example.json"><expression>3.14159.round(3) = 2</expression><output type="boolean">true</output></test>
+		<test name="testRound2" inputfile="patient-example.json"><expression>3.14159.round(3) = 2</expression><output type="boolean">false</output></test>
   </group>
   
   <group name="testSqrt">
