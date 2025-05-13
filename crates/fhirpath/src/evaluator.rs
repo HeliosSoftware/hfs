@@ -152,7 +152,7 @@ pub fn evaluate(
                                     }
                                 }
                             }
-                            Expression::Invocation(ref parent_expr_of_field, Invocation::Member(ref field_name_from_invocation)) => { // Scenario 2: `object.field.extension()`
+                            Expression::Invocation(parent_expr_of_field, Invocation::Member(field_name_from_invocation)) => { // Scenario 2: `object.field.extension()`
                                 // Evaluate the parent expression (e.g., `object` in `object.field`)
                                 let parent_obj_eval_result = evaluate(parent_expr_of_field, context, current_item)?;
                                 if let EvaluationResult::Object(ref actual_parent_map) = parent_obj_eval_result {
