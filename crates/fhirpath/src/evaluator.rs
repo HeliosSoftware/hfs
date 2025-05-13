@@ -4591,7 +4591,9 @@ fn apply_type_operation(
                     );
                 }
             }
-            _ => {} // Other TypeSpecifier variants (like QualifiedIdentifier with Some(type)) will fall through or are handled above.
+            // All variants of TypeSpecifier::QualifiedIdentifier are covered by the arms above,
+            // and TypeSpecifier only has this single variant.
+            // Thus, a wildcard match `_ => {}` would be unreachable.
         }
     }
 

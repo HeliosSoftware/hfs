@@ -589,52 +589,16 @@ pub fn apply_polymorphic_type_operation(
                 }
             },
             "as" => {
-                match value {
-                    EvaluationResult::Object(obj) => {
-                        // First try to find a polymorphic field directly in the object
-                        for (key, field_value) in obj.iter() {
-                            if key.ends_with(type_name) && key.len() > type_name.len() {
-                                let base_name = &key[0..(key.len() - type_name.len())];
-                                if is_choice_element(base_name) {
-                                    return Ok(field_value.clone());
-                                }
-                            }
-                        }
-                        
-                        // Special case for "value" -> Quantity for Observation.value.as(Quantity)
-                        if type_name == "Quantity" {
-                            // Check if there's a valueQuantity field
-                            if let Some(value_quantity) = obj.get("valueQuantity") {
-                                return Ok(value_quantity.clone());
-                            }
-                            
-                            // If there's a "value" field that looks like a Quantity, return it
-                            if let Some(EvaluationResult::Object(value_obj)) = obj.get("value") {
-                                if value_obj.contains_key("value") && value_obj.contains_key("unit") {
-                                    return Ok(EvaluationResult::Object(value_obj.clone()));
-                                }
-                            }
-                        }
-                        
-                        // If no direct field was found, check if the object itself is of the requested type
-                        // For FHIR resources, check resourceType
-                        if let Some(EvaluationResult::String(rt)) = obj.get("resourceType") {
-                            if rt == type_name {
-                                return Ok(value.clone());
-                            }
-                        }
-                        
-                        // Not found, return Empty
-                        Ok(EvaluationResult::Empty)
-                    },
-                    // For primitive types, return the value if it matches the type, otherwise Empty
-                    _ => {
-                        let is_result = apply_polymorphic_type_operation(value, "is", type_name, namespace)?;
-                        match is_result {
-                            EvaluationResult::Boolean(true) => Ok(value.clone()),
-                            _ => Ok(EvaluationResult::Empty),
-                        }
-                    }
+                // The 'as' operator returns the input value if it 'is' of the specified type,
+                // otherwise it returns Empty.
+                let is_type_result = apply_polymorphic_type_operation(value, "is", type_name, namespace)?;
+                match is_type_result {
+                    EvaluationResult::Boolean(true) => Ok(value.clone()),
+                    EvaluationResult::Boolean(false) => Ok(EvaluationResult::Empty),
+                    EvaluationResult::Empty => Ok(EvaluationResult::Empty), // 'is' on Empty can be Empty
+                    _ => Err(EvaluationError::TypeError(
+                        format!("'is' operation returned non-Boolean: {:?}", is_type_result)
+                    )),
                 }
             },
             _ => Err(EvaluationError::TypeError(
