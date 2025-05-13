@@ -846,9 +846,25 @@ fn evaluate_invocation(
                     // Logic for handling 'is' and 'as' functions by parsing their AST argument
                     let type_spec_opt = match &args_exprs[0] {
                         Expression::Term(Term::Literal(Literal::String(type_name_str))) => {
-                            // Argument is a string literal like 'Patient' or 'System.String'.
-                            // Pass as is; extract_namespace_and_type will handle dot separation and namespace.
-                            Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                            // Argument is a string literal like 'Patient', 'System.String', or 'FHIR.Patient'.
+                            // Parse it into namespace and type name if qualified.
+                            if type_name_str.contains('.') {
+                                let parts: Vec<&str> = type_name_str.split('.').collect();
+                                if parts.len() >= 2 {
+                                    let namespace = parts[0].to_string();
+                                    let type_part = parts[1..].join("."); // Handles potential multi-part type names after namespace
+                                    Some(TypeSpecifier::QualifiedIdentifier(
+                                        namespace,
+                                        Some(type_part),
+                                    ))
+                                } else {
+                                    // Malformed (e.g., ".Patient" or "FHIR.") - treat as unqualified or let downstream handle
+                                    Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                                }
+                            } else {
+                                // Unqualified like 'Patient'
+                                Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                            }
                         }
                         Expression::Term(Term::Invocation(Invocation::Member(type_name_ident))) => {
                             // Argument is an identifier like Patient or Quantity.
