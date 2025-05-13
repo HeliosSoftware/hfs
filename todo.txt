@@ -1,3 +1,5 @@
+- run_expression in polymorphic_r4_tests.r4 needs to be in lib.r4 
+- fix_type_operators.rs is totally unnecessary  
 - There are some Special Cases in r4_tests.rs that we need to eliminate
 - Remove eprintln from implementation code
 - Mismatch of implementation in separate files vs single evaluator.rs

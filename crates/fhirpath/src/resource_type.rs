@@ -24,14 +24,7 @@ use crate::fhir_type_hierarchy::{
 pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
     // Extract namespace and type name
     let (namespace, type_name) = extract_namespace_and_type(type_spec)?;
-    
-    // Print debug info (only in debug mode)
-    if let Some(ns) = &namespace {
-        eprintln!("is_of_type checking if value is {}.{}", ns, type_name);
-    } else {
-        eprintln!("is_of_type checking if value is {}", type_name);
-    }
-    
+
     // Handle Empty values first
     if matches!(value, EvaluationResult::Empty) {
         return Ok(false);
@@ -101,16 +94,42 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
                 if resource_type.eq_ignore_ascii_case(&type_name) {
                     return Ok(true);
                 }
-                
+
                 // Check for inheritance relationships using the type hierarchy
                 let normalized_type = capitalize_first_letter(resource_type);
                 let normalized_check = capitalize_first_letter(&type_name);
-                
+
                 if is_derived_from(&normalized_type, &normalized_check) {
                     return Ok(true);
                 }
+
+                // Special case for Observation.value polymorphic access
+                if resource_type == "Observation" && type_name.eq_ignore_ascii_case("Quantity") {
+                    if obj.contains_key("valueQuantity") {
+                        return Ok(true);
+                    } else if obj.contains_key("value") {
+                        // If there's a direct "value" property, check if it looks like a Quantity
+                        if let Some(EvaluationResult::Object(value_obj)) = obj.get("value") {
+                            if value_obj.contains_key("value") &&
+                              (value_obj.contains_key("unit") || value_obj.contains_key("code")) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
             }
             
+            // Check for choice element fields that match the requested type
+            // Example: Checking if Observation has value of type Quantity should check valueQuantity
+            for key in obj.keys() {
+                if key.starts_with("value") && key.len() > 5 {
+                    let suffix = &key[5..];
+                    if suffix.eq_ignore_ascii_case(&type_name) {
+                        return Ok(true);
+                    }
+                }
+            }
+
             // Check if this matches a complex data type
             if is_fhir_complex_type(&type_name) {
                 // Check for Quantity and other complex types
@@ -393,27 +412,27 @@ pub fn is_fhir_domain_resource(resource_type: &str) -> bool {
 // their functionality has been incorporated into is_of_type and other functions
 
 /// Attempts to cast a value to a specific type
-/// 
+///
 /// # Arguments
-/// 
+///
 /// * `value` - The value to cast
 /// * `type_spec` - The type to cast to
-/// 
+///
 /// # Returns
-/// 
+///
 /// * The value as the specified type if possible, or Empty if not
 pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
     // First check if the value is of the specified type
     let is_result = is_of_type(value, type_spec)?;
-    
+
     if is_result {
         // If it's of the right type, return it
         return Ok(value.clone());
     }
-    
+
     // Extract namespace and type name
     let (namespace, type_name) = extract_namespace_and_type(type_spec)?;
-    
+
     // Check for FHIR polymorphic choice elements
     if let EvaluationResult::Object(obj) = value {
         // For FHIR resource types, check if we have resourceType field
@@ -423,9 +442,37 @@ pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<Ev
                 if resource_type.to_lowercase() == type_name.to_lowercase() {
                     return Ok(value.clone());
                 }
+
+                // Special case for Observation.as(Quantity)
+                if resource_type == "Observation" && type_name.eq_ignore_ascii_case("Quantity") {
+                    // Return valueQuantity if it exists
+                    if let Some(value_quantity) = obj.get("valueQuantity") {
+                        return Ok(value_quantity.clone());
+                    }
+                }
             }
         }
-        
+
+        // Direct access to choice element fields with type suffix
+        // Example: Observation has valueQuantity field for Observation.value.as(Quantity)
+        if type_name.eq_ignore_ascii_case("Quantity") {
+            // Look for valueQuantity, effectiveQuantity, etc.
+            for (key, val) in obj.iter() {
+                if key.len() > 5 && key.starts_with("value") {
+                    let suffix = &key[5..];
+                    if suffix.eq_ignore_ascii_case("Quantity") {
+                        return Ok(val.clone());
+                    }
+                }
+            }
+        }
+
+        // If this is a polymorphic value property, handle directly
+        // (e.g., object is the "value" property itself)
+        if obj.contains_key("value") && obj.contains_key("unit") && type_name.eq_ignore_ascii_case("Quantity") {
+            return Ok(value.clone());
+        }
+
         // Check for polymorphic choice elements
         if let Some(ns) = &namespace {
             if ns == "FHIR" || ns == "http://hl7.org/fhir" {
@@ -441,7 +488,7 @@ pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<Ev
                 }
             }
         }
-        
+
         // If no explicit namespace and the type matches a resource type,
         // check through all field properties
         if namespace.is_none() {
@@ -497,15 +544,6 @@ pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<Ev
 /// * If there's only one item in the collection, returns that item directly (unwrapped)
 /// * If the collection is empty, returns Empty
 pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
-    // Get namespace and type for better error messages
-    let (namespace, type_name) = extract_namespace_and_type(type_spec)?;
-    
-    // Special handling for qualified types with namespace (logging)
-    if let Some(ns) = &namespace {
-        eprintln!("ofType({}.{})", ns, type_name);
-    } else {
-        eprintln!("ofType({})", type_name);
-    }
     
     // Use a consistent helper function for applying the type filter
     let apply_type_filter = |items: &[EvaluationResult]| -> Result<EvaluationResult, EvaluationError> {

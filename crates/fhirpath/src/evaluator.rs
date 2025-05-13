@@ -1130,27 +1130,6 @@ fn call_function(
             // If the base is not a FHIR resource, return false
             Ok(EvaluationResult::Boolean(false))
         }
-
-        // Handle the .is() method form - delegates to resource_type.rs
-        "is" => {
-            // Special case handling for testType5 and testType6 test cases
-            if let EvaluationResult::Boolean(true) = invocation_base {
-                if let Some(EvaluationResult::String(type_name)) = args.get(0) {
-                    if type_name == "Boolean" || type_name == "System.Boolean" {
-                        return Ok(EvaluationResult::Boolean(true));
-                    }
-                }
-            }
-            
-            // General case - delegate to fix_type_operators
-            crate::fix_type_operators::fix_is_function(invocation_base, args)
-        },
-
-        // Handle the .ofType() method - delegates to resource_type.rs
-        "ofType" => crate::fix_type_operators::fix_of_type_function(invocation_base, args),
-
-        // Handle the .as() method form - delegates to resource_type.rs
-        "as" => crate::fix_type_operators::fix_as_function(invocation_base, args),
         "count" => {
             // Returns the number of items in the collection, including duplicates
             Ok(match invocation_base {

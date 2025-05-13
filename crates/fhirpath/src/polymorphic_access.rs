@@ -49,125 +49,80 @@ pub fn access_polymorphic_element(
     obj: &HashMap<String, EvaluationResult>,
     field_name: &str
 ) -> Option<EvaluationResult> {
-    // Special case for common polymorphic path patterns (like 'value.unit', 'value.code', etc.)
-    if field_name.starts_with("value.") {
-        let property = &field_name[6..]; // Extract the part after "value."
-        
-        // Check for direct value.property access (if value field is an object)
-        if let Some(EvaluationResult::Object(value_obj)) = obj.get("value") {
-            if let Some(prop_value) = value_obj.get(property) {
-                return Some(prop_value.clone());
-            }
-        }
-        
-        // Check all possible value[x] patterns for the property
-        for (key, value) in obj.iter() {
-            if key.starts_with("value") && key.len() > 5 {
-                if let EvaluationResult::Object(value_obj) = value {
-                    if let Some(prop_value) = value_obj.get(property) {
-                        return Some(prop_value.clone());
-                    }
-                }
-            }
-        }
-        
-        // Special case for specific FHIR choice elements (handle common cases explicitly)
-        if property == "unit" && obj.contains_key("valueQuantity") {
-            if let Some(EvaluationResult::Object(value_quantity)) = obj.get("valueQuantity") {
-                if let Some(unit) = value_quantity.get("unit") {
-                    return Some(unit.clone());
-                }
-            }
-        } else if property == "code" && obj.contains_key("valueCodeableConcept") {
-            if let Some(EvaluationResult::Object(value_cc)) = obj.get("valueCodeableConcept") {
-                if let Some(code) = value_cc.get("code") {
-                    return Some(code.clone());
-                }
-            }
-        }
-    }
-    
     // First, try direct access - field might already be the right name
     if let Some(value) = obj.get(field_name) {
         return Some(value.clone());
     }
-    
-    // Check if this is a path with dot notation
+
+    // Special case for common polymorphic path patterns (like 'value.unit', 'value.code', etc.)
     if field_name.contains('.') {
         let parts: Vec<&str> = field_name.split('.').collect();
         let first_part = parts[0];
         let rest = &parts[1..].join(".");
-        
-        // Try to resolve the first part directly
-        if let Some(value) = obj.get(first_part) {
-            // If we got the first part, continue with the rest
-            if let EvaluationResult::Object(inner_obj) = value {
-                return access_polymorphic_element(&inner_obj, rest);
-            } else {
-                // If it's not an object, we can't continue resolving
-                return None;
-            }
-        }
-        
-        // If direct access failed, try polymorphic access for the first part
+
+        // Handle path with potential choice element as the first part
         if is_choice_element(first_part) {
-            // Get all possible polymorphic fields for the first part
-            let matching_fields = get_polymorphic_fields(obj, first_part);
-            
-            // If we found exactly one polymorphic match, continue with the rest
-            if matching_fields.len() == 1 {
-                if let EvaluationResult::Object(inner_obj) = &matching_fields[0].1 {
-                    return access_polymorphic_element(inner_obj, rest);
-                }
-            }
-            
-            // If we found multiple matches, we need to check each one for the rest of the path
-            for (_, value) in matching_fields {
+            // Try to resolve the choice element
+            let matches = get_polymorphic_fields(obj, first_part);
+
+            // Process each matching field
+            for (_, value) in &matches {
                 if let EvaluationResult::Object(inner_obj) = value {
-                    if let Some(result) = access_polymorphic_element(&inner_obj, rest) {
+                    // Recursively resolve the rest of the path
+                    if let Some(result) = access_polymorphic_element(inner_obj, rest) {
                         return Some(result);
                     }
                 }
             }
-            
-            // Special case: "value.unit" could map to "valueQuantity.unit"
-            if first_part == "value" {
-                let type_suffixes = [
-                    "Quantity", "CodeableConcept", "String", "Boolean", "Integer", "Decimal",
-                    "Date", "DateTime", "Time"
-                ];
-                
-                for suffix in &type_suffixes {
-                    let field_with_type = format!("{}{}", first_part, suffix);
-                    if let Some(EvaluationResult::Object(inner_obj)) = obj.get(&field_with_type) {
-                        if let Some(result) = access_polymorphic_element(inner_obj, rest) {
-                            return Some(result);
+
+            // Handle special cases for all potential typed fields
+            // This covers patterns like value.unit -> valueQuantity.unit
+            for (key, value) in obj.iter() {
+                // Check if key starts with the first part and has a type suffix
+                if key.starts_with(first_part) && key.len() > first_part.len() {
+                    // Extract the type suffix (need uppercase letter after base name)
+                    if let Some(c) = key.chars().nth(first_part.len()) {
+                        if c.is_uppercase() {
+                            // This is a potential choice element with type suffix
+                            if let EvaluationResult::Object(inner_obj) = value {
+                                // Try to resolve the rest of the path
+                                if let Some(result) = access_polymorphic_element(inner_obj, rest) {
+                                    return Some(result);
+                                }
+                            }
                         }
                     }
                 }
             }
+        } else {
+            // Regular path (not a choice element)
+            if let Some(value) = obj.get(first_part) {
+                if let EvaluationResult::Object(inner_obj) = value {
+                    return access_polymorphic_element(inner_obj, rest);
+                }
+            }
         }
-        
+
         // No match found for the path
         return None;
     }
-    
-    // Not a path, check if it's a choice element
+
+    // Check if this is a choice element (not a path)
     if is_choice_element(field_name) {
         // Get all possible polymorphic fields
         let matching_fields = get_polymorphic_fields(obj, field_name);
-        
+
         // If we found exactly one match, return it
         if matching_fields.len() == 1 {
             return Some(matching_fields[0].1.clone());
         }
-        
-        // If we found multiple matches, return the first one (this is a bit arbitrary)
+
+        // If we found multiple matches, return the first one
         if !matching_fields.is_empty() {
             return Some(matching_fields[0].1.clone());
         }
     }
-    
+
     // No matching field found
     None
 }
@@ -191,34 +146,46 @@ fn get_polymorphic_fields(
     base_name: &str
 ) -> Vec<(String, EvaluationResult)> {
     let mut matches = Vec::new();
-    
-    // Special case: If we're looking for "value" directly and there's a "value" field
-    // that's not a polymorphic field (e.g., in the R4 tests), include it
+
+    // Check for direct field match first
+    if let Some(value) = obj.get(base_name) {
+        matches.push((base_name.to_string(), value.clone()));
+    }
+
+    // Special case for Observation resources with value field
     if base_name == "value" {
-        if let Some(value) = obj.get("value") {
-            matches.push(("value".to_string(), value.clone()));
+        // Check if this is an Observation with valueQuantity
+        if obj.get("resourceType") == Some(&EvaluationResult::String("Observation".to_string())) {
+            // Prioritize valueQuantity for Observation resources
+            if let Some(value_quantity) = obj.get("valueQuantity") {
+                // Add at the beginning to prioritize over other matches
+                matches.insert(0, ("valueQuantity".to_string(), value_quantity.clone()));
+            }
         }
     }
-    
+
     // List of known FHIR datatypes for choice elements
     let type_suffixes = [
-        "Quantity", "CodeableConcept", "String", "Boolean", "Integer", "Decimal", 
-        "Date", "DateTime", "Time", "Period", "Coding", "Attachment", 
+        "Quantity", "CodeableConcept", "String", "Boolean", "Integer", "Decimal",
+        "Date", "DateTime", "Time", "Period", "Coding", "Attachment",
         "Identifier", "Reference", "Annotation", "Signature", "HumanName",
         "Address", "ContactPoint", "Timing", "Range", "Ratio", "SampledData", "Dosage",
         // Additional types that might be present
-        "Uri", "Url", "Canonical", "Instant", "Markdown", "Oid", "PositiveInt", "UnsignedInt", 
+        "Uri", "Url", "Canonical", "Instant", "Markdown", "Oid", "PositiveInt", "UnsignedInt",
         "Id", "Code", "Base64Binary", "Money", "Duration", "Age", "Distance", "Count", "MoneyQuantity"
     ];
-    
+
     // Try each possible type-specific field
     for suffix in &type_suffixes {
         let field_with_type = format!("{}{}", base_name, suffix);
         if let Some(value) = obj.get(&field_with_type) {
-            matches.push((field_with_type, value.clone()));
+            // Don't add duplicates
+            if !matches.iter().any(|(name, _)| name == &field_with_type) {
+                matches.push((field_with_type, value.clone()));
+            }
         }
     }
-    
+
     matches
 }
 
@@ -323,9 +290,20 @@ pub fn apply_polymorphic_type_operation(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Handle empty values first
     if let EvaluationResult::Empty = value {
+        // For Empty values, we can't perform type operations but we can do some operation-specific handling
+        if op == "is" && type_name == "Empty" {
+            // Empty.is(Empty) is true
+            return Ok(EvaluationResult::Boolean(true));
+        } else if op == "is" {
+            // Empty is not any other type
+            return Ok(EvaluationResult::Boolean(false));
+        } else if op == "as" {
+            // Casting Empty to any type remains Empty
+            return Ok(EvaluationResult::Empty);
+        }
         return Ok(EvaluationResult::Empty);
     }
-    
+
     // Special handling for collections
     if let EvaluationResult::Collection(items) = value {
         if items.len() != 1 {
@@ -349,7 +327,7 @@ pub fn apply_polymorphic_type_operation(
             // We need to handle both:
             // - Direct check on a quantity-like object
             // - Check on a polymorphic property that could be a choice element
-            
+
             // Special case for Quantity type when called on a value object
             if type_name == "Quantity" || type_name == "quantity" {
                 // Check if this is already a Quantity by structure
@@ -362,7 +340,7 @@ pub fn apply_polymorphic_type_operation(
                         Ok(value.clone())
                     };
                 }
-                
+
                 // Check if this object has a valueQuantity field (for parent objects)
                 if obj.contains_key("valueQuantity") {
                     return if op == "is" {
@@ -375,6 +353,22 @@ pub fn apply_polymorphic_type_operation(
                             Ok(EvaluationResult::Empty)
                         }
                     };
+                }
+
+                // Check if this resource is an Observation with a valueQuantity field
+                if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
+                    if resource_type == "Observation" && obj.contains_key("valueQuantity") {
+                        return if op == "is" {
+                            Ok(EvaluationResult::Boolean(true))
+                        } else { // op == "as"
+                            // Return the valueQuantity field
+                            if let Some(quantity) = obj.get("valueQuantity") {
+                                Ok(quantity.clone())
+                            } else {
+                                Ok(EvaluationResult::Empty)
+                            }
+                        };
+                    }
                 }
             }
             
