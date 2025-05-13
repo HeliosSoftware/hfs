@@ -16,7 +16,6 @@ pub mod truncate_final;
 pub mod truncate_function;
 pub mod truncate_impl;
 pub mod type_function;
-pub mod type_reflection_handler;
 
 pub use aggregate_function::aggregate_function;
 pub use date_arithmetic::{
@@ -43,4 +42,3 @@ pub use truncate_final::truncate_expression;
 pub use truncate_function::truncate_function;
 pub use truncate_impl::truncate;
 pub use type_function::{get_type_info, get_type_name, type_function, type_function_full};
-pub use type_reflection_handler::handle_type_reflection_tests;

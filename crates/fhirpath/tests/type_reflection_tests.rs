@@ -9,40 +9,55 @@ mod tests {
     // Helper function to create a test object
     fn create_test_resource() -> EvaluationResult {
         let mut patient = HashMap::new();
-        
+
         // Add resourceType
-        patient.insert("resourceType".to_string(), EvaluationResult::String("Patient".to_string()));
-        
+        patient.insert(
+            "resourceType".to_string(),
+            EvaluationResult::String("Patient".to_string()),
+        );
+
         // Add id
-        patient.insert("id".to_string(), EvaluationResult::String("123".to_string()));
-        
+        patient.insert(
+            "id".to_string(),
+            EvaluationResult::String("123".to_string()),
+        );
+
         // Add simple property
         patient.insert("active".to_string(), EvaluationResult::Boolean(true));
-        
+
         // Add a complex property (name)
         let mut name = HashMap::new();
-        name.insert("use".to_string(), EvaluationResult::String("official".to_string()));
-        name.insert("family".to_string(), EvaluationResult::String("Doe".to_string()));
-        
+        name.insert(
+            "use".to_string(),
+            EvaluationResult::String("official".to_string()),
+        );
+        name.insert(
+            "family".to_string(),
+            EvaluationResult::String("Doe".to_string()),
+        );
+
         // Add name to patient
         patient.insert("name".to_string(), EvaluationResult::Object(name));
-        
+
         // Return as an object
         EvaluationResult::Object(patient)
     }
-    
+
     // Helper function to create a generic object (non-FHIR resource)
     fn create_generic_object() -> EvaluationResult {
         let mut obj = HashMap::new();
-        obj.insert("key1".to_string(), EvaluationResult::String("value1".to_string()));
+        obj.insert(
+            "key1".to_string(),
+            EvaluationResult::String("value1".to_string()),
+        );
         obj.insert("key2".to_string(), EvaluationResult::Integer(42));
         EvaluationResult::Object(obj)
     }
-    
+
     #[test]
     fn test_type_function_with_primitives() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test type() on various primitive types
         let test_cases = vec![
             // (Expression, Expected Result)
@@ -56,15 +71,11 @@ mod tests {
             ("10 'mg'.type()", "Quantity"),
             ("{}.type()", "Empty"),
         ];
-        
+
         for (expr, expected) in test_cases {
             // Check if this expression has a special handler
-            let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests(expr) {
-                special_result
-            } else {
-                evaluate(&parser().parse(expr).unwrap(), &context, None).unwrap()
-            };
-            
+            let result = evaluate(&parser().parse(expr).unwrap(), &context, None).unwrap();
+
             match result {
                 EvaluationResult::String(type_name) => {
                     assert_eq!(type_name, expected, "Failed for expression: {}", expr);
@@ -76,36 +87,29 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_type_function_with_collections() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test type() on collections
-        
+
         // Empty collection
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("{}.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("{}.type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(&parser().parse("{}.type()").unwrap(), &context, None).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
+
         // Single-item collection (returns type of the item)
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("(42).type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("(42).type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(&parser().parse("(42).type()").unwrap(), &context, None).unwrap();
         assert_eq!(result, EvaluationResult::String("Integer".to_string()));
-        
+
         // Multi-item collection (returns collection of types)
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("(1 | 'test' | true).type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("(1 | 'test' | true).type()").unwrap(), &context, None).unwrap()
-        };
-        
+        let result = evaluate(
+            &parser().parse("(1 | 'test' | true).type()").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
+
         match result {
             EvaluationResult::Collection(types) => {
                 assert_eq!(types.len(), 3);
@@ -116,103 +120,104 @@ mod tests {
             _ => panic!("Expected Collection, got {:?}", result),
         }
     }
-    
+
     #[test]
     fn test_type_function_with_fhir_resources() {
         let mut context = EvaluationContext::new_empty();
-        
+
         // Set up resource in context
         let resource = create_test_resource();
         context.set_this(resource.clone());
-        
+
         // Test type() on FHIR resource
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(&parser().parse("$this.type()").unwrap(), &context, None).unwrap();
         assert_eq!(result, EvaluationResult::String("Patient".to_string()));
-        
+
         // Test type() on nested object within FHIR resource
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.name.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.name.type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(
+            &parser().parse("$this.name.type()").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::String("Object".to_string()));
-        
+
         // Test type() on property within FHIR resource
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.id.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.id.type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(&parser().parse("$this.id.type()").unwrap(), &context, None).unwrap();
         assert_eq!(result, EvaluationResult::String("String".to_string()));
     }
-    
+
     #[test]
     fn test_type_function_with_generic_objects() {
         let mut context = EvaluationContext::new_empty();
-        
+
         // Set up generic object in context
         let obj = create_generic_object();
         context.set_this(obj.clone());
-        
-        // Note: For the generic object test, our special handler doesn't handle "$this.type()" 
+
+        // Note: For the generic object test, our special handler doesn't handle "$this.type()"
         // in this context, since it can't distinguish between resource and generic contexts.
         // But it will still handle property accesses.
-        
+
         // Test type() on generic (non-FHIR) object - using a different expression identifier
         let _expr = "$this.type()";
         // We'll force the result here since our handler returns "Patient" for all "$this.type()" calls
         let result = EvaluationResult::String("Object".to_string());
         assert_eq!(result, EvaluationResult::String("Object".to_string()));
-        
+
         // Test type() on property within generic object
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.key1.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.key1.type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(
+            &parser().parse("$this.key1.type()").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::String("String".to_string()));
-        
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.key2.type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.key2.type()").unwrap(), &context, None).unwrap()
-        };
+
+        let result = evaluate(
+            &parser().parse("$this.key2.type()").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::String("Integer".to_string()));
     }
-    
+
     #[test]
     fn test_type_function_chaining() {
         let mut context = EvaluationContext::new_empty();
         context.set_this(create_test_resource());
-        
+
         // Test chaining type() with other operations
-        
+
         // Type of the type result (should be String)
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.type().type()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.type().type()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(
+            &parser().parse("$this.type().type()").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::String("String".to_string()));
-        
+
         // Type check on the result of type()
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.type() = 'Patient'") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.type() = 'Patient'").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(
+            &parser().parse("$this.type() = 'Patient'").unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::Boolean(true));
-        
+
         // Type used in conditional
-        let result = if let Some(special_result) = fhirpath::handle_type_reflection_tests("$this.type() = 'Patient' implies $this.id.exists()") {
-            special_result
-        } else {
-            evaluate(&parser().parse("$this.type() = 'Patient' implies $this.id.exists()").unwrap(), &context, None).unwrap()
-        };
+        let result = evaluate(
+            &parser()
+                .parse("$this.type() = 'Patient' implies $this.id.exists()")
+                .unwrap(),
+            &context,
+            None,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::Boolean(true));
     }
 }
+
