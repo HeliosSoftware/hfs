@@ -1133,6 +1133,41 @@ fn call_function(
     args: &[EvaluationResult],
 ) -> Result<EvaluationResult, EvaluationError> {
     match name {
+        "is" | "as" => {
+            if args.len() != 1 {
+                return Err(EvaluationError::InvalidArity(format!(
+                    "Function '{}' expects 1 argument (type specifier)",
+                    name
+                )));
+            }
+            let type_name_str = match &args[0] {
+                EvaluationResult::String(s) => s,
+                EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // item.is({}) -> {}
+                _ => {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Function '{}' expects a string type specifier argument, found {}",
+                        name,
+                        args[0].type_name()
+                    )));
+                }
+            };
+
+            // Convert the string type name to a TypeSpecifier
+            let type_spec = if type_name_str.contains('.') {
+                let mut parts = type_name_str.splitn(2, '.');
+                let namespace = parts.next().unwrap_or("").to_string();
+                let type_part = parts.next().map(|s| s.to_string());
+                if type_part.is_some() && !namespace.is_empty() {
+                    TypeSpecifier::QualifiedIdentifier(namespace, type_part)
+                } else {
+                    TypeSpecifier::Identifier(type_name_str.to_string())
+                }
+            } else {
+                TypeSpecifier::Identifier(type_name_str.to_string())
+            };
+
+            apply_type_operation(invocation_base, name, &type_spec)
+        }
         // Handle the conformsTo() function
         "conformsTo" => {
             // Check that we have exactly one argument (the profile URL)
@@ -3853,6 +3888,8 @@ fn call_function(
                 "aggregate",
                 "trace",
                 "ofType",
+                "is",
+                "as",
                 "children",
                 "descendants",
                 "type",
