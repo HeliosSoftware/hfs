@@ -4556,33 +4556,63 @@ fn apply_type_operation(
     op: &str,
     type_spec: &TypeSpecifier,
 ) -> Result<EvaluationResult, EvaluationError> {
+    // Handle singleton evaluation for 'is' and 'as' before attempting polymorphic or resource_type logic
+    if (op == "is" || op == "as") && value.count() > 1 {
+        return Err(EvaluationError::SingletonEvaluationError(format!(
+            "'{}' operator requires a singleton input", op
+        )));
+    }
+
+    // Attempt to handle 'is' and 'as' with polymorphic_access for non-System FHIR types
+    if op == "is" || op == "as" {
+        match type_spec {
+            TypeSpecifier::QualifiedIdentifier(namespace, Some(type_name)) => {
+                // If the namespace is not "System", assume it's a FHIR type (Resource or DataType)
+                // that polymorphic_access should handle.
+                if !namespace.eq_ignore_ascii_case("System") {
+                    return crate::polymorphic_access::apply_polymorphic_type_operation(
+                        value,
+                        op,
+                        type_name,
+                        Some(namespace.as_str()),
+                    );
+                }
+            }
+            TypeSpecifier::Identifier(type_name) => {
+                // For unqualified identifiers, if it's not a FHIR primitive type (which are System types),
+                // assume it's a FHIR complex type or resource type.
+                // FHIR primitive types are handled by the fallback logic (System types).
+                if !crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase()) {
+                     return crate::polymorphic_access::apply_polymorphic_type_operation(
+                        value,
+                        op,
+                        type_name,
+                        Some("FHIR"), // Assume FHIR namespace for non-primitive, unqualified types
+                    );
+                }
+            }
+            _ => {} // Other TypeSpecifier variants (like just a namespace) will fall through.
+        }
+    }
+
+    // Fallback to existing logic (crate::resource_type) for:
+    // 1. System types (e.g., System.String, or primitives like 'boolean' which are System.Boolean).
+    // 2. The "ofType" operation.
+    // 3. Other TypeSpecifier variants or unhandled 'is'/'as' cases.
     match op {
         "is" => {
-            // Handle singleton evaluation: 'is' errors on multi-item collections
-            if value.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError(
-                    "'is' operator requires a singleton input".to_string(),
-                ));
-            }
-
-            // Call is_of_type from resource_type.rs
+            // Singleton check (value.count() > 1) is now handled at the top of the function.
+            // This path is for System types or other fallbacks.
             let is_result = crate::resource_type::is_of_type(value, type_spec)?;
             Ok(EvaluationResult::Boolean(is_result))
         }
         "as" => {
-            // Handle singleton evaluation: 'as' errors on multi-item collections
-            if value.count() > 1 {
-                return Err(EvaluationError::SingletonEvaluationError(
-                    "'as' operator requires a singleton input".to_string(),
-                ));
-            }
-
-            // Call as_type from resource_type.rs
+            // Singleton check (value.count() > 1) is now handled at the top of the function.
+            // This path is for System types or other fallbacks.
             crate::resource_type::as_type(value, type_spec)
         }
         "ofType" => {
-            // ofType should work on collections and does not need singleton check
-            // Call of_type from resource_type.rs
+            // ofType works on collections and does not need the top-level singleton check.
             crate::resource_type::of_type(value, type_spec)
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
