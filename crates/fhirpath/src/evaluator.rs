@@ -842,6 +842,43 @@ fn evaluate_invocation(
                         )))
                     }
                 }
+                "is" | "as" if args_exprs.len() == 1 => {
+                    // Logic for handling 'is' and 'as' functions by parsing their AST argument
+                    let type_spec_opt = match &args_exprs[0] {
+                        Expression::Term(Term::Literal(Literal::String(type_name_str))) => {
+                            // Argument is a string literal like 'Patient' or 'System.String'.
+                            // Pass as is; extract_namespace_and_type will handle dot separation and namespace.
+                            Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                        }
+                        Expression::Term(Term::Invocation(Invocation::Member(type_name_ident))) => {
+                            // Argument is an identifier like Patient or Quantity.
+                            // Pass as is; extract_namespace_and_type will infer namespace.
+                            Some(TypeSpecifier::QualifiedIdentifier(type_name_ident.clone(), None))
+                        }
+                        Expression::Invocation(base_expr, Invocation::Member(member_name)) => {
+                            // Argument is a qualified identifier like System.String
+                            if let Expression::Term(Term::Invocation(Invocation::Member(base_name))) = &**base_expr {
+                                Some(TypeSpecifier::QualifiedIdentifier(
+                                    base_name.clone(),
+                                    Some(member_name.clone()),
+                                ))
+                            } else {
+                                None // Unexpected structure for qualified identifier
+                            }
+                        }
+                        _ => None, // Argument is not a recognized type identifier structure
+                    };
+
+                    if let Some(type_spec) = type_spec_opt {
+                        apply_type_operation(invocation_base, name, &type_spec)
+                    } else {
+                        // Fallback: argument expression is complex, evaluate it and expect a string.
+                        // This allows for dynamic type names, e.g., item.is(%variableHoldingTypeName)
+                        let evaluated_arg = evaluate(&args_exprs[0], context, None)?;
+                        // The existing call_function logic for 'is'/'as' handles evaluated string args.
+                        call_function(name, invocation_base, &[evaluated_arg])
+                    }
+                }
                 "iif" if args_exprs.len() >= 2 => {
                     // iif(condition, trueResult, [otherwiseResult])
                     let condition_expr = &args_exprs[0];
