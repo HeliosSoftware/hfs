@@ -123,7 +123,7 @@ pub fn evaluate(
         Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left_expr, invocation) => {
             // Check for special handling of the 'extension' function
-            if let Invocation::Function(ref func_name, ref args_exprs) = invocation {
+            if let Invocation::Function(func_name, args_exprs) = invocation {
                 if func_name == "extension" {
                     let evaluated_args = args_exprs
                         .iter()
@@ -137,8 +137,8 @@ pub fn evaluate(
                     // to find a potential underscore-prefixed peer element.
                     if !base_candidate.is_collection() && !matches!(base_candidate, EvaluationResult::Object(_)) {
                         match left_expr.as_ref() {
-                            Expression::Term(Term::Invocation(Invocation::Member(ref field_name_from_term))) => { // Scenario 1: `field.extension()`
-                                let parent_map_for_field = if let Some(EvaluationResult::Object(ref map)) = current_item {
+                            Expression::Term(Term::Invocation(Invocation::Member(field_name_from_term))) => { // Scenario 1: `field.extension()`
+                                let parent_map_for_field = if let Some(EvaluationResult::Object(map)) = current_item {
                                     Some(map)
                                 } else if let Some(EvaluationResult::Object(ref map)) = context.this {
                                     Some(map)
