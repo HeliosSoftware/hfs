@@ -1155,15 +1155,25 @@ fn call_function(
             // Convert the string type name to a TypeSpecifier
             let type_spec = if type_name_str.contains('.') {
                 let mut parts = type_name_str.splitn(2, '.');
-                let namespace = parts.next().unwrap_or("").to_string();
-                let type_part = parts.next().map(|s| s.to_string());
-                if type_part.is_some() && !namespace.is_empty() {
-                    TypeSpecifier::QualifiedIdentifier(namespace, type_part)
-                } else {
-                    TypeSpecifier::Identifier(type_name_str.to_string())
-                }
+                let namespace = parts.next().unwrap().to_string(); // Safe due to contains('.')
+                let type_name = parts.next().map(|s| s.to_string());
+                // If namespace is empty (e.g., ".Foo") or type_name is None (e.g., "Foo."),
+                // it might be a malformed qualified identifier. Pass as is, `apply_type_operation` should handle.
+                TypeSpecifier::QualifiedIdentifier(namespace, type_name)
             } else {
-                TypeSpecifier::Identifier(type_name_str.to_string())
+                // No dot, simple identifier like "Patient" or "boolean"
+                let (namespace_str, type_name_part_str);
+                if crate::fhir_type_hierarchy::is_fhir_primitive_type(type_name_str) {
+                    namespace_str = "System".to_string();
+                    type_name_part_str = type_name_str.to_string();
+                } else { 
+                    // For non-primitives, assume FHIR namespace.
+                    // is_fhir_resource_type and is_fhir_complex_type (called by is_of_type)
+                    // handle capitalization. We should provide the capitalized name.
+                    namespace_str = "FHIR".to_string();
+                    type_name_part_str = crate::fhir_type_hierarchy::capitalize_first_letter(type_name_str);
+                }
+                TypeSpecifier::QualifiedIdentifier(namespace_str, Some(type_name_part_str))
             };
 
             apply_type_operation(invocation_base, name, &type_spec)
