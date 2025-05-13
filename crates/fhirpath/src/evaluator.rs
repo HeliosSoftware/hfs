@@ -575,22 +575,28 @@ fn evaluate_term(
 
             // If not $this or a variable, it must be a member/function invocation.
             // Determine the base context for this invocation.
-            let base_context = current_item.cloned().unwrap_or_else(|| {
-                // Default to the main resource context if no specific item
-                if context.resources.is_empty() {
-                    EvaluationResult::Empty
-                } else if context.resources.len() == 1 {
-                    convert_resource_to_result(&context.resources[0])
-                } else {
-                    EvaluationResult::Collection(
-                        context
-                            .resources
-                            .iter()
-                            .map(convert_resource_to_result)
-                            .collect(),
-                    )
+            // Priority: current_item > context.this > context.resources
+            let base_context = match current_item {
+                Some(item) => item.clone(),
+                None => match &context.this {
+                    Some(this_item) => this_item.clone(),
+                    None => { // Fallback to resources if context.this is also None
+                        if context.resources.is_empty() {
+                            EvaluationResult::Empty
+                        } else if context.resources.len() == 1 {
+                            convert_resource_to_result(&context.resources[0])
+                        } else {
+                            EvaluationResult::Collection(
+                                context
+                                    .resources
+                                    .iter()
+                                    .map(convert_resource_to_result)
+                                    .collect(),
+                            )
+                        }
+                    }
                 }
-            });
+            };
 
             // Evaluate the member/function invocation on the base context.
             // This is the final return value for this match arm in this case.
