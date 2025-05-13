@@ -4578,20 +4578,20 @@ fn apply_type_operation(
                     );
                 }
             }
-            TypeSpecifier::Identifier(type_name) => {
-                // For unqualified identifiers, if it's not a FHIR primitive type (which are System types),
-                // assume it's a FHIR complex type or resource type.
-                // FHIR primitive types are handled by the fallback logic (System types).
+            TypeSpecifier::QualifiedIdentifier(type_name, None) => {
+                // This case handles unqualified type names like 'Quantity'.
+                // If unqualified, it's a primitive type (System namespace) or a FHIR type.
+                // FHIR primitive types (e.g. "boolean", "string") are handled by the fallback logic (System types).
                 if !crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase()) {
                      return crate::polymorphic_access::apply_polymorphic_type_operation(
                         value,
                         op,
-                        type_name,
+                        type_name, 
                         Some("FHIR"), // Assume FHIR namespace for non-primitive, unqualified types
                     );
                 }
             }
-            _ => {} // Other TypeSpecifier variants (like just a namespace) will fall through.
+            _ => {} // Other TypeSpecifier variants (like QualifiedIdentifier with Some(type)) will fall through or are handled above.
         }
     }
 
