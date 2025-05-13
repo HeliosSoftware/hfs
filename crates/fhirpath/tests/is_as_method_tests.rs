@@ -7,7 +7,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    #[ignore]
     fn test_is_method_form() {
         // Create a Patient resource as a HashMap
         let mut patient = HashMap::new();
@@ -104,7 +103,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_as_method_form() {
         // Create a Patient resource as a HashMap
         let mut patient = HashMap::new();
@@ -255,4 +253,3 @@ mod tests {
         }
     }
 }
-

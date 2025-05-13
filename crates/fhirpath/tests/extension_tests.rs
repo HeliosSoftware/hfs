@@ -163,7 +163,6 @@ fn test_extension_function_with_variable() {
 // This test is specifically for the behavior we need to implement
 // It depends on special handling in the extension_helpers that's not fully implemented
 #[test]
-#[ignore] // Ignoring until extension_helpers is fully implemented
 fn test_underscore_property_access() {
     let ctx = create_patient_context();
 
@@ -181,4 +180,3 @@ fn test_underscore_property_access() {
     );
     assert_eq!(result, EvaluationResult::Boolean(true));
 }
-

@@ -28,7 +28,6 @@ fn test_polymorphic_value_unit() {
 
 /// Tests that the 'is' operator correctly identifies choice element types
 #[test]
-#[ignore]
 fn test_polymorphic_is_quantity() {
     // Load the Observation example
     let context = load_test_resource("observation-example.json").expect("Failed to load resource");
@@ -46,7 +45,6 @@ fn test_polymorphic_is_quantity() {
 
 /// Tests that the 'as' operator correctly filters choice elements by type
 #[test]
-#[ignore]
 fn test_polymorphic_as_quantity() {
     // Load the Observation example
     let context = load_test_resource("observation-example.json").expect("Failed to load resource");
