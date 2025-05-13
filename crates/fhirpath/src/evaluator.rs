@@ -136,42 +136,39 @@ pub fn evaluate(
                     // If base_candidate is a primitive, check if left_expr was a field access
                     // to find a potential underscore-prefixed peer element.
                     if !base_candidate.is_collection() && !matches!(base_candidate, EvaluationResult::Object(_)) {
-                        let mut parent_obj_map_opt: Option<&HashMap<String, EvaluationResult>> = None;
-                        let mut field_name_opt: Option<&String> = None;
+                        match left_expr.as_ref() {
+                            Expression::Term(Term::Invocation(Invocation::Member(ref field_name_from_term))) => { // Scenario 1: `field.extension()`
+                                let parent_map_for_field = if let Some(EvaluationResult::Object(ref map)) = current_item {
+                                    Some(map)
+                                } else if let Some(EvaluationResult::Object(ref map)) = context.this {
+                                    Some(map)
+                                } else {
+                                    None
+                                };
 
-                        // Scenario 1: left_expr is `field` (e.g., `birthDate` evaluated on Patient)
-                        if let Expression::Term(Term::Invocation(Invocation::Member(ref field_name_from_term))) = left_expr.as_ref() {
-                            if let Some(EvaluationResult::Object(parent_map_from_current_item)) = current_item {
-                                parent_obj_map_opt = Some(parent_map_from_current_item);
-                                field_name_opt = Some(field_name_from_term);
-                            } else if let Some(EvaluationResult::Object(ref patient_obj_map)) = context.this {
-                                // Fallback to context.this if current_item is not an object (e.g. root context)
-                                parent_obj_map_opt = Some(patient_obj_map);
-                                field_name_opt = Some(field_name_from_term);
+                                if let Some(parent_map) = parent_map_for_field {
+                                    if let Some(underscore_element) = parent_map.get(&format!("_{}", field_name_from_term)) {
+                                        final_base_for_extension = underscore_element.clone();
+                                    }
+                                }
                             }
-                        }
-                        // Scenario 2: left_expr is `object.field`
-                        else if let Expression::Invocation(ref parent_expr_of_field, Invocation::Member(ref field_name_from_invocation)) = left_expr.as_ref() {
-                            // Evaluate parent_expr_of_field to get the object containing 'field_name'
-                            // The context for parent_expr_of_field is the same current_item as for left_expr.
-                            let parent_obj_eval_result = evaluate(parent_expr_of_field, context, current_item)?;
-                            if let EvaluationResult::Object(parent_map_from_expr) = parent_obj_eval_result {
-                                // This path requires parent_obj_eval_result to be owned or cloned to get HashMap.
-                                // For simplicity, we'll assume it's not commonly hit or needs further refinement if it is.
-                                // To make it work, we'd need to store parent_map_from_expr and then get a reference.
-                                // For now, this branch might not correctly get parent_obj_map_opt if parent_obj_eval_result is not context.this or current_item.
-                                // However, for Patient.birthDate.extension(), current_item is Patient, and left_expr is Term(Invocation(Member("birthDate"))), so Scenario 1 handles it.
-                                 if let EvaluationResult::Object(map_val) = context.this.as_ref().filter(|_| parent_obj_eval_result == **context.this.as_ref().unwrap_or(&EvaluationResult::Empty) ) {
-                                     parent_obj_map_opt = Some(map_val);
-                                     field_name_opt = Some(field_name_from_invocation);
-                                 }
+                            Expression::Invocation(ref parent_expr_of_field, Invocation::Member(ref field_name_from_invocation)) => { // Scenario 2: `object.field.extension()`
+                                // Evaluate the parent expression (e.g., `object` in `object.field`)
+                                let parent_obj_eval_result = evaluate(parent_expr_of_field, context, current_item)?;
+                                if let EvaluationResult::Object(ref actual_parent_map) = parent_obj_eval_result {
+                                    // `actual_parent_map` is the map of the `object` part.
+                                    // `field_name_from_invocation` is `field`.
+                                    // We need to look for `_field` in `actual_parent_map`.
+                                    if let Some(underscore_element) = actual_parent_map.get(&format!("_{}", field_name_from_invocation)) {
+                                        final_base_for_extension = underscore_element.clone();
+                                    }
+                                }
+                                // If parent_obj_eval_result is not an Object, or _field is not found,
+                                // final_base_for_extension remains the primitive `base_candidate`.
                             }
-                        }
-
-                        if let (Some(parent_map), Some(field_name)) = (parent_obj_map_opt, field_name_opt) {
-                            let underscore_field_name = format!("_{}", field_name);
-                            if let Some(underscore_element) = parent_map.get(&underscore_field_name) {
-                                final_base_for_extension = underscore_element.clone();
+                            _ => {
+                                // `left_expr` is not a simple field access or object.field access.
+                                // No special handling to find underscore peer.
                             }
                         }
                     }
