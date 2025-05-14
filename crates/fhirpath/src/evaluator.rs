@@ -234,7 +234,7 @@ pub fn evaluate(
             let left_result = evaluate(left, context, current_item)?;
             // Index expression doesn't depend on $this, evaluate normally
             let index_result = evaluate(index, context, None)?;
-            evaluate_indexer(&left_result, &index_result)
+            evaluate_indexer(&left_result, &index_result, context) // Pass context
         }
         Expression::Polarity(op, expr) => {
             let result = evaluate(expr, context, current_item)?;
@@ -1541,25 +1541,33 @@ fn call_function(
             Ok(EvaluationResult::Boolean(false)) // No false item found
         }
         "first" => {
-            // Returns the first item in the collection
+            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+                if *has_undefined_order && context.check_ordered_functions {
+                    return Err(EvaluationError::SemanticError(
+                        "first() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                    ));
+                }
+            }
             Ok(
-                if let EvaluationResult::Collection(items) = invocation_base {
-                    // Wrap in Ok
+                if let EvaluationResult::Collection { items, .. } = invocation_base {
                     items.first().cloned().unwrap_or(EvaluationResult::Empty)
                 } else {
-                    // A single item is returned as is (unless it's Empty)
                     invocation_base.clone()
                 },
             )
         }
         "last" => {
-            // Returns the last item in the collection
+            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+                if *has_undefined_order && context.check_ordered_functions {
+                    return Err(EvaluationError::SemanticError(
+                        "last() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                    ));
+                }
+            }
             Ok(
-                if let EvaluationResult::Collection(items) = invocation_base {
-                    // Wrap in Ok
+                if let EvaluationResult::Collection { items, .. } = invocation_base {
                     items.last().cloned().unwrap_or(EvaluationResult::Empty)
                 } else {
-                    // A single item is returned as is (unless it's Empty)
                     invocation_base.clone()
                 },
             )
@@ -1837,9 +1845,16 @@ fn call_function(
             };
 
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, has_undefined_order } => {
+                    if *has_undefined_order && context.check_ordered_functions {
+                        return Err(EvaluationError::SemanticError(
+                            "skip() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                        ));
+                    }
+                    items.clone()
+                }
                 EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()], // Treat single item as collection
+                single_item => vec![single_item.clone()],
             };
 
             let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
@@ -1847,14 +1862,20 @@ fn call_function(
                 EvaluationResult::Empty
             } else {
                 let skipped_items = items[num_to_skip..].to_vec();
-                normalize_collection_result(skipped_items, input_was_unordered) // Preserve order status
+                normalize_collection_result(skipped_items, input_was_unordered)
             })
         }
         "tail" => {
-            // Returns the collection with all items except the first
+            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+                if *has_undefined_order && context.check_ordered_functions {
+                    return Err(EvaluationError::SemanticError(
+                        "tail() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                    ));
+                }
+            }
             let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
             Ok(
-                if let EvaluationResult::Collection { items, .. } = invocation_base { // Destructure to get items
+                if let EvaluationResult::Collection { items, .. } = invocation_base {
                     if items.len() > 1 {
                         EvaluationResult::Collection { items: items[1..].to_vec(), has_undefined_order: input_was_unordered }
                     } else {
@@ -1894,14 +1915,21 @@ fn call_function(
             }
 
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, has_undefined_order } => {
+                    if *has_undefined_order && context.check_ordered_functions {
+                        return Err(EvaluationError::SemanticError(
+                            "take() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                        ));
+                    }
+                    items.clone()
+                }
                 EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()], // Treat single item as collection
+                single_item => vec![single_item.clone()],
             };
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
             let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
-            Ok(normalize_collection_result(taken_items, input_was_unordered)) // Preserve order status
+            Ok(normalize_collection_result(taken_items, input_was_unordered))
         }
         "intersect" => {
             // Returns the intersection of two collections (items present in both, order not guaranteed)
@@ -4250,8 +4278,9 @@ fn is_valid_fhirpath_quantity_unit(unit: &str) -> bool {
 
 /// Evaluates an indexer expression
 fn evaluate_indexer(
-    collection: &EvaluationResult,
+    collection_result: &EvaluationResult, // Renamed from collection to avoid confusion with items
     index: &EvaluationResult,
+    context: &EvaluationContext, // Added context for check_ordered_functions
 ) -> Result<EvaluationResult, EvaluationError> {
     // Get the index as an integer, ensuring it's non-negative
     let idx_opt: Option<usize> = match index {
@@ -4284,9 +4313,13 @@ fn evaluate_indexer(
     };
 
     // Access the item at the given index
-    Ok(match collection {
-        // Wrap result in Ok
-        EvaluationResult::Collection(items) => {
+    Ok(match collection_result {
+        EvaluationResult::Collection { items, has_undefined_order } => {
+            if *has_undefined_order && context.check_ordered_functions {
+                return Err(EvaluationError::SemanticError(
+                    "Indexer operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
+                ));
+            }
             items.get(idx).cloned().unwrap_or(EvaluationResult::Empty)
         }
         // Indexer on single item or empty returns empty
