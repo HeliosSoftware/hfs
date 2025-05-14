@@ -29,7 +29,8 @@ pub enum EvaluationResult {
 }
 
 /// Data for a collection, including items and order status
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// Remove derived traits as EvaluationResult's implementations are manual
+#[derive(Debug, Clone)] 
 pub struct CollectionData {
     pub items: Vec<EvaluationResult>,
     pub has_undefined_order: bool,
@@ -226,7 +227,7 @@ impl Hash for EvaluationResult {
 impl EvaluationResult {
     /// Checks if the result is a collection variant.
     pub fn is_collection(&self) -> bool {
-        matches!(self, EvaluationResult::Collection(_))
+        matches!(self, EvaluationResult::Collection { .. })
     }
 
     /// Returns the count of items in the result according to FHIRPath rules.
