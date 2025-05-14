@@ -2494,17 +2494,15 @@ fn call_function(
                                 EvaluationResult::Empty // Invalid unit
                             }
                         } else {
-                            EvaluationResult::Empty // Invalid value part
+                            EvaluationResult::Empty
                         }
                     } else {
-                        // More than two parts is invalid format
                         EvaluationResult::Empty
                     }
                 }
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                _ => EvaluationResult::Empty, // Other types cannot convert
-            }) // Close the Ok() wrapper here
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                _ => EvaluationResult::Empty,
+            })
         }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
@@ -3986,7 +3984,8 @@ fn call_function(
             if all_descendants.is_empty() {
                 Ok(EvaluationResult::Empty)
             } else {
-                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: overall_descendants_unordered })
+                // descendants() output order is undefined.
+                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: true })
             }
         }
         "extension" => {
