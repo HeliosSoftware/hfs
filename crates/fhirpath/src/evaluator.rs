@@ -3936,7 +3936,7 @@ fn call_function(
                     // Apply children() to each item in the collection and flatten the results
                     let mut all_children: Vec<EvaluationResult> = Vec::new();
                     for item in items {
-                        match call_function("children", item, &[])? {
+                        match call_function("children", item, &[], context)? {
                             EvaluationResult::Empty => (), // Skip empty results
                             EvaluationResult::Collection(children) => {
                                 all_children.extend(children);
