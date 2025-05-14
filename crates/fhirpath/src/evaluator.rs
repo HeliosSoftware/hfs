@@ -1807,12 +1807,12 @@ fn call_function(
                 // Attempt to insert the item into the HashSet.
                 // If insert returns true, it's the first time we've seen this item (or an equivalent one).
                 if distinct_set.insert(item.clone()) {
-                    distinct_items.push(item); // Add to the result list to preserve order
+                    distinct_items.push(item);
                 }
             }
 
-            // Return Empty or Collection, apply normalization
-            Ok(normalize_collection_result(distinct_items))
+            // distinct() output order is not guaranteed by spec, so mark as undefined.
+            Ok(normalize_collection_result(distinct_items, true))
         }
         "skip" => {
             // Returns the collection with the first 'num' items removed
@@ -3960,38 +3960,38 @@ fn call_function(
                     for (key, value) in map {
                         if key != "resourceType" {
                             match value {
-                                // Unwrap collections into individual elements
-                                EvaluationResult::Collection(items) => {
+                                EvaluationResult::Collection { items, .. } => { // Destructure
                                     children.extend(items.clone());
                                 }
-                                // Add individual elements directly
                                 _ => children.push(value.clone()),
                             }
                         }
                     }
-                    // Return the children as a collection
                     if children.is_empty() {
                         EvaluationResult::Empty
                     } else {
-                        EvaluationResult::Collection(children)
+                        // children() produces a collection with undefined order
+                        EvaluationResult::Collection { items: children, has_undefined_order: true }
                     }
                 }
-                EvaluationResult::Collection(items) => {
-                    // Apply children() to each item in the collection and flatten the results
-                    let mut all_children: Vec<EvaluationResult> = Vec::new();
-                    for item in items {
+                EvaluationResult::Collection { items, .. } => { // Destructure
+                    let mut all_children_items: Vec<EvaluationResult> = Vec::new();
+                    let mut result_is_unordered = false;
+                    for item in items { // Iterate over destructured items
                         match call_function("children", item, &[], context)? {
-                            EvaluationResult::Empty => (), // Skip empty results
-                            EvaluationResult::Collection(children) => {
-                                all_children.extend(children);
+                            EvaluationResult::Empty => (),
+                            EvaluationResult::Collection { items: children_items, has_undefined_order } => {
+                                all_children_items.extend(children_items);
+                                if has_undefined_order { result_is_unordered = true; }
                             }
-                            child => all_children.push(child), // Add single child
+                            child => all_children_items.push(child),
                         }
                     }
-                    if all_children.is_empty() {
+                    if all_children_items.is_empty() {
                         EvaluationResult::Empty
                     } else {
-                        EvaluationResult::Collection(all_children)
+                        // The overall result is unordered if any child collection was unordered.
+                        EvaluationResult::Collection { items: all_children_items, has_undefined_order: result_is_unordered }
                     }
                 }
                 // Primitive types have no children
