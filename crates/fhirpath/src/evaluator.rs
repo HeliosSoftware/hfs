@@ -127,7 +127,7 @@ pub fn evaluate(
     // This applies when current_item is None (not in an iteration) and the expression
     // starts with a simple member identifier.
     if current_item.is_none() {
-        if let Expression::Term(Term::Invocation(Invocation::Member(ref initial_name))) = expr {
+        if let Expression::Term(Term::Invocation(Invocation::Member(initial_name))) = expr {
             let global_context_item = if let Some(this_item) = &context.this {
                 this_item.clone()
             } else if !context.resources.is_empty() {
