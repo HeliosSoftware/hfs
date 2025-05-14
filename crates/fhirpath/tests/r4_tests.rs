@@ -748,10 +748,16 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 .unwrap_or("")
                 .to_string();
             
-            let invalid_attr_val = expression_node_opt // Read 'invalid' from <expression>
+            // Try to read 'invalid' attribute from <expression> tag first
+            let mut invalid_attr_val = expression_node_opt
                 .and_then(|n| n.attribute("invalid"))
                 .unwrap_or("")
                 .to_string();
+
+            // If not found on <expression>, try to read from <test> tag
+            if invalid_attr_val.is_empty() {
+                invalid_attr_val = test.attribute("invalid").unwrap_or("").to_string();
+            }
 
             // Find expected outputs
             let mut outputs = Vec::new();
