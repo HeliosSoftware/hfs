@@ -261,7 +261,7 @@ pub fn evaluate(
             let left_result = evaluate(left, context, current_item)?;
             let right_result = evaluate(right, context, current_item)?;
             // compare_equality now returns Result, so just call it directly
-            compare_equality(&left_result, op, &right_result)
+            compare_equality(&left_result, op, &right_result, context)
         }
         Expression::Membership(left, op, right) => {
             let left_result = evaluate(left, context, current_item)?;
@@ -937,13 +937,13 @@ fn evaluate_invocation(
                     };
 
                     if let Some(type_spec) = type_spec_opt {
-                        apply_type_operation(invocation_base, name, &type_spec)
+                        apply_type_operation(invocation_base, name, &type_spec, context)
                     } else {
                         // Fallback: argument expression is complex, evaluate it and expect a string.
                         // This allows for dynamic type names, e.g., item.is(%variableHoldingTypeName)
                         let evaluated_arg = evaluate(&args_exprs[0], context, None)?;
                         // The existing call_function logic for 'is'/'as' handles evaluated string args.
-                        call_function(name, invocation_base, &[evaluated_arg])
+                        call_function(name, invocation_base, &[evaluated_arg], context)
                     }
                 }
                 "iif" if args_exprs.len() >= 2 => {
@@ -3966,7 +3966,7 @@ fn call_function(
 
                 // Get children of the current level
                 for item in &current_level {
-                    match call_function("children", item, &[])? {
+                    match call_function("children", item, &[], context)? {
                         EvaluationResult::Empty => (), // Skip empty results
                         EvaluationResult::Collection(children) => {
                             // Add children to both descendants and next level
@@ -5106,13 +5106,13 @@ fn check_membership(
                     // Use map_or to handle potential error from compare_equality
                     // Pass context to compare_equality
                     .any(|item| {
-                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
+                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean()) // context is captured here
                     }),
                 // If right is a single non-empty item, compare directly
                 // Use map_or to handle potential error from compare_equality
                 // Pass context to compare_equality
                 single_item => {
-                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean())
+                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean()) // context is available here
                 }
             };
 
@@ -5141,7 +5141,7 @@ fn check_membership(
                     // Use map_or to handle potential error from compare_equality
                     // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", right, context).map_or(false, |r| r.to_boolean())
+                        compare_equality(item, "=", right, context).map_or(false, |r| r.to_boolean()) // context is captured here
                     });
                     EvaluationResult::Boolean(contains)
                 }
@@ -5162,7 +5162,7 @@ fn check_membership(
                 // Use map_or to handle potential error from compare_equality
                 // Pass context to compare_equality
                 single_item => EvaluationResult::Boolean(
-                    compare_equality(single_item, "=", right, context).map_or(false, |r| r.to_boolean()),
+                    compare_equality(single_item, "=", right, context).map_or(false, |r| r.to_boolean()), // context is available here
                 ),
             })
         }
