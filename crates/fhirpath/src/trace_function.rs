@@ -101,23 +101,28 @@ pub fn trace_function(
 
         let mut projected_items = Vec::new();
         let mut projected_is_unordered = base_was_unordered; // Start with base order status
-        for item in items {
+        for item in items { // Iterate over destructured items
             // Evaluate the projection expression with the current item as context
             let result = evaluate(projection, context, Some(&item))?;
             match result {
-                EvaluationResult::Collection(inner) => projected_items.extend(inner),
+                EvaluationResult::Collection { items: inner, has_undefined_order } => { // Destructure
+                    projected_items.extend(inner);
+                    if has_undefined_order { projected_is_unordered = true; }
+                }
                 EvaluationResult::Empty => {} // Skip empty results
                 single_result => projected_items.push(single_result),
             }
         }
 
-        // Return the projected items as a collection (or single item if only one)
         if projected_items.is_empty() {
             EvaluationResult::Empty
         } else if projected_items.len() == 1 {
             projected_items[0].clone()
         } else {
-            EvaluationResult::Collection(projected_items)
+            // The order of projected items depends on the input and the projection itself.
+            // If the base was unordered, or if any projection resulted in an unordered collection,
+            // the result is unordered.
+            EvaluationResult::Collection { items: projected_items, has_undefined_order: projected_is_unordered }
         }
     } else {
         // When no projection is provided, trace the input directly
