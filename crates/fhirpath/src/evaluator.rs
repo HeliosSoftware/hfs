@@ -243,7 +243,7 @@ pub fn evaluate(
         }
         Expression::Type(left, op, type_spec) => {
             let result = evaluate(left, context, current_item)?;
-            apply_type_operation(&result, op, type_spec)
+            apply_type_operation(&result, op, type_spec, context) // Pass context
         }
         Expression::Union(left, right) => {
             let left_result = evaluate(left, context, current_item)?;
@@ -4660,6 +4660,7 @@ fn apply_type_operation(
     value: &EvaluationResult,
     op: &str,
     type_spec: &TypeSpecifier,
+    context: &EvaluationContext, // Added context
 ) -> Result<EvaluationResult, EvaluationError> {
     // Handle singleton evaluation for 'is' and 'as' before attempting polymorphic or resource_type logic
     if (op == "is" || op == "as") && value.count() > 1 {
@@ -4668,58 +4669,64 @@ fn apply_type_operation(
         )));
     }
 
-    // Attempt to handle 'is' and 'as' with polymorphic_access for non-System FHIR types
-    if op == "is" || op == "as" {
-        match type_spec {
-            TypeSpecifier::QualifiedIdentifier(namespace, Some(type_name)) => {
-                // If the namespace is not "System", assume it's a FHIR type (Resource or DataType)
-                // that polymorphic_access should handle.
-                if !namespace.eq_ignore_ascii_case("System") {
-                    return crate::polymorphic_access::apply_polymorphic_type_operation(
-                        value,
-                        op,
-                        type_name,
-                        Some(namespace.as_str()),
-                    );
-                }
+    // Determine if the type_spec refers to a non-System FHIR type
+    let (is_fhir_type_for_poly, type_name_for_poly, namespace_for_poly_opt) = match type_spec {
+        TypeSpecifier::QualifiedIdentifier(namespace, Some(type_name)) => {
+            if !namespace.eq_ignore_ascii_case("System") {
+                (true, type_name.clone(), Some(namespace.as_str()))
+            } else {
+                (false, String::new(), None) // System type, handle by resource_type
             }
-            TypeSpecifier::QualifiedIdentifier(type_name, None) => {
-                // This case handles unqualified type names like 'Quantity'.
-                // If unqualified, it's a primitive type (System namespace) or a FHIR type.
-                // FHIR primitive types (e.g. "boolean", "string") are handled by the fallback logic (System types).
-                if !crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase()) {
-                     return crate::polymorphic_access::apply_polymorphic_type_operation(
-                        value,
-                        op,
-                        type_name, 
-                        Some("FHIR"), // Assume FHIR namespace for non-primitive, unqualified types
-                    );
-                }
-            }
-            // All variants of TypeSpecifier::QualifiedIdentifier are covered by the arms above,
-            // and TypeSpecifier only has this single variant.
-            // Thus, a wildcard match `_ => {}` would be unreachable.
         }
+        TypeSpecifier::QualifiedIdentifier(type_name, None) => {
+            // Unqualified: could be System primitive or FHIR type
+            if !crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase()) {
+                (true, type_name.clone(), Some("FHIR")) // Assume FHIR namespace
+            } else {
+                (false, String::new(), None) // System primitive, handle by resource_type
+            }
+        }
+    };
+
+    if (op == "is" || op == "as") && is_fhir_type_for_poly {
+        // Handle with polymorphic_access
+        let poly_result = crate::polymorphic_access::apply_polymorphic_type_operation(
+            value,
+            op,
+            &type_name_for_poly,
+            namespace_for_poly_opt,
+        );
+
+        if op == "as" && context.is_strict_mode && value != &EvaluationResult::Empty {
+            if let Ok(EvaluationResult::Empty) = poly_result {
+                return Err(EvaluationError::SemanticError(format!(
+                    "Type cast of '{}' to '{:?}' (FHIR type path) failed in strict mode, resulting in empty.",
+                    value.type_name(), type_spec
+                )));
+            }
+        }
+        return poly_result;
     }
 
-    // Fallback to existing logic (crate::resource_type) for:
-    // 1. System types (e.g., System.String, or primitives like 'boolean' which are System.Boolean).
-    // 2. The "ofType" operation.
-    // 3. Other TypeSpecifier variants or unhandled 'is'/'as' cases.
+    // Fallback to crate::resource_type for System types, 'ofType', or if not handled by polymorphic_access
     match op {
         "is" => {
-            // Singleton check (value.count() > 1) is now handled at the top of the function.
-            // This path is for System types or other fallbacks.
             let is_result = crate::resource_type::is_of_type(value, type_spec)?;
             Ok(EvaluationResult::Boolean(is_result))
         }
         "as" => {
-            // Singleton check (value.count() > 1) is now handled at the top of the function.
-            // This path is for System types or other fallbacks.
-            crate::resource_type::as_type(value, type_spec)
+            // This path is for System types.
+            let cast_result = crate::resource_type::as_type(value, type_spec)?;
+            if context.is_strict_mode && value != &EvaluationResult::Empty && cast_result == EvaluationResult::Empty {
+                Err(EvaluationError::SemanticError(format!(
+                    "Type cast of '{}' to '{:?}' (System type path) failed in strict mode, resulting in empty.",
+                    value.type_name(), type_spec
+                )))
+            } else {
+                Ok(cast_result)
+            }
         }
         "ofType" => {
-            // ofType works on collections and does not need the top-level singleton check.
             crate::resource_type::of_type(value, type_spec)
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
