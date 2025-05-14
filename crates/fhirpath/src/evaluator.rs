@@ -4505,8 +4505,14 @@ fn apply_polarity(op: char, value: &EvaluationResult) -> Result<EvaluationResult
                 // Wrap result in Ok
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(-*d),
                 EvaluationResult::Integer(i) => EvaluationResult::Integer(-*i),
-                // Polarity on non-numeric or empty returns empty
-                _ => EvaluationResult::Empty,
+                // Polarity on non-numeric or empty should be a type error
+                EvaluationResult::Empty => EvaluationResult::Empty, // Polarity on empty is empty
+                other => {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot apply unary minus to type {}",
+                        other.type_name()
+                    )));
+                }
             })
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
