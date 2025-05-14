@@ -173,8 +173,10 @@ mod tests {
     #[test]
     fn test_aggregate_sum() {
         // Create a collection of integers 1 through 9
-        let collection =
-            EvaluationResult::Collection((1..=9).map(|i| EvaluationResult::Integer(i)).collect());
+        let collection = EvaluationResult::Collection {
+            items: (1..=9).map(|i| EvaluationResult::Integer(i)).collect(),
+            has_undefined_order: false, // Assuming ordered for this literal collection
+        };
 
         // This expression uses $this + $total to sum values
         let expr = crate::parser::parser().parse("$this + $total").unwrap();
@@ -237,17 +239,20 @@ mod tests {
     #[test]
     fn test_aggregate_min() {
         // Create a collection of integers
-        let collection = EvaluationResult::Collection(vec![
-            EvaluationResult::Integer(5),
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(9),
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(7),
-        ]);
+        let collection = EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(5),
+                EvaluationResult::Integer(3),
+                EvaluationResult::Integer(9),
+                EvaluationResult::Integer(1),
+                EvaluationResult::Integer(7),
+            ],
+            has_undefined_order: false, // Assuming ordered for this literal collection
+        };
 
         // Get the items to aggregate
         let items_to_aggregate = match &collection {
-            EvaluationResult::Collection(items) => items.clone(),
+            EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
             EvaluationResult::Empty => vec![],
             single_item => vec![single_item.clone()],
         };
@@ -284,17 +289,20 @@ mod tests {
     #[test]
     fn test_aggregate_max() {
         // Create a collection of integers
-        let collection = EvaluationResult::Collection(vec![
-            EvaluationResult::Integer(5),
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(9),
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(7),
-        ]);
+        let collection = EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(5),
+                EvaluationResult::Integer(3),
+                EvaluationResult::Integer(9),
+                EvaluationResult::Integer(1),
+                EvaluationResult::Integer(7),
+            ],
+            has_undefined_order: false, // Assuming ordered for this literal collection
+        };
 
         // Get the items to aggregate
         let items_to_aggregate = match &collection {
-            EvaluationResult::Collection(items) => items.clone(),
+            EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
             EvaluationResult::Empty => vec![],
             single_item => vec![single_item.clone()],
         };

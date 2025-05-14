@@ -31,11 +31,10 @@ fn run_fhir_r4_test(
             0 => EvaluationResult::Empty, // Empty collection or Empty item
             1 => {
                 // Single item. If it's a Boolean, use its value. Otherwise, it becomes true.
-                let single_item_value =
-                    if let EvaluationResult::Collection(ref c_items) = eval_result {
-                        // This case handles a collection with one item.
-                        // We need to get the item itself to check if it's a boolean.
-                        c_items[0].clone()
+                let single_item_value = if let EvaluationResult::Collection { items: ref c_items, .. } = eval_result {
+                    // This case handles a collection with one item.
+                    // We need to get the item itself to check if it's a boolean.
+                    c_items[0].clone()
                     } else {
                         // This case handles a single, non-collection item (e.g. String, Integer).
                         eval_result.clone()
@@ -62,7 +61,7 @@ fn run_fhir_r4_test(
 
     // Convert the (potentially coerced) result to a vec for comparison
     let result_vec = match &final_eval_result_for_comparison {
-        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
         EvaluationResult::Empty => Vec::new(), // Empty result means an empty list for comparison
         single_item => vec![single_item.clone()], // Single item becomes a list with one item
     };

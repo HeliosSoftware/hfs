@@ -604,10 +604,10 @@ mod tests {
             EvaluationResult::String("John".to_string()),
             EvaluationResult::String("Q".to_string()),
         ];
-        name.insert("given".to_string(), EvaluationResult::Collection(given));
+        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false });
         
         let names = vec![EvaluationResult::Object(name)];
-        patient.insert("name".to_string(), EvaluationResult::Collection(names));
+        patient.insert("name".to_string(), EvaluationResult::Collection { items: names, has_undefined_order: false });
         
         // Add birthDate
         patient.insert("birthDate".to_string(), EvaluationResult::String("1974-12-25".to_string()));

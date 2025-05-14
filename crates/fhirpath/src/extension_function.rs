@@ -164,7 +164,7 @@ mod tests {
         
         // Create a test element with the extension
         let mut obj = HashMap::new();
-        obj.insert("extension".to_string(), EvaluationResult::Collection(vec![extension.clone()]));
+        obj.insert("extension".to_string(), EvaluationResult::Collection { items: vec![extension.clone()], has_undefined_order: false });
         let element = EvaluationResult::Object(obj);
         
         // Test the extension function
@@ -187,7 +187,7 @@ mod tests {
         
         // Create a test element with the extension
         let mut obj = HashMap::new();
-        obj.insert("extension".to_string(), EvaluationResult::Collection(vec![extension]));
+        obj.insert("extension".to_string(), EvaluationResult::Collection { items: vec![extension], has_undefined_order: false });
         let element = EvaluationResult::Object(obj);
         
         // Test the extension function with a different URL
@@ -242,7 +242,7 @@ mod tests {
         
         // Create a test element with multiple extensions
         let mut obj = HashMap::new();
-        obj.insert("extension".to_string(), EvaluationResult::Collection(vec![extension1.clone(), extension2.clone()]));
+        obj.insert("extension".to_string(), EvaluationResult::Collection { items: vec![extension1.clone(), extension2.clone()], has_undefined_order: false });
         let element = EvaluationResult::Object(obj);
         
         // Test the extension function
@@ -270,7 +270,7 @@ mod tests {
         
         // Create a test underscore element
         let mut underscore_obj = HashMap::new();
-        underscore_obj.insert("extension".to_string(), EvaluationResult::Collection(vec![extension.clone()]));
+        underscore_obj.insert("extension".to_string(), EvaluationResult::Collection { items: vec![extension.clone()], has_undefined_order: false });
         
         // Create a test parent object with the underscore element
         let mut parent_obj = HashMap::new();
