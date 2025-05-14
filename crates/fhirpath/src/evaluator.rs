@@ -267,7 +267,7 @@ pub fn evaluate(
             let left_result = evaluate(left, context, current_item)?;
             let right_result = evaluate(right, context, current_item)?;
             // Membership returns Empty on empty operand or errors on multi-item left
-            check_membership(&left_result, op, &right_result)
+            check_membership(&left_result, op, &right_result, context)
         }
         Expression::And(left, right) => {
             // Evaluate operands first
@@ -5081,6 +5081,7 @@ fn check_membership(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
+    context: &EvaluationContext, // Added context
 ) -> Result<EvaluationResult, EvaluationError> {
     // Specific handling for 'in' and 'contains' based on FHIRPath spec regarding empty collections
     match op {
