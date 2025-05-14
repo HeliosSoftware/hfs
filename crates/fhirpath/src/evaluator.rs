@@ -1798,7 +1798,7 @@ fn call_function(
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
-                EvaluationResult::Collection(items, ..) => items,
+                EvaluationResult::Collection { items, .. } => items,
                 EvaluationResult::Empty => &[][..],
                 single => &[single.clone()][..],
             };
@@ -5398,7 +5398,7 @@ fn check_membership(
             Ok(match left {
                 // Wrap result in Ok
                 // For collections, check if any item equals the right value
-                EvaluationResult::Collection(items) => {
+                EvaluationResult::Collection { items, .. } => {
                     // Use map_or to handle potential error from compare_equality
                     // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
