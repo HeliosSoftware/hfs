@@ -153,37 +153,23 @@ pub fn compare_date_time_values(left: &EvaluationResult, right: &EvaluationResul
         },
         
         // Handle other conversions
-        (EvaluationResult::String(s), EvaluationResult::Date(d)) if s.starts_with('@') => {
-            let value = s.trim_start_matches('@');
-            if !value.contains('T') {
-                compare_dates(value, d)
-            } else {
-                None
-            }
+        // String vs Date
+        (EvaluationResult::String(s_val), EvaluationResult::Date(d_val)) => {
+            // Attempt to parse s_val as a date and compare with d_val
+            compare_dates(s_val, d_val)
         },
-        (EvaluationResult::Date(d), EvaluationResult::String(s)) if s.starts_with('@') => {
-            let value = s.trim_start_matches('@');
-            if !value.contains('T') {
-                compare_dates(d, value)
-            } else {
-                None
-            }
+        (EvaluationResult::Date(d_val), EvaluationResult::String(s_val)) => {
+            // Attempt to parse s_val as a date and compare with d_val
+            compare_dates(d_val, s_val)
         },
-        (EvaluationResult::String(s), EvaluationResult::DateTime(dt)) if s.starts_with('@') => {
-            let value = s.trim_start_matches('@');
-            if value.contains('T') {
-                compare_datetimes(value, dt)
-            } else {
-                None
-            }
+        // String vs DateTime
+        (EvaluationResult::String(s_val), EvaluationResult::DateTime(dt_val)) => {
+            // Attempt to parse s_val as a datetime and compare with dt_val
+            compare_datetimes(s_val, dt_val)
         },
-        (EvaluationResult::DateTime(dt), EvaluationResult::String(s)) if s.starts_with('@') => {
-            let value = s.trim_start_matches('@');
-            if value.contains('T') {
-                compare_datetimes(dt, value)
-            } else {
-                None
-            }
+        (EvaluationResult::DateTime(dt_val), EvaluationResult::String(s_val)) => {
+            // Attempt to parse s_val as a datetime and compare with dt_val
+            compare_datetimes(dt_val, s_val)
         },
         
         // Cannot compare different types
