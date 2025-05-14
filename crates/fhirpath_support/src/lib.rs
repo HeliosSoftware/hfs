@@ -80,6 +80,32 @@ impl std::fmt::Display for EvaluationError {
     }
 }
 
+// --- PartialEq and Eq Implementation ---
+// Implement PartialEq and Eq manually
+impl PartialEq for EvaluationResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EvaluationResult::Empty, EvaluationResult::Empty) => true,
+            (EvaluationResult::Boolean(a), EvaluationResult::Boolean(b)) => a == b,
+            (EvaluationResult::String(a), EvaluationResult::String(b)) => a == b,
+            (EvaluationResult::Decimal(a), EvaluationResult::Decimal(b)) => a.normalize() == b.normalize(),
+            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => a == b,
+            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => a == b,
+            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => a == b,
+            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => a == b,
+            (EvaluationResult::Quantity(val_a, unit_a), EvaluationResult::Quantity(val_b, unit_b)) => {
+                val_a.normalize() == val_b.normalize() && unit_a == unit_b
+            }
+            (EvaluationResult::Collection { items: a_items, has_undefined_order: a_undef }, EvaluationResult::Collection { items: b_items, has_undefined_order: b_undef }) => {
+                a_undef == b_undef && a_items == b_items
+            }
+            (EvaluationResult::Object(a), EvaluationResult::Object(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for EvaluationResult {}
+
 // --- Ord Implementation ---
 // Define an arbitrary but consistent order for variants for sorting purposes.
 // Note: This order does not necessarily reflect FHIRPath comparison rules,
