@@ -209,7 +209,8 @@ pub fn evaluate(
             }
             // Default: evaluate left, then invoke on result
             let left_result = evaluate(left_expr, context, current_item)?;
-            evaluate_invocation(&left_result, invocation, context)
+            // Pass current_item to evaluate_invocation for argument evaluation context
+            evaluate_invocation(&left_result, invocation, context, current_item)
         }
         Expression::Indexer(left, index) => {
             let left_result = evaluate(left, context, current_item)?;
@@ -628,8 +629,8 @@ fn evaluate_term(
             };
 
             // Evaluate the member/function invocation on the base context.
-            // This is the final return value for this match arm in this case.
-            evaluate_invocation(&base_context, invocation, context)
+            // Pass current_item to evaluate_invocation for argument evaluation context
+            evaluate_invocation(&base_context, invocation, context, current_item)
         }
         Term::Literal(literal) => Ok(evaluate_literal(literal)), // Wrap in Ok
         Term::ExternalConstant(name) => {
@@ -706,6 +707,7 @@ fn evaluate_invocation(
     invocation_base: &EvaluationResult, // The result of the expression the invocation is called on
     invocation: &Invocation,
     context: &EvaluationContext, // The overall evaluation context (for variables etc.)
+    current_item_for_args: Option<&EvaluationResult>, // Context for $this in function arguments
 ) -> Result<EvaluationResult, EvaluationError> {
     let result = match invocation {
         Invocation::Member(name) => {
@@ -741,7 +743,8 @@ fn evaluate_invocation(
                     let mut results = Vec::new();
                     for item in items {
                         // Recursively call member access on each item, propagating errors
-                        match evaluate_invocation(item, &Invocation::Member(name.clone()), context)
+                        // Pass current_item_for_args down for consistency, though Member invocations don't use it for args
+                        match evaluate_invocation(item, &Invocation::Member(name.clone()), context, current_item_for_args)
                         {
                             Ok(EvaluationResult::Empty) => {} // Skip empty results
                             Ok(res) => results.push(res),
@@ -1030,7 +1033,8 @@ fn evaluate_invocation(
                     // Default: Evaluate all standard function arguments first (without $this context), then call function
                     let mut evaluated_args = Vec::with_capacity(args_exprs.len());
                     for arg_expr in args_exprs {
-                        evaluated_args.push(evaluate(arg_expr, context, None)?); // Evaluate args, propagate error
+                        // Use current_item_for_args when evaluating function arguments
+                        evaluated_args.push(evaluate(arg_expr, context, current_item_for_args)?);
                     }
                     // Call with updated signature (name, base, args)
                     call_function(name, invocation_base, &evaluated_args)
