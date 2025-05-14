@@ -29,7 +29,7 @@ impl EvaluationContext {
             resources,
             variables: HashMap::new(),
             this: None,
-            is_strict_mode: false, // Default to non-strict mode
+            is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
         }
     }
@@ -40,7 +40,7 @@ impl EvaluationContext {
             resources: Vec::new(),
             variables: HashMap::new(),
             this: None,
-            is_strict_mode: false, // Default to non-strict mode
+            is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
         }
     }
@@ -185,31 +185,50 @@ pub fn evaluate(
 
                     // If base_candidate is a primitive, check if left_expr was a field access
                     // to find a potential underscore-prefixed peer element.
-                    if !base_candidate.is_collection() && !matches!(base_candidate, EvaluationResult::Object(_)) {
+                    if !base_candidate.is_collection()
+                        && !matches!(base_candidate, EvaluationResult::Object(_))
+                    {
                         match left_expr.as_ref() {
-                            Expression::Term(Term::Invocation(Invocation::Member(field_name_from_term))) => { // Scenario 1: `field.extension()`
-                                let parent_map_for_field = if let Some(EvaluationResult::Object(map)) = current_item {
-                                    Some(map)
-                                } else if let Some(EvaluationResult::Object(ref map)) = context.this {
-                                    Some(map)
-                                } else {
-                                    None
-                                };
+                            Expression::Term(Term::Invocation(Invocation::Member(
+                                field_name_from_term,
+                            ))) => {
+                                // Scenario 1: `field.extension()`
+                                let parent_map_for_field =
+                                    if let Some(EvaluationResult::Object(map)) = current_item {
+                                        Some(map)
+                                    } else if let Some(EvaluationResult::Object(ref map)) =
+                                        context.this
+                                    {
+                                        Some(map)
+                                    } else {
+                                        None
+                                    };
 
                                 if let Some(parent_map) = parent_map_for_field {
-                                    if let Some(underscore_element) = parent_map.get(&format!("_{}", field_name_from_term)) {
+                                    if let Some(underscore_element) =
+                                        parent_map.get(&format!("_{}", field_name_from_term))
+                                    {
                                         final_base_for_extension = underscore_element.clone();
                                     }
                                 }
                             }
-                            Expression::Invocation(parent_expr_of_field, Invocation::Member(field_name_from_invocation)) => { // Scenario 2: `object.field.extension()`
+                            Expression::Invocation(
+                                parent_expr_of_field,
+                                Invocation::Member(field_name_from_invocation),
+                            ) => {
+                                // Scenario 2: `object.field.extension()`
                                 // Evaluate the parent expression (e.g., `object` in `object.field`)
-                                let parent_obj_eval_result = evaluate(parent_expr_of_field, context, current_item)?;
-                                if let EvaluationResult::Object(ref actual_parent_map) = parent_obj_eval_result {
+                                let parent_obj_eval_result =
+                                    evaluate(parent_expr_of_field, context, current_item)?;
+                                if let EvaluationResult::Object(ref actual_parent_map) =
+                                    parent_obj_eval_result
+                                {
                                     // `actual_parent_map` is the map of the `object` part.
                                     // `field_name_from_invocation` is `field`.
                                     // We need to look for `_field` in `actual_parent_map`.
-                                    if let Some(underscore_element) = actual_parent_map.get(&format!("_{}", field_name_from_invocation)) {
+                                    if let Some(underscore_element) = actual_parent_map
+                                        .get(&format!("_{}", field_name_from_invocation))
+                                    {
                                         final_base_for_extension = underscore_element.clone();
                                     }
                                 }
@@ -222,7 +241,10 @@ pub fn evaluate(
                             }
                         }
                     }
-                    return crate::extension_function::extension_function(&final_base_for_extension, &evaluated_args);
+                    return crate::extension_function::extension_function(
+                        &final_base_for_extension,
+                        &evaluated_args,
+                    );
                 }
             }
             // Default: evaluate left, then invoke on result
@@ -517,22 +539,35 @@ pub fn evaluate(
 /// Normalizes a vector of results according to FHIRPath singleton evaluation rules.
 /// Returns Empty if vec is empty, the single item if len is 1, or Collection(vec) otherwise.
 /// The `has_undefined_order` flag for the resulting collection is determined by the input items.
-fn normalize_collection_result(mut items: Vec<EvaluationResult>, items_have_undefined_order: bool) -> EvaluationResult {
+fn normalize_collection_result(
+    mut items: Vec<EvaluationResult>,
+    items_have_undefined_order: bool,
+) -> EvaluationResult {
     if items.is_empty() {
         EvaluationResult::Empty
     } else if items.len() == 1 {
         // If the single item is itself a collection, preserve its undefined_order status.
         // Otherwise, a single non-collection item is considered ordered.
         let single_item = items.pop().unwrap();
-        if let EvaluationResult::Collection { items: inner_items, has_undefined_order: inner_undef_order } = single_item {
+        if let EvaluationResult::Collection {
+            items: inner_items,
+            has_undefined_order: inner_undef_order,
+        } = single_item
+        {
             // If the single item was a collection, re-wrap it, preserving its order status.
             // This typically happens if flatten_collections_recursive returns a single collection.
-            EvaluationResult::Collection { items: inner_items, has_undefined_order: inner_undef_order }
+            EvaluationResult::Collection {
+                items: inner_items,
+                has_undefined_order: inner_undef_order,
+            }
         } else {
             single_item // Not a collection, or already handled.
         }
     } else {
-        EvaluationResult::Collection { items, has_undefined_order: items_have_undefined_order }
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order: items_have_undefined_order,
+        }
     }
 }
 
@@ -543,12 +578,16 @@ fn flatten_collections_recursive(result: EvaluationResult) -> (Vec<EvaluationRes
     let mut any_undefined_order = false;
 
     match result {
-        EvaluationResult::Collection { items, has_undefined_order } => {
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+        } => {
             if has_undefined_order {
                 any_undefined_order = true;
             }
             for item in items {
-                let (nested_flattened, nested_undefined_order) = flatten_collections_recursive(item);
+                let (nested_flattened, nested_undefined_order) =
+                    flatten_collections_recursive(item);
                 flattened_items.extend(nested_flattened);
                 if nested_undefined_order {
                     any_undefined_order = true;
@@ -640,7 +679,8 @@ fn evaluate_term(
                 Some(item) => item.clone(),
                 None => match &context.this {
                     Some(this_item) => this_item.clone(),
-                    None => { // Fallback to resources if context.this is also None
+                    None => {
+                        // Fallback to resources if context.this is also None
                         if context.resources.is_empty() {
                             EvaluationResult::Empty
                         } else if context.resources.len() == 1 {
@@ -656,7 +696,7 @@ fn evaluate_term(
                             }
                         }
                     }
-                }
+                },
             };
 
             // Evaluate the member/function invocation on the base context.
@@ -777,7 +817,10 @@ fn evaluate_invocation(
                         Ok(EvaluationResult::Empty)
                     }
                 }
-                EvaluationResult::Collection { items, has_undefined_order: base_was_unordered } => {
+                EvaluationResult::Collection {
+                    items,
+                    has_undefined_order: base_was_unordered,
+                } => {
                     // For collections, apply member access to each item and collect results
                     let mut results = Vec::new();
                     // Propagate the undefined order status of the base collection to the results,
@@ -786,8 +829,17 @@ fn evaluate_invocation(
 
                     for item in items {
                         // Pass current_item_for_args down for consistency
-                        let res = evaluate_invocation(item, &Invocation::Member(name.clone()), context, current_item_for_args)?;
-                        if let EvaluationResult::Collection { has_undefined_order: true, .. } = &res {
+                        let res = evaluate_invocation(
+                            item,
+                            &Invocation::Member(name.clone()),
+                            context,
+                            current_item_for_args,
+                        )?;
+                        if let EvaluationResult::Collection {
+                            has_undefined_order: true,
+                            ..
+                        } = &res
+                        {
                             result_is_unordered = true;
                         }
                         if res != EvaluationResult::Empty {
@@ -800,9 +852,13 @@ fn evaluate_invocation(
                     } else {
                         let mut combined_results_for_flattening = Vec::new();
                         // Start with the propagated order status from the loop above
-                        let mut any_item_was_unordered_collection = result_is_unordered; 
+                        let mut any_item_was_unordered_collection = result_is_unordered;
                         for res_item in results {
-                            if let EvaluationResult::Collection{items: inner_items, has_undefined_order: item_is_unordered} = res_item {
+                            if let EvaluationResult::Collection {
+                                items: inner_items,
+                                has_undefined_order: item_is_unordered,
+                            } = res_item
+                            {
                                 combined_results_for_flattening.extend(inner_items);
                                 if item_is_unordered {
                                     any_item_was_unordered_collection = true;
@@ -811,14 +867,18 @@ fn evaluate_invocation(
                                 combined_results_for_flattening.push(res_item);
                             }
                         }
-                        
+
                         let temp_collection_for_flattening = EvaluationResult::Collection {
                             items: combined_results_for_flattening,
                             has_undefined_order: any_item_was_unordered_collection,
                         };
 
-                        let (flattened_items, final_is_unordered) = flatten_collections_recursive(temp_collection_for_flattening);
-                        Ok(normalize_collection_result(flattened_items, final_is_unordered))
+                        let (flattened_items, final_is_unordered) =
+                            flatten_collections_recursive(temp_collection_for_flattening);
+                        Ok(normalize_collection_result(
+                            flattened_items,
+                            final_is_unordered,
+                        ))
                     }
                 }
                 // Special handling for primitive types
@@ -944,21 +1004,33 @@ fn evaluate_invocation(
                                     ))
                                 } else {
                                     // Malformed (e.g., ".Patient" or "FHIR.") - treat as unqualified or let downstream handle
-                                    Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                                    Some(TypeSpecifier::QualifiedIdentifier(
+                                        type_name_str.clone(),
+                                        None,
+                                    ))
                                 }
                             } else {
                                 // Unqualified like 'Patient'
-                                Some(TypeSpecifier::QualifiedIdentifier(type_name_str.clone(), None))
+                                Some(TypeSpecifier::QualifiedIdentifier(
+                                    type_name_str.clone(),
+                                    None,
+                                ))
                             }
                         }
                         Expression::Term(Term::Invocation(Invocation::Member(type_name_ident))) => {
                             // Argument is an identifier like Patient or Quantity.
                             // Pass as is; extract_namespace_and_type will infer namespace.
-                            Some(TypeSpecifier::QualifiedIdentifier(type_name_ident.clone(), None))
+                            Some(TypeSpecifier::QualifiedIdentifier(
+                                type_name_ident.clone(),
+                                None,
+                            ))
                         }
                         Expression::Invocation(base_expr, Invocation::Member(member_name)) => {
                             // Argument is a qualified identifier like System.String
-                            if let Expression::Term(Term::Invocation(Invocation::Member(base_name))) = &**base_expr {
+                            if let Expression::Term(Term::Invocation(Invocation::Member(
+                                base_name,
+                            ))) = &**base_expr
+                            {
                                 Some(TypeSpecifier::QualifiedIdentifier(
                                     base_name.clone(),
                                     Some(member_name.clone()),
@@ -1148,7 +1220,10 @@ fn evaluate_where(
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     let (items_to_filter, input_was_unordered) = match collection {
-        EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order),
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+        } => (items.clone(), *has_undefined_order),
         EvaluationResult::Empty => (vec![], false),
         single_item => (vec![single_item.clone()], false),
     };
@@ -1178,13 +1253,23 @@ fn evaluate_where(
             .any(|item| matches!(item, EvaluationResult::Collection { .. })); // Update pattern
 
         if has_nested_collections {
-            let collection_result = EvaluationResult::Collection {items: filtered_items, has_undefined_order: input_was_unordered };
-            let (flattened_items, is_result_unordered) = flatten_collections_recursive(collection_result);
-            return Ok(normalize_collection_result(flattened_items, is_result_unordered));
+            let collection_result = EvaluationResult::Collection {
+                items: filtered_items,
+                has_undefined_order: input_was_unordered,
+            };
+            let (flattened_items, is_result_unordered) =
+                flatten_collections_recursive(collection_result);
+            return Ok(normalize_collection_result(
+                flattened_items,
+                is_result_unordered,
+            ));
         }
     }
 
-    Ok(normalize_collection_result(filtered_items, input_was_unordered))
+    Ok(normalize_collection_result(
+        filtered_items,
+        input_was_unordered,
+    ))
 }
 
 /// Evaluates the 'select' function.
@@ -1194,7 +1279,10 @@ fn evaluate_select(
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     let (items_to_project, input_was_unordered) = match collection {
-        EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order),
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+        } => (items.clone(), *has_undefined_order),
         EvaluationResult::Empty => (vec![], false),
         single_item => (vec![single_item.clone()], false),
     };
@@ -1203,15 +1291,25 @@ fn evaluate_select(
     let mut result_is_unordered = input_was_unordered; // Start with input's order status
     for item in items_to_project {
         let projection_result = evaluate(projection_expr, context, Some(&item))?;
-        if let EvaluationResult::Collection { has_undefined_order: true, .. } = &projection_result {
+        if let EvaluationResult::Collection {
+            has_undefined_order: true,
+            ..
+        } = &projection_result
+        {
             result_is_unordered = true;
         }
         projected_items.push(projection_result);
     }
 
-    let collection_result = EvaluationResult::Collection { items: projected_items, has_undefined_order: result_is_unordered };
+    let collection_result = EvaluationResult::Collection {
+        items: projected_items,
+        has_undefined_order: result_is_unordered,
+    };
     let (flattened_items, final_is_unordered) = flatten_collections_recursive(collection_result);
-    Ok(normalize_collection_result(flattened_items, final_is_unordered))
+    Ok(normalize_collection_result(
+        flattened_items,
+        final_is_unordered,
+    ))
 }
 
 /// Evaluates the 'all' function with a criteria expression.
@@ -1259,7 +1357,7 @@ fn call_function(
     invocation_base: &EvaluationResult, // Renamed from context to avoid confusion
     args: &[EvaluationResult],
     // Add context parameter here, as call_function is called from evaluate_invocation which has context
-    context: &EvaluationContext, 
+    context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     match name {
         "is" | "as" => {
@@ -1295,12 +1393,13 @@ fn call_function(
                 if crate::fhir_type_hierarchy::is_fhir_primitive_type(type_name_str) {
                     namespace_str = "System".to_string();
                     type_name_part_str = type_name_str.to_string();
-                } else { 
+                } else {
                     // For non-primitives, assume FHIR namespace.
                     // is_fhir_resource_type and is_fhir_complex_type (called by is_of_type)
                     // handle capitalization. We should provide the capitalized name.
                     namespace_str = "FHIR".to_string();
-                    type_name_part_str = crate::fhir_type_hierarchy::capitalize_first_letter(type_name_str);
+                    type_name_part_str =
+                        crate::fhir_type_hierarchy::capitalize_first_letter(type_name_str);
                 }
                 TypeSpecifier::QualifiedIdentifier(namespace_str, Some(type_name_part_str))
             };
@@ -1365,7 +1464,8 @@ fn call_function(
         "count" => {
             // Returns the number of items in the collection, including duplicates
             Ok(match invocation_base {
-                EvaluationResult::Collection { items, .. } => { // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    // Destructure
                     EvaluationResult::Integer(items.len() as i64)
                 }
                 EvaluationResult::Empty => EvaluationResult::Integer(0),
@@ -1383,7 +1483,9 @@ fn call_function(
             Ok(match invocation_base {
                 // Wrap result in Ok
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
-                EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(items.is_empty()), // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    EvaluationResult::Boolean(items.is_empty())
+                } // Destructure
                 _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
             })
         }
@@ -1392,7 +1494,9 @@ fn call_function(
             // exists(criteria) is handled in evaluate_invocation.
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Boolean(false),
-                EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(!items.is_empty()), // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    EvaluationResult::Boolean(!items.is_empty())
+                } // Destructure
                 _ => EvaluationResult::Boolean(true), // Single non-empty item exists
             })
         }
@@ -1401,7 +1505,8 @@ fn call_function(
             // all(criteria) is handled in evaluate_invocation.
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
-                EvaluationResult::Collection { items, .. } => { // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    // Destructure
                     // Check if all items evaluate to true
                     // Wrap the boolean result
                     EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean()))
@@ -1510,7 +1615,11 @@ fn call_function(
             Ok(EvaluationResult::Boolean(false)) // No false item found
         }
         "first" => {
-            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+            if let EvaluationResult::Collection {
+                has_undefined_order,
+                ..
+            } = invocation_base
+            {
                 if *has_undefined_order && context.check_ordered_functions {
                     return Err(EvaluationError::SemanticError(
                         "first() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
@@ -1526,7 +1635,11 @@ fn call_function(
             )
         }
         "last" => {
-            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+            if let EvaluationResult::Collection {
+                has_undefined_order,
+                ..
+            } = invocation_base
+            {
                 if *has_undefined_order && context.check_ordered_functions {
                     return Err(EvaluationError::SemanticError(
                         "last() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
@@ -1599,7 +1712,8 @@ fn call_function(
                         )));
                     }
                 }
-                EvaluationResult::Collection { items, .. } => { // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    // Destructure
                     // Collection contains item (using equality)
                     // Use map_or to handle potential error from compare_equality
                     let contains = items.iter().any(|item| {
@@ -1615,7 +1729,8 @@ fn call_function(
                     // Use map_or to handle potential error from compare_equality
                     EvaluationResult::Boolean(
                         // Pass context to compare_equality if it needs it
-                        compare_equality(single_item, "=", arg, context).map_or(false, |r| r.to_boolean()),
+                        compare_equality(single_item, "=", arg, context)
+                            .map_or(false, |r| r.to_boolean()),
                     )
                 }
             }) // Close Ok wrapping the match
@@ -1636,7 +1751,8 @@ fn call_function(
                 for j in (i + 1)..items.len() {
                     // Use compare_equality, handle potential error, default to false if error
                     // Pass context to compare_equality
-                    if compare_equality(&items[i], "=", &items[j], context).map_or(false, |r| r.to_boolean())
+                    if compare_equality(&items[i], "=", &items[j], context)
+                        .map_or(false, |r| r.to_boolean())
                     {
                         return Ok(EvaluationResult::Boolean(false)); // Found a duplicate
                     }
@@ -1655,12 +1771,12 @@ fn call_function(
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
-                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Collection(items, ..) => items,
                 EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Empty set is subset of anything
                 single => &[single.clone()][..], // Treat single item as slice
             };
             let other_items = match other_collection {
-                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Collection(items, ..) => items,
                 EvaluationResult::Empty => &[][..], // Empty slice
                 single => &[single.clone()][..],    // Treat single item as slice
             };
@@ -1682,12 +1798,12 @@ fn call_function(
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
-                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Collection(items, ..) => items,
                 EvaluationResult::Empty => &[][..],
                 single => &[single.clone()][..],
             };
             let other_items = match other_collection {
-                EvaluationResult::Collection(items) => items,
+                EvaluationResult::Collection(items, ..) => items,
                 EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Anything is superset of empty set
                 single => &[single.clone()][..],
             };
@@ -1813,7 +1929,10 @@ fn call_function(
             };
 
             let (items, input_was_unordered) = match invocation_base {
-                EvaluationResult::Collection { items, has_undefined_order } => {
+                EvaluationResult::Collection {
+                    items,
+                    has_undefined_order,
+                } => {
                     if *has_undefined_order && context.check_ordered_functions {
                         return Err(EvaluationError::SemanticError(
                             "skip() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
@@ -1832,18 +1951,33 @@ fn call_function(
             })
         }
         "tail" => {
-            if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base {
+            if let EvaluationResult::Collection {
+                has_undefined_order,
+                ..
+            } = invocation_base
+            {
                 if *has_undefined_order && context.check_ordered_functions {
                     return Err(EvaluationError::SemanticError(
                         "tail() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
                     ));
                 }
             }
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base { *has_undefined_order } else { false }; // Correctly get order status
+            let input_was_unordered = if let EvaluationResult::Collection {
+                has_undefined_order,
+                ..
+            } = invocation_base
+            {
+                *has_undefined_order
+            } else {
+                false
+            }; // Correctly get order status
             Ok(
                 if let EvaluationResult::Collection { items, .. } = invocation_base {
                     if items.len() > 1 {
-                        EvaluationResult::Collection { items: items[1..].to_vec(), has_undefined_order: input_was_unordered }
+                        EvaluationResult::Collection {
+                            items: items[1..].to_vec(),
+                            has_undefined_order: input_was_unordered,
+                        }
                     } else {
                         EvaluationResult::Empty
                     }
@@ -1881,7 +2015,10 @@ fn call_function(
             }
 
             let (items, input_was_unordered) = match invocation_base {
-                EvaluationResult::Collection { items, has_undefined_order } => {
+                EvaluationResult::Collection {
+                    items,
+                    has_undefined_order,
+                } => {
                     if *has_undefined_order && context.check_ordered_functions {
                         return Err(EvaluationError::SemanticError(
                             "take() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
@@ -1894,7 +2031,10 @@ fn call_function(
             };
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
-            Ok(normalize_collection_result(taken_items, input_was_unordered))
+            Ok(normalize_collection_result(
+                taken_items,
+                input_was_unordered,
+            ))
         }
         "intersect" => {
             // Returns the intersection of two collections (items present in both, order not guaranteed)
@@ -1932,7 +2072,8 @@ fn call_function(
                 // Use map_or to handle potential error from compare_equality
                 // Pass context to compare_equality
                 let exists_in_right = right_items.iter().any(|right_item| {
-                    compare_equality(left_item, "=", right_item, context).map_or(false, |r| r.to_boolean())
+                    compare_equality(left_item, "=", right_item, context)
+                        .map_or(false, |r| r.to_boolean())
                 });
 
                 if exists_in_right {
@@ -1982,7 +2123,8 @@ fn call_function(
                 // Use map_or to handle potential error from compare_equality
                 // Pass context to compare_equality
                 let exists_in_right = right_items.iter().any(|right_item| {
-                    compare_equality(left_item, "=", right_item, context).map_or(false, |r| r.to_boolean())
+                    compare_equality(left_item, "=", right_item, context)
+                        .map_or(false, |r| r.to_boolean())
                 });
 
                 // Keep the item if it does NOT exist in the right collection
@@ -1991,8 +2133,19 @@ fn call_function(
                 }
             }
             // exclude() preserves order of the left operand.
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
-            Ok(normalize_collection_result(result_items, input_was_unordered))
+            let input_was_unordered = if let EvaluationResult::Collection {
+                has_undefined_order: true,
+                ..
+            } = invocation_base
+            {
+                true
+            } else {
+                false
+            };
+            Ok(normalize_collection_result(
+                result_items,
+                input_was_unordered,
+            ))
         }
         "union" => {
             // Returns the union of two collections (distinct items from both, order not guaranteed)
@@ -2069,7 +2222,8 @@ fn call_function(
         "single" => {
             // Returns the single item in a collection, or empty if 0 or >1 items
             match invocation_base {
-                EvaluationResult::Collection { items, .. } => { // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    // Destructure
                     if items.len() == 1 {
                         Ok(items[0].clone())
                     } else if items.is_empty() {
@@ -2195,13 +2349,11 @@ fn call_function(
                         EvaluationResult::Empty // Other decimals are not convertible
                     }
                 }
-                EvaluationResult::String(s) => {
-                    match s.to_lowercase().as_str() {
-                        "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
-                        "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
-                        _ => EvaluationResult::Empty,
-                    }
-                }
+                EvaluationResult::String(s) => match s.to_lowercase().as_str() {
+                    "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
+                    "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
+                    _ => EvaluationResult::Empty,
+                },
                 EvaluationResult::Collection { .. } => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
@@ -2232,7 +2384,7 @@ fn call_function(
                 | EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Add Quantity case
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
-                EvaluationResult::Empty => EvaluationResult::Empty, 
+                EvaluationResult::Empty => EvaluationResult::Empty,
                 EvaluationResult::Collection { .. } => unreachable!(), // Already handled by singleton check
             })
         }
@@ -2301,7 +2453,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toDate called on a collection");
                     EvaluationResult::Empty
@@ -2321,7 +2473,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToDate called on a collection");
                     EvaluationResult::Empty
@@ -2363,7 +2515,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toDateTime called on a collection");
                     EvaluationResult::Empty
@@ -2383,7 +2535,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToDateTime called on a collection");
                     EvaluationResult::Empty
@@ -2443,7 +2595,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toTime called on a collection");
                     EvaluationResult::Empty
@@ -2463,7 +2615,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { 
+                EvaluationResult::Collection { .. } => {
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToTime called on a collection");
                     EvaluationResult::Empty
@@ -2598,7 +2750,7 @@ fn call_function(
                         _ => false,
                     }
                 }),
-                EvaluationResult::Collection { .. } => unreachable!(), 
+                EvaluationResult::Collection { .. } => unreachable!(),
                 _ => EvaluationResult::Boolean(false),
             })
         }
@@ -2613,7 +2765,7 @@ fn call_function(
             Ok(match invocation_base {
                 // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
-                EvaluationResult::Empty => EvaluationResult::Empty, 
+                EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -2731,7 +2883,7 @@ fn call_function(
                         EvaluationResult::String(result)
                     }
                 }
-                EvaluationResult::Empty => EvaluationResult::Empty, 
+                EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -3970,7 +4122,8 @@ fn call_function(
                     for (key, value) in map {
                         if key != "resourceType" {
                             match value {
-                                EvaluationResult::Collection { items, .. } => { // Destructure
+                                EvaluationResult::Collection { items, .. } => {
+                                    // Destructure
                                     children.extend(items.clone());
                                 }
                                 _ => children.push(value.clone()),
@@ -3981,18 +4134,28 @@ fn call_function(
                         EvaluationResult::Empty
                     } else {
                         // children() produces a collection with undefined order
-                        EvaluationResult::Collection { items: children, has_undefined_order: true }
+                        EvaluationResult::Collection {
+                            items: children,
+                            has_undefined_order: true,
+                        }
                     }
                 }
-                EvaluationResult::Collection { items, .. } => { // Destructure
+                EvaluationResult::Collection { items, .. } => {
+                    // Destructure
                     let mut all_children_items: Vec<EvaluationResult> = Vec::new();
                     let mut result_is_unordered = false;
-                    for item in items { // Iterate over destructured items
+                    for item in items {
+                        // Iterate over destructured items
                         match call_function("children", item, &[], context)? {
                             EvaluationResult::Empty => (),
-                            EvaluationResult::Collection { items: children_items, has_undefined_order } => {
+                            EvaluationResult::Collection {
+                                items: children_items,
+                                has_undefined_order,
+                            } => {
                                 all_children_items.extend(children_items);
-                                if has_undefined_order { result_is_unordered = true; }
+                                if has_undefined_order {
+                                    result_is_unordered = true;
+                                }
                             }
                             child => all_children_items.push(child),
                         }
@@ -4001,7 +4164,10 @@ fn call_function(
                         EvaluationResult::Empty
                     } else {
                         // The overall result is unordered if any child collection was unordered.
-                        EvaluationResult::Collection { items: all_children_items, has_undefined_order: result_is_unordered }
+                        EvaluationResult::Collection {
+                            items: all_children_items,
+                            has_undefined_order: result_is_unordered,
+                        }
                     }
                 }
                 // Primitive types have no children
@@ -4023,10 +4189,15 @@ fn call_function(
                 for item in &current_level {
                     match call_function("children", item, &[], context)? {
                         EvaluationResult::Empty => (),
-                        EvaluationResult::Collection { items: children_items, has_undefined_order } => {
+                        EvaluationResult::Collection {
+                            items: children_items,
+                            has_undefined_order,
+                        } => {
                             all_descendants.extend(children_items.clone());
                             next_level.extend(children_items);
-                            if has_undefined_order { overall_descendants_unordered = true; }
+                            if has_undefined_order {
+                                overall_descendants_unordered = true;
+                            }
                         }
                         child => {
                             all_descendants.push(child.clone());
@@ -4041,7 +4212,10 @@ fn call_function(
                 Ok(EvaluationResult::Empty)
             } else {
                 // descendants() output order is undefined.
-                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: true })
+                Ok(EvaluationResult::Collection {
+                    items: all_descendants,
+                    has_undefined_order: true,
+                })
             }
         }
         "extension" => {
@@ -4296,7 +4470,10 @@ fn evaluate_indexer(
 
     // Access the item at the given index
     Ok(match collection_result {
-        EvaluationResult::Collection { items, has_undefined_order } => {
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+        } => {
             if *has_undefined_order && context.check_ordered_functions {
                 return Err(EvaluationError::SemanticError(
                     "Indexer operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
@@ -4730,7 +4907,8 @@ fn apply_type_operation(
     // Handle singleton evaluation for 'is' and 'as' before attempting polymorphic or resource_type logic
     if (op == "is" || op == "as") && value.count() > 1 {
         return Err(EvaluationError::SingletonEvaluationError(format!(
-            "'{}' operator requires a singleton input", op
+            "'{}' operator requires a singleton input",
+            op
         )));
     }
 
@@ -4766,7 +4944,8 @@ fn apply_type_operation(
             if let Ok(EvaluationResult::Empty) = poly_result {
                 return Err(EvaluationError::SemanticError(format!(
                     "Type cast of '{}' to '{:?}' (FHIR type path) failed in strict mode, resulting in empty.",
-                    value.type_name(), type_spec
+                    value.type_name(),
+                    type_spec
                 )));
             }
         }
@@ -4782,18 +4961,20 @@ fn apply_type_operation(
         "as" => {
             // This path is for System types.
             let cast_result = crate::resource_type::as_type(value, type_spec)?;
-            if context.is_strict_mode && value != &EvaluationResult::Empty && cast_result == EvaluationResult::Empty {
+            if context.is_strict_mode
+                && value != &EvaluationResult::Empty
+                && cast_result == EvaluationResult::Empty
+            {
                 Err(EvaluationError::SemanticError(format!(
                     "Type cast of '{}' to '{:?}' (System type path) failed in strict mode, resulting in empty.",
-                    value.type_name(), type_spec
+                    value.type_name(),
+                    type_spec
                 )))
             } else {
                 Ok(cast_result)
             }
         }
-        "ofType" => {
-            crate::resource_type::of_type(value, type_spec)
-        }
+        "ofType" => crate::resource_type::of_type(value, type_spec),
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown type operator: {}",
             op
@@ -4841,7 +5022,10 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
         EvaluationResult::Empty
     } else {
         // Union output order is undefined
-        EvaluationResult::Collection { items: union_items, has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: union_items,
+            has_undefined_order: true,
+        }
     }
 }
 
@@ -4960,7 +5144,16 @@ fn compare_equality(
             }
             Ok(match (left, right) {
                 // Wrap result in Ok
-                (EvaluationResult::Collection { items: l_items, has_undefined_order: l_undef }, EvaluationResult::Collection { items: r_items, has_undefined_order: r_undef }) => {
+                (
+                    EvaluationResult::Collection {
+                        items: l_items,
+                        has_undefined_order: l_undef,
+                    },
+                    EvaluationResult::Collection {
+                        items: r_items,
+                        has_undefined_order: r_undef,
+                    },
+                ) => {
                     // For strict equality, order matters, and undefined_order flags must also match.
                     if l_undef != r_undef || l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
@@ -4972,7 +5165,9 @@ fn compare_equality(
                     }
                 }
                 // If only one is a collection, they are not equal
-                (EvaluationResult::Collection { .. }, _) | (_, EvaluationResult::Collection { .. }) => { // Updated pattern
+                (EvaluationResult::Collection { .. }, _)
+                | (_, EvaluationResult::Collection { .. }) => {
+                    // Updated pattern
                     EvaluationResult::Boolean(false)
                 }
                 // Primitive comparison (Empty case handled above)
@@ -4995,11 +5190,24 @@ fn compare_equality(
                     EvaluationResult::Boolean(Decimal::from(*l) == *r)
                 }
                 // Attempt date/time comparison first if either operand could be date/time related
-                _ if (matches!(left, EvaluationResult::Date(_) | EvaluationResult::DateTime(_) | EvaluationResult::Time(_) | EvaluationResult::String(_))
-                    && matches!(right, EvaluationResult::Date(_) | EvaluationResult::DateTime(_) | EvaluationResult::Time(_) | EvaluationResult::String(_))) =>
+                _ if (matches!(
+                    left,
+                    EvaluationResult::Date(_)
+                        | EvaluationResult::DateTime(_)
+                        | EvaluationResult::Time(_)
+                        | EvaluationResult::String(_)
+                ) && matches!(
+                    right,
+                    EvaluationResult::Date(_)
+                        | EvaluationResult::DateTime(_)
+                        | EvaluationResult::Time(_)
+                        | EvaluationResult::String(_)
+                )) =>
                 {
                     match crate::datetime_impl::compare_date_time_values(left, right) {
-                        Some(ordering) => EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal),
+                        Some(ordering) => {
+                            EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal)
+                        }
                         None => {
                             // compare_date_time_values returned None. This means the values are not comparable
                             // under date/time specific rules (e.g., String "abc" vs Date, or Date vs Time).
@@ -5065,7 +5273,11 @@ fn compare_equality(
                 }
                 // Collection equivalence: Order doesn't matter, duplicates DO matter.
                 // has_undefined_order flag does not affect equivalence.
-                (EvaluationResult::Collection { items: l_items, .. }, EvaluationResult::Collection { items: r_items, .. }) => { // Destructure
+                (
+                    EvaluationResult::Collection { items: l_items, .. },
+                    EvaluationResult::Collection { items: r_items, .. },
+                ) => {
+                    // Destructure
                     if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
                     } else {
@@ -5073,14 +5285,18 @@ fn compare_equality(
                         let mut r_sorted = r_items.clone();
                         l_sorted.sort();
                         r_sorted.sort();
-                        let all_equivalent = l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
-                            compare_equality(li, "~", ri, context).map_or(false, |r| r.to_boolean())
-                        });
+                        let all_equivalent =
+                            l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
+                                compare_equality(li, "~", ri, context)
+                                    .map_or(false, |r| r.to_boolean())
+                            });
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
                 // If only one is a collection, they are not equivalent (Empty case handled earlier)
-                (EvaluationResult::Collection { .. }, _) | (_, EvaluationResult::Collection { .. }) => { // Updated pattern
+                (EvaluationResult::Collection { .. }, _)
+                | (_, EvaluationResult::Collection { .. }) => {
+                    // Updated pattern
                     EvaluationResult::Boolean(false)
                 }
                 // Quantity equivalence (requires same units and equivalent values)
@@ -5157,9 +5373,8 @@ fn check_membership(
                     .any(|item| {
                         compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
                     }),
-                single_item => {
-                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean())
-                }
+                single_item => compare_equality(left, "=", single_item, context)
+                    .map_or(false, |r| r.to_boolean()),
             };
 
             Ok(EvaluationResult::Boolean(is_in))
@@ -5187,7 +5402,8 @@ fn check_membership(
                     // Use map_or to handle potential error from compare_equality
                     // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", right, context).map_or(false, |r| r.to_boolean()) // context is captured here
+                        compare_equality(item, "=", right, context)
+                            .map_or(false, |r| r.to_boolean()) // context is captured here
                     });
                     EvaluationResult::Boolean(contains)
                 }
@@ -5208,7 +5424,8 @@ fn check_membership(
                 // Use map_or to handle potential error from compare_equality
                 // Pass context to compare_equality
                 single_item => EvaluationResult::Boolean(
-                    compare_equality(single_item, "=", right, context).map_or(false, |r| r.to_boolean()), // context is available here
+                    compare_equality(single_item, "=", right, context)
+                        .map_or(false, |r| r.to_boolean()), // context is available here
                 ),
             })
         }
