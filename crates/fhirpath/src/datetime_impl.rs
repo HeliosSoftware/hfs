@@ -171,6 +171,15 @@ pub fn compare_date_time_values(left: &EvaluationResult, right: &EvaluationResul
             // Attempt to parse s_val as a datetime and compare with dt_val
             compare_datetimes(dt_val, s_val)
         },
+        // String vs Time
+        (EvaluationResult::String(s_val), EvaluationResult::Time(t_val)) => {
+            // Attempt to parse s_val as a time and compare with t_val
+            compare_times(s_val, t_val)
+        },
+        (EvaluationResult::Time(t_val), EvaluationResult::String(s_val)) => {
+            // Attempt to parse s_val as a time and compare with t_val
+            compare_times(t_val, s_val)
+        },
         
         // Cannot compare different types
         _ => None,

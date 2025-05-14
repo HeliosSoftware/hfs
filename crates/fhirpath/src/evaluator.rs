@@ -4905,29 +4905,43 @@ fn compare_equality(
                 (EvaluationResult::Integer(l), EvaluationResult::Decimal(r)) => {
                     EvaluationResult::Boolean(Decimal::from(*l) == *r)
                 }
-                // Handle all date/time comparisons with our new helper function
-                (left, right)
-                    if crate::datetime_impl::compare_date_time_values(left, right).is_some() =>
+                // Attempt date/time comparison first if either operand could be date/time related
+                _ if (matches!(left, EvaluationResult::Date(_) | EvaluationResult::DateTime(_) | EvaluationResult::Time(_) | EvaluationResult::String(_))
+                    && matches!(right, EvaluationResult::Date(_) | EvaluationResult::DateTime(_) | EvaluationResult::Time(_) | EvaluationResult::String(_))) =>
                 {
-                    // Use the ordering result to determine equality
-                    let ordering =
-                        crate::datetime_impl::compare_date_time_values(left, right).unwrap();
-                    EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal)
+                    match crate::datetime_impl::compare_date_time_values(left, right) {
+                        Some(ordering) => EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal),
+                        None => {
+                            // compare_date_time_values returned None. This means the values are not comparable
+                            // under date/time specific rules (e.g., String "abc" vs Date, or Date vs Time).
+                            // According to general FHIRPath equality, if types are different and not
+                            // implicitly convertible, '=' is false.
+                            if left.type_name() == right.type_name() {
+                                // This case implies they are the same type (e.g. two Strings) but
+                                // one or both were not valid date/time representations for comparison.
+                                // If they were equal as strings, the String==String case above would have caught it.
+                                // So, if we reach here, they are not equal.
+                                EvaluationResult::Boolean(false)
+                            } else {
+                                // Different types, and not comparable as date/time values.
+                                EvaluationResult::Boolean(false)
+                            }
+                        }
+                    }
                 }
                 // Quantity equality (requires same units and equal values)
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
                 ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
-                // Any other combination is an error for '='
-                _ => {
-                    return Err(EvaluationError::TypeError(format!(
-                        "Cannot compare {} and {} using '='",
-                        left.type_name(),
-                        right.type_name()
-                    )));
-                }
-            }) // This parenthesis now correctly closes the Ok() started above
+                // General case: if types are different and not handled by specific rules above, equality is false.
+                _ if left.type_name() != right.type_name() => EvaluationResult::Boolean(false),
+                // If types are the same but not handled by any specific rule above (e.g. two Objects),
+                // this indicates an unhandled comparison scenario for identical types.
+                // FHIRPath spec implies complex types are compared field by field, which is not fully implemented here.
+                // For now, default to false for unhandled same-type comparisons.
+                _ => EvaluationResult::Boolean(false),
+            })
         }
         "!=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
