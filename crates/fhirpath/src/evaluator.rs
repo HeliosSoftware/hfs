@@ -1760,7 +1760,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(),
                 // Other types are not convertible
                 _ => EvaluationResult::Empty,
             })
@@ -2232,7 +2232,7 @@ fn call_function(
                 | EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Add Quantity case
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
-                EvaluationResult::Empty => EvaluationResult::Empty, // Already handled above, but needed for match
+                EvaluationResult::Empty => EvaluationResult::Empty, 
                 EvaluationResult::Collection { .. } => unreachable!(), // Already handled by singleton check
             })
         }
@@ -2301,7 +2301,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toDate called on a collection");
                     EvaluationResult::Empty
@@ -2321,7 +2321,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToDate called on a collection");
                     EvaluationResult::Empty
@@ -2363,7 +2363,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toDateTime called on a collection");
                     EvaluationResult::Empty
@@ -2383,7 +2383,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToDateTime called on a collection");
                     EvaluationResult::Empty
@@ -2443,7 +2443,7 @@ fn call_function(
                     }
                 }
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: toTime called on a collection");
                     EvaluationResult::Empty
@@ -2463,7 +2463,7 @@ fn call_function(
                 // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => { // Pattern for struct variant
+                EvaluationResult::Collection { .. } => { 
                     // This arm should be unreachable due to the count check above
                     eprintln!("Warning: convertsToTime called on a collection");
                     EvaluationResult::Empty
@@ -2557,7 +2557,7 @@ fn call_function(
                 }
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => EvaluationResult::Empty, // Other types cannot convert
-            }) // Close the Ok() wrapper here
+            })
         }
         "convertsToQuantity" => {
             // Checks if the input can be converted to Quantity
@@ -2613,7 +2613,7 @@ fn call_function(
             Ok(match invocation_base {
                 // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
-                EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
+                EvaluationResult::Empty => EvaluationResult::Empty, 
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -2731,7 +2731,7 @@ fn call_function(
                         EvaluationResult::String(result)
                     }
                 }
-                EvaluationResult::Empty => EvaluationResult::Empty, // Substring on empty is empty
+                EvaluationResult::Empty => EvaluationResult::Empty, 
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
@@ -3926,7 +3926,7 @@ fn call_function(
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
                 // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(),
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "toChars requires a String input".to_string(),
@@ -4805,13 +4805,13 @@ fn apply_type_operation(
 fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> EvaluationResult {
     // Returns EvaluationResult, not Result
     let left_items = match left {
-        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Collection { items, .. } => items.clone(),
         EvaluationResult::Empty => vec![],
         _ => vec![left.clone()],
     };
 
     let right_items = match right {
-        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Collection { items, .. } => items.clone(),
         EvaluationResult::Empty => vec![],
         _ => vec![right.clone()],
     };
@@ -4840,7 +4840,8 @@ fn union_collections(left: &EvaluationResult, right: &EvaluationResult) -> Evalu
     if union_items.is_empty() {
         EvaluationResult::Empty
     } else {
-        EvaluationResult::Collection(union_items)
+        // Union output order is undefined
+        EvaluationResult::Collection { items: union_items, has_undefined_order: true }
     }
 }
 

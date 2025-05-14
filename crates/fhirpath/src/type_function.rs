@@ -258,7 +258,7 @@ fn get_fhir_element_type_from_context(obj: &HashMap<String, EvaluationResult>) -
 pub fn get_type_name(value: &EvaluationResult) -> EvaluationResult {
     match get_type_info(value) {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Collection(items) => {
+        EvaluationResult::Collection { items, has_undefined_order } => {
             // Map each item to just the name
             let names: Vec<EvaluationResult> = items
                 .iter()
@@ -273,7 +273,7 @@ pub fn get_type_name(value: &EvaluationResult) -> EvaluationResult {
                     _ => EvaluationResult::String("Unknown".to_string()),
                 })
                 .collect();
-            EvaluationResult::Collection(names)
+            EvaluationResult::Collection { items: names, has_undefined_order }
         },
         EvaluationResult::Object(map) => {
             // Just extract the name property
