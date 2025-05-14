@@ -521,11 +521,20 @@ fn test_r4_test_suite() {
             // Create the appropriate context for this test
             let mut context = if test.input_file.is_empty() {
                 // Use empty context for tests without input files
-                EvaluationContext::new_empty()
+                let mut ctx = EvaluationContext::new_empty();
+                if test.mode == "strict" {
+                    ctx.set_strict_mode(true);
+                }
+                ctx
             } else {
                 // Try to load the resource for tests with input files
                 match load_test_resource(&test.input_file) {
-                    Ok(ctx) => ctx,
+                    Ok(mut ctx) => {
+                        if test.mode == "strict" {
+                            ctx.set_strict_mode(true);
+                        }
+                        ctx
+                    }
                     Err(e) => {
                         println!(
                             "  SKIP: {} - '{}' - Failed to load JSON resource for {}: {}",
@@ -702,6 +711,7 @@ struct TestInfo {
     input_file: String,
     invalid: String,
     predicate: String, // Added predicate attribute
+    mode: String,      // Added mode attribute
     expression: String,
     outputs: Vec<(String, String)>, // (type, value)
 }
@@ -719,7 +729,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let test_name = test.attribute("name").unwrap_or("unnamed").to_string();
             let description = test.attribute("description").unwrap_or("").to_string();
             let input_file = test.attribute("inputfile").unwrap_or("").to_string();
-            // let invalid = test.attribute("invalid").unwrap_or("").to_string(); // Old: read from <test>
+            let mode = test.attribute("mode").unwrap_or("").to_string(); // Parse mode attribute
             let predicate = test.attribute("predicate").unwrap_or("").to_string(); // Parse predicate attribute
 
             // Find the expression node to get its text and 'invalid' attribute
@@ -750,6 +760,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 input_file,
                 invalid: invalid_attr_val, // Use the 'invalid' from <expression>
                 predicate, // Store predicate attribute
+                mode,      // Store mode attribute
                 expression: expression_text, // Use parsed expression_text
                 outputs,
             });

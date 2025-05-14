@@ -16,6 +16,8 @@ pub struct EvaluationContext {
     pub variables: HashMap<String, EvaluationResult>,
     /// The 'this' context for direct evaluation (used in tests)
     pub this: Option<EvaluationResult>,
+    /// Flag to enable strict mode evaluation (e.g., error on non-existent members)
+    pub is_strict_mode: bool,
 }
 
 impl EvaluationContext {
@@ -25,6 +27,7 @@ impl EvaluationContext {
             resources,
             variables: HashMap::new(),
             this: None,
+            is_strict_mode: false, // Default to non-strict mode
         }
     }
 
@@ -34,7 +37,13 @@ impl EvaluationContext {
             resources: Vec::new(),
             variables: HashMap::new(),
             this: None,
+            is_strict_mode: false, // Default to non-strict mode
         }
+    }
+
+    /// Sets the strict mode for evaluation.
+    pub fn set_strict_mode(&mut self, is_strict: bool) {
+        self.is_strict_mode = is_strict;
     }
 
     /// Sets the 'this' context for direct evaluation (used primarily in tests)
@@ -735,8 +744,15 @@ fn evaluate_invocation(
                         return Ok(result); // Return polymorphic result
                     }
 
-                    // Fallback to empty if not found
-                    Ok(EvaluationResult::Empty)
+                    // Fallback to empty if not found, or error in strict mode
+                    if context.is_strict_mode {
+                        Err(EvaluationError::SemanticError(format!(
+                            "Member '{}' not found on object in strict mode.",
+                            name
+                        )))
+                    } else {
+                        Ok(EvaluationResult::Empty)
+                    }
                 }
                 EvaluationResult::Collection(items) => {
                     // For collections, apply member access to each item and collect results
