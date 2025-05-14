@@ -5151,12 +5151,14 @@ fn check_membership(
                 ));
             }
             let is_in = match right {
-                EvaluationResult::Collection { items, .. } => items
+                EvaluationResult::Collection { items, .. } => items // Destructure
                     .iter()
                     .any(|item| {
                         compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
                     }),
-                single_item => compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean()),
+                single_item => {
+                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean())
+                }
             };
 
             Ok(EvaluationResult::Boolean(is_in))
