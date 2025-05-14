@@ -579,8 +579,9 @@ pub fn apply_polymorphic_type_operation(
                                               type_name.ends_with(".Quantity");
                         Ok(EvaluationResult::Boolean(is_quantity_type))
                     },
+                    // These cases should never happen due to earlier checks
                     EvaluationResult::Empty => Ok(EvaluationResult::Boolean(false)),
-                    EvaluationResult::Collection { .. } => Ok(EvaluationResult::Boolean(false)), // Pattern for struct variant
+                    EvaluationResult::Collection { .. } => Ok(EvaluationResult::Boolean(false)),
                 }
             },
             "as" => {
