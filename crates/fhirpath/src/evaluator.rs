@@ -1599,7 +1599,7 @@ fn call_function(
                         )));
                     }
                 }
-                EvaluationResult::Collection(items) => {
+                EvaluationResult::Collection { items, .. } => { // Destructure
                     // Collection contains item (using equality)
                     // Use map_or to handle potential error from compare_equality
                     let contains = items.iter().any(|item| {
