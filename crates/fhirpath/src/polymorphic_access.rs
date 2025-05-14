@@ -304,17 +304,13 @@ pub fn apply_polymorphic_type_operation(
         return Ok(EvaluationResult::Empty);
     }
 
-    // Special handling for collections
-    if let EvaluationResult::Collection { items, .. } = value { // Destructure
+    if let EvaluationResult::Collection { items, .. } = value {
         if items.len() != 1 {
-            // FHIRPath requires singleton operand for type operations
             return Ok(EvaluationResult::Empty);
         }
-        // Apply the operation to the single item in the collection
         return apply_polymorphic_type_operation(&items[0], op, type_name, namespace);
     }
     
-    // Handle path-based expressions like Observation.value.is(Quantity)
     // Since we need to determine if the original path is a choice element
     if op == "is" || op == "as" {
         // The value being checked could be:

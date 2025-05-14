@@ -777,11 +777,14 @@ fn evaluate_invocation(
                         Ok(EvaluationResult::Empty)
                     }
                 }
-                EvaluationResult::Collection(items) => {
+                EvaluationResult::Collection { items, has_undefined_order: base_was_unordered } => {
                     // For collections, apply member access to each item and collect results
                     let mut results = Vec::new();
+                    // Propagate the undefined order status of the base collection to the results,
+                    // unless the member access itself defines a new order (e.g. specific functions)
+                    let mut result_is_unordered = *base_was_unordered;
+
                     for item in items {
-                        // Recursively call member access on each item, propagating errors
                         // Pass current_item_for_args down for consistency
                         let res = evaluate_invocation(item, &Invocation::Member(name.clone()), context, current_item_for_args)?;
                         if let EvaluationResult::Collection { has_undefined_order: true, .. } = &res {
@@ -796,14 +799,15 @@ fn evaluate_invocation(
                         Ok(normalize_collection_result(results, result_is_unordered))
                     } else {
                         let mut combined_results_for_flattening = Vec::new();
-                        let mut any_item_was_unordered_collection = result_is_unordered; // Start with base
+                        // Start with the propagated order status from the loop above
+                        let mut any_item_was_unordered_collection = result_is_unordered; 
                         for res_item in results {
                             if let EvaluationResult::Collection{items: inner_items, has_undefined_order: item_is_unordered} = res_item {
                                 combined_results_for_flattening.extend(inner_items);
                                 if item_is_unordered {
                                     any_item_was_unordered_collection = true;
                                 }
-                            } else if res_item != EvaluationResult::Empty { // Ensure Empty is not pushed
+                            } else if res_item != EvaluationResult::Empty {
                                 combined_results_for_flattening.push(res_item);
                             }
                         }
@@ -1115,7 +1119,7 @@ fn evaluate_exists_with_criteria(
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     let items_to_check = match collection {
-        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Collection { items, .. } => items.clone(),
         EvaluationResult::Empty => vec![],
         // Treat single item as a one-item collection
         single_item => vec![single_item.clone()],
@@ -1144,10 +1148,10 @@ fn evaluate_where(
     criteria_expr: &Expression,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
-    let items_to_filter = match collection {
-        EvaluationResult::Collection(items) => items.clone(),
-        EvaluationResult::Empty => vec![],
-        single_item => vec![single_item.clone()],
+    let (items_to_filter, input_was_unordered) = match collection {
+        EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order),
+        EvaluationResult::Empty => (vec![], false), // Default order status for empty
+        single_item => (vec![single_item.clone()], false), // Single item is ordered
     };
 
     let mut filtered_items = Vec::new();
@@ -1172,7 +1176,7 @@ fn evaluate_where(
         // Check if any filtered items are collections themselves
         let has_nested_collections = filtered_items
             .iter()
-            .any(|item| matches!(item, EvaluationResult::Collection(_)));
+            .any(|item| matches!(item, EvaluationResult::Collection { .. }));
 
         if has_nested_collections {
             let collection_result = EvaluationResult::Collection {items: filtered_items, has_undefined_order: input_was_unordered };
@@ -1190,13 +1194,14 @@ fn evaluate_select(
     projection_expr: &Expression,
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
-    let items_to_project = match collection {
-        EvaluationResult::Collection(items) => items.clone(),
-        EvaluationResult::Empty => vec![],
-        single_item => vec![single_item.clone()],
+    let (items_to_project, input_was_unordered) = match collection {
+        EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order),
+        EvaluationResult::Empty => (vec![], false), // Default order status for empty
+        single_item => (vec![single_item.clone()], false), // Single item is ordered
     };
 
     let mut projected_items = Vec::new();
+    let mut result_is_unordered = input_was_unordered;
     for item in items_to_project {
         let projection_result = evaluate(projection_expr, context, Some(&item))?;
         if let EvaluationResult::Collection { has_undefined_order: true, .. } = &projection_result {
@@ -1217,9 +1222,8 @@ fn evaluate_all_with_criteria(
     context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     let items_to_check = match collection {
-        EvaluationResult::Collection(items) => items.clone(),
-        EvaluationResult::Empty => vec![],
-        // Treat single item as a one-item collection
+        EvaluationResult::Collection { items, .. } => items.clone(),
+        EvaluationResult::Empty => vec![], // Default order status for empty
         single_item => vec![single_item.clone()],
     };
 
@@ -1362,12 +1366,9 @@ fn call_function(
         "count" => {
             // Returns the number of items in the collection, including duplicates
             Ok(match invocation_base {
-                // Wrap result in Ok
-                EvaluationResult::Collection(items) => {
-                    EvaluationResult::Integer(items.len() as i64)
-                }
+                EvaluationResult::Collection { items, .. } => EvaluationResult::Integer(items.len() as i64),
                 EvaluationResult::Empty => EvaluationResult::Integer(0),
-                _ => EvaluationResult::Integer(1), // Single item counts as 1
+                _ => EvaluationResult::Integer(1),
             })
         }
         "type" => {
@@ -1380,43 +1381,35 @@ fn call_function(
             // Returns true if the collection is empty (0 items)
             Ok(match invocation_base {
                 // Wrap result in Ok
-                // Use invocation_base, not context
                 EvaluationResult::Empty => EvaluationResult::Boolean(true),
-                EvaluationResult::Collection(items) => EvaluationResult::Boolean(items.is_empty()),
-                _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
+                EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(items.is_empty()),
+                _ => EvaluationResult::Boolean(false),
             })
         }
         "exists" => {
             // This handles exists() without criteria.
             // exists(criteria) is handled in evaluate_invocation.
             Ok(match invocation_base {
-                // Wrap result in Ok
                 EvaluationResult::Empty => EvaluationResult::Boolean(false),
-                EvaluationResult::Collection(items) => EvaluationResult::Boolean(!items.is_empty()),
-                _ => EvaluationResult::Boolean(true), // Single non-empty item exists
+                EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(!items.is_empty()),
+                _ => EvaluationResult::Boolean(true),
             })
         }
         "all" => {
             // This handles all() without criteria.
             // all(criteria) is handled in evaluate_invocation.
             Ok(match invocation_base {
-                // Wrap result in Ok
-                EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
-                EvaluationResult::Collection(items) => {
-                    // Check if all items evaluate to true
-                    // Wrap the boolean result
-                    EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean()))
-                }
-                single_item => EvaluationResult::Boolean(single_item.to_boolean()), // Check single item
+                EvaluationResult::Empty => EvaluationResult::Boolean(true),
+                EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean())),
+                single_item => EvaluationResult::Boolean(single_item.to_boolean()),
             })
         }
         "allTrue" => {
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Collection { items, .. } => items.clone(),
+                EvaluationResult::Empty => vec![], // Default order status for empty
+                single_item => vec![single_item.clone()], // Single item is ordered
             };
-            // allTrue is true for an empty collection
             if items.is_empty() {
                 return Ok(EvaluationResult::Boolean(true));
             }
@@ -1438,11 +1431,10 @@ fn call_function(
         }
         "anyTrue" => {
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Collection { items, .. } => items.clone(),
+                EvaluationResult::Empty => vec![], // Default order status for empty
+                single_item => vec![single_item.clone()], // Single item is ordered
             };
-            // anyTrue is false for an empty collection
             if items.is_empty() {
                 return Ok(EvaluationResult::Boolean(false));
             }
@@ -1462,11 +1454,10 @@ fn call_function(
         }
         "allFalse" => {
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Collection { items, .. } => items.clone(),
+                EvaluationResult::Empty => vec![], // Default order status for empty
+                single_item => vec![single_item.clone()], // Single item is ordered
             };
-            // allFalse is true for an empty collection
             if items.is_empty() {
                 return Ok(EvaluationResult::Boolean(true));
             }
@@ -1488,11 +1479,10 @@ fn call_function(
         }
         "anyFalse" => {
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Collection { items, .. } => items.clone(),
+                EvaluationResult::Empty => vec![], // Default order status for empty
+                single_item => vec![single_item.clone()], // Single item is ordered
             };
-            // anyFalse is false for an empty collection
             if items.is_empty() {
                 return Ok(EvaluationResult::Boolean(false));
             }
@@ -1720,13 +1710,10 @@ fn call_function(
                     // Try parsing as Decimal
                     s.parse::<Decimal>()
                         .map(EvaluationResult::Decimal)
-                        .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
+                        .unwrap_or(EvaluationResult::Empty)
                 }
-                // Quantity to Decimal (returns the value part) - Added
                 EvaluationResult::Quantity(val, _) => EvaluationResult::Decimal(*val),
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(), // This arm is unreachable due to the count check above
-                // Other types are not convertible
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 _ => EvaluationResult::Empty,
             })
         }
@@ -1768,14 +1755,11 @@ fn call_function(
             })
         }
         "distinct" => {
-            // Returns the collection with duplicates removed (based on equality)
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
-                single_item => return Ok(single_item.clone()), // Wrap single_item return in Ok
+                single_item => return Ok(single_item.clone()),
             };
-
-            // If we reach here, items has at least 2 elements
 
             // Use HashSet to efficiently find distinct items
             let mut distinct_set = HashSet::new();
@@ -2069,9 +2053,8 @@ fn call_function(
             Ok(normalize_collection_result(combined_items, true))
         }
         "single" => {
-            // Returns the single item in a collection, or empty if 0 or >1 items
             match invocation_base {
-                EvaluationResult::Collection(items) => {
+                EvaluationResult::Collection { items, .. } => {
                     if items.len() == 1 {
                         Ok(items[0].clone())
                     } else if items.is_empty() {
@@ -2132,12 +2115,8 @@ fn call_function(
                     // Check if the string parses to an i64
                     EvaluationResult::Boolean(s.parse::<i64>().is_ok())
                 }
-                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true), // Booleans can convert (0 or 1)
-                // Per FHIRPath spec, Decimal cannot be converted unless it has no fractional part
-                EvaluationResult::Decimal(d) => {
-                    EvaluationResult::Boolean(d.fract() == Decimal::ZERO)
-                }
-                // Other types are not convertible to Integer
+                EvaluationResult::Boolean(_) => EvaluationResult::Boolean(true),
+                EvaluationResult::Decimal(d) => EvaluationResult::Boolean(d.fract().is_zero()),
                 _ => EvaluationResult::Boolean(false),
             })
         }
@@ -2202,12 +2181,10 @@ fn call_function(
                     match s.to_lowercase().as_str() {
                         "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
                         "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
-                        _ => EvaluationResult::Empty, // Other strings are not convertible
+                        _ => EvaluationResult::Empty,
                     }
                 }
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                // Other types are not convertible
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 _ => EvaluationResult::Empty,
             })
         }
@@ -2236,9 +2213,8 @@ fn call_function(
                 | EvaluationResult::Quantity(_, _) => EvaluationResult::Boolean(true), // Add Quantity case
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object(_) => EvaluationResult::Boolean(false),
-                // Add cases for Empty and Collection to satisfy exhaustiveness check
-                EvaluationResult::Empty => EvaluationResult::Empty, // Already handled above, but needed for match
-                EvaluationResult::Collection(_) => unreachable!(), // Already handled by singleton check
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
             })
         }
         "toString" => {
@@ -2250,12 +2226,9 @@ fn call_function(
                 ));
             }
             Ok(match invocation_base {
-                // Wrap in Ok
-                EvaluationResult::Empty => EvaluationResult::Empty, // toString on empty is empty
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                // Convert single item to string
-                single_item => EvaluationResult::String(single_item.to_string_value()), // Uses updated to_string_value
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                single_item => EvaluationResult::String(single_item.to_string_value()),
             })
         }
         "toDate" => {
@@ -2305,9 +2278,8 @@ fn call_function(
                         }
                     }
                 }
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                _ => EvaluationResult::Empty, // Other types cannot convert
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                _ => EvaluationResult::Empty,
             })
         }
         "convertsToDate" => {
@@ -2319,12 +2291,10 @@ fn call_function(
                 ));
             }
             Ok(match invocation_base {
-                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 EvaluationResult::Date(_) => EvaluationResult::Boolean(true),
-                EvaluationResult::DateTime(_) => EvaluationResult::Boolean(true), // Can extract date part
+                EvaluationResult::DateTime(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::String(s) => {
                     // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or start like a DateTime?
                     let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
@@ -2359,9 +2329,8 @@ fn call_function(
                         EvaluationResult::Empty
                     }
                 }
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                _ => EvaluationResult::Empty, // Other types cannot convert
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                _ => EvaluationResult::Empty,
             })
         }
         "convertsToDateTime" => {
@@ -2373,12 +2342,10 @@ fn call_function(
                 ));
             }
             Ok(match invocation_base {
-                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 EvaluationResult::DateTime(_) => EvaluationResult::Boolean(true),
-                EvaluationResult::Date(_) => EvaluationResult::Boolean(true), // Can represent as DateTime
+                EvaluationResult::Date(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::String(s) => {
                     // Basic check: Does it look like YYYY, YYYY-MM, YYYY-MM-DD, or YYYY-MM-DDTHH...?
                     let is_date_like = s.len() == 4 || s.len() == 7 || s.len() == 10;
@@ -2431,9 +2398,8 @@ fn call_function(
                         EvaluationResult::Empty
                     }
                 }
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
-                _ => EvaluationResult::Empty, // Other types cannot convert
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                _ => EvaluationResult::Empty,
             })
         }
         "convertsToTime" => {
@@ -2445,10 +2411,8 @@ fn call_function(
                 ));
             }
             Ok(match invocation_base {
-                // Wrap in Ok
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 EvaluationResult::Time(_) => EvaluationResult::Boolean(true),
                 EvaluationResult::String(s) => {
                     // Basic check (same as toTime)
@@ -2579,11 +2543,10 @@ fn call_function(
                                 !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
                             value_parses && unit_is_valid
                         }
-                        // 0 or >2 parts are not convertible
                         _ => false,
                     }
-                }), // Close the EvaluationResult::Boolean wrapper
-                // Other types are not convertible
+                }),
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 _ => EvaluationResult::Boolean(false),
             })
         }
@@ -2598,9 +2561,8 @@ fn call_function(
             Ok(match invocation_base {
                 // Wrap in Ok
                 EvaluationResult::String(s) => EvaluationResult::Integer(s.chars().count() as i64), // Use chars().count() for correct length
-                EvaluationResult::Empty => EvaluationResult::Empty, // Length on empty is empty
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "length() requires a String input".to_string(),
@@ -2716,9 +2678,8 @@ fn call_function(
                         EvaluationResult::String(result)
                     }
                 }
-                EvaluationResult::Empty => EvaluationResult::Empty, // Substring on empty is empty
-                // Collections handled by initial check
-                EvaluationResult::Collection(_) => unreachable!(),
+                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
                 _ => {
                     return Err(EvaluationError::TypeError(
                         "substring requires a String input".to_string(),
@@ -4025,8 +3986,7 @@ fn call_function(
             if all_descendants.is_empty() {
                 Ok(EvaluationResult::Empty)
             } else {
-                // descendants() produces a collection with undefined order
-                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: true })
+                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: overall_descendants_unordered })
             }
         }
         "extension" => {
@@ -4942,26 +4902,18 @@ fn compare_equality(
             if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
-            // Strict equality: Order and duplicates matter for collections
             Ok(match (left, right) {
-                // Wrap result in Ok
-                (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
-                    if l_items.len() != r_items.len() {
+                (EvaluationResult::Collection { items: l_items, has_undefined_order: l_undef }, EvaluationResult::Collection { items: r_items, has_undefined_order: r_undef }) => {
+                    if l_undef != r_undef || l_items.len() != r_items.len() { // Check has_undefined_order flags
                         EvaluationResult::Boolean(false)
                     } else {
-                        // Compare element by element using '=' recursively
-                        // Pass context to recursive call
                         let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
                             compare_equality(li, "=", ri, context).map_or(false, |r| r.to_boolean())
-                        }); // Handle potential error from recursive call
+                        });
                         EvaluationResult::Boolean(all_equal)
                     }
                 }
-                // If only one is a collection, they are not equal
-                (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
-                    EvaluationResult::Boolean(false)
-                }
-                // Primitive comparison (Empty case handled above)
+                (EvaluationResult::Collection { .. }, _) | (_, EvaluationResult::Collection { .. }) => EvaluationResult::Boolean(false),
                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                     EvaluationResult::Boolean(l == r)
                 }

@@ -7,10 +7,8 @@ pub fn get_type_info(value: &EvaluationResult) -> EvaluationResult {
     let mut obj = HashMap::new();
     
     match value {
-        EvaluationResult::Empty => {
-            return EvaluationResult::Empty;
-        },
-        EvaluationResult::Collection { items, has_undefined_order } => { // Destructure
+        EvaluationResult::Empty => return EvaluationResult::Empty,
+        EvaluationResult::Collection { items, has_undefined_order } => {
             if items.is_empty() {
                 return EvaluationResult::Empty;
             } else if items.len() == 1 {
@@ -18,9 +16,8 @@ pub fn get_type_info(value: &EvaluationResult) -> EvaluationResult {
             } else {
                 let type_infos: Vec<EvaluationResult> = items
                     .iter()
-                    .map(|item| get_type_info(item))
+                    .map(get_type_info) // Simplified map
                     .collect();
-                // The order of types corresponds to the order of items in the input collection.
                 return EvaluationResult::Collection { items: type_infos, has_undefined_order: *has_undefined_order };
             }
         },
@@ -297,24 +294,17 @@ pub fn type_function(
     args: &[EvaluationResult],
     return_full_object: bool,
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Special handling for collections based on test expectations
-    if let EvaluationResult::Collection { items, has_undefined_order } = invocation_base { // Destructure
+    if let EvaluationResult::Collection { items, has_undefined_order } = invocation_base {
         if items.len() > 1 {
-            // For multi-item collections in tests, we need to return a collection of types
-            let mut type_results = Vec::new();
-            for item in items { // Iterate over destructured items
-                type_results.push(if return_full_object {
-                    get_type_info(item)
-                } else {
-                    get_type_name(item)
-                });
-            }
-            // Preserve order status of the input collection for the collection of types
+            let type_results: Vec<EvaluationResult> = items
+                .iter()
+                .map(|item| if return_full_object { get_type_info(item) } else { get_type_name(item) })
+                .collect();
             return Ok(EvaluationResult::Collection { items: type_results, has_undefined_order: *has_undefined_order });
         }
+        // If single item collection, fall through to evaluate the single item
     }
     
-    // Check that no arguments were provided
     if !args.is_empty() {
         return Err(EvaluationError::InvalidArity(
             "Function 'type' expects 0 arguments".to_string(),
