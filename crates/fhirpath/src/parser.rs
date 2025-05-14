@@ -390,60 +390,59 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Removed unused emit_error helper function
 
-    let date_datetime_time = just('@')
-        .ignore_then(date_format.clone().or_not())
-        .then(
-            just('T')
-                .ignore_then(
-                    time_format
-                        .clone()
-                        .then(timezone_format.clone().or_not())
-                        .or_not(),
-                )
-                .or_not(),
-        )
-        .map(|(date_part, time_part)| {
-            match (date_part, time_part) {
-                // @2022-01-01T12:30 or @2022-01-01T12:30Z or @2022-01-01T12:30+01:00
-                (Some(Literal::Date(date_str)), Some(Some((time_str, timezone)))) => {
-                    Literal::DateTime(date_str, Some((time_str, timezone)))
-                }
-                // @2022-01-01T
-                (Some(Literal::Date(date_str)), Some(None)) => Literal::DateTime(date_str, None),
-                // @2022-01-01
-                (Some(Literal::Date(date_str)), None) => Literal::Date(date_str),
-                // @T12:30 or @T12:30Z or @T12:30+01:00
-                (None, Some(Some((time_str, timezone)))) => {
-                    // Combine time string with timezone if present
-                    if let Some(tz) = &timezone {
-                        Literal::Time(format!("{}{}", time_str, tz))
-                    } else {
-                        Literal::Time(time_str)
-                    }
-                }
-                // @T... (handled above)
-                // (None, Some(Some((time_str, None)))) => Literal::Time(time_str), // This pattern is unreachable
-                // Invalid combinations or parsing errors
-                _ => {
-                    // This case indicates an unexpected parsing result.
-                        // Log or handle this error appropriately.
-                        // Returning Null might mask issues. Consider a dedicated Error literal or panic.
-                        eprintln!("Warning: Unexpected combination in date/time parsing.");
-                        Literal::Null // Or handle as an error
-                    }
-                }
-            })
-            .padded();
+    // Parser for DateTime: @Date T Time [Timezone]
+    let datetime_literal = just('@')
+        .ignore_then(date_format_str.clone())
+        .then_ignore(just('T'))
+        .then(time_format.clone())
+        .then(timezone_format.clone().or_not())
+        .map(|((date_str, time_str), tz_opt)| {
+            Literal::DateTime(date_str, Some((time_str, tz_opt)))
+        });
 
-    // Order matters: try quantity before plain number/integer
+    // Parser for Partial DateTime: @Date T
+    let partial_datetime_literal = just('@')
+        .ignore_then(date_format_str.clone())
+        .then_ignore(just('T'))
+        .map(|date_str| {
+            Literal::DateTime(date_str, None) // No time numbers, no timezone
+        });
+
+    // Parser for Time: @ T Time (strictly no timezone)
+    // Uses try_map to fail parsing if a timezone is present.
+    let time_literal = just('@')
+        .ignore_then(
+            just('T')
+                .ignore_then(time_format.clone())
+                .then(timezone_format.clone().or_not()) // Parse time and optional timezone
+        )
+        .try_map(|(time_str, tz_opt), span| { // Validate that timezone is not present
+            if tz_opt.is_some() {
+                Err(Simple::custom(span, "Time literal cannot have a timezone offset"))
+            } else {
+                Ok(Literal::Time(time_str))
+            }
+        });
+
+    // Parser for Date: @ Date
+    let date_literal = just('@')
+        .ignore_then(date_format_str.clone())
+        .map(Literal::Date);
+
+    // Order matters: try quantity before plain number/integer.
+    // Specific date/time formats should be tried before more general ones if there's ambiguity,
+    // though the new structure aims to make them distinct.
     let literal = choice((
         null,
         boolean,
         string,
-        quantity, // Try quantity first
-        number,   // Then number (requires '.')
-        integer,  // Then integer
-        date_datetime_time,
+        quantity,                   // Try quantity first
+        number,                     // Then number (requires '.')
+        integer,                    // Then integer
+        datetime_literal.padded(),           // @Date T Time [TZ]
+        partial_datetime_literal.padded(),   // @Date T
+        time_literal.padded(),               // @ T Time (will fail if TZ present)
+        date_literal.padded(),               // @Date
     ))
     .map(Term::Literal);
 
