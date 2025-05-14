@@ -1053,7 +1053,7 @@ fn evaluate_invocation(
                         evaluated_args.push(evaluate(arg_expr, context, current_item_for_args)?);
                     }
                     // Call with updated signature (name, base, args)
-                    call_function(name, invocation_base, &evaluated_args)
+                    call_function(name, invocation_base, &evaluated_args, context) // Pass context
                 }
             }
         }
@@ -1236,6 +1236,8 @@ fn call_function(
     name: &str,
     invocation_base: &EvaluationResult, // Renamed from context to avoid confusion
     args: &[EvaluationResult],
+    // Add context parameter here, as call_function is called from evaluate_invocation which has context
+    context: &EvaluationContext, 
 ) -> Result<EvaluationResult, EvaluationError> {
     match name {
         "is" | "as" => {
@@ -1281,7 +1283,7 @@ fn call_function(
                 TypeSpecifier::QualifiedIdentifier(namespace_str, Some(type_name_part_str))
             };
 
-            apply_type_operation(invocation_base, name, &type_spec)
+            apply_type_operation(invocation_base, name, &type_spec, context) // Pass context
         }
         // Handle the conformsTo() function
         "conformsTo" => {
@@ -1575,7 +1577,9 @@ fn call_function(
                     // Collection contains item (using equality)
                     // Use map_or to handle potential error from compare_equality
                     let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", arg).map_or(false, |r| r.to_boolean())
+                        // Pass context to compare_equality if it needs it, or ensure it's available
+                        // For now, assuming compare_equality doesn't need context directly for this path
+                        compare_equality(item, "=", arg, context).map_or(false, |r| r.to_boolean())
                     });
                     EvaluationResult::Boolean(contains)
                 }
@@ -1584,7 +1588,8 @@ fn call_function(
                     // Treat as single-item collection: check if the item equals the argument
                     // Use map_or to handle potential error from compare_equality
                     EvaluationResult::Boolean(
-                        compare_equality(single_item, "=", arg).map_or(false, |r| r.to_boolean()),
+                        // Pass context to compare_equality if it needs it
+                        compare_equality(single_item, "=", arg, context).map_or(false, |r| r.to_boolean()),
                     )
                 }
             }) // Close Ok wrapping the match
@@ -1604,7 +1609,8 @@ fn call_function(
             for i in 0..items.len() {
                 for j in (i + 1)..items.len() {
                     // Use compare_equality, handle potential error, default to false if error
-                    if compare_equality(&items[i], "=", &items[j]).map_or(false, |r| r.to_boolean())
+                    // Pass context to compare_equality
+                    if compare_equality(&items[i], "=", &items[j], context).map_or(false, |r| r.to_boolean())
                     {
                         return Ok(EvaluationResult::Boolean(false)); // Found a duplicate
                     }
@@ -1888,8 +1894,9 @@ fn call_function(
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
                 // Use map_or to handle potential error from compare_equality
+                // Pass context to compare_equality
                 let exists_in_right = right_items.iter().any(|right_item| {
-                    compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean())
+                    compare_equality(left_item, "=", right_item, context).map_or(false, |r| r.to_boolean())
                 });
 
                 if exists_in_right {
@@ -1937,8 +1944,9 @@ fn call_function(
             for left_item in &left_items {
                 // Check if the left_item exists in the right_items (using equality '=')
                 // Use map_or to handle potential error from compare_equality
+                // Pass context to compare_equality
                 let exists_in_right = right_items.iter().any(|right_item| {
-                    compare_equality(left_item, "=", right_item).map_or(false, |r| r.to_boolean())
+                    compare_equality(left_item, "=", right_item, context).map_or(false, |r| r.to_boolean())
                 });
 
                 // Keep the item if it does NOT exist in the right collection
@@ -4876,6 +4884,7 @@ fn compare_equality(
     left: &EvaluationResult,
     op: &str,
     right: &EvaluationResult,
+    context: &EvaluationContext, // Added context
 ) -> Result<EvaluationResult, EvaluationError> {
     // Changed return type
     // Helper function for string equivalence normalization
@@ -4899,8 +4908,9 @@ fn compare_equality(
                         EvaluationResult::Boolean(false)
                     } else {
                         // Compare element by element using '=' recursively
+                        // Pass context to recursive call
                         let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
-                            compare_equality(li, "=", ri).map_or(false, |r| r.to_boolean())
+                            compare_equality(li, "=", ri, context).map_or(false, |r| r.to_boolean())
                         }); // Handle potential error from recursive call
                         EvaluationResult::Boolean(all_equal)
                     }
@@ -4972,7 +4982,8 @@ fn compare_equality(
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
             // Strict inequality: Negation of '='
-            let eq_result = compare_equality(left, "=", right)?; // Propagate error
+            // Pass context to compare_equality
+            let eq_result = compare_equality(left, "=", right, context)?; // Propagate error
             Ok(match eq_result {
                 // Wrap result in Ok
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
@@ -5011,7 +5022,8 @@ fn compare_equality(
                         // Compare sorted collections element-wise using '~' recursively
                         let all_equivalent =
                             l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
-                                compare_equality(li, "~", ri).map_or(false, |r| r.to_boolean())
+                                // Pass context to recursive call
+                                compare_equality(li, "~", ri, context).map_or(false, |r| r.to_boolean())
                             }); // Handle potential error
                         EvaluationResult::Boolean(all_equivalent)
                     }
@@ -5030,7 +5042,7 @@ fn compare_equality(
                     // TODO: Implement proper UCUM equivalence if needed
                 }
                 // Primitive equivalence falls back to strict equality ('=') for other types
-                _ => compare_equality(left, "=", right)?, // Propagate error
+                _ => compare_equality(left, "=", right, context)?, // Propagate error, pass context
             })
         }
         "!~" => {
@@ -5046,7 +5058,8 @@ fn compare_equality(
                 } // Empty is not equivalent to non-empty
                 // For non-empty operands, negate the result of '~'
                 _ => {
-                    let equiv_result = compare_equality(left, "~", right)?; // Propagate error
+                    // Pass context to compare_equality
+                    let equiv_result = compare_equality(left, "~", right, context)?; // Propagate error
                     match equiv_result {
                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                         // If '~' somehow returned Empty for non-empty operands, propagate Empty
@@ -5091,13 +5104,15 @@ fn check_membership(
                 EvaluationResult::Collection(items) => items
                     .iter()
                     // Use map_or to handle potential error from compare_equality
+                    // Pass context to compare_equality
                     .any(|item| {
-                        compare_equality(left, "=", item).map_or(false, |r| r.to_boolean())
+                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
                     }),
                 // If right is a single non-empty item, compare directly
                 // Use map_or to handle potential error from compare_equality
+                // Pass context to compare_equality
                 single_item => {
-                    compare_equality(left, "=", single_item).map_or(false, |r| r.to_boolean())
+                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean())
                 }
             };
 
@@ -5124,8 +5139,9 @@ fn check_membership(
                 // For collections, check if any item equals the right value
                 EvaluationResult::Collection(items) => {
                     // Use map_or to handle potential error from compare_equality
+                    // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", right).map_or(false, |r| r.to_boolean())
+                        compare_equality(item, "=", right, context).map_or(false, |r| r.to_boolean())
                     });
                     EvaluationResult::Boolean(contains)
                 }
@@ -5144,8 +5160,9 @@ fn check_membership(
                 },
                 // Treat single non-empty item as collection of one
                 // Use map_or to handle potential error from compare_equality
+                // Pass context to compare_equality
                 single_item => EvaluationResult::Boolean(
-                    compare_equality(single_item, "=", right).map_or(false, |r| r.to_boolean()),
+                    compare_equality(single_item, "=", right, context).map_or(false, |r| r.to_boolean()),
                 ),
             })
         }
