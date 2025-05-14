@@ -525,6 +525,9 @@ fn test_r4_test_suite() {
                 if test.mode == "strict" {
                     ctx.set_strict_mode(true);
                 }
+                if test.check_ordered_functions == "true" {
+                    ctx.set_check_ordered_functions(true);
+                }
                 ctx
             } else {
                 // Try to load the resource for tests with input files
@@ -532,6 +535,9 @@ fn test_r4_test_suite() {
                     Ok(mut ctx) => {
                         if test.mode == "strict" {
                             ctx.set_strict_mode(true);
+                        }
+                        if test.check_ordered_functions == "true" {
+                            ctx.set_check_ordered_functions(true);
                         }
                         ctx
                     }
@@ -712,6 +718,7 @@ struct TestInfo {
     invalid: String,
     predicate: String, // Added predicate attribute
     mode: String,      // Added mode attribute
+    check_ordered_functions: String, // Added checkOrderedFunctions attribute
     expression: String,
     outputs: Vec<(String, String)>, // (type, value)
 }
@@ -731,6 +738,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let input_file = test.attribute("inputfile").unwrap_or("").to_string();
             let mode = test.attribute("mode").unwrap_or("").to_string(); // Parse mode attribute
             let predicate = test.attribute("predicate").unwrap_or("").to_string(); // Parse predicate attribute
+            let check_ordered_functions = test.attribute("checkOrderedFunctions").unwrap_or("").to_string(); // Parse checkOrderedFunctions
 
             // Find the expression node to get its text and 'invalid' attribute
             let expression_node_opt = test.children().find(|n| n.has_tag_name("expression"));
@@ -761,6 +769,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 invalid: invalid_attr_val, // Use the 'invalid' from <expression>
                 predicate, // Store predicate attribute
                 mode,      // Store mode attribute
+                check_ordered_functions, // Store check_ordered_functions
                 expression: expression_text, // Use parsed expression_text
                 outputs,
             });

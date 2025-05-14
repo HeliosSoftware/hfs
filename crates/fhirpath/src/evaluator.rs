@@ -18,6 +18,8 @@ pub struct EvaluationContext {
     pub this: Option<EvaluationResult>,
     /// Flag to enable strict mode evaluation (e.g., error on non-existent members)
     pub is_strict_mode: bool,
+    /// Flag to enable checks for operations on collections with undefined order
+    pub check_ordered_functions: bool,
 }
 
 impl EvaluationContext {
@@ -28,6 +30,7 @@ impl EvaluationContext {
             variables: HashMap::new(),
             this: None,
             is_strict_mode: false, // Default to non-strict mode
+            check_ordered_functions: false, // Default to false
         }
     }
 
@@ -38,12 +41,18 @@ impl EvaluationContext {
             variables: HashMap::new(),
             this: None,
             is_strict_mode: false, // Default to non-strict mode
+            check_ordered_functions: false, // Default to false
         }
     }
 
     /// Sets the strict mode for evaluation.
     pub fn set_strict_mode(&mut self, is_strict: bool) {
         self.is_strict_mode = is_strict;
+    }
+
+    /// Sets the check for ordered functions mode.
+    pub fn set_check_ordered_functions(&mut self, check: bool) {
+        self.check_ordered_functions = check;
     }
 
     /// Sets the 'this' context for direct evaluation (used primarily in tests)

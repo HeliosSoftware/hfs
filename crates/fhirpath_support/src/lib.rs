@@ -10,7 +10,7 @@ pub trait IntoEvaluationResult {
 }
 
 /// Result of evaluating a FHIRPath expression
-#[derive(Debug, Clone, PartialEq, Eq)] // Add Eq here
+#[derive(Debug, Clone)] // Removed PartialEq, Eq here, will implement manually
 pub enum EvaluationResult {
     Empty,
     Boolean(bool),
@@ -21,8 +21,18 @@ pub enum EvaluationResult {
     DateTime(String),
     Time(String),
     Quantity(Decimal, String), // Added Quantity variant (value, unit)
-    Collection(Vec<EvaluationResult>),
+    Collection {
+        items: Vec<EvaluationResult>,
+        has_undefined_order: bool,
+    },
     Object(HashMap<String, EvaluationResult>),
+}
+
+/// Data for a collection, including items and order status
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CollectionData {
+    pub items: Vec<EvaluationResult>,
+    pub has_undefined_order: bool,
 }
 
 /// Represents errors that can occur during FHIRPath evaluation.
@@ -125,19 +135,19 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Quantity(_, _), _) => Ordering::Less,
             (_, EvaluationResult::Quantity(_, _)) => Ordering::Greater,
 
-
-            (EvaluationResult::Collection(a), EvaluationResult::Collection(b)) => {
-                // Compare collections lexicographically after sorting them internally
-                // This ensures consistent ordering for sorting purposes, even if FHIRPath
-                // equivalence doesn't strictly require it.
-                let mut a_sorted = a.clone();
-                let mut b_sorted = b.clone();
-                a_sorted.sort(); // Recursive call to Ord::cmp
-                b_sorted.sort();
-                a_sorted.cmp(&b_sorted)
+            (EvaluationResult::Collection { items: a_items, has_undefined_order: a_undef }, EvaluationResult::Collection { items: b_items, has_undefined_order: b_undef }) => {
+                // Order by has_undefined_order first (false < true), then by items.
+                match a_undef.cmp(b_undef) {
+                    Ordering::Equal => {
+                        // If order flags are the same, compare items as ordered lists.
+                        // FHIRPath collections are ordered, even if the source order was "undefined".
+                        a_items.cmp(b_items)
+                    }
+                    other => other,
+                }
             }
-            (EvaluationResult::Collection(_), _) => Ordering::Less,
-            (_, EvaluationResult::Collection(_)) => Ordering::Greater,
+            (EvaluationResult::Collection { .. }, _) => Ordering::Less,
+            (_, EvaluationResult::Collection { .. }) => Ordering::Greater,
 
             (EvaluationResult::Object(a), EvaluationResult::Object(b)) => {
                 // Compare objects based on sorted keys and then values
@@ -191,13 +201,10 @@ impl Hash for EvaluationResult {
                 val.normalize().hash(state); // Hash normalized decimal value
                 unit.hash(state); // Hash the unit string
             }
-            EvaluationResult::Collection(items) => {
-                // Hash the length and potentially the elements (order matters for hash)
-                // Use sorted hash for collections to match Ord/PartialEq behavior for sets
-                let mut sorted_items = items.clone();
-                sorted_items.sort_unstable(); // Sort based on Ord impl
-                sorted_items.len().hash(state);
-                for item in items {
+            EvaluationResult::Collection { items, has_undefined_order } => {
+                has_undefined_order.hash(state); // Hash the flag
+                items.len().hash(state);         // Hash length
+                for item in items {              // Hash items in their given order
                     item.hash(state);
                 }
             }
@@ -226,7 +233,7 @@ impl EvaluationResult {
     pub fn count(&self) -> usize {
         match self {
             EvaluationResult::Empty => 0,
-            EvaluationResult::Collection(items) => items.len(),
+            EvaluationResult::Collection { items, .. } => items.len(),
             _ => 1, // All single items count as 1
         }
     }
@@ -239,7 +246,7 @@ impl EvaluationResult {
             EvaluationResult::Decimal(d) => !d.is_zero(),
             EvaluationResult::Integer(i) => *i != 0,
             EvaluationResult::Quantity(q, _) => !q.is_zero(), // Quantity is truthy if value is non-zero
-            EvaluationResult::Collection(c) => !c.is_empty(),
+            EvaluationResult::Collection { items, .. } => !items.is_empty(),
             _ => true, // Other types (Date, DateTime, Time, Object) are considered truthy
         }
     }
@@ -256,14 +263,14 @@ impl EvaluationResult {
             EvaluationResult::DateTime(dt) => dt.clone(), // Return stored string
             EvaluationResult::Time(t) => t.clone(), // Return stored string
             EvaluationResult::Quantity(val, unit) => format!("{} '{}'", val, unit), // Format as "value 'unit'"
-            EvaluationResult::Collection(c) => {
+            EvaluationResult::Collection { items, .. } => {
                 // toString on collection: Empty if 0 or >1 items, string of item if 1 item
-                if c.len() == 1 {
-                    c[0].to_string_value()
+                if items.len() == 1 {
+                    items[0].to_string_value()
                 } else {
                     format!(
                         "[{}]",
-                        c.iter()
+                        items.iter()
                             .map(|r| r.to_string_value())
                             .collect::<Vec<_>>()
                             .join(", ")
@@ -287,7 +294,7 @@ impl EvaluationResult {
                 "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
                 _ => EvaluationResult::Empty, // Other strings evaluate to empty in boolean logic
             }),
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 if items.len() == 1 {
                     // Recursively call on the single item
                     items[0].to_boolean_for_logic()
@@ -329,7 +336,7 @@ impl EvaluationResult {
             EvaluationResult::DateTime(_) => "DateTime",
             EvaluationResult::Time(_) => "Time",
             EvaluationResult::Quantity(_, _) => "Quantity",
-            EvaluationResult::Collection(_) => "Collection",
+            EvaluationResult::Collection { .. } => "Collection",
             EvaluationResult::Object(_) => "Object",
         }
     }
@@ -399,7 +406,7 @@ where
             .iter()
             .map(|item| item.into_evaluation_result())
             .collect();
-        EvaluationResult::Collection(collection)
+        EvaluationResult::Collection { items: collection, has_undefined_order: false } // Default to ordered for new collections from Vec<T>
     }
 }
 
