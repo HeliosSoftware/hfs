@@ -271,7 +271,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Date format: YYYY(-MM(-DD)?)?
     // This handles all valid formats: 1972, 2015, 1972-12, 1972-12-14
-    let date_format = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
+    // Returns String for the date part.
+    let date_format_str = filter::<_, _, Simple<char>>(|c: &char| c.is_ascii_digit())
         .repeated()
         .exactly(4)
         .collect::<String>()
@@ -310,7 +311,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
                 }
             }
 
-            Literal::Date(date_str)
+            date_str // Returns String
         })
         .boxed();
 
