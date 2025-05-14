@@ -4996,37 +4996,27 @@ fn compare_equality(
                 }
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
-                } // Empty is only equivalent to Empty
-                // String equivalence (normalized)
-                (EvaluationResult::String(l), EvaluationResult::String(r)) => {
-                    EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
                 }
-                // Collection equivalence: Order doesn't matter, duplicates DO matter.
-                (EvaluationResult::Collection(l_items), EvaluationResult::Collection(r_items)) => {
+                (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::Boolean(normalize_string(l) == normalize_string(r)),
+                (EvaluationResult::Collection { items: l_items, .. }, EvaluationResult::Collection { items: r_items, .. }) => {
+                    // For equivalence, order of items and has_undefined_order flag do not matter.
+                    // Only content and counts.
                     if l_items.len() != r_items.len() {
-                        EvaluationResult::Boolean(false) // Different counts cannot be equivalent
+                        EvaluationResult::Boolean(false)
                     } else {
-                        // Sort copies of the collections
+                        // This requires a more complex check for multiset equivalence if duplicates matter.
+                        // For now, sort and compare for simplicity, assuming Ord is well-defined.
                         let mut l_sorted = l_items.clone();
                         let mut r_sorted = r_items.clone();
-                        // Note: Sorting requires Ord. EvaluationResult implements Ord.
                         l_sorted.sort();
                         r_sorted.sort();
-
-                        // Compare sorted collections element-wise using '~' recursively
-                        let all_equivalent =
-                            l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
-                                // Pass context to recursive call
-                                compare_equality(li, "~", ri, context).map_or(false, |r| r.to_boolean())
-                            }); // Handle potential error
+                        let all_equivalent = l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
+                            compare_equality(li, "~", ri, context).map_or(false, |r| r.to_boolean())
+                        });
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
-                // If only one is a collection, they are not equivalent (Empty case handled earlier)
-                (EvaluationResult::Collection(_), _) | (_, EvaluationResult::Collection(_)) => {
-                    EvaluationResult::Boolean(false)
-                }
-                // Quantity equivalence (requires same units and equivalent values)
+                (EvaluationResult::Collection { .. }, _) | (_, EvaluationResult::Collection { .. }) => EvaluationResult::Boolean(false),
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
@@ -5094,21 +5084,13 @@ fn check_membership(
                     "'in' operator requires singleton left operand".to_string(),
                 ));
             }
-            // Proceed with check if both are non-empty (operands are not Empty)
             let is_in = match right {
-                EvaluationResult::Collection(items) => items
+                EvaluationResult::Collection { items, .. } => items
                     .iter()
-                    // Use map_or to handle potential error from compare_equality
-                    // Pass context to compare_equality
                     .any(|item| {
-                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean()) // context is captured here
+                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
                     }),
-                // If right is a single non-empty item, compare directly
-                // Use map_or to handle potential error from compare_equality
-                // Pass context to compare_equality
-                single_item => {
-                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean()) // context is available here
-                }
+                single_item => compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean()),
             };
 
             Ok(EvaluationResult::Boolean(is_in))
