@@ -14,6 +14,7 @@ fn run_fhir_r4_test(
     expression: &str,
     context: &EvaluationContext,
     expected: &[EvaluationResult],
+    is_predicate_test: bool, // New parameter
 ) -> Result<(), String> {
     // Parse the expression
     let parsed = parser()
@@ -21,13 +22,46 @@ fn run_fhir_r4_test(
         .map_err(|e| format!("Parse error: {:?}", e))?;
 
     // Evaluate the expression
-    let result =
+    let eval_result =
         evaluate(&parsed, context, None).map_err(|e| format!("Evaluation error: {:?}", e))?;
 
-    // Convert result to a vec if needed - make sure to clone result where needed
-    let result_vec = match &result {
+    // If this is a predicate test, coerce the result according to FHIRPath spec 5.1.1
+    let final_eval_result_for_comparison = if is_predicate_test {
+        match eval_result.count() {
+            0 => EvaluationResult::Empty, // Empty collection or Empty item
+            1 => {
+                // Single item. If it's a Boolean, use its value. Otherwise, it becomes true.
+                let single_item_value = if let EvaluationResult::Collection(ref c_items) = eval_result {
+                    // This case handles a collection with one item.
+                    // We need to get the item itself to check if it's a boolean.
+                    c_items[0].clone()
+                } else {
+                    // This case handles a single, non-collection item (e.g. String, Integer).
+                    eval_result.clone()
+                };
+
+                if let EvaluationResult::Boolean(b_val) = single_item_value {
+                    EvaluationResult::Boolean(b_val) // Preserve original boolean value
+                } else {
+                    EvaluationResult::Boolean(true) // Non-boolean single item becomes true in boolean context
+                }
+            }
+            _ => { // count > 1
+                return Err(format!(
+                    "Predicate test expression resulted in a collection with {} items, evaluation cannot proceed according to FHIRPath spec 5.1.1: {:?}",
+                    eval_result.count(), eval_result
+                ));
+            }
+        }
+    } else {
+        eval_result
+    };
+
+    // Convert the (potentially coerced) result to a vec for comparison
+    let result_vec = match &final_eval_result_for_comparison {
         EvaluationResult::Collection(items) => items.clone(),
-        _ => vec![result.clone()],
+        EvaluationResult::Empty => Vec::new(), // Empty result means an empty list for comparison
+        single_item => vec![single_item.clone()], // Single item becomes a list with one item
     };
 
     // Special case: If there are no expected results, we just verify execution completed
@@ -623,7 +657,8 @@ fn test_r4_test_suite() {
             }
 
             // Run the test
-            match run_fhir_r4_test(&test.expression, &context, &expected_results) {
+            let is_predicate_test = test.predicate == "true";
+            match run_fhir_r4_test(&test.expression, &context, &expected_results, is_predicate_test) {
                 Ok(_) => {
                     println!("  PASS: {} - '{}'", test.name, test.expression);
                     passed_tests += 1;
@@ -693,6 +728,7 @@ struct TestInfo {
     description: String,
     input_file: String,
     invalid: String,
+    predicate: String, // Added predicate attribute
     expression: String,
     outputs: Vec<(String, String)>, // (type, value)
 }
@@ -711,6 +747,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let description = test.attribute("description").unwrap_or("").to_string();
             let input_file = test.attribute("inputfile").unwrap_or("").to_string();
             let invalid = test.attribute("invalid").unwrap_or("").to_string();
+            let predicate = test.attribute("predicate").unwrap_or("").to_string(); // Parse predicate attribute
 
             // Find the expression
             let expression = test
@@ -733,6 +770,7 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 description,
                 input_file,
                 invalid,
+                predicate, // Store predicate attribute
                 expression,
                 outputs,
             });
