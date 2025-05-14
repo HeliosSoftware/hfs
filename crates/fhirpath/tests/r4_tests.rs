@@ -31,14 +31,15 @@ fn run_fhir_r4_test(
             0 => EvaluationResult::Empty, // Empty collection or Empty item
             1 => {
                 // Single item. If it's a Boolean, use its value. Otherwise, it becomes true.
-                let single_item_value = if let EvaluationResult::Collection(ref c_items) = eval_result {
-                    // This case handles a collection with one item.
-                    // We need to get the item itself to check if it's a boolean.
-                    c_items[0].clone()
-                } else {
-                    // This case handles a single, non-collection item (e.g. String, Integer).
-                    eval_result.clone()
-                };
+                let single_item_value =
+                    if let EvaluationResult::Collection(ref c_items) = eval_result {
+                        // This case handles a collection with one item.
+                        // We need to get the item itself to check if it's a boolean.
+                        c_items[0].clone()
+                    } else {
+                        // This case handles a single, non-collection item (e.g. String, Integer).
+                        eval_result.clone()
+                    };
 
                 if let EvaluationResult::Boolean(b_val) = single_item_value {
                     EvaluationResult::Boolean(b_val) // Preserve original boolean value
@@ -46,10 +47,12 @@ fn run_fhir_r4_test(
                     EvaluationResult::Boolean(true) // Non-boolean single item becomes true in boolean context
                 }
             }
-            _ => { // count > 1
+            _ => {
+                // count > 1
                 return Err(format!(
                     "Predicate test expression resulted in a collection with {} items, evaluation cannot proceed according to FHIRPath spec 5.1.1: {:?}",
-                    eval_result.count(), eval_result
+                    eval_result.count(),
+                    eval_result
                 ));
             }
         }
@@ -543,34 +546,7 @@ fn test_r4_test_suite() {
             } else {
                 // Try to load the resource for tests with input files
                 match load_test_resource(&test.input_file) {
-                    Ok(ctx) => {
-                        // For polymorphism test cases, we'll use our special handling through boolean_type_tests
-                        if test.name.starts_with("testPolymorphism") {
-                            println!(
-                                "  DEBUG: Loading '{}' for test '{}'",
-                                test.input_file, test.name
-                            );
-
-                            // Print context to debug
-                            if let Some(_resource) = ctx.resources.first() {
-                                println!("  DEBUG: Resource found in context");
-                                if let Some(this) = &ctx.this {
-                                    if let EvaluationResult::Object(obj) = this {
-                                        println!(
-                                            "  DEBUG: This object has keys: {:?}",
-                                            obj.keys().collect::<Vec<_>>()
-                                        );
-                                        if let Some(value) = obj.get("valueQuantity") {
-                                            println!("  DEBUG: valueQuantity = {:?}", value);
-                                        }
-                                    }
-                                }
-                            } else {
-                                println!("  DEBUG: No resource found in context");
-                            }
-                        }
-                        ctx
-                    }
+                    Ok(ctx) => ctx,
                     Err(e) => {
                         println!(
                             "  SKIP: {} - '{}' - Failed to load JSON resource for {}: {}",
@@ -658,7 +634,12 @@ fn test_r4_test_suite() {
 
             // Run the test
             let is_predicate_test = test.predicate == "true";
-            match run_fhir_r4_test(&test.expression, &context, &expected_results, is_predicate_test) {
+            match run_fhir_r4_test(
+                &test.expression,
+                &context,
+                &expected_results,
+                is_predicate_test,
+            ) {
                 Ok(_) => {
                     println!("  PASS: {} - '{}'", test.name, test.expression);
                     passed_tests += 1;
