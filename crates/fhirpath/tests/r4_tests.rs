@@ -719,14 +719,20 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
             let test_name = test.attribute("name").unwrap_or("unnamed").to_string();
             let description = test.attribute("description").unwrap_or("").to_string();
             let input_file = test.attribute("inputfile").unwrap_or("").to_string();
-            let invalid = test.attribute("invalid").unwrap_or("").to_string();
+            // let invalid = test.attribute("invalid").unwrap_or("").to_string(); // Old: read from <test>
             let predicate = test.attribute("predicate").unwrap_or("").to_string(); // Parse predicate attribute
 
-            // Find the expression
-            let expression = test
-                .children()
-                .find(|n| n.has_tag_name("expression"))
+            // Find the expression node to get its text and 'invalid' attribute
+            let expression_node_opt = test.children().find(|n| n.has_tag_name("expression"));
+            
+            let expression_text = expression_node_opt
+                .as_ref() // Convert Option<&Node> to Option<&Node> for consistent map/and_then usage
                 .and_then(|n| n.text())
+                .unwrap_or("")
+                .to_string();
+            
+            let invalid_attr_val = expression_node_opt // Read 'invalid' from <expression>
+                .and_then(|n| n.attribute("invalid"))
                 .unwrap_or("")
                 .to_string();
 
@@ -742,9 +748,9 @@ fn find_test_groups(root: &Node) -> Vec<(String, Vec<TestInfo>)> {
                 name: test_name,
                 description,
                 input_file,
-                invalid,
+                invalid: invalid_attr_val, // Use the 'invalid' from <expression>
                 predicate, // Store predicate attribute
-                expression,
+                expression: expression_text, // Use parsed expression_text
                 outputs,
             });
         }
