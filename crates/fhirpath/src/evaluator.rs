@@ -119,6 +119,38 @@ pub fn evaluate(
     context: &EvaluationContext,
     current_item: Option<&EvaluationResult>,
 ) -> Result<EvaluationResult, EvaluationError> {
+    // FHIRPath Spec Section 3: Path Selection
+    // "When resolving an identifier that is also the root of a FHIRPath expression,
+    // it is resolved as a type name first, and if it resolves to a type, it must
+    // resolve to the type of the context (or a supertype). Otherwise, it is resolved
+    // as a path on the context."
+    // This applies when current_item is None (not in an iteration) and the expression
+    // starts with a simple member identifier.
+    if current_item.is_none() {
+        if let Expression::Term(Term::Invocation(Invocation::Member(ref initial_name))) = expr {
+            let global_context_item = if let Some(this_item) = &context.this {
+                this_item.clone()
+            } else if !context.resources.is_empty() {
+                convert_resource_to_result(&context.resources[0])
+            } else {
+                EvaluationResult::Empty
+            };
+
+            if let EvaluationResult::Object(obj_map) = &global_context_item {
+                if let Some(EvaluationResult::String(ctx_type)) = obj_map.get("resourceType") {
+                    // The parser ensures initial_name is cleaned of backticks.
+                    if initial_name.eq_ignore_ascii_case(ctx_type) {
+                        // The initial identifier matches the context type.
+                        // The expression resolves to the context item itself.
+                        return Ok(global_context_item);
+                    }
+                }
+            }
+            // If no match, or context is not an Object with resourceType,
+            // evaluation proceeds normally (initial_name treated as member access on context).
+        }
+    }
+
     let result = match expr {
         Expression::Term(term) => evaluate_term(term, context, current_item),
         Expression::Invocation(left_expr, invocation) => {
