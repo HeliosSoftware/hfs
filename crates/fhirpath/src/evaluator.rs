@@ -516,44 +516,54 @@ pub fn evaluate(
 
 /// Normalizes a vector of results according to FHIRPath singleton evaluation rules.
 /// Returns Empty if vec is empty, the single item if len is 1, or Collection(vec) otherwise.
-fn normalize_collection_result(mut items: Vec<EvaluationResult>) -> EvaluationResult {
+/// The `has_undefined_order` flag for the resulting collection is determined by the input items.
+fn normalize_collection_result(mut items: Vec<EvaluationResult>, items_have_undefined_order: bool) -> EvaluationResult {
     if items.is_empty() {
         EvaluationResult::Empty
     } else if items.len() == 1 {
-        items.pop().unwrap() // Take the single item
+        // If the single item is itself a collection, preserve its undefined_order status.
+        // Otherwise, a single non-collection item is considered ordered.
+        let single_item = items.pop().unwrap();
+        if let EvaluationResult::Collection { items: inner_items, has_undefined_order: inner_undef_order } = single_item {
+            // If the single item was a collection, re-wrap it, preserving its order status.
+            // This typically happens if flatten_collections_recursive returns a single collection.
+            EvaluationResult::Collection { items: inner_items, has_undefined_order: inner_undef_order }
+        } else {
+            single_item // Not a collection, or already handled.
+        }
     } else {
-        EvaluationResult::Collection(items)
+        EvaluationResult::Collection { items, has_undefined_order: items_have_undefined_order }
     }
 }
 
 /// Flattens a collection and all nested collections recursively according to FHIRPath rules.
-/// This function ensures that collections are properly flattened at all levels.
-///
-/// For example, a collection containing [Collection([1, 2]), Collection([3, 4])] becomes [1, 2, 3, 4].
-///
-/// FHIRPath rules for member access state that when accessing a member of a collection,
-/// the result should be a flattened collection of all member values.
-fn flatten_collections_recursive(result: EvaluationResult) -> Vec<EvaluationResult> {
-    let mut flattened = Vec::new();
+/// Returns a tuple: (flattened_items, was_any_input_collection_undefined_order).
+fn flatten_collections_recursive(result: EvaluationResult) -> (Vec<EvaluationResult>, bool) {
+    let mut flattened_items = Vec::new();
+    let mut any_undefined_order = false;
 
     match result {
-        EvaluationResult::Collection(items) => {
-            // For each item in the collection, recursively flatten it
+        EvaluationResult::Collection { items, has_undefined_order } => {
+            if has_undefined_order {
+                any_undefined_order = true;
+            }
             for item in items {
-                let nested_flattened = flatten_collections_recursive(item);
-                flattened.extend(nested_flattened);
+                let (nested_flattened, nested_undefined_order) = flatten_collections_recursive(item);
+                flattened_items.extend(nested_flattened);
+                if nested_undefined_order {
+                    any_undefined_order = true;
+                }
             }
         }
         EvaluationResult::Empty => {
-            // Skip empty results as per FHIRPath rules
+            // Skip empty results
         }
         other => {
             // Add non-collection, non-empty items directly
-            flattened.push(other);
+            flattened_items.push(other);
         }
     }
-
-    flattened
+    (flattened_items, any_undefined_order)
 }
 
 /// Evaluates a term in the given context, potentially with a specific item as context ($this).
@@ -780,20 +790,43 @@ fn evaluate_invocation(
                     // Special handling for accessing primitive field "id" and "extension"
                     // For FHIR resources, every primitive value can have an "id" and "extension" property
                     if name == "id" || name == "extension" {
-                        // Keep results as is, do not flatten
-                        Ok(normalize_collection_result(results))
+                        // For 'id' and 'extension', the order status depends on the input items.
+                        // If any item in 'results' was an unordered collection, the result is unordered.
+                        // This is a simplification; true propagation would be more complex here.
+                        // For now, assume ordered unless an item itself is an unordered collection.
+                        let mut is_unordered = false;
+                        for r in &results {
+                            if let EvaluationResult::Collection { has_undefined_order: true, .. } = r {
+                                is_unordered = true;
+                                break;
+                            }
+                        }
+                        Ok(normalize_collection_result(results, is_unordered))
                     } else {
                         // For regular fields, perform proper flattening of nested collections
-                        // according to FHIRPath rules
+                        let mut combined_results_for_flattening = Vec::new();
+                        let mut any_item_was_unordered_collection = false;
+                        for res_item in results {
+                            if let EvaluationResult::Collection{items: inner_items, has_undefined_order: item_is_unordered} = res_item {
+                                combined_results_for_flattening.extend(inner_items);
+                                if item_is_unordered {
+                                    any_item_was_unordered_collection = true;
+                                }
+                            } else if res_item != EvaluationResult::Empty {
+                                combined_results_for_flattening.push(res_item);
+                            }
+                        }
+                        
+                        // The `flatten_collections_recursive` function expects a single EvaluationResult.
+                        // We need to wrap `combined_results_for_flattening` into one if it's not already handled.
+                        // The `has_undefined_order` for this temporary collection should reflect if any constituent was unordered.
+                        let temp_collection_for_flattening = EvaluationResult::Collection {
+                            items: combined_results_for_flattening,
+                            has_undefined_order: any_item_was_unordered_collection,
+                        };
 
-                        // Create a collection result from individual results
-                        let collection_result = EvaluationResult::Collection(results);
-
-                        // Use our recursive flattening function to flatten everything properly
-                        let flattened_results = flatten_collections_recursive(collection_result);
-
-                        // Normalize the flattened results
-                        Ok(normalize_collection_result(flattened_results))
+                        let (flattened_items, is_result_unordered) = flatten_collections_recursive(temp_collection_for_flattening);
+                        Ok(normalize_collection_result(flattened_items, is_result_unordered))
                     }
                 }
                 // Special handling for primitive types
@@ -1155,18 +1188,22 @@ fn evaluate_where(
 
         if has_nested_collections {
             // Create a collection from all filtered items
-            let collection_result = EvaluationResult::Collection(filtered_items);
+            // The order status of this intermediate collection depends on the input `collection`'s order status.
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
+            let collection_result = EvaluationResult::Collection {items: filtered_items, has_undefined_order: input_was_unordered };
+
 
             // Properly flatten all nested collections
-            let flattened_results = flatten_collections_recursive(collection_result);
+            let (flattened_items, is_result_unordered) = flatten_collections_recursive(collection_result);
 
             // Return normalized result
-            return Ok(normalize_collection_result(flattened_results));
+            return Ok(normalize_collection_result(flattened_items, is_result_unordered));
         }
     }
 
     // If no nested collections, just return normalized result directly
-    Ok(normalize_collection_result(filtered_items))
+    let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
+    Ok(normalize_collection_result(filtered_items, input_was_unordered))
 }
 
 /// Evaluates the 'select' function.
@@ -1190,14 +1227,17 @@ fn evaluate_select(
         projected_items.push(projection_result);
     }
 
-    // Create a collection from all the projected results
-    let collection_result = EvaluationResult::Collection(projected_items);
+    // Create a collection from all the projected results.
+    // The order status of this intermediate collection depends on the input `collection`'s order status.
+    let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
+    let collection_result = EvaluationResult::Collection { items: projected_items, has_undefined_order: input_was_unordered };
+
 
     // Properly flatten all nested collections
-    let flattened_results = flatten_collections_recursive(collection_result);
+    let (flattened_items, is_result_unordered) = flatten_collections_recursive(collection_result);
 
     // Return Empty or Collection, apply normalization
-    Ok(normalize_collection_result(flattened_results))
+    Ok(normalize_collection_result(flattened_items, is_result_unordered))
 }
 
 /// Evaluates the 'all' function with a criteria expression.
@@ -1802,32 +1842,27 @@ fn call_function(
                 single_item => vec![single_item.clone()], // Treat single item as collection
             };
 
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
             Ok(if num_to_skip >= items.len() {
-                // Wrap in Ok
                 EvaluationResult::Empty
             } else {
                 let skipped_items = items[num_to_skip..].to_vec();
-                // Return Empty or Collection, apply normalization
-                normalize_collection_result(skipped_items)
+                normalize_collection_result(skipped_items, input_was_unordered) // Preserve order status
             })
         }
         "tail" => {
             // Returns the collection with all items except the first
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
             Ok(
-                if let EvaluationResult::Collection(items) = invocation_base {
-                    // Wrap in Ok
+                if let EvaluationResult::Collection { items, .. } = invocation_base { // Destructure to get items
                     if items.len() > 1 {
-                        // Create a new Vec containing elements from the second one onwards
-                        EvaluationResult::Collection(items[1..].to_vec())
+                        EvaluationResult::Collection { items: items[1..].to_vec(), has_undefined_order: input_was_unordered }
                     } else {
-                        // Empty or single-item collection results in empty
                         EvaluationResult::Empty
                     }
                 } else if invocation_base == &EvaluationResult::Empty {
-                    // Tail on Empty results in Empty
                     EvaluationResult::Empty
                 } else {
-                    // Tail on a single non-collection item results in empty
                     EvaluationResult::Empty
                 },
             )
@@ -1865,9 +1900,8 @@ fn call_function(
             };
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
-
-            // Return Empty or Collection, apply normalization
-            Ok(normalize_collection_result(taken_items))
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
+            Ok(normalize_collection_result(taken_items, input_was_unordered)) // Preserve order status
         }
         "intersect" => {
             // Returns the intersection of two collections (items present in both, order not guaranteed)
@@ -1917,8 +1951,8 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection, apply normalization
-            Ok(normalize_collection_result(intersection_items))
+            // intersect() output order is not guaranteed by spec, so mark as undefined.
+            Ok(normalize_collection_result(intersection_items, true))
         }
         "exclude" => {
             // Returns items in invocation_base that are NOT in the argument collection (preserves order and duplicates)
@@ -1963,9 +1997,9 @@ fn call_function(
                     result_items.push(left_item.clone());
                 }
             }
-
-            // Return Empty or Collection, preserving duplicates and order, apply normalization
-            Ok(normalize_collection_result(result_items))
+            // exclude() preserves order of the left operand.
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
+            Ok(normalize_collection_result(result_items, input_was_unordered))
         }
         "union" => {
             // Returns the union of two collections (distinct items from both, order not guaranteed)
@@ -2007,8 +2041,8 @@ fn call_function(
                 }
             }
 
-            // Return Empty or Collection, apply normalization
-            Ok(normalize_collection_result(union_items))
+            // union() output order is not guaranteed by spec, so mark as undefined.
+            Ok(normalize_collection_result(union_items, true))
         }
         "combine" => {
             // Returns a collection containing all items from both collections, including duplicates, preserving order
@@ -2036,8 +2070,8 @@ fn call_function(
             let mut combined_items = left_items;
             combined_items.extend(right_items);
 
-            // Return Empty or Collection, apply normalization
-            Ok(normalize_collection_result(combined_items))
+            // combine() output order is not guaranteed by spec, so mark as undefined.
+            Ok(normalize_collection_result(combined_items, true))
         }
         "single" => {
             // Returns the single item in a collection, or empty if 0 or >1 items
@@ -3876,7 +3910,8 @@ fn call_function(
                             .chars()
                             .map(|c| EvaluationResult::String(c.to_string()))
                             .collect();
-                        normalize_collection_result(chars) // Apply normalization
+                        // toChars() produces an ordered collection
+                        normalize_collection_result(chars, false)
                     }
                 }
                 EvaluationResult::Empty => EvaluationResult::Empty,
@@ -3965,40 +4000,38 @@ fn call_function(
         }
         "descendants" => {
             // Returns a collection with all descendant nodes of all items in the input collection
-            // In FHIRPath, descendants() is a shorthand for repeat(children())
             let mut all_descendants: Vec<EvaluationResult> = Vec::new();
-            let mut current_level = vec![invocation_base.clone()];
+            let mut current_level = match invocation_base {
+                EvaluationResult::Collection { items, .. } => items.clone(),
+                EvaluationResult::Empty => vec![],
+                single_item => vec![single_item.clone()],
+            };
+            let mut overall_descendants_unordered = false; // Track if any part contributes to undefined order
 
-            // Process each level of the hierarchy
             while !current_level.is_empty() {
                 let mut next_level: Vec<EvaluationResult> = Vec::new();
-
-                // Get children of the current level
                 for item in &current_level {
                     match call_function("children", item, &[], context)? {
-                        EvaluationResult::Empty => (), // Skip empty results
-                        EvaluationResult::Collection(children) => {
-                            // Add children to both descendants and next level
-                            all_descendants.extend(children.clone());
-                            next_level.extend(children);
+                        EvaluationResult::Empty => (),
+                        EvaluationResult::Collection { items: children_items, has_undefined_order } => {
+                            all_descendants.extend(children_items.clone());
+                            next_level.extend(children_items);
+                            if has_undefined_order { overall_descendants_unordered = true; }
                         }
                         child => {
-                            // Add single child to both descendants and next level
                             all_descendants.push(child.clone());
                             next_level.push(child);
                         }
                     }
                 }
-
-                // Move to the next level
                 current_level = next_level;
             }
 
-            // Return all descendants
             if all_descendants.is_empty() {
                 Ok(EvaluationResult::Empty)
             } else {
-                Ok(EvaluationResult::Collection(all_descendants))
+                // descendants() produces a collection with undefined order
+                Ok(EvaluationResult::Collection { items: all_descendants, has_undefined_order: true })
             }
         }
         "extension" => {
