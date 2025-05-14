@@ -588,13 +588,14 @@ fn evaluate_term(
                     } else if context.resources.len() == 1 {
                         convert_resource_to_result(&context.resources[0])
                     } else {
-                        EvaluationResult::Collection(
-                            context
+                        EvaluationResult::Collection {
+                            items: context
                                 .resources
                                 .iter()
                                 .map(convert_resource_to_result)
                                 .collect(),
-                        )
+                            has_undefined_order: false, // Resources in context are typically ordered
+                        }
                     }
                 }); // Close Ok() here
             }
@@ -611,14 +612,15 @@ fn evaluate_term(
                         } else if context.resources.len() == 1 {
                             convert_resource_to_result(&context.resources[0])
                         } else {
-                            EvaluationResult::Collection(
-                                context
+                            EvaluationResult::Collection {
+                                items: context
                                     .resources
                                     .iter()
                                     .map(convert_resource_to_result)
                                     .collect(),
-                            )
-                        }); // Removed the misplaced }); here
+                                has_undefined_order: false, // Resources in context are typically ordered
+                            }
+                        });
                     } else {
                         // Return other variable value or error if undefined
                         return match context.get_variable(var_name) {
@@ -644,13 +646,14 @@ fn evaluate_term(
                         } else if context.resources.len() == 1 {
                             convert_resource_to_result(&context.resources[0])
                         } else {
-                            EvaluationResult::Collection(
-                                context
+                            EvaluationResult::Collection {
+                                items: context
                                     .resources
                                     .iter()
                                     .map(convert_resource_to_result)
                                     .collect(),
-                            )
+                                has_undefined_order: false, // Resources in context are typically ordered
+                            }
                         }
                     }
                 }
@@ -670,13 +673,14 @@ fn evaluate_term(
                 } else if context.resources.len() == 1 {
                     convert_resource_to_result(&context.resources[0])
                 } else {
-                    EvaluationResult::Collection(
-                        context
+                    EvaluationResult::Collection {
+                        items: context
                             .resources
                             .iter()
                             .map(convert_resource_to_result)
                             .collect(),
-                    )
+                        has_undefined_order: false, // Resources in context are typically ordered
+                    }
                 }) // Correctly placed Ok() wrapping
             } else {
                 // Return variable value or error if undefined
@@ -778,55 +782,39 @@ fn evaluate_invocation(
                     let mut results = Vec::new();
                     for item in items {
                         // Recursively call member access on each item, propagating errors
-                        // Pass current_item_for_args down for consistency, though Member invocations don't use it for args
-                        match evaluate_invocation(item, &Invocation::Member(name.clone()), context, current_item_for_args)
-                        {
-                            Ok(EvaluationResult::Empty) => {} // Skip empty results
-                            Ok(res) => results.push(res),
-                            Err(e) => return Err(e), // Propagate error immediately
+                        // Pass current_item_for_args down for consistency
+                        let res = evaluate_invocation(item, &Invocation::Member(name.clone()), context, current_item_for_args)?;
+                        if let EvaluationResult::Collection { has_undefined_order: true, .. } = &res {
+                            result_is_unordered = true;
+                        }
+                        if res != EvaluationResult::Empty {
+                            results.push(res);
                         }
                     }
 
-                    // Special handling for accessing primitive field "id" and "extension"
-                    // For FHIR resources, every primitive value can have an "id" and "extension" property
                     if name == "id" || name == "extension" {
-                        // For 'id' and 'extension', the order status depends on the input items.
-                        // If any item in 'results' was an unordered collection, the result is unordered.
-                        // This is a simplification; true propagation would be more complex here.
-                        // For now, assume ordered unless an item itself is an unordered collection.
-                        let mut is_unordered = false;
-                        for r in &results {
-                            if let EvaluationResult::Collection { has_undefined_order: true, .. } = r {
-                                is_unordered = true;
-                                break;
-                            }
-                        }
-                        Ok(normalize_collection_result(results, is_unordered))
+                        Ok(normalize_collection_result(results, result_is_unordered))
                     } else {
-                        // For regular fields, perform proper flattening of nested collections
                         let mut combined_results_for_flattening = Vec::new();
-                        let mut any_item_was_unordered_collection = false;
+                        let mut any_item_was_unordered_collection = result_is_unordered; // Start with base
                         for res_item in results {
                             if let EvaluationResult::Collection{items: inner_items, has_undefined_order: item_is_unordered} = res_item {
                                 combined_results_for_flattening.extend(inner_items);
                                 if item_is_unordered {
                                     any_item_was_unordered_collection = true;
                                 }
-                            } else if res_item != EvaluationResult::Empty {
+                            } else if res_item != EvaluationResult::Empty { // Ensure Empty is not pushed
                                 combined_results_for_flattening.push(res_item);
                             }
                         }
                         
-                        // The `flatten_collections_recursive` function expects a single EvaluationResult.
-                        // We need to wrap `combined_results_for_flattening` into one if it's not already handled.
-                        // The `has_undefined_order` for this temporary collection should reflect if any constituent was unordered.
                         let temp_collection_for_flattening = EvaluationResult::Collection {
                             items: combined_results_for_flattening,
                             has_undefined_order: any_item_was_unordered_collection,
                         };
 
-                        let (flattened_items, is_result_unordered) = flatten_collections_recursive(temp_collection_for_flattening);
-                        Ok(normalize_collection_result(flattened_items, is_result_unordered))
+                        let (flattened_items, final_is_unordered) = flatten_collections_recursive(temp_collection_for_flattening);
+                        Ok(normalize_collection_result(flattened_items, final_is_unordered))
                     }
                 }
                 // Special handling for primitive types
@@ -1187,22 +1175,12 @@ fn evaluate_where(
             .any(|item| matches!(item, EvaluationResult::Collection(_)));
 
         if has_nested_collections {
-            // Create a collection from all filtered items
-            // The order status of this intermediate collection depends on the input `collection`'s order status.
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
             let collection_result = EvaluationResult::Collection {items: filtered_items, has_undefined_order: input_was_unordered };
-
-
-            // Properly flatten all nested collections
             let (flattened_items, is_result_unordered) = flatten_collections_recursive(collection_result);
-
-            // Return normalized result
             return Ok(normalize_collection_result(flattened_items, is_result_unordered));
         }
     }
 
-    // If no nested collections, just return normalized result directly
-    let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
     Ok(normalize_collection_result(filtered_items, input_was_unordered))
 }
 
@@ -1220,24 +1198,16 @@ fn evaluate_select(
 
     let mut projected_items = Vec::new();
     for item in items_to_project {
-        // Evaluate projection, propagate error
         let projection_result = evaluate(projection_expr, context, Some(&item))?;
-
-        // Add the result to our collection of projected items
+        if let EvaluationResult::Collection { has_undefined_order: true, .. } = &projection_result {
+            result_is_unordered = true;
+        }
         projected_items.push(projection_result);
     }
 
-    // Create a collection from all the projected results.
-    // The order status of this intermediate collection depends on the input `collection`'s order status.
-    let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
-    let collection_result = EvaluationResult::Collection { items: projected_items, has_undefined_order: input_was_unordered };
-
-
-    // Properly flatten all nested collections
-    let (flattened_items, is_result_unordered) = flatten_collections_recursive(collection_result);
-
-    // Return Empty or Collection, apply normalization
-    Ok(normalize_collection_result(flattened_items, is_result_unordered))
+    let collection_result = EvaluationResult::Collection { items: projected_items, has_undefined_order: result_is_unordered };
+    let (flattened_items, final_is_unordered) = flatten_collections_recursive(collection_result);
+    Ok(normalize_collection_result(flattened_items, final_is_unordered))
 }
 
 /// Evaluates the 'all' function with a criteria expression.
@@ -1844,20 +1814,18 @@ fn call_function(
                 }
             };
 
-            let items = match invocation_base {
+            let (items, input_was_unordered) = match invocation_base {
                 EvaluationResult::Collection { items, has_undefined_order } => {
                     if *has_undefined_order && context.check_ordered_functions {
                         return Err(EvaluationError::SemanticError(
                             "skip() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
                         ));
                     }
-                    items.clone()
+                    (items.clone(), *has_undefined_order)
                 }
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Empty => (vec![], false), // Default order status for empty
+                single_item => (vec![single_item.clone()], false), // Single item is ordered
             };
-
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
             Ok(if num_to_skip >= items.len() {
                 EvaluationResult::Empty
             } else {
@@ -1873,7 +1841,7 @@ fn call_function(
                     ));
                 }
             }
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order, .. } = invocation_base { *has_undefined_order } else { false }; // Correctly get order status
             Ok(
                 if let EvaluationResult::Collection { items, .. } = invocation_base {
                     if items.len() > 1 {
@@ -1914,21 +1882,20 @@ fn call_function(
                 return Ok(EvaluationResult::Empty);
             }
 
-            let items = match invocation_base {
+            let (items, input_was_unordered) = match invocation_base {
                 EvaluationResult::Collection { items, has_undefined_order } => {
                     if *has_undefined_order && context.check_ordered_functions {
                         return Err(EvaluationError::SemanticError(
                             "take() operation on collection with undefined order is not allowed when checkOrderedFunctions is true.".to_string()
                         ));
                     }
-                    items.clone()
+                    (items.clone(), *has_undefined_order)
                 }
-                EvaluationResult::Empty => vec![],
-                single_item => vec![single_item.clone()],
+                EvaluationResult::Empty => (vec![], false), // Default order status for empty
+                single_item => (vec![single_item.clone()], false), // Single item is ordered
             };
 
             let taken_items: Vec<EvaluationResult> = items.into_iter().take(num_to_take).collect();
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = invocation_base { true } else { false };
             Ok(normalize_collection_result(taken_items, input_was_unordered))
         }
         "intersect" => {
