@@ -1771,12 +1771,12 @@ fn call_function(
             let other_collection = &args[0];
 
             let self_items = match invocation_base {
-                EvaluationResult::Collection(items, ..) => items,
+                EvaluationResult::Collection { items, .. } => items,
                 EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Empty set is subset of anything
                 single => &[single.clone()][..], // Treat single item as slice
             };
             let other_items = match other_collection {
-                EvaluationResult::Collection(items, ..) => items,
+                EvaluationResult::Collection { items, .. } => items,
                 EvaluationResult::Empty => &[][..], // Empty slice
                 single => &[single.clone()][..],    // Treat single item as slice
             };
@@ -1803,7 +1803,7 @@ fn call_function(
                 single => &[single.clone()][..],
             };
             let other_items = match other_collection {
-                EvaluationResult::Collection(items, ..) => items,
+                EvaluationResult::Collection { items, .. } => items,
                 EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Anything is superset of empty set
                 single => &[single.clone()][..],
             };
@@ -2054,12 +2054,12 @@ fn call_function(
 
             // Convert inputs to Vec for processing
             let left_items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 single_item => vec![single_item.clone()],
             };
 
             let right_items = match other_collection {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 single_item => vec![single_item.clone()],
             };
 
@@ -2108,12 +2108,12 @@ fn call_function(
 
             // Convert inputs to Vec for processing
             let left_items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 single_item => vec![single_item.clone()],
             };
 
             let right_items = match other_collection {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 single_item => vec![single_item.clone()],
             };
 
@@ -2158,13 +2158,13 @@ fn call_function(
 
             // Convert inputs to Vec for processing
             let left_items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()],
             };
 
             let right_items = match other_collection {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()],
             };
@@ -2201,13 +2201,13 @@ fn call_function(
 
             // Convert inputs to Vec for processing
             let left_items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()],
             };
 
             let right_items = match other_collection {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(),
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()],
             };
