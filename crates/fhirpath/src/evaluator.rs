@@ -2536,7 +2536,6 @@ fn call_function(
                             // Two parts: Value must parse AND unit must be valid
                             let value_parses = parts[0].parse::<Decimal>().is_ok();
                             let unit_str = parts[1].trim_matches('\'');
-                            // Unit must be non-empty AND pass validation
                             let unit_is_valid =
                                 !unit_str.is_empty() && is_valid_fhirpath_quantity_unit(unit_str);
                             value_parses && unit_is_valid
@@ -2544,7 +2543,7 @@ fn call_function(
                         _ => false,
                     }
                 }),
-                EvaluationResult::Collection { .. } => unreachable!(), // Pattern for struct variant
+                EvaluationResult::Collection { .. } => unreachable!(), 
                 _ => EvaluationResult::Boolean(false),
             })
         }
@@ -4998,13 +4997,9 @@ fn compare_equality(
                 }
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => EvaluationResult::Boolean(normalize_string(l) == normalize_string(r)),
                 (EvaluationResult::Collection { items: l_items, .. }, EvaluationResult::Collection { items: r_items, .. }) => {
-                    // For equivalence, order of items and has_undefined_order flag do not matter.
-                    // Only content and counts.
                     if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
                     } else {
-                        // This requires a more complex check for multiset equivalence if duplicates matter.
-                        // For now, sort and compare for simplicity, assuming Ord is well-defined.
                         let mut l_sorted = l_items.clone();
                         let mut r_sorted = r_items.clone();
                         l_sorted.sort();
@@ -5084,12 +5079,14 @@ fn check_membership(
                 ));
             }
             let is_in = match right {
-                EvaluationResult::Collection { items, .. } => items
+                EvaluationResult::Collection { items, .. } => items // Destructure
                     .iter()
                     .any(|item| {
                         compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
                     }),
-                single_item => compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean()),
+                single_item => {
+                    compare_equality(left, "=", single_item, context).map_or(false, |r| r.to_boolean())
+                }
             };
 
             Ok(EvaluationResult::Boolean(is_in))
