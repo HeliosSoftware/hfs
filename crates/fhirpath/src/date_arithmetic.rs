@@ -1,4 +1,4 @@
-use chrono::{Duration, NaiveDate, NaiveDateTime, Datelike};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc, Datelike};
 use fhirpath_support::{EvaluationError, EvaluationResult};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -80,7 +80,7 @@ pub fn add_date_time_quantity(
 
                 match result {
                     Some(new_dt) => Ok(EvaluationResult::DateTime(
-                        new_dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                        new_dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     )),
                     None => Err(EvaluationError::TypeError("DateTime arithmetic overflow".to_string())),
                 }
@@ -194,8 +194,8 @@ pub fn date_time_difference(
                 .ok_or_else(|| EvaluationError::TypeError(format!("Invalid datetime: {}", dt2)))?;
             
             let diff = match unit {
-                "year" | "years" => calculate_year_difference(d1.date(), d2.date()),
-                "month" | "months" => calculate_month_difference(d1.date(), d2.date()),
+                "year" | "years" => calculate_year_difference(d1.date_naive(), d2.date_naive()),
+                "month" | "months" => calculate_month_difference(d1.date_naive(), d2.date_naive()),
                 "week" | "weeks" => {
                     let days = (d1.signed_duration_since(d2)).num_days();
                     Decimal::from(days / 7)
@@ -287,9 +287,10 @@ fn add_years_to_date(date: NaiveDate, years: i64) -> Option<NaiveDate> {
 }
 
 /// Helper function to add years to a datetime
-fn add_years_to_datetime(dt: NaiveDateTime, years: i64) -> Option<NaiveDateTime> {
-    add_years_to_date(dt.date(), years).map(|new_date| {
-        NaiveDateTime::new(new_date, dt.time())
+fn add_years_to_datetime(dt: DateTime<Utc>, years: i64) -> Option<DateTime<Utc>> {
+    add_years_to_date(dt.date_naive(), years).map(|new_date_naive| {
+        let naive_dt = NaiveDateTime::new(new_date_naive, dt.time());
+        DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc)
     })
 }
 
@@ -308,9 +309,10 @@ fn add_months_to_date(date: NaiveDate, months: i64) -> Option<NaiveDate> {
 }
 
 /// Helper function to add months to a datetime
-fn add_months_to_datetime(dt: NaiveDateTime, months: i64) -> Option<NaiveDateTime> {
-    add_months_to_date(dt.date(), months).map(|new_date| {
-        NaiveDateTime::new(new_date, dt.time())
+fn add_months_to_datetime(dt: DateTime<Utc>, months: i64) -> Option<DateTime<Utc>> {
+    add_months_to_date(dt.date_naive(), months).map(|new_date_naive| {
+        let naive_dt = NaiveDateTime::new(new_date_naive, dt.time());
+        DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc)
     })
 }
 
