@@ -507,30 +507,9 @@ fn test_r4_test_suite() {
         for test in tests {
             total_tests += 1;
 
-            // Skip invalid expressions for now
-            if !test.invalid.is_empty() {
-                println!(
-                    "  SKIP: {} - Invalid expression: {}",
-                    test.name, test.expression
-                );
-                skipped_tests += 1;
-                continue;
-            }
-
             // Skip tests with empty expressions
             if test.expression.is_empty() {
                 println!("  SKIP: {} - Empty expression", test.name);
-                skipped_tests += 1;
-                continue;
-            }
-
-            // Check if this is an explicitly marked invalid expression
-            // These are expected to fail and are skipped in the test suite
-            if !test.invalid.is_empty() {
-                println!(
-                    "  SKIP: {} - Invalid expression: {}",
-                    test.name, test.expression
-                );
                 skipped_tests += 1;
                 continue;
             }
@@ -634,49 +613,62 @@ fn test_r4_test_suite() {
 
             // Run the test
             let is_predicate_test = test.predicate == "true";
-            match run_fhir_r4_test(
+            let test_run_result = run_fhir_r4_test(
                 &test.expression,
                 &context,
                 &expected_results,
                 is_predicate_test,
-            ) {
-                Ok(_) => {
-                    println!("  PASS: {} - '{}'", test.name, test.expression);
-                    passed_tests += 1;
-                }
-                Err(e) => {
-                    // We're now treating all evaluation issues as failures
-                    // This ensures we don't artificially pass tests with unimplemented features
+            );
 
-                    if e.contains("Unsupported function called") {
-                        // Unsupported functions are now treated as failures, not skipped
+            if !test.invalid.is_empty() {
+                // This test is expected to be invalid (e.g., "semantic" or "syntax" error)
+                match test_run_result {
+                    Ok(_) => {
+                        // Expected an error, but got Ok. This is a failure.
                         println!(
-                            "  NOT IMPLEMENTED: {} - '{}' - Function not implemented: {}",
-                            test.name, test.expression, e
+                            "  FAIL (expected error '{}'): {} - '{}' - Got Ok instead of error",
+                            test.invalid, test.name, test.expression
                         );
                         failed_tests += 1;
-                    } else if e.contains("TypeError")
-                        || e.contains("Empty")
-                        || e.contains("doesn't match")
-                    {
-                        // Any type errors or empty results are implementation issues
+                    }
+                    Err(e) => {
+                        // Expected an error and got an error. This is a pass for an invalid test.
+                        // We could be more specific here, e.g. if invalid="semantic", check for TypeError.
+                        // For now, any error is considered a pass for an invalid test.
                         println!(
-                            "  NOT IMPLEMENTED: {} - '{}' - {}",
+                            "  PASS (invalid test): {} - '{}' - Correctly failed with: {}",
                             test.name, test.expression, e
                         );
-                        failed_tests += 1;
-                    } else {
-                        // All other errors are also counted as failures
-                        println!("  FAIL: {} - '{}' - {}", test.name, test.expression, e);
-                        failed_tests += 1;
+                        passed_tests += 1;
+                    }
+                }
+            } else {
+                // This test is expected to be valid
+                match test_run_result {
+                    Ok(_) => {
+                        // Test ran successfully, expected_results should have been compared by run_fhir_r4_test
+                        // If run_fhir_r4_test returned Ok, it means the outputs matched.
+                        println!("  PASS: {} - '{}'", test.name, test.expression);
+                        passed_tests += 1;
+                    }
+                    Err(e) => {
+                        // Test was expected to be valid but failed.
+                        // Classify as FAIL or NOT IMPLEMENTED.
+                        if e.contains("Unsupported function called") || e.contains("Not yet implemented") {
+                            println!(
+                                "  NOT IMPLEMENTED: {} - '{}' - {}",
+                                test.name, test.expression, e
+                            );
+                            failed_tests += 1; 
+                        } else {
+                            println!("  FAIL: {} - '{}' - {}", test.name, test.expression, e);
+                            failed_tests += 1;
+                        }
                     }
                 }
             }
         }
     }
-
-    // failed_tests is now incremented directly in the code
-    // No need to calculate it here
 
     println!("\nTest Summary:");
     println!("  Total tests: {}", total_tests);
