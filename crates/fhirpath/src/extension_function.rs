@@ -252,8 +252,8 @@ mod tests {
         ).unwrap();
         
         // Verify the result is a collection containing both extensions
-        assert!(matches!(result, EvaluationResult::Collection(_)));
-        if let EvaluationResult::Collection(extensions) = result {
+        assert!(matches!(result, EvaluationResult::Collection { .. })); // Updated pattern
+        if let EvaluationResult::Collection { items: extensions, .. } = result { // Destructure
             assert_eq!(extensions.len(), 2);
             assert_eq!(extensions[0], extension1);
             assert_eq!(extensions[1], extension2);

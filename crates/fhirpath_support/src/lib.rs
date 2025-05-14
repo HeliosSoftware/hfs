@@ -28,13 +28,7 @@ pub enum EvaluationResult {
     Object(HashMap<String, EvaluationResult>),
 }
 
-/// Data for a collection, including items and order status
-// Remove derived traits as EvaluationResult's implementations are manual
-#[derive(Debug, Clone)] 
-pub struct CollectionData {
-    pub items: Vec<EvaluationResult>,
-    pub has_undefined_order: bool,
-}
+// Removed CollectionData struct as it's no longer needed with the new Collection variant structure
 
 /// Represents errors that can occur during FHIRPath evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
