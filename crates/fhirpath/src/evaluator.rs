@@ -1623,7 +1623,7 @@ fn call_function(
         "isDistinct" => {
             // Returns true if all items in the collection are distinct (based on equality)
             let items = match invocation_base {
-                EvaluationResult::Collection(items) => items.clone(),
+                EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()], // Treat single item as collection
             };
