@@ -408,7 +408,7 @@ fn test_basic_fhirpath_expressions() {
     let total = test_cases.len();
 
     for (expr, expected) in &test_cases {
-        match run_fhir_r4_test(expr, &context, &[expected.clone()]) {
+        match run_fhir_r4_test(expr, &context, &[expected.clone()], false) {
             Ok(_) => {
                 println!("  PASS: '{}'", expr);
                 passed += 1;
