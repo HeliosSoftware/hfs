@@ -56,7 +56,7 @@ pub fn extension_function(
 
     if let EvaluationResult::Object(obj) = invocation_base {
         // Case 1: Check for direct extension array on this element
-        if let Some(EvaluationResult::Collection(extensions)) = obj.get("extension") {
+        if let Some(EvaluationResult::Collection { items: extensions, .. }) = obj.get("extension") { // Destructure
             let result = find_extension_by_url(extensions, extension_url)?;
             if !matches!(result, EvaluationResult::Empty) {
                 return Ok(result);
@@ -64,7 +64,7 @@ pub fn extension_function(
         }
         
         // Case 2: Check for modifierExtension
-        if let Some(EvaluationResult::Collection(mod_extensions)) = obj.get("modifierExtension") {
+        if let Some(EvaluationResult::Collection { items: mod_extensions, .. }) = obj.get("modifierExtension") { // Destructure
             let result = find_extension_by_url(mod_extensions, extension_url)?;
             if !matches!(result, EvaluationResult::Empty) {
                 return Ok(result);
@@ -100,7 +100,8 @@ fn find_extension_by_url(
     } else if matching_extensions.len() == 1 {
         Ok(matching_extensions[0].clone())
     } else {
-        Ok(EvaluationResult::Collection(matching_extensions))
+        // Extensions are typically ordered as they appear in the resource
+        Ok(EvaluationResult::Collection { items: matching_extensions, has_undefined_order: false })
     }
 }
 
@@ -130,9 +131,9 @@ pub fn find_extension_in_underscore_property(
     // Look for the underscore-prefixed element
     if let Some(EvaluationResult::Object(underscore_obj)) = parent_obj.get(&underscore_name) {
         // Check for extensions array
-        if let Some(EvaluationResult::Collection(extensions)) = underscore_obj.get("extension") {
+        if let Some(EvaluationResult::Collection { items: extensions, .. }) = underscore_obj.get("extension") { // Destructure
             // Search for matching extension
-            for ext in extensions {
+            for ext in extensions { // Iterate over destructured items
                 if let EvaluationResult::Object(ext_obj) = ext {
                     if let Some(EvaluationResult::String(ext_url)) = ext_obj.get("url") {
                         if ext_url == extension_url {

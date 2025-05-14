@@ -47,24 +47,19 @@ pub fn truncate(invocation_base: &EvaluationResult, args: &[EvaluationResult])
     // Handle different collection cases
     match invocation_base {
         EvaluationResult::Empty => {
-            // Empty result returns empty
             return Ok(EvaluationResult::Empty);
         },
-        EvaluationResult::Collection(items) => {
+        EvaluationResult::Collection { items, .. } => { // Destructure
             if items.is_empty() {
-                // Empty collection returns empty
                 return Ok(EvaluationResult::Empty);
             } else if items.len() > 1 {
-                // Multiple items - error per FHIRPath spec
                 return Err(EvaluationError::SingletonEvaluationError(
                     "truncate requires a singleton input".to_string(),
                 ));
             } else {
-                // Single item collection - apply truncate to the item
                 return truncate_numeric(&items[0]);
             }
         }
-        // For scalar values, apply truncate_numeric directly
         _ => truncate_numeric(invocation_base),
     }
 }

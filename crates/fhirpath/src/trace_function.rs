@@ -93,13 +93,14 @@ pub fn trace_function(
     // Determine what to trace: either the input collection or a projection of it
     let trace_value = if let Some(projection) = projection_expr {
         // When projection is provided, evaluate it on each item and collect results
-        let items = match invocation_base {
-            EvaluationResult::Collection(items) => items.clone(),
-            EvaluationResult::Empty => Vec::new(),
-            single_item => vec![single_item.clone()],
+        let (items, base_was_unordered) = match invocation_base {
+            EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order), // Destructure
+            EvaluationResult::Empty => (Vec::new(), false),
+            single_item => (vec![single_item.clone()], false),
         };
 
         let mut projected_items = Vec::new();
+        let mut projected_is_unordered = base_was_unordered; // Start with base order status
         for item in items {
             // Evaluate the projection expression with the current item as context
             let result = evaluate(projection, context, Some(&item))?;

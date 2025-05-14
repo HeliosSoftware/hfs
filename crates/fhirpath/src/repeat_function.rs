@@ -26,7 +26,7 @@ pub fn repeat_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Get the initial items to traverse
     let initial_items = match invocation_base {
-        EvaluationResult::Collection(items) => items.clone(),
+        EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
         EvaluationResult::Empty => Vec::new(),
         single_item => vec![single_item.clone()],
     };
@@ -60,10 +60,10 @@ pub fn repeat_function(
             let projected = evaluate(projection_expr, context, Some(item))?;
             
             // Flatten the projection result
-            let projected_items = match projected {
-                EvaluationResult::Collection(items) => items,
-                EvaluationResult::Empty => Vec::new(),
-                single_item => vec![single_item],
+            let (projected_items, _projected_order_status) = match projected { // Capture order status if needed, though repeat() output is unordered
+                EvaluationResult::Collection { items, .. } => (items, false), // Destructure, order status of sub-projection doesn't make overall repeat ordered
+                EvaluationResult::Empty => (Vec::new(), false),
+                single_item => (vec![single_item], false),
             };
             
             // Process each projected item
@@ -93,7 +93,8 @@ pub fn repeat_function(
     } else if result.len() == 1 {
         Ok(result[0].clone())
     } else {
-        Ok(EvaluationResult::Collection(result))
+        // repeat() output order is undefined
+        Ok(EvaluationResult::Collection { items: result, has_undefined_order: true })
     }
 }
 

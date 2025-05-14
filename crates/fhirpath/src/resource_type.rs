@@ -31,11 +31,11 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
     }
     
     // Handle collections for expressions like "1 | 1 is Integer"
-    if let EvaluationResult::Collection(items) = value {
+    if let EvaluationResult::Collection { items, .. } = value { // Destructure
         // If checking if a collection is a specific type, check if all items are of that type
         if !items.is_empty() {
             // Check each item in the collection
-            for item in items {
+            for item in items { // Iterate over destructured items
                 if !is_of_type(item, type_spec)? {
                     return Ok(false);
                 }
@@ -558,19 +558,16 @@ pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Resu
         if result.is_empty() {
             Ok(EvaluationResult::Empty)
         } else if result.len() == 1 {
-            // Special case: if there's only one result, return it directly (unwrapped)
-            // This matches FHIRPath normalization rules
             Ok(result[0].clone())
         } else {
-            Ok(EvaluationResult::Collection(result))
+            // ofType preserves the order of the input collection
+            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
+            Ok(EvaluationResult::Collection { items: result, has_undefined_order: input_was_unordered })
         }
     };
     
     match collection {
-        // For collections, filter based on type
-        EvaluationResult::Collection(items) => apply_type_filter(items),
-        
-        // Empty -> Empty
+        EvaluationResult::Collection { items, .. } => apply_type_filter(items), // Destructure
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         
         // For a singleton value, treat it like a collection of one

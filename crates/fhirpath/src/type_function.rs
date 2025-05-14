@@ -8,23 +8,20 @@ pub fn get_type_info(value: &EvaluationResult) -> EvaluationResult {
     
     match value {
         EvaluationResult::Empty => {
-            // Return Empty for Empty
             return EvaluationResult::Empty;
         },
-        EvaluationResult::Collection(items) => {
+        EvaluationResult::Collection { items, has_undefined_order } => { // Destructure
             if items.is_empty() {
-                // Empty collection returns Empty
                 return EvaluationResult::Empty;
             } else if items.len() == 1 {
-                // Single item collection - get type of the item
                 return get_type_info(&items[0]);
             } else {
-                // Multi-item collection - Return a collection of types
                 let type_infos: Vec<EvaluationResult> = items
                     .iter()
                     .map(|item| get_type_info(item))
                     .collect();
-                return EvaluationResult::Collection(type_infos);
+                // The order of types corresponds to the order of items in the input collection.
+                return EvaluationResult::Collection { items: type_infos, has_undefined_order: *has_undefined_order };
             }
         },
         EvaluationResult::Boolean(_) => {
@@ -301,18 +298,19 @@ pub fn type_function(
     return_full_object: bool,
 ) -> Result<EvaluationResult, EvaluationError> {
     // Special handling for collections based on test expectations
-    if let EvaluationResult::Collection(items) = invocation_base {
+    if let EvaluationResult::Collection { items, has_undefined_order } = invocation_base { // Destructure
         if items.len() > 1 {
             // For multi-item collections in tests, we need to return a collection of types
             let mut type_results = Vec::new();
-            for item in items {
+            for item in items { // Iterate over destructured items
                 type_results.push(if return_full_object {
                     get_type_info(item)
                 } else {
                     get_type_name(item)
                 });
             }
-            return Ok(EvaluationResult::Collection(type_results));
+            // Preserve order status of the input collection for the collection of types
+            return Ok(EvaluationResult::Collection { items: type_results, has_undefined_order: *has_undefined_order });
         }
     }
     

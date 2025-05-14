@@ -305,7 +305,7 @@ pub fn apply_polymorphic_type_operation(
     }
 
     // Special handling for collections
-    if let EvaluationResult::Collection(items) = value {
+    if let EvaluationResult::Collection { items, .. } = value { // Destructure
         if items.len() != 1 {
             // FHIRPath requires singleton operand for type operations
             return Ok(EvaluationResult::Empty);
