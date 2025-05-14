@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use fhirpath_support::EvaluationResult;
 use std::cmp::Ordering;
 
@@ -43,40 +43,44 @@ pub fn parse_time(time_str: &str) -> Option<NaiveTime> {
     }
 }
 
-/// Parses a datetime string to a NaiveDateTime
-/// Handles various formats including timezone information
-pub fn parse_datetime(datetime_str: &str) -> Option<NaiveDateTime> {
-    // Split by 'T' to get date and time parts
+/// Parses a datetime string to a DateTime<Utc>
+/// Handles various formats including timezone information by normalizing to UTC.
+pub fn parse_datetime(datetime_str: &str) -> Option<DateTime<Utc>> {
+    // Attempt to parse directly as RFC3339, which handles offsets.
+    // This will work for "YYYY-MM-DDTHH:MM:SS[.sss][Z|+/-HH:MM]"
+    if let Ok(dt_with_offset) = DateTime::parse_from_rfc3339(datetime_str) {
+        return Some(dt_with_offset.with_timezone(&Utc));
+    }
+
+    // Fallback for partial datetimes or those without explicit offsets.
+    // These are interpreted based on available components and assumed UTC if no offset specified.
     let parts: Vec<&str> = datetime_str.splitn(2, 'T').collect();
-    
+
     if parts.len() == 2 {
-        let date_str = parts[0];
-        let mut time_str = parts[1];
-        
-        // Remove timezone info for parsing as NaiveDateTime
-        if time_str.contains('Z') {
-            time_str = time_str.trim_end_matches('Z');
-        } else if time_str.contains('+') || time_str.contains('-') {
-            let idx = time_str.find(|c| c == '+' || c == '-').unwrap_or(time_str.len());
-            time_str = &time_str[..idx];
-        }
-        
-        // Parse date and time separately
-        let date = parse_date(date_str)?;
-        let time = if time_str.is_empty() {
+        // Format like "YYYY-MM-DDTHH:MM:SS" (no offset) or "YYYY-MM-DDTHH" etc.
+        let date_part_str = parts[0];
+        let time_part_str = parts[1];
+
+        let date = parse_date(date_part_str)?; // NaiveDate
+
+        let time = if time_part_str.is_empty() { // e.g., "YYYY-MM-DDTHH" (T implies start of period)
             NaiveTime::from_hms_opt(0, 0, 0)?
         } else {
-            parse_time(time_str)?
+            parse_time(time_part_str)? // NaiveTime
         };
         
-        // Combine into a NaiveDateTime
-        Some(NaiveDateTime::new(date, time))
+        let naive_dt = NaiveDateTime::new(date, time);
+        // For datetimes parsed without an explicit offset, assume they are UTC.
+        Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))
+
     } else if parts.len() == 1 {
-        // Only date part
-        let date = parse_date(parts[0])?;
-        Some(NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0)?))
+        // Only a date part, e.g., "YYYY-MM-DD". FHIRPath treats this as a DateTime at the start of the day.
+        let date = parse_date(parts[0])?; // NaiveDate
+        let naive_dt = NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0)?);
+        // Assume UTC for date-only strings converted to DateTime.
+        Some(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))
     } else {
-        None
+        None // Unparseable format
     }
 }
 
