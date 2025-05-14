@@ -40,6 +40,7 @@ pub enum EvaluationError {
     InvalidTypeSpecifier(String),
     // Error for singleton evaluation failures
     SingletonEvaluationError(String), // e.g., "Expected singleton, found collection with N items"
+    SemanticError(String), // Added for semantic errors like accessing non-existent members in strict mode
     // Add more specific errors as needed
     Other(String), // Generic error
 }
@@ -62,6 +63,7 @@ impl std::fmt::Display for EvaluationError {
             EvaluationError::InvalidRegex(msg) => write!(f, "Invalid Regex: {}", msg),
             EvaluationError::InvalidTypeSpecifier(msg) => write!(f, "Invalid Type Specifier: {}", msg),
             EvaluationError::SingletonEvaluationError(msg) => write!(f, "Singleton Evaluation Error: {}", msg),
+            EvaluationError::SemanticError(msg) => write!(f, "Semantic Error: {}", msg),
             EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
         }
     }
