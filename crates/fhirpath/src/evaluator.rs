@@ -4906,12 +4906,11 @@ fn apply_additive(
                 )));
             }
 
-            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
-                return Ok(EvaluationResult::Empty);
-            }
-
-            // At this point, both are singletons (and not Empty)
-            // to_string_value() is appropriate here as per spec "string representation of its operands"
+            // If one of the operands is Empty, to_string_value() will convert it to "".
+            // The multi-item collection check above ensures that if an operand is a collection,
+            // it's not a multi-item collection. Empty collections have count() = 0.
+            // The spec says: "Otherwise, the operator concatenates the string representation of its operands."
+            // This implies that Empty operands should also have their string representation used for concatenation.
             let left_str = left.to_string_value();
             let right_str = right.to_string_value();
             
