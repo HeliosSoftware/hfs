@@ -2775,31 +2775,27 @@ fn call_function(
                             // Single part: Must be parseable as a number (int or decimal)
                             parts[0].parse::<Decimal>().is_ok()
                         }
-                        2 => {
-                            // Two parts: Value must parse AND unit must be valid
+                        2 => { // Value and Unit parts
                             let value_parses = parts[0].parse::<Decimal>().is_ok();
                             if !value_parses {
-                                false // Value part doesn't parse
+                                false // Value part does not parse to a number
                             } else {
                                 let original_unit_part = parts[1];
-                                let unit_after_trimming_quotes = original_unit_part.trim_matches('\'');
-
-                                if unit_after_trimming_quotes.is_empty() {
-                                    false // Empty unit after trimming
+                                // According to FHIRPath spec, the unit in a string representation
+                                // of a quantity must be enclosed in single quotes.
+                                if original_unit_part.starts_with('\'') &&
+                                   original_unit_part.ends_with('\'') &&
+                                   original_unit_part.len() >= 2 { // Ensures there are quotes and potentially content
+                                    
+                                    // Extract the content within the quotes
+                                    let unit_content = &original_unit_part[1..original_unit_part.len()-1];
+                                    
+                                    // Validate the unit content (e.g., "mg", "wk", "day")
+                                    // is_valid_fhirpath_quantity_unit handles empty content (e.g. from "''")
+                                    is_valid_fhirpath_quantity_unit(unit_content)
                                 } else {
-                                    let is_structurally_valid_unit = is_valid_fhirpath_quantity_unit(unit_after_trimming_quotes);
-                                    if !is_structurally_valid_unit {
-                                        false // Not a structurally valid unit (e.g. contains invalid chars)
-                                    } else {
-                                        // Special handling for "wk" to pass testStringQuantityWeekConvertsToQuantityFalse
-                                        // This logic implies "wk" is only valid if it was quoted in the input string.
-                                        if unit_after_trimming_quotes == "wk" {
-                                            original_unit_part.starts_with('\'') && original_unit_part.ends_with('\'') && original_unit_part.len() >= 2
-                                        } else {
-                                            // For all other units, if is_valid_fhirpath_quantity_unit passed, it's convertible.
-                                            true
-                                        }
-                                    }
+                                    // Unit part is not properly single-quoted
+                                    false
                                 }
                             }
                         }
