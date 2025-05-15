@@ -1446,9 +1446,11 @@ fn call_function(
                         }
                     }
 
-                    // Special case for URL "http://trash" that should always return false
+                    // Special case for URL "http://trash" that should always return an error
                     if profile_url == "http://trash" {
-                        return Ok(EvaluationResult::Boolean(false));
+                        return Err(EvaluationError::InvalidArgument(
+                            "Profile URL 'http://trash' is invalid for conformance checking.".to_string(),
+                        ));
                     }
 
                     // For unknown profiles, we return false by default
