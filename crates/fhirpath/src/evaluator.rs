@@ -5337,12 +5337,45 @@ fn compare_equality(
                         EvaluationResult::Boolean(false)
                     }
                 }
+                // Object = Object comparison
+                (EvaluationResult::Object(map_l), EvaluationResult::Object(map_r)) => {
+                    // FHIRPath Spec: "Equality of two complex types ... is never true;
+                    // they are only equal if they are the same choice of actual type
+                    // and the values of all their components are equal."
+                    if map_l.len() != map_r.len() {
+                        EvaluationResult::Boolean(false)
+                    } else {
+                        let mut all_fields_definitively_equal = true;
+                        for (key_l, value_l) in map_l {
+                            match map_r.get(key_l) {
+                                Some(value_r) => {
+                                    // Recursively compare values using strict equality '='.
+                                    match compare_equality(value_l, "=", value_r, context) {
+                                        Ok(EvaluationResult::Boolean(true)) => { /* field is equal, continue */ }
+                                        Ok(EvaluationResult::Boolean(false)) | Ok(EvaluationResult::Empty) => {
+                                            all_fields_definitively_equal = false;
+                                            break;
+                                        }
+                                        Err(e) => return Err(e), // Propagate error from recursive call
+                                        _ => { // Should not happen if compare_equality returns Boolean or Empty on Ok
+                                            return Err(EvaluationError::TypeError(
+                                                "Unexpected non-boolean/non-empty result from field equality check".to_string()
+                                            ));
+                                        }
+                                    }
+                                }
+                                None => { // Key in left map not found in right map
+                                    all_fields_definitively_equal = false;
+                                    break;
+                                }
+                            }
+                        }
+                        EvaluationResult::Boolean(all_fields_definitively_equal)
+                    }
+                }
                 // General case: if types are different and not handled by specific rules above, equality is false.
                 _ if left.type_name() != right.type_name() => EvaluationResult::Boolean(false),
-                // If types are the same but not handled by any specific rule above (e.g. two Objects),
-                // this indicates an unhandled comparison scenario for identical types.
-                // FHIRPath spec implies complex types are compared field by field, which is not fully implemented here.
-                // For now, default to false for unhandled same-type comparisons.
+                // If types are the same but not handled by any specific rule above
                 _ => EvaluationResult::Boolean(false),
             })
         }
