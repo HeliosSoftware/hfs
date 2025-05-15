@@ -5226,10 +5226,17 @@ fn compare_equality(
                         has_undefined_order: r_undef,
                     },
                 ) => {
-                    // For strict equality, order matters, and undefined_order flags must also match.
-                    if l_undef != r_undef || l_items.len() != r_items.len() {
+                    // For strict equality, order matters.
+                    // The has_undefined_order flag itself does not contribute to equality if the
+                    // items and their sequence are identical. The primary check is item count and sequence.
+                    if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
                     } else {
+                        // If l_undef is false (ordered) and r_undef is true (unordered),
+                        // they can still be equal if the items in r_items happen to be in the same order as l_items.
+                        // If both are unordered, their current sequence must match.
+                        // If both are ordered, their sequence must match.
+                        // The critical aspect is that the sequence of items in both collections, as they currently are, must be identical.
                         let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
                             compare_equality(li, "=", ri, context).map_or(false, |r| r.to_boolean())
                         });
