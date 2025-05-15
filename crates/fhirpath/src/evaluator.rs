@@ -218,8 +218,9 @@ pub fn evaluate(
                             ) => {
                                 // Scenario 2: `object.field.extension()`
                                 // Evaluate the parent expression (e.g., `object` in `object.field`)
+                                // Ensure parent_expr_of_field (e.g., "Patient") is evaluated in global context by passing None for current_item.
                                 let parent_obj_eval_result =
-                                    evaluate(parent_expr_of_field, context, current_item)?;
+                                    evaluate(parent_expr_of_field, context, None)?;
                                 if let EvaluationResult::Object(ref actual_parent_map) =
                                     parent_obj_eval_result
                                 {
