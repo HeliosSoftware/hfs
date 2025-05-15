@@ -1406,63 +1406,6 @@ fn call_function(
 
             apply_type_operation(invocation_base, name, &type_spec, context) // Pass context
         }
-        // Handle the conformsTo() function
-        "conformsTo" => {
-            // Check that we have exactly one argument (the profile URL)
-            if args.len() != 1 {
-                return Err(EvaluationError::InvalidArity(format!(
-                    "Function 'conformsTo' expects 1 argument, got {}",
-                    args.len()
-                )));
-            }
-
-            // Get the profile URL from the argument
-            let profile_url = match &args[0] {
-                EvaluationResult::String(url) => url,
-                _ => {
-                    return Err(EvaluationError::TypeError(format!(
-                        "conformsTo() function requires a string URL argument, got {}",
-                        args[0].type_name()
-                    )));
-                }
-            };
-
-            // For FHIR resources, we should check if the resource conforms to the provided profile
-            // Currently we'll implement a basic check that just verifies if the URL is a known FHIR URL
-
-            if let EvaluationResult::Object(obj) = invocation_base {
-                // Check if this is a FHIR resource with matching resourceType
-                if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
-                    // Simple pattern: check if the URL contains the resource type and is a valid FHIR profile URL
-                    if profile_url.contains("http://hl7.org/fhir/StructureDefinition/") {
-                        // Extract the resource type from the URL
-                        let profile_parts: Vec<&str> = profile_url.split('/').collect();
-                        if let Some(profile_type) = profile_parts.last() {
-                            // For most FHIR profile URLs, the last part after the slash is the resource type
-                            // We do a case-insensitive comparison to account for casing differences
-                            if profile_type.eq_ignore_ascii_case(resource_type) {
-                                return Ok(EvaluationResult::Boolean(true));
-                            }
-                        }
-                    }
-
-                    // Special case for URL "http://trash" that should always return an error
-                    if profile_url == "http://trash" {
-                        return Err(EvaluationError::InvalidArgument(
-                            "Profile URL 'http://trash' is invalid for conformance checking.".to_string(),
-                        ));
-                    }
-
-                    // For unknown profiles, we return false by default
-                    // A full implementation would check the profile definitions
-                    // and validate the resource against them
-                    return Ok(EvaluationResult::Boolean(false));
-                }
-            }
-
-            // If the base is not a FHIR resource, return false
-            Ok(EvaluationResult::Boolean(false))
-        }
         "count" => {
             // Returns the number of items in the collection, including duplicates
             Ok(match invocation_base {
