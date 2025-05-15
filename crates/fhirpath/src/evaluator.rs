@@ -2873,16 +2873,9 @@ fn call_function(
 
                     if let Some(length_res) = length_res_opt {
                         // Two arguments: start and length
-                        let length = match length_res {
-                            // If length is negative, return empty string per spec
-                            EvaluationResult::Integer(l) if *l < 0 => {
-                                return Ok(EvaluationResult::String("".to_string()));
-                            }
-                            // If length is non-negative integer, use it
-                            EvaluationResult::Integer(l) => *l as usize,
-                            // Handle empty length argument (treat as if not provided)
-                            EvaluationResult::Empty => s.chars().count() - start_index, // Length to end of string
-                            // Any other type for length is invalid
+                        let length_val = match length_res {
+                            EvaluationResult::Integer(l) => *l, // Store as i64 first
+                            EvaluationResult::Empty => return Ok(EvaluationResult::String("".to_string())), // length is {} -> ""
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
@@ -2890,18 +2883,28 @@ fn call_function(
                             }
                         };
 
-                        let result: String = s.chars().skip(start_index).take(length).collect();
+                        // Spec: "If length ... a value less than or equal to 0, the result is an empty string ('')."
+                        if length_val <= 0 {
+                            return Ok(EvaluationResult::String("".to_string()));
+                        }
+                        
+                        // Now length_val is > 0
+                        // Note: start_usize was defined in the previous block which was successfully applied.
+                        // We use start_usize here as intended by the previous change.
+                        let length_usize = length_val as usize;
+                        let result: String = s.chars().skip(start_usize).take(length_usize).collect();
                         EvaluationResult::String(result)
                     } else {
                         // One argument: start index only (substring to end)
-                        let result: String = s.chars().skip(start_index).collect();
+                        // Note: start_usize was defined in the previous block.
+                        let result: String = s.chars().skip(start_usize).collect();
                         EvaluationResult::String(result)
                     }
                 }
-                EvaluationResult::Empty => EvaluationResult::Empty,
+                EvaluationResult::Empty => EvaluationResult::Empty, // substring on {} is {}
                 // Collections handled by initial check
-                EvaluationResult::Collection { .. } => unreachable!(),
-                _ => {
+                EvaluationResult::Collection { .. } => unreachable!(), // Should have been caught by singleton check
+                _ => { // Non-string, non-empty, non-collection base
                     return Err(EvaluationError::TypeError(
                         "substring requires a String input".to_string(),
                     ));
