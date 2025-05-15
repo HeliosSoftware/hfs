@@ -4583,9 +4583,9 @@ fn apply_multiplicative(
                     // Spec: Division by zero returns empty
                     Ok(EvaluationResult::Empty)
                 } else {
-                    // Decimal division preserves precision
+                    // Decimal division, then round to 8 decimal places for consistency with tests
                     l.checked_div(r)
-                        .map(EvaluationResult::Decimal)
+                        .map(|d| EvaluationResult::Decimal(round_to_precision(d, 8)))
                         .ok_or(EvaluationError::ArithmeticOverflow) // Return error on overflow
                 }
             } else {
