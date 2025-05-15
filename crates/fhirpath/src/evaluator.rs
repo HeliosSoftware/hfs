@@ -5240,7 +5240,19 @@ fn compare_equality(
     right: &EvaluationResult,
     context: &EvaluationContext, // Added context
 ) -> Result<EvaluationResult, EvaluationError> {
-    // Changed return type
+    // Apply singleton evaluation if one operand is a single-item collection and the other is scalar
+    let (l_cmp, r_cmp) = match (left, right) {
+        (EvaluationResult::Collection { items, .. }, r_val) if items.len() == 1 && !r_val.is_collection() => {
+            // Left is single-item collection, Right is scalar
+            (items[0].clone(), r_val.clone())
+        }
+        (l_val, EvaluationResult::Collection { items, .. }) if items.len() == 1 && !l_val.is_collection() => {
+            // Left is scalar, Right is single-item collection
+            (l_val.clone(), items[0].clone())
+        }
+        _ => (left.clone(), right.clone()) // Default: use original operands (or both are collections/scalars already)
+    };
+
     // Helper function for string equivalence normalization
     fn normalize_string(s: &str) -> String {
         let trimmed = s.trim();
@@ -5251,10 +5263,11 @@ fn compare_equality(
     match op {
         "=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
-            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+            // Use l_cmp and r_cmp which might have been unwrapped
+            if l_cmp == EvaluationResult::Empty || r_cmp == EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
-            Ok(match (left, right) {
+            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
                 // Wrap result in Ok
                 (
                     EvaluationResult::Collection {
@@ -5278,15 +5291,18 @@ fn compare_equality(
                         // If both are ordered, their sequence must match.
                         // The critical aspect is that the sequence of items in both collections, as they currently are, must be identical.
                         let all_equal = l_items.iter().zip(r_items.iter()).all(|(li, ri)| {
+                            // Recursive call should use original left/right if they were collections,
+                            // or the potentially unwrapped l_cmp/r_cmp if they were scalars.
+                            // However, for Collection = Collection, items are always elements.
                             compare_equality(li, "=", ri, context).map_or(false, |r| r.to_boolean())
                         });
                         EvaluationResult::Boolean(all_equal)
                     }
                 }
-                // If only one is a collection, they are not equal
+                // If only one is a collection (after potential unwrap of the other side), they are not equal.
+                // This case should be less common now due to the initial unwrap.
                 (EvaluationResult::Collection { .. }, _)
                 | (_, EvaluationResult::Collection { .. }) => {
-                    // Updated pattern
                     EvaluationResult::Boolean(false)
                 }
                 // Primitive comparison (Empty case handled above)
@@ -5310,36 +5326,27 @@ fn compare_equality(
                 }
                 // Attempt date/time comparison first if either operand could be date/time related
                 _ if (matches!(
-                    left,
+                    l_cmp, // Use l_cmp
                     EvaluationResult::Date(_)
                         | EvaluationResult::DateTime(_)
                         | EvaluationResult::Time(_)
                         | EvaluationResult::String(_)
                 ) && matches!(
-                    right,
+                    r_cmp, // Use r_cmp
                     EvaluationResult::Date(_)
                         | EvaluationResult::DateTime(_)
                         | EvaluationResult::Time(_)
                         | EvaluationResult::String(_)
                 )) =>
                 {
-                    match crate::datetime_impl::compare_date_time_values(left, right) {
+                    match crate::datetime_impl::compare_date_time_values(&l_cmp, &r_cmp) { // Use l_cmp, r_cmp
                         Some(ordering) => {
                             EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal)
                         }
                         None => {
-                            // compare_date_time_values returned None. This means the values are not comparable
-                            // under date/time specific rules (e.g., String "abc" vs Date, or Date vs Time).
-                            // According to general FHIRPath equality, if types are different and not
-                            // implicitly convertible, '=' is false.
-                            if left.type_name() == right.type_name() {
-                                // This case implies they are the same type (e.g. two Strings) but
-                                // one or both were not valid date/time representations for comparison.
-                                // If they were equal as strings, the String==String case above would have caught it.
-                                // So, if we reach here, they are not equal.
+                            if l_cmp.type_name() == r_cmp.type_name() {
                                 EvaluationResult::Boolean(false)
                             } else {
-                                // Different types, and not comparable as date/time values.
                                 EvaluationResult::Boolean(false)
                             }
                         }
@@ -5349,7 +5356,7 @@ fn compare_equality(
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
-                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r), // Simple string comparison for units
+                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
 
                 // Object vs Quantity for equality
                 (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
@@ -5414,49 +5421,44 @@ fn compare_equality(
                     }
                 }
                 // General case: if types are different and not handled by specific rules above, equality is false.
-                _ if left.type_name() != right.type_name() => EvaluationResult::Boolean(false),
+                _ if l_cmp.type_name() != r_cmp.type_name() => EvaluationResult::Boolean(false),
                 // If types are the same but not handled by any specific rule above
                 _ => EvaluationResult::Boolean(false),
             })
         }
         "!=" => {
             // FHIRPath Spec 5.1 Equality (=, !=): If either operand is empty, the result is empty.
-            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+            // Use l_cmp and r_cmp
+            if l_cmp == EvaluationResult::Empty || r_cmp == EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
             // Strict inequality: Negation of '='
-            // Pass context to compare_equality
-            let eq_result = compare_equality(left, "=", right, context)?; // Propagate error
+            // Pass context to compare_equality, using original left/right for recursion,
+            // as l_cmp/r_cmp are local to this call.
+            let eq_result = compare_equality(left, "=", right, context)?;
             Ok(match eq_result {
-                // Wrap result in Ok
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                // If '=' returned Empty (due to empty operand), '!=' also returns Empty
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                _ => EvaluationResult::Empty, // Should not happen otherwise
+                _ => EvaluationResult::Empty, 
             })
         }
         "~" => {
             // Equivalence: Order doesn't matter, duplicates DO matter.
-            Ok(match (left, right) {
-                // Wrap result in Ok
-                // Handle Empty cases specifically for '~'
+            // Use l_cmp and r_cmp for equivalence checks too.
+            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
                 }
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
                 }
-                // String equivalence (normalized)
                 (EvaluationResult::String(l), EvaluationResult::String(r)) => {
                     EvaluationResult::Boolean(normalize_string(l) == normalize_string(r))
                 }
-                // Collection equivalence: Order doesn't matter, duplicates DO matter.
-                // has_undefined_order flag does not affect equivalence.
                 (
                     EvaluationResult::Collection { items: l_items, .. },
                     EvaluationResult::Collection { items: r_items, .. },
                 ) => {
-                    // Destructure
                     if l_items.len() != r_items.len() {
                         EvaluationResult::Boolean(false)
                     } else {
@@ -5466,28 +5468,23 @@ fn compare_equality(
                         r_sorted.sort();
                         let all_equivalent =
                             l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
+                                // Recursive call should use original left/right if they were collections
                                 compare_equality(li, "~", ri, context)
                                     .map_or(false, |r| r.to_boolean())
                             });
                         EvaluationResult::Boolean(all_equivalent)
                     }
                 }
-                // If only one is a collection, they are not equivalent (Empty case handled earlier)
                 (EvaluationResult::Collection { .. }, _)
                 | (_, EvaluationResult::Collection { .. }) => {
-                    // Updated pattern
                     EvaluationResult::Boolean(false)
                 }
-                // Quantity equivalence (requires same units and equivalent values)
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
                 ) => {
-                    // For now, treat quantity equivalence same as equality (simple string unit comparison)
                     EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
-                    // TODO: Implement proper UCUM equivalence if needed (e.g. 'kg' ~ '1000 g')
                 }
-                // Object vs Quantity for equivalence
                 (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
@@ -5514,29 +5511,27 @@ fn compare_equality(
                     }
                 }
                 // Primitive equivalence falls back to strict equality ('=') for other types
-                _ => compare_equality(left, "=", right, context)?, // Propagate error, pass context
+                // Use original left/right for recursive call to ensure consistent behavior
+                _ => compare_equality(left, "=", right, context)?,
             })
         }
         "!~" => {
             // Non-equivalence: Negation of '~'
-            // Handle empty cases specifically for '!~'
-            Ok(match (left, right) {
-                // Wrap result in Ok
+            // Use l_cmp and r_cmp
+            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
-                } // Empty is equivalent to Empty
+                } 
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
-                } // Empty is not equivalent to non-empty
-                // For non-empty operands, negate the result of '~'
+                } 
                 _ => {
-                    // Pass context to compare_equality
-                    let equiv_result = compare_equality(left, "~", right, context)?; // Propagate error
+                    // Recursive call with original left/right
+                    let equiv_result = compare_equality(left, "~", right, context)?;
                     match equiv_result {
                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
-                        // If '~' somehow returned Empty for non-empty operands, propagate Empty
                         EvaluationResult::Empty => EvaluationResult::Empty,
-                        _ => EvaluationResult::Empty, // Should not happen
+                        _ => EvaluationResult::Empty, 
                     }
                 }
             })
