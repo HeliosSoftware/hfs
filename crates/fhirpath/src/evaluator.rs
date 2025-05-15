@@ -5114,7 +5114,7 @@ fn compare_inequality(
         (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
         // Quantity comparison (only if units match)
         (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
-            if unit_l == unit_r {
+            if unit_l == unit_r { // Simple string comparison for now
                 Some(val_l.cmp(val_r))
             } else {
                 // Incompatible units for comparison, return error
@@ -5124,7 +5124,53 @@ fn compare_inequality(
                 )));
             }
         }
-        // Incomparable types - Return error instead of None/Empty
+        // Object vs Quantity
+        (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
+            let val_l_obj = obj_l.get("value");
+            // Prefer "code" for unit comparison if available, fallback to "unit"
+            let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
+
+            if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
+                if unit_l_str == unit_r_prim { // Simple string comparison
+                    Some(val_l.cmp(val_r_prim))
+                } else {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot compare Quantities with different units: '{}' (from Object) and '{}' (from Primitive)",
+                        unit_l_str, unit_r_prim
+                    )));
+                }
+            } else {
+                // Object is not a valid Quantity representation or fields are missing/wrong type
+                return Err(EvaluationError::TypeError(format!(
+                    "Cannot compare Object (expected Quantity representation) and Primitive Quantity. Left Object: {:?}, Right Quantity: {} {}",
+                    obj_l, val_r_prim, unit_r_prim
+                )));
+            }
+        }
+        // Quantity vs Object (symmetric case)
+        (EvaluationResult::Quantity(val_l_prim, unit_l_prim), EvaluationResult::Object(obj_r)) => {
+            let val_r_obj = obj_r.get("value");
+            // Prefer "code" for unit comparison if available, fallback to "unit"
+            let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
+
+            if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
+                if unit_l_prim == unit_r_str { // Simple string comparison
+                    Some(val_l_prim.cmp(val_r))
+                } else {
+                    return Err(EvaluationError::TypeError(format!(
+                        "Cannot compare Quantities with different units: '{}' (from Primitive) and '{}' (from Object)",
+                        unit_l_prim, unit_r_str
+                    )));
+                }
+            } else {
+                 // Object is not a valid Quantity representation or fields are missing/wrong type
+                return Err(EvaluationError::TypeError(format!(
+                    "Cannot compare Primitive Quantity and Object (expected Quantity representation). Left Quantity: {} {}, Right Object: {:?}",
+                    val_l_prim, unit_l_prim, obj_r
+                )));
+            }
+        }
+        // Incomparable types - Return error
         _ => {
             return Err(EvaluationError::TypeError(format!(
                 "Cannot compare {} and {}",
@@ -5256,7 +5302,34 @@ fn compare_equality(
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
-                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
+                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r), // Simple string comparison for units
+
+                // Object vs Quantity for equality
+                (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
+                    let val_l_obj = obj_l.get("value");
+                    let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
+
+                    if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
+                        // For equality, if units match and values match, it's true. Otherwise false.
+                        EvaluationResult::Boolean(unit_l_str == unit_r_prim && val_l == val_r_prim)
+                    } else {
+                        // Object is not a valid Quantity representation or fields are missing/wrong type
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                // Quantity vs Object for equality (symmetric case)
+                (EvaluationResult::Quantity(val_l_prim, unit_l_prim), EvaluationResult::Object(obj_r)) => {
+                    let val_r_obj = obj_r.get("value");
+                    let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
+
+                    if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
+                        // For equality, if units match and values match, it's true. Otherwise false.
+                        EvaluationResult::Boolean(unit_l_prim == unit_r_str && val_l_prim == val_r)
+                    } else {
+                        // Object is not a valid Quantity representation or fields are missing/wrong type
+                        EvaluationResult::Boolean(false)
+                    }
+                }
                 // General case: if types are different and not handled by specific rules above, equality is false.
                 _ if left.type_name() != right.type_name() => EvaluationResult::Boolean(false),
                 // If types are the same but not handled by any specific rule above (e.g. two Objects),
@@ -5330,9 +5403,35 @@ fn compare_equality(
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
                 ) => {
-                    // For now, treat quantity equivalence same as equality
+                    // For now, treat quantity equivalence same as equality (simple string unit comparison)
                     EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
-                    // TODO: Implement proper UCUM equivalence if needed
+                    // TODO: Implement proper UCUM equivalence if needed (e.g. 'kg' ~ '1000 g')
+                }
+                // Object vs Quantity for equivalence
+                (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
+                    let val_l_obj = obj_l.get("value");
+                    let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
+
+                    if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
+                        // For equivalence, if units match (simple string compare) and values match, it's true. Otherwise false.
+                        // TODO: Proper UCUM equivalence for units.
+                        EvaluationResult::Boolean(unit_l_str == unit_r_prim && val_l == val_r_prim)
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
+                }
+                // Quantity vs Object for equivalence (symmetric case)
+                (EvaluationResult::Quantity(val_l_prim, unit_l_prim), EvaluationResult::Object(obj_r)) => {
+                    let val_r_obj = obj_r.get("value");
+                    let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
+
+                    if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
+                        // For equivalence, if units match (simple string compare) and values match, it's true. Otherwise false.
+                        // TODO: Proper UCUM equivalence for units.
+                        EvaluationResult::Boolean(unit_l_prim == unit_r_str && val_l_prim == val_r)
+                    } else {
+                        EvaluationResult::Boolean(false)
+                    }
                 }
                 // Primitive equivalence falls back to strict equality ('=') for other types
                 _ => compare_equality(left, "=", right, context)?, // Propagate error, pass context
