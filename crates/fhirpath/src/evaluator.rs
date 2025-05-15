@@ -4506,6 +4506,7 @@ fn apply_polarity(op: char, value: &EvaluationResult) -> Result<EvaluationResult
                 // Wrap result in Ok
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(-*d),
                 EvaluationResult::Integer(i) => EvaluationResult::Integer(-*i),
+                EvaluationResult::Quantity(val, unit) => EvaluationResult::Quantity(-*val, unit.clone()), // Negate Quantity value
                 // Polarity on non-numeric or empty should be a type error
                 EvaluationResult::Empty => EvaluationResult::Empty, // Polarity on empty is empty
                 other => {
