@@ -3227,7 +3227,7 @@ fn call_function(
 
                     // Try to get the square root
                     match sqrt_decimal(decimal) {
-                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Ok(result) => Ok(EvaluationResult::Decimal(round_to_precision(result, 8))),
                         Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                     }
                 }
@@ -3239,7 +3239,7 @@ fn call_function(
 
                     // Try to get the square root
                     match sqrt_decimal(*d) {
-                        Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                        Ok(result) => Ok(EvaluationResult::Decimal(round_to_precision(result, 8))),
                         Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                     }
                 }
@@ -3254,7 +3254,7 @@ fn call_function(
                         Ok(result) => {
                             // For quantities, sqrt might require adjusting the unit
                             // For now, just keep the same unit (this is a simplification)
-                            Ok(EvaluationResult::Quantity(result, unit.clone()))
+                            Ok(EvaluationResult::Quantity(round_to_precision(result, 8), unit.clone()))
                         }
                         Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                     }
@@ -3271,7 +3271,7 @@ fn call_function(
 
                             // Try to get the square root
                             match sqrt_decimal(d) {
-                                Ok(result) => Ok(EvaluationResult::Decimal(result)),
+                                Ok(result) => Ok(EvaluationResult::Decimal(round_to_precision(result, 8))),
                                 Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                             }
                         }
