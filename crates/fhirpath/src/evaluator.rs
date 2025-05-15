@@ -674,7 +674,7 @@ fn evaluate_term(
             }
 
             // If not $this or a variable, it must be a member/function invocation.
-            // Determine the base context for this invocation.
+            // Determine the base context for this invocation ($this for the current term).
             // Priority: current_item > context.this > context.resources
             let base_context = match current_item {
                 Some(item) => item.clone(),
@@ -700,8 +700,30 @@ fn evaluate_term(
                 },
             };
 
-            // Evaluate the member/function invocation on the base context.
-            // Pass current_item to evaluate_invocation for argument evaluation context
+            // If the invocation is a simple member identifier (not a variable)
+            // that matches the resourceType of the base_context (focus),
+            // then this term resolves to the base_context itself.
+            // Example: If base_context is a Patient resource, and invocation is Member("Patient"),
+            // this term resolves to the Patient resource.
+            if let Invocation::Member(name) = invocation {
+                // This check ensures we don't misinterpret %variables as type names.
+                // Variables (starting with '%') are handled earlier and would have returned.
+                if !name.starts_with('%') { // Ensure it's not a variable name
+                    if let EvaluationResult::Object(obj_map) = &base_context {
+                        if let Some(EvaluationResult::String(ctx_type)) = obj_map.get("resourceType") {
+                            // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
+                            if name.eq_ignore_ascii_case(ctx_type) {
+                                 return Ok(base_context.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // For all other cases (e.g., function calls, or member access not matching type, or variables already handled),
+            // evaluate the invocation on the base_context.
+            // Pass current_item (from evaluate_term's scope) as current_item_for_args
+            // to evaluate_invocation, which is used for $this in function arguments (e.g., for lambdas).
             evaluate_invocation(&base_context, invocation, context, current_item)
         }
         Term::Literal(literal) => Ok(evaluate_literal(literal)), // Wrap in Ok
