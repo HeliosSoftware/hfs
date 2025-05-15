@@ -2788,16 +2788,19 @@ fn call_function(
                                 if !is_valid_fhirpath_quantity_unit(unit_content_after_trimming) {
                                     false
                                 } else {
-                                    // At this point, unit_content_after_trimming is a non-empty, valid unit (e.g., "day", "wk", "mg").
-                                    // The test suite implies "wk" specifically requires quotes in string form to be convertible,
-                                    // while other units like "day" or "mg" might not.
-                                    if unit_content_after_trimming == "wk" {
-                                        // For "wk", the original unit part must have been quoted.
+                                    // At this point, unit_content_after_trimming is a non-empty, valid unit.
+                                    // Specific UCUM calendar codes require explicit quoting in string form
+                                    // to be convertible, as implied by test suite behavior for "wk".
+                                    // Other units (e.g., "mg", or full calendar keywords like "day")
+                                    // are considered convertible even if not explicitly quoted.
+                                    const UCUM_CALENDAR_CODES_REQUIRING_QUOTES: &[&str] = &["wk", "a", "mo", "d", "h", "min", "s", "ms"];
+
+                                    if UCUM_CALENDAR_CODES_REQUIRING_QUOTES.contains(&unit_content_after_trimming) {
+                                        // For these specific UCUM codes, the original unit part must have been quoted.
                                         original_unit_part.starts_with('\'') && original_unit_part.ends_with('\'') && original_unit_part.len() >= 2
                                     } else {
-                                        // For other valid units (e.g., "day", "mg"), they are considered convertible
-                                        // from string form even if not explicitly quoted, per test suite behavior
-                                        // and some spec examples like '10 mg'.
+                                        // For other valid units (e.g., "mg", or full calendar keywords like "day", "month"),
+                                        // they are considered convertible from string form even if not explicitly quoted.
                                         true
                                     }
                                 }
