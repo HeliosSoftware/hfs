@@ -53,23 +53,22 @@ pub fn aggregate_function(
 
     // Iterate through the items
     for (idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
-        // Create a new context with special variables
+        // Create a new context for evaluating the aggregator expression.
+        // This context inherits variables and settings from the parent context.
         let mut agg_context = EvaluationContext::new_empty();
+        agg_context.variables = context.variables.clone(); // Copy variables
+        agg_context.is_strict_mode = context.is_strict_mode; // Propagate strict mode
+        agg_context.check_ordered_functions = context.check_ordered_functions; // Propagate ordered check
 
-        // Copy the standard variables from the original context
-        for (name, value) in &context.variables {
-            agg_context.set_variable_result(name, value.clone());
-        }
+        // Set the special $total accumulator for this iteration.
+        // The $this context is handled by passing `Some(item)` to `evaluate`.
+        // $index is not fully handled by Invocation::Index yet, but setting it as a variable
+        // was incorrect for how $index is parsed. For now, we remove the incorrect variable setting.
+        // TODO: Implement proper $index resolution via context.current_index if needed by other tests.
+        agg_context.current_aggregate_total = Some(total.clone());
 
-        // Add special aggregate variables
-        agg_context.set_variable_result("$this", item.clone()); // $this is the current item
-        agg_context.set_variable_result("$index", EvaluationResult::Integer(idx as i64)); // $index is the current index
-        agg_context.set_variable_result("$total", total.clone()); // $total is the accumulated result
-
-        // Set the context's 'this' value
-        agg_context.set_this(item.clone());
-
-        // Evaluate the aggregator expression with the augmented context
+        // Evaluate the aggregator expression. The `current_item` (Some(item)) sets the focus for $this.
+        // The `agg_context` (passed as `context` to `evaluate`) provides $total via `current_aggregate_total`.
         let result = evaluate(aggregator_expr, &agg_context, Some(item))?;
 
         // Update the total
