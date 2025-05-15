@@ -20,6 +20,8 @@ pub struct EvaluationContext {
     pub is_strict_mode: bool,
     /// Flag to enable checks for operations on collections with undefined order
     pub check_ordered_functions: bool,
+    /// Holds the current accumulator value for the aggregate() function's $total variable
+    pub current_aggregate_total: Option<EvaluationResult>,
 }
 
 impl EvaluationContext {
@@ -31,6 +33,7 @@ impl EvaluationContext {
             this: None,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
+            current_aggregate_total: None,  // Initialize aggregate total
         }
     }
 
@@ -42,6 +45,7 @@ impl EvaluationContext {
             this: None,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
+            current_aggregate_total: None,  // Initialize aggregate total
         }
     }
 
@@ -1197,9 +1201,17 @@ fn evaluate_invocation(
             Ok(EvaluationResult::Empty)
         }
         Invocation::Total => {
-            // $total should return the total number of items in the original collection
-            // For now, we return Empty as this requires tracking the original collection
-            Ok(EvaluationResult::Empty)
+            // $total has two meanings:
+            // 1. In aggregate(): it's the accumulator.
+            // 2. Elsewhere (often with $index): it's the count of the context collection.
+            // This implementation prioritizes the aggregate() meaning if context is set.
+            if let Some(accumulator) = &context.current_aggregate_total {
+                Ok(accumulator.clone())
+            } else {
+                // TODO: Implement the "count of context collection" meaning of $total.
+                // For now, return Empty if not in an aggregate() context.
+                Ok(EvaluationResult::Empty)
+            }
         }
     };
     result // Return the result
@@ -5247,11 +5259,11 @@ fn compare_equality(
                 (
                     EvaluationResult::Collection {
                         items: l_items,
-                        has_undefined_order: l_undef,
+                        has_undefined_order: _l_undef, // Marked as unused
                     },
                     EvaluationResult::Collection {
                         items: r_items,
-                        has_undefined_order: r_undef,
+                        has_undefined_order: _r_undef, // Marked as unused
                     },
                 ) => {
                     // For strict equality, order matters.
