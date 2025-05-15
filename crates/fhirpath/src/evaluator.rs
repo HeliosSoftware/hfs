@@ -4248,7 +4248,7 @@ fn call_function(
                 EvaluationResult::Empty => vec![],
                 single_item => vec![single_item.clone()],
             };
-            let mut overall_descendants_unordered = false; // Track if any part contributes to undefined order
+            // let mut overall_descendants_unordered = false; // Not needed, descendants() always has undefined order.
 
             while !current_level.is_empty() {
                 let mut next_level: Vec<EvaluationResult> = Vec::new();
@@ -4257,13 +4257,11 @@ fn call_function(
                         EvaluationResult::Empty => (),
                         EvaluationResult::Collection {
                             items: children_items,
-                            has_undefined_order,
+                            has_undefined_order: _, // Children's order doesn't change descendant's undefined nature
                         } => {
                             all_descendants.extend(children_items.clone());
                             next_level.extend(children_items);
-                            if has_undefined_order {
-                                overall_descendants_unordered = true;
-                            }
+                            // overall_descendants_unordered = true; // Not needed
                         }
                         child => {
                             all_descendants.push(child.clone());
