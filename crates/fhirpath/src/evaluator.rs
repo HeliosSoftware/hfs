@@ -4893,19 +4893,29 @@ fn apply_additive(
             })
         }
         "&" => {
-            // Handle string concatenation using '&'
-            let left_str = match left {
-                EvaluationResult::Empty => "".to_string(),
-                _ => left.to_string_value(), // Convert left to string
-            };
-            let right_str = match right {
-                EvaluationResult::Empty => "".to_string(),
-                _ => right.to_string_value(), // Convert right to string
-            };
-            Ok(EvaluationResult::String(format!(
-                "{}{}",
-                left_str, right_str
-            )))
+            // FHIRPath Spec for '&' (String Concatenation):
+            // "If either argument is an empty collection, the result is an empty collection."
+            // "If either argument is a collection with more than one item, an error is raised."
+            // "Otherwise, the operator concatenates the string representation of its operands."
+
+            if left.count() > 1 || right.count() > 1 {
+                return Err(EvaluationError::TypeError(format!(
+                    "Operator '&' requires singleton operands, but found counts {} and {} respectively.",
+                    left.count(),
+                    right.count()
+                )));
+            }
+
+            if left == &EvaluationResult::Empty || right == &EvaluationResult::Empty {
+                return Ok(EvaluationResult::Empty);
+            }
+
+            // At this point, both are singletons (and not Empty)
+            // to_string_value() is appropriate here as per spec "string representation of its operands"
+            let left_str = left.to_string_value();
+            let right_str = right.to_string_value();
+            
+            Ok(EvaluationResult::String(format!("{}{}", left_str, right_str)))
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown additive operator: {}",
