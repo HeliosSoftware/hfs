@@ -2775,13 +2775,15 @@ fn call_function(
                             // Single part: Must be parseable as a number (int or decimal)
                             parts[0].parse::<Decimal>().is_ok()
                         }
-                        2 => { // Value and Unit parts
+                        2 => {
+                            // Value and Unit parts
                             let value_parses = parts[0].parse::<Decimal>().is_ok();
                             if !value_parses {
                                 false // Value part does not parse to a number
                             } else {
                                 let original_unit_part = parts[1];
-                                let unit_content_after_trimming = original_unit_part.trim_matches('\'');
+                                let unit_content_after_trimming =
+                                    original_unit_part.trim_matches('\'');
 
                                 // Check if the unit content (after trimming quotes) is a valid FHIRPath unit.
                                 // This also handles if unit_content_after_trimming is empty (which is invalid).
@@ -2793,11 +2795,16 @@ fn call_function(
                                     // to be convertible, as implied by test suite behavior for "wk".
                                     // Other units (e.g., "mg", or full calendar keywords like "day")
                                     // are considered convertible even if not explicitly quoted.
-                                    const UCUM_CALENDAR_CODES_REQUIRING_QUOTES: &[&str] = &["wk", "a", "mo", "d", "h", "min", "s", "ms"];
+                                    const UCUM_CALENDAR_CODES_REQUIRING_QUOTES: &[&str] =
+                                        &["wk", "a", "mo", "d", "h", "min", "s", "ms"];
 
-                                    if UCUM_CALENDAR_CODES_REQUIRING_QUOTES.contains(&unit_content_after_trimming) {
+                                    if UCUM_CALENDAR_CODES_REQUIRING_QUOTES
+                                        .contains(&unit_content_after_trimming)
+                                    {
                                         // For these specific UCUM codes, the original unit part must have been quoted.
-                                        original_unit_part.starts_with('\'') && original_unit_part.ends_with('\'') && original_unit_part.len() >= 2
+                                        original_unit_part.starts_with('\'')
+                                            && original_unit_part.ends_with('\'')
+                                            && original_unit_part.len() >= 2
                                     } else {
                                         // For other valid units (e.g., "mg", or full calendar keywords like "day", "month"),
                                         // they are considered convertible from string form even if not explicitly quoted.
