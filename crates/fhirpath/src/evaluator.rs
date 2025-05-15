@@ -2849,24 +2849,27 @@ fn call_function(
             let length_res_opt = args.get(1);
 
             Ok(match invocation_base {
-                // Wrap in Ok
                 EvaluationResult::String(s) => {
-                    let start_index = match start_index_res {
-                        EvaluationResult::Integer(i) if *i >= 0 => *i as usize,
-                        // Handle empty start index
-                        EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
+                    let start_val_i64 = match start_index_res {
+                        EvaluationResult::Integer(i) => *i,
+                        EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // start is {} -> result is {}
                         _ => {
                             return Err(EvaluationError::InvalidArgument(
-                                "substring start index must be a non-negative integer".to_string(),
+                                "substring start index must be an integer".to_string(),
                             ));
                         }
                     };
 
-                    // If start index is out of bounds (>= length), return empty string
-                    if start_index >= s.chars().count() {
-                        // Spec says empty {}, but returning "" is safer for string context
-                        return Ok(EvaluationResult::String("".to_string()));
+                    let s_char_count = s.chars().count();
+
+                    // Spec: "If start is out of bounds (less than 0 or greater than or equal to the length of the string), 
+                    // the result is an empty collection ({})." This applies to both 1-arg and 2-arg versions.
+                    if start_val_i64 < 0 || start_val_i64 >= s_char_count as i64 {
+                        return Ok(EvaluationResult::Empty);
                     }
+
+                    // If we reach here, start_val_i64 is valid (0 <= start_val_i64 < s_char_count)
+                    let start_usize = start_val_i64 as usize;
 
                     if let Some(length_res) = length_res_opt {
                         // Two arguments: start and length
