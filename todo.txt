@@ -4,7 +4,7 @@
 - Remove eprintln from implementation code
 - Mismatch of implementation in separate files vs single evaluator.rs
 - RESOURCE_TYPE_HIERARCHY is temporarily hard coded
-- Need a full UCUM conversion engine  
+- Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 
 - Test to see if invalid attributes in the FHIR JSON model are allowed/disallowed?
 - R6 tests need help - Integer64 issues in comparison because we download them each time, so might need an exclusion list for R6
 - Search for SLM TODO - need to change the others I think

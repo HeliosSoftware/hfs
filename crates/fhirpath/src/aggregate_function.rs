@@ -52,7 +52,7 @@ pub fn aggregate_function(
     let start_idx = if init_value.is_some() { 0 } else { 1 };
 
     // Iterate through the items
-    for (idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
+    for (_idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
         // Create a new context for evaluating the aggregator expression.
         // This context inherits variables and settings from the parent context.
         let mut agg_context = EvaluationContext::new_empty();
@@ -362,4 +362,3 @@ mod tests {
         assert_eq!(result_no_init, EvaluationResult::Empty);
     }
 }
-

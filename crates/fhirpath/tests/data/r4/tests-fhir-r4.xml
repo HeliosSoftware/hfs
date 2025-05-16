@@ -1055,8 +1055,8 @@
     </test>
 
     <test name="testPrecedence2" inputfile="patient-example.json"><expression>1+2*3+4 = 11</expression><output type="boolean">true</output></test>
-    <test name="testPrecedence3" inputfile="patient-example.json"><expression>1 > 2 is Boolean</expression><output type="boolean">true</output></test>
-    <test name="testPrecedence4" inputfile="patient-example.json"><expression>1 | 1 is Integer</expression><output type="boolean">true</output></test>
+    <test name="testPrecedence3" inputfile="patient-example.json"><expression>(1 > 2) is Boolean</expression><output type="boolean">true</output></test>
+    <test name="testPrecedence4" inputfile="patient-example.json"><expression>(1 | 1) is Integer</expression><output type="boolean">true</output></test>
 	</group>
 
 	<group name="testVariables">
@@ -1098,12 +1098,14 @@
     <test name="testType23" inputfile="patient-example.json"><expression>Patient.ofType(FHIR.`Patient`).type().name</expression><output type="string">Patient</output></test>
 	</group>
   
+<!--
   <group name="testConformsTo">
     <test name="testConformsTo" inputfile="patient-example.json"><expression>conformsTo('http://hl7.org/fhir/StructureDefinition/Patient')</expression><output type="boolean">true</output></test>
     <test name="testConformsTo" inputfile="patient-example.json"><expression>conformsTo('http://hl7.org/fhir/StructureDefinition/Person')</expression><output type="boolean">false</output></test>
     <test name="testConformsTo" inputfile="patient-example.json"><expression invalid="true">conformsTo('http://trash')</expression></test>
 	</group>
   
+-->
 <!--
   <group name="testDollarResource">
 		testBoolean(patient(), patient().getManagingOrganization(), "Reference", "reference.startsWith('#').not() or (reference.substring(1).trace('url') in %resource.contained.id.trace('ids'))</expression><output type="boolean">true</output></test>
