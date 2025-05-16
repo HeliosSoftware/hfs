@@ -5386,9 +5386,22 @@ fn compare_equality(
                 }
                 // Object = Object comparison
                 (EvaluationResult::Object(map_l), EvaluationResult::Object(map_r)) => {
-                    // FHIRPath Spec: "Equality of two complex types ... is never true;
-                    // they are only equal if they are the same choice of actual type
-                    // and the values of all their components are equal."
+                    // If both are FHIR primitive objects, compare their "value" fields.
+                    if map_l.contains_key("fhirType") && map_l.contains_key("value") &&
+                       map_r.contains_key("fhirType") && map_r.contains_key("value") {
+                        // Both are FHIR primitive wrappers, compare their values and fhirTypes
+                        let type_l = map_l.get("fhirType");
+                        let type_r = map_r.get("fhirType");
+                        if type_l != type_r {
+                            // Different fhirTypes means not equal, unless one is a subtype of another (not handled here for primitives)
+                            // For simple primitive fhirTypes, they must match.
+                            return Ok(EvaluationResult::Boolean(false));
+                        }
+                        // fhirTypes are the same, compare their "value" fields
+                        return compare_equality(map_l.get("value").unwrap(), op, map_r.get("value").unwrap(), context);
+                    }
+
+                    // Standard Object vs Object comparison (e.g. for complex types)
                     if map_l.len() != map_r.len() {
                         EvaluationResult::Boolean(false)
                     } else {
@@ -5396,22 +5409,21 @@ fn compare_equality(
                         for (key_l, value_l) in map_l {
                             match map_r.get(key_l) {
                                 Some(value_r) => {
-                                    // Recursively compare values using strict equality '='.
                                     match compare_equality(value_l, "=", value_r, context) {
                                         Ok(EvaluationResult::Boolean(true)) => { /* field is equal, continue */ }
                                         Ok(EvaluationResult::Boolean(false)) | Ok(EvaluationResult::Empty) => {
                                             all_fields_definitively_equal = false;
                                             break;
                                         }
-                                        Err(e) => return Err(e), // Propagate error from recursive call
-                                        _ => { // Should not happen if compare_equality returns Boolean or Empty on Ok
+                                        Err(e) => return Err(e),
+                                        _ => {
                                             return Err(EvaluationError::TypeError(
                                                 "Unexpected non-boolean/non-empty result from field equality check".to_string()
                                             ));
                                         }
                                     }
                                 }
-                                None => { // Key in left map not found in right map
+                                None => {
                                     all_fields_definitively_equal = false;
                                     break;
                                 }
@@ -5419,6 +5431,30 @@ fn compare_equality(
                         }
                         EvaluationResult::Boolean(all_fields_definitively_equal)
                     }
+                }
+                // Comparison between an Object (potentially FHIR primitive wrapper) and a direct Primitive
+                (EvaluationResult::Object(obj_map), prim_val)
+                if !matches!(prim_val, EvaluationResult::Object(_)) && !matches!(prim_val, EvaluationResult::Collection { .. } ) => {
+                    if obj_map.contains_key("fhirType") && obj_map.contains_key("value") {
+                        if let Some(obj_val) = obj_map.get("value") {
+                            // Compare the Object's "value" field with the direct primitive value
+                            return compare_equality(obj_val, op, prim_val, context);
+                        }
+                    }
+                    // If not a FHIR primitive wrapper or "value" is missing, they are not equal.
+                    EvaluationResult::Boolean(false)
+                }
+                // Symmetric case: Primitive vs Object (potentially FHIR primitive wrapper)
+                (prim_val, EvaluationResult::Object(obj_map))
+                if !matches!(prim_val, EvaluationResult::Object(_)) && !matches!(prim_val, EvaluationResult::Collection { .. } ) => {
+                    if obj_map.contains_key("fhirType") && obj_map.contains_key("value") {
+                        if let Some(obj_val) = obj_map.get("value") {
+                            // Compare the direct primitive value with the Object's "value" field
+                            return compare_equality(prim_val, op, obj_val, context);
+                        }
+                    }
+                    // If not a FHIR primitive wrapper or "value" is missing, they are not equal.
+                    EvaluationResult::Boolean(false)
                 }
                 // General case: if types are different and not handled by specific rules above, equality is false.
                 _ if l_cmp.type_name() != r_cmp.type_name() => EvaluationResult::Boolean(false),
