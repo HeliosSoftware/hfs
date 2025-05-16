@@ -54,7 +54,15 @@ pub fn get_type_info(value: &EvaluationResult) -> EvaluationResult {
             obj.insert("name".to_string(), EvaluationResult::String("Quantity".to_string()));
         },
         EvaluationResult::Object(map) => {
-            // First check if this is a FHIR primitive type with value property
+            // Check for our "fhirType" marker first
+            if let Some(EvaluationResult::String(fhir_type_name)) = map.get("fhirType") {
+                obj.insert("namespace".to_string(), EvaluationResult::String("FHIR".to_string()));
+                obj.insert("name".to_string(), EvaluationResult::String(fhir_type_name.clone()));
+                return EvaluationResult::Object(obj); // Return early
+            }
+            
+            // Fallback to existing logic if "fhirType" is not present
+            // First check if this is a FHIR primitive type with value property (original logic)
             if map.contains_key("id") && map.contains_key("value") {
                 if let Some(value_type) = get_fhir_primitive_type(map) {
                     obj.insert("namespace".to_string(), EvaluationResult::String("FHIR".to_string()));
@@ -63,7 +71,7 @@ pub fn get_type_info(value: &EvaluationResult) -> EvaluationResult {
                 }
             }
             
-            // Use the more robust FHIR type detection
+            // Use the more robust FHIR type detection (original logic)
             if let Some(type_info) = get_fhir_element_type_from_context(map) {
                 obj.insert("namespace".to_string(), EvaluationResult::String(type_info.namespace));
                 obj.insert("name".to_string(), EvaluationResult::String(type_info.name));
