@@ -69,19 +69,41 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
     // FHIR namespace type checks
     if namespace.as_deref() == Some(FHIR_NAMESPACE) || namespace.as_deref().map(|s| s.eq_ignore_ascii_case(FHIR_NAMESPACE)).unwrap_or(false) {
         // First, check primitive types with FHIR namespace
-        if is_fhir_primitive_type(&type_name) {
+        if is_fhir_primitive_type(&type_name) { // type_name is a valid FHIR primitive, e.g., "boolean", "string", "code"
+            // Check 1: Object with fhirType marker
+            if let EvaluationResult::Object(obj_map) = value {
+                if let Some(EvaluationResult::String(fhir_type_value)) = obj_map.get("fhirType") {
+                    if fhir_type_value.eq_ignore_ascii_case(&type_name) {
+                        return Ok(true);
+                    }
+                }
+                // If an object doesn't have a matching "fhirType", it's not this FHIR primitive.
+                return Ok(false);
+            }
+            // Check 2: Direct EvaluationResult primitive matches the FHIR primitive type_name
+            // This handles cases like `true.is(FHIR.boolean)`
             match value {
                 EvaluationResult::Boolean(_) => return Ok(type_name.eq_ignore_ascii_case("boolean")),
-                EvaluationResult::String(_) => return Ok(type_name.eq_ignore_ascii_case("string")),
-                EvaluationResult::Integer(_) => return Ok(type_name.eq_ignore_ascii_case("integer")),
+                EvaluationResult::String(_) => {
+                    // Check if type_name is one of the string-backed FHIR primitives
+                    // (e.g., string, code, id, uri, url, canonical, markdown, base64binary, xhtml)
+                    let string_backed_fhir_primitives = [
+                        "string", "code", "id", "uri", "url", "canonical", "markdown", "base64binary", "xhtml"
+                    ];
+                    return Ok(string_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
+                }
+                EvaluationResult::Integer(_) => {
+                    let integer_backed_fhir_primitives = ["integer", "positiveint", "unsignedint"];
+                    return Ok(integer_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
+                }
                 EvaluationResult::Decimal(_) => return Ok(type_name.eq_ignore_ascii_case("decimal")),
                 EvaluationResult::Date(_) => return Ok(type_name.eq_ignore_ascii_case("date")),
                 EvaluationResult::DateTime(_) => {
-                    return Ok(type_name.eq_ignore_ascii_case("dateTime") || 
-                              type_name.eq_ignore_ascii_case("datetime"))
-                },
+                    let datetime_backed_fhir_primitives = ["datetime", "instant"];
+                    return Ok(datetime_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
+                }
                 EvaluationResult::Time(_) => return Ok(type_name.eq_ignore_ascii_case("time")),
-                // FHIR primitive types don't match non-primitive values
+                // If value is not a direct primitive that matches, or an object with fhirType, it's not this FHIR primitive.
                 _ => return Ok(false),
             }
         }
