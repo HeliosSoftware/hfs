@@ -1,7 +1,7 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use chrono::{Local, Timelike};
 use fhir::FhirResource;
-use fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult}; // Import EvaluationError
+use fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult};
 use regex::Regex;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -712,12 +712,15 @@ fn evaluate_term(
             if let Invocation::Member(name) = invocation {
                 // This check ensures we don't misinterpret %variables as type names.
                 // Variables (starting with '%') are handled earlier and would have returned.
-                if !name.starts_with('%') { // Ensure it's not a variable name
+                if !name.starts_with('%') {
+                    // Ensure it's not a variable name
                     if let EvaluationResult::Object(obj_map) = &base_context {
-                        if let Some(EvaluationResult::String(ctx_type)) = obj_map.get("resourceType") {
+                        if let Some(EvaluationResult::String(ctx_type)) =
+                            obj_map.get("resourceType")
+                        {
                             // The parser ensures 'name' is cleaned of backticks if it was a delimited identifier.
                             if name.eq_ignore_ascii_case(ctx_type) {
-                                 return Ok(base_context.clone());
+                                return Ok(base_context.clone());
                             }
                         }
                     }
@@ -2896,7 +2899,7 @@ fn call_function(
 
                     let s_char_count = s.chars().count();
 
-                    // Spec: "If start is out of bounds (less than 0 or greater than or equal to the length of the string), 
+                    // Spec: "If start is out of bounds (less than 0 or greater than or equal to the length of the string),
                     // the result is an empty collection ({})." This applies to both 1-arg and 2-arg versions.
                     if start_val_i64 < 0 || start_val_i64 >= s_char_count as i64 {
                         return Ok(EvaluationResult::Empty);
@@ -2909,7 +2912,9 @@ fn call_function(
                         // Two arguments: start and length
                         let length_val = match length_res {
                             EvaluationResult::Integer(l) => *l, // Store as i64 first
-                            EvaluationResult::Empty => return Ok(EvaluationResult::String("".to_string())), // length is {} -> ""
+                            EvaluationResult::Empty => {
+                                return Ok(EvaluationResult::String("".to_string()));
+                            } // length is {} -> ""
                             _ => {
                                 return Err(EvaluationError::InvalidArgument(
                                     "substring length must be an integer".to_string(),
@@ -2921,12 +2926,13 @@ fn call_function(
                         if length_val <= 0 {
                             return Ok(EvaluationResult::String("".to_string()));
                         }
-                        
+
                         // Now length_val is > 0
                         // Note: start_usize was defined in the previous block which was successfully applied.
                         // We use start_usize here as intended by the previous change.
                         let length_usize = length_val as usize;
-                        let result: String = s.chars().skip(start_usize).take(length_usize).collect();
+                        let result: String =
+                            s.chars().skip(start_usize).take(length_usize).collect();
                         EvaluationResult::String(result)
                     } else {
                         // One argument: start index only (substring to end)
@@ -2938,7 +2944,8 @@ fn call_function(
                 EvaluationResult::Empty => EvaluationResult::Empty, // substring on {} is {}
                 // Collections handled by initial check
                 EvaluationResult::Collection { .. } => unreachable!(), // Should have been caught by singleton check
-                _ => { // Non-string, non-empty, non-collection base
+                _ => {
+                    // Non-string, non-empty, non-collection base
                     return Err(EvaluationError::TypeError(
                         "substring requires a String input".to_string(),
                     ));
@@ -3294,7 +3301,10 @@ fn call_function(
                         Ok(result) => {
                             // For quantities, sqrt might require adjusting the unit
                             // For now, just keep the same unit (this is a simplification)
-                            Ok(EvaluationResult::Quantity(round_to_precision(result, 8), unit.clone()))
+                            Ok(EvaluationResult::Quantity(
+                                round_to_precision(result, 8),
+                                unit.clone(),
+                            ))
                         }
                         Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                     }
@@ -3311,7 +3321,9 @@ fn call_function(
 
                             // Try to get the square root
                             match sqrt_decimal(d) {
-                                Ok(result) => Ok(EvaluationResult::Decimal(round_to_precision(result, 8))),
+                                Ok(result) => {
+                                    Ok(EvaluationResult::Decimal(round_to_precision(result, 8)))
+                                }
                                 Err(_) => Ok(EvaluationResult::Empty), // Handle any errors in the square root calculation
                             }
                         }
@@ -4546,7 +4558,9 @@ fn apply_polarity(op: char, value: &EvaluationResult) -> Result<EvaluationResult
                 // Wrap result in Ok
                 EvaluationResult::Decimal(d) => EvaluationResult::Decimal(-*d),
                 EvaluationResult::Integer(i) => EvaluationResult::Integer(-*i),
-                EvaluationResult::Quantity(val, unit) => EvaluationResult::Quantity(-*val, unit.clone()), // Negate Quantity value
+                EvaluationResult::Quantity(val, unit) => {
+                    EvaluationResult::Quantity(-*val, unit.clone())
+                } // Negate Quantity value
                 // Polarity on non-numeric or empty should be a type error
                 EvaluationResult::Empty => EvaluationResult::Empty, // Polarity on empty is empty
                 other => {
@@ -4953,8 +4967,11 @@ fn apply_additive(
             // This implies that Empty operands should also have their string representation used for concatenation.
             let left_str = left.to_string_value();
             let right_str = right.to_string_value();
-            
-            Ok(EvaluationResult::String(format!("{}{}", left_str, right_str)))
+
+            Ok(EvaluationResult::String(format!(
+                "{}{}",
+                left_str, right_str
+            )))
         }
         _ => Err(EvaluationError::InvalidOperation(format!(
             "Unknown additive operator: {}",
@@ -5154,7 +5171,8 @@ fn compare_inequality(
         (EvaluationResult::String(l), EvaluationResult::String(r)) => Some(l.cmp(r)),
         // Quantity comparison (only if units match)
         (EvaluationResult::Quantity(val_l, unit_l), EvaluationResult::Quantity(val_r, unit_r)) => {
-            if unit_l == unit_r { // Simple string comparison for now
+            if unit_l == unit_r {
+                // Simple string comparison for now
                 Some(val_l.cmp(val_r))
             } else {
                 // Incompatible units for comparison, return error
@@ -5170,8 +5188,13 @@ fn compare_inequality(
             // Prefer "code" for unit comparison if available, fallback to "unit"
             let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
 
-            if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
-                if unit_l_str == unit_r_prim { // Simple string comparison
+            if let (
+                Some(EvaluationResult::Decimal(val_l)),
+                Some(EvaluationResult::String(unit_l_str)),
+            ) = (val_l_obj, unit_l_obj_field)
+            {
+                if unit_l_str == unit_r_prim {
+                    // Simple string comparison
                     Some(val_l.cmp(val_r_prim))
                 } else {
                     return Err(EvaluationError::TypeError(format!(
@@ -5193,8 +5216,13 @@ fn compare_inequality(
             // Prefer "code" for unit comparison if available, fallback to "unit"
             let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
 
-            if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
-                if unit_l_prim == unit_r_str { // Simple string comparison
+            if let (
+                Some(EvaluationResult::Decimal(val_r)),
+                Some(EvaluationResult::String(unit_r_str)),
+            ) = (val_r_obj, unit_r_obj_field)
+            {
+                if unit_l_prim == unit_r_str {
+                    // Simple string comparison
                     Some(val_l_prim.cmp(val_r))
                 } else {
                     return Err(EvaluationError::TypeError(format!(
@@ -5203,7 +5231,7 @@ fn compare_inequality(
                     )));
                 }
             } else {
-                 // Object is not a valid Quantity representation or fields are missing/wrong type
+                // Object is not a valid Quantity representation or fields are missing/wrong type
                 return Err(EvaluationError::TypeError(format!(
                     "Cannot compare Primitive Quantity and Object (expected Quantity representation). Left Quantity: {} {}, Right Object: {:?}",
                     val_l_prim, unit_l_prim, obj_r
@@ -5242,15 +5270,19 @@ fn compare_equality(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Apply singleton evaluation if one operand is a single-item collection and the other is scalar
     let (l_cmp, r_cmp) = match (left, right) {
-        (EvaluationResult::Collection { items, .. }, r_val) if items.len() == 1 && !r_val.is_collection() => {
+        (EvaluationResult::Collection { items, .. }, r_val)
+            if items.len() == 1 && !r_val.is_collection() =>
+        {
             // Left is single-item collection, Right is scalar
             (items[0].clone(), r_val.clone())
         }
-        (l_val, EvaluationResult::Collection { items, .. }) if items.len() == 1 && !l_val.is_collection() => {
+        (l_val, EvaluationResult::Collection { items, .. })
+            if items.len() == 1 && !l_val.is_collection() =>
+        {
             // Left is scalar, Right is single-item collection
             (l_val.clone(), items[0].clone())
         }
-        _ => (left.clone(), right.clone()) // Default: use original operands (or both are collections/scalars already)
+        _ => (left.clone(), right.clone()), // Default: use original operands (or both are collections/scalars already)
     };
 
     // Helper function for string equivalence normalization
@@ -5267,7 +5299,8 @@ fn compare_equality(
             if l_cmp == EvaluationResult::Empty || r_cmp == EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
-            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
+            Ok(match (&l_cmp, &r_cmp) {
+                // Use references to l_cmp and r_cmp
                 // Wrap result in Ok
                 (
                     EvaluationResult::Collection {
@@ -5302,9 +5335,7 @@ fn compare_equality(
                 // If only one is a collection (after potential unwrap of the other side), they are not equal.
                 // This case should be less common now due to the initial unwrap.
                 (EvaluationResult::Collection { .. }, _)
-                | (_, EvaluationResult::Collection { .. }) => {
-                    EvaluationResult::Boolean(false)
-                }
+                | (_, EvaluationResult::Collection { .. }) => EvaluationResult::Boolean(false),
                 // Primitive comparison (Empty case handled above)
                 (EvaluationResult::Boolean(l), EvaluationResult::Boolean(r)) => {
                     EvaluationResult::Boolean(l == r)
@@ -5339,7 +5370,8 @@ fn compare_equality(
                         | EvaluationResult::String(_)
                 )) =>
                 {
-                    match crate::datetime_impl::compare_date_time_values(&l_cmp, &r_cmp) { // Use l_cmp, r_cmp
+                    match crate::datetime_impl::compare_date_time_values(&l_cmp, &r_cmp) {
+                        // Use l_cmp, r_cmp
                         Some(ordering) => {
                             EvaluationResult::Boolean(ordering == std::cmp::Ordering::Equal)
                         }
@@ -5359,11 +5391,18 @@ fn compare_equality(
                 ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
 
                 // Object vs Quantity for equality
-                (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
+                (
+                    EvaluationResult::Object(obj_l),
+                    EvaluationResult::Quantity(val_r_prim, unit_r_prim),
+                ) => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
 
-                    if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
+                    if let (
+                        Some(EvaluationResult::Decimal(val_l)),
+                        Some(EvaluationResult::String(unit_l_str)),
+                    ) = (val_l_obj, unit_l_obj_field)
+                    {
                         // For equality, if units match and values match, it's true. Otherwise false.
                         EvaluationResult::Boolean(unit_l_str == unit_r_prim && val_l == val_r_prim)
                     } else {
@@ -5372,11 +5411,18 @@ fn compare_equality(
                     }
                 }
                 // Quantity vs Object for equality (symmetric case)
-                (EvaluationResult::Quantity(val_l_prim, unit_l_prim), EvaluationResult::Object(obj_r)) => {
+                (
+                    EvaluationResult::Quantity(val_l_prim, unit_l_prim),
+                    EvaluationResult::Object(obj_r),
+                ) => {
                     let val_r_obj = obj_r.get("value");
                     let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
 
-                    if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
+                    if let (
+                        Some(EvaluationResult::Decimal(val_r)),
+                        Some(EvaluationResult::String(unit_r_str)),
+                    ) = (val_r_obj, unit_r_obj_field)
+                    {
                         // For equality, if units match and values match, it's true. Otherwise false.
                         EvaluationResult::Boolean(unit_l_prim == unit_r_str && val_l_prim == val_r)
                     } else {
@@ -5387,8 +5433,11 @@ fn compare_equality(
                 // Object = Object comparison
                 (EvaluationResult::Object(map_l), EvaluationResult::Object(map_r)) => {
                     // If both are FHIR primitive objects, compare their "value" fields.
-                    if map_l.contains_key("fhirType") && map_l.contains_key("value") &&
-                       map_r.contains_key("fhirType") && map_r.contains_key("value") {
+                    if map_l.contains_key("fhirType")
+                        && map_l.contains_key("value")
+                        && map_r.contains_key("fhirType")
+                        && map_r.contains_key("value")
+                    {
                         // Both are FHIR primitive wrappers, compare their values and fhirTypes
                         let type_l = map_l.get("fhirType");
                         let type_r = map_r.get("fhirType");
@@ -5398,7 +5447,12 @@ fn compare_equality(
                             return Ok(EvaluationResult::Boolean(false));
                         }
                         // fhirTypes are the same, compare their "value" fields
-                        return compare_equality(map_l.get("value").unwrap(), op, map_r.get("value").unwrap(), context);
+                        return compare_equality(
+                            map_l.get("value").unwrap(),
+                            op,
+                            map_r.get("value").unwrap(),
+                            context,
+                        );
                     }
 
                     // Standard Object vs Object comparison (e.g. for complex types)
@@ -5410,8 +5464,10 @@ fn compare_equality(
                             match map_r.get(key_l) {
                                 Some(value_r) => {
                                     match compare_equality(value_l, "=", value_r, context) {
-                                        Ok(EvaluationResult::Boolean(true)) => { /* field is equal, continue */ }
-                                        Ok(EvaluationResult::Boolean(false)) | Ok(EvaluationResult::Empty) => {
+                                        Ok(EvaluationResult::Boolean(true)) => { /* field is equal, continue */
+                                        }
+                                        Ok(EvaluationResult::Boolean(false))
+                                        | Ok(EvaluationResult::Empty) => {
                                             all_fields_definitively_equal = false;
                                             break;
                                         }
@@ -5434,7 +5490,9 @@ fn compare_equality(
                 }
                 // Comparison between an Object (potentially FHIR primitive wrapper) and a direct Primitive
                 (EvaluationResult::Object(obj_map), prim_val)
-                if !matches!(prim_val, EvaluationResult::Object(_)) && !matches!(prim_val, EvaluationResult::Collection { .. } ) => {
+                    if !matches!(prim_val, EvaluationResult::Object(_))
+                        && !matches!(prim_val, EvaluationResult::Collection { .. }) =>
+                {
                     if obj_map.contains_key("fhirType") && obj_map.contains_key("value") {
                         if let Some(obj_val) = obj_map.get("value") {
                             // Compare the Object's "value" field with the direct primitive value
@@ -5446,7 +5504,9 @@ fn compare_equality(
                 }
                 // Symmetric case: Primitive vs Object (potentially FHIR primitive wrapper)
                 (prim_val, EvaluationResult::Object(obj_map))
-                if !matches!(prim_val, EvaluationResult::Object(_)) && !matches!(prim_val, EvaluationResult::Collection { .. } ) => {
+                    if !matches!(prim_val, EvaluationResult::Object(_))
+                        && !matches!(prim_val, EvaluationResult::Collection { .. }) =>
+                {
                     if obj_map.contains_key("fhirType") && obj_map.contains_key("value") {
                         if let Some(obj_val) = obj_map.get("value") {
                             // Compare the direct primitive value with the Object's "value" field
@@ -5475,13 +5535,14 @@ fn compare_equality(
             Ok(match eq_result {
                 EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                _ => EvaluationResult::Empty, 
+                _ => EvaluationResult::Empty,
             })
         }
         "~" => {
             // Equivalence: Order doesn't matter, duplicates DO matter.
             // Use l_cmp and r_cmp for equivalence checks too.
-            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
+            Ok(match (&l_cmp, &r_cmp) {
+                // Use references to l_cmp and r_cmp
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
                 }
@@ -5512,20 +5573,23 @@ fn compare_equality(
                     }
                 }
                 (EvaluationResult::Collection { .. }, _)
-                | (_, EvaluationResult::Collection { .. }) => {
-                    EvaluationResult::Boolean(false)
-                }
+                | (_, EvaluationResult::Collection { .. }) => EvaluationResult::Boolean(false),
                 (
                     EvaluationResult::Quantity(val_l, unit_l),
                     EvaluationResult::Quantity(val_r, unit_r),
+                ) => EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r),
+                (
+                    EvaluationResult::Object(obj_l),
+                    EvaluationResult::Quantity(val_r_prim, unit_r_prim),
                 ) => {
-                    EvaluationResult::Boolean(unit_l == unit_r && val_l == val_r)
-                }
-                (EvaluationResult::Object(obj_l), EvaluationResult::Quantity(val_r_prim, unit_r_prim)) => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
 
-                    if let (Some(EvaluationResult::Decimal(val_l)), Some(EvaluationResult::String(unit_l_str))) = (val_l_obj, unit_l_obj_field) {
+                    if let (
+                        Some(EvaluationResult::Decimal(val_l)),
+                        Some(EvaluationResult::String(unit_l_str)),
+                    ) = (val_l_obj, unit_l_obj_field)
+                    {
                         // For equivalence, if units match (simple string compare) and values match, it's true. Otherwise false.
                         // TODO: Proper UCUM equivalence for units.
                         EvaluationResult::Boolean(unit_l_str == unit_r_prim && val_l == val_r_prim)
@@ -5534,11 +5598,18 @@ fn compare_equality(
                     }
                 }
                 // Quantity vs Object for equivalence (symmetric case)
-                (EvaluationResult::Quantity(val_l_prim, unit_l_prim), EvaluationResult::Object(obj_r)) => {
+                (
+                    EvaluationResult::Quantity(val_l_prim, unit_l_prim),
+                    EvaluationResult::Object(obj_r),
+                ) => {
                     let val_r_obj = obj_r.get("value");
                     let unit_r_obj_field = obj_r.get("code").or_else(|| obj_r.get("unit"));
 
-                    if let (Some(EvaluationResult::Decimal(val_r)), Some(EvaluationResult::String(unit_r_str))) = (val_r_obj, unit_r_obj_field) {
+                    if let (
+                        Some(EvaluationResult::Decimal(val_r)),
+                        Some(EvaluationResult::String(unit_r_str)),
+                    ) = (val_r_obj, unit_r_obj_field)
+                    {
                         // For equivalence, if units match (simple string compare) and values match, it's true. Otherwise false.
                         // TODO: Proper UCUM equivalence for units.
                         EvaluationResult::Boolean(unit_l_prim == unit_r_str && val_l_prim == val_r)
@@ -5554,20 +5625,21 @@ fn compare_equality(
         "!~" => {
             // Non-equivalence: Negation of '~'
             // Use l_cmp and r_cmp
-            Ok(match (&l_cmp, &r_cmp) { // Use references to l_cmp and r_cmp
+            Ok(match (&l_cmp, &r_cmp) {
+                // Use references to l_cmp and r_cmp
                 (EvaluationResult::Empty, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(false)
-                } 
+                }
                 (EvaluationResult::Empty, _) | (_, EvaluationResult::Empty) => {
                     EvaluationResult::Boolean(true)
-                } 
+                }
                 _ => {
                     // Recursive call with original left/right
                     let equiv_result = compare_equality(left, "~", right, context)?;
                     match equiv_result {
                         EvaluationResult::Boolean(b) => EvaluationResult::Boolean(!b),
                         EvaluationResult::Empty => EvaluationResult::Empty,
-                        _ => EvaluationResult::Empty, 
+                        _ => EvaluationResult::Empty,
                     }
                 }
             })
