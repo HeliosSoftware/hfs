@@ -2,7 +2,9 @@
 
 # Helios FHIR Server
 
-The Helios FHIR Server is a high performance FHIR Server written in Rust.  It is ...
+The Helios FHIR Server is a high-performance, purpose-built FHIR server written in Rust for clinical analytics workloads. 
+Its modular architecture enables it to operate at ludicrous speed across diverse environments—from your personal laptop
+to a petabyte-scale, serverless cloud cluster.
 
 # Quick Start
 

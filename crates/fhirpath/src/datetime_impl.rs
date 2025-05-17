@@ -43,7 +43,7 @@ pub fn parse_time(time_str: &str) -> Option<NaiveTime> {
     }
 }
 
-/// Parses a datetime string to a DateTime<Utc>
+/// Parses a datetime string to a DateTime\<Utc\>
 /// Handles various formats including timezone information by normalizing to UTC.
 pub fn parse_datetime(datetime_str: &str) -> Option<DateTime<Utc>> {
     // Attempt to parse directly as RFC3339, which handles offsets.
