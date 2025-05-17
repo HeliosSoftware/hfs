@@ -848,7 +848,7 @@ where
                     .map(|e| e.into_evaluation_result())
                     .collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::Collection { items: ext_collection, has_undefined_order: false });
+                    map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection, false));
                 }
             }
             // Only return Object if map is not empty (i.e., id or extension was actually present)
@@ -888,7 +888,7 @@ where
                     .map(|e| e.into_evaluation_result())
                     .collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::Collection { items: ext_collection, has_undefined_order: false });
+                    map.insert("extension".to_string(), EvaluationResult::Collection(ext_collection, false));
                 }
             }
              // Only return Object if map is not empty
