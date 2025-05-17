@@ -545,8 +545,7 @@ fn generate_element_definition(
         let base_type = match ty.code.as_str() {
             // https://build.fhir.org/fhirpath.html#types
             "http://hl7.org/fhirpath/System.Boolean" => "bool",
-            "http://hl7.org/fhirpath/System.String" => "String", // SLM TODO - compete
-            // remainder!?!?!
+            "http://hl7.org/fhirpath/System.String" => "String",
             "http://hl7.org/fhirpath/System.Integer" => "std::primitive::i32",
             "http://hl7.org/fhirpath/System.Long" => "std::primitive::i64",
             "http://hl7.org/fhirpath/System.Decimal" => "std::primitive::f64",
