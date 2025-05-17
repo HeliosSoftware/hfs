@@ -4,6 +4,7 @@ use fhirpath::evaluator::{EvaluationContext, evaluate};
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
 use roxmltree::{Document, Node};
+use rust_decimal::Decimal;
 use serde_json;
 use std::collections::HashMap;
 use std::fs::File;
@@ -116,6 +117,14 @@ fn run_fhir_r4_test(
                     return Err(format!(
                         "Decimal result {} doesn't match: expected {} ({}), got {} ({})",
                         i, b, b, a, a
+                    ));
+                }
+            }
+            (EvaluationResult::Quantity(a_val, a_unit), EvaluationResult::Quantity(b_val, b_unit)) => {
+                if a_val != b_val || a_unit != b_unit {
+                    return Err(format!(
+                        "Quantity result {} doesn't match: expected value {:?} unit {:?}, got value {:?} unit {:?}",
+                        i, b_val, b_unit, a_val, a_unit
                     ));
                 }
             }
@@ -605,6 +614,44 @@ fn test_r4_test_suite() {
                     "code" => {
                         // FHIR code type is also just a string in our implementation
                         expected_results.push(EvaluationResult::String(output_value.clone()));
+                    }
+                    "Quantity" => {
+                        // Parse "value 'unit'" format, e.g., "1 '1'" or "10.5 'mg'"
+                        let parts: Vec<&str> = output_value.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            let value_str = parts[0];
+                            let unit_str_quoted = parts[1];
+                            if unit_str_quoted.starts_with('\'') && unit_str_quoted.ends_with('\'') && unit_str_quoted.len() >= 2 {
+                                let unit_str = &unit_str_quoted[1..unit_str_quoted.len()-1];
+                                match value_str.parse::<Decimal>() {
+                                    Ok(decimal_val) => {
+                                        expected_results.push(EvaluationResult::Quantity(decimal_val, unit_str.to_string()));
+                                    }
+                                    Err(_) => {
+                                        println!(
+                                            "  SKIP: {} - Invalid decimal value for Quantity: {}",
+                                            test.name, output_value
+                                        );
+                                        skipped_tests += 1;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                println!(
+                                    "  SKIP: {} - Invalid unit format for Quantity (expected 'unit'): {}",
+                                    test.name, output_value
+                                );
+                                skipped_tests += 1;
+                                continue;
+                            }
+                        } else {
+                            println!(
+                                "  SKIP: {} - Invalid Quantity format (expected \"value 'unit'\"): {}",
+                                test.name, output_value
+                            );
+                            skipped_tests += 1;
+                            continue;
+                        }
                     }
                     _ => {
                         // Types we don't handle yet
