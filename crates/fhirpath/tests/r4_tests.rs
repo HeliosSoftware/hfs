@@ -560,6 +560,13 @@ fn test_r4_test_suite() {
                 }
             };
 
+            // Pre-define environment variables for tests that expect them
+            context.set_variable("sct", "http://snomed.info/sct".to_string());
+            context.set_variable("loinc", "http://loinc.org".to_string());
+            context.set_variable("ucum", "http://unitsofmeasure.org".to_string());
+            context.set_variable("vs-administrative-gender", "http://hl7.org/fhir/ValueSet/administrative-gender".to_string());
+
+
             // Special handling for extension tests - make sure they have test data
             // This is fine to do in the test framework rather than the implementation
             if test.name.starts_with("testExtension") || test.expression.contains("extension(") {
