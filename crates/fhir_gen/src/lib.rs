@@ -428,7 +428,7 @@ fn process_elements(
 
             // Add documentation comment for the enum
             output.push_str(&format!(
-                "/// Choice of types for the {}[x] field in {}\n",
+                "/// Choice of types for the {}\\[x\\] field in {}\n",
                 base_name,
                 capitalize_first_letter(&type_name)
             ));
