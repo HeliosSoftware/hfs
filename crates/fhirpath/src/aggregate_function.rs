@@ -30,7 +30,7 @@ pub fn aggregate_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Get the items to aggregate
     let items_to_aggregate = match invocation_base {
-        EvaluationResult::Collection { items, .. } => items.clone(), // Destructure
+        EvaluationResult::Collection { items, .. } => items.clone(),
         EvaluationResult::Empty => vec![],
         single_item => vec![single_item.clone()],
     };
@@ -195,7 +195,7 @@ mod tests {
         // that uses our mocked evaluator
 
         let items_to_aggregate = match &collection {
-            EvaluationResult::Collection(items) => items.clone(),
+            EvaluationResult::Collection { items, .. } => items.clone(),
             EvaluationResult::Empty => vec![],
             single_item => vec![single_item.clone()],
         };

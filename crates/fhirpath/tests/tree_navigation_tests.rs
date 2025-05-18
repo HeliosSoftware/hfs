@@ -28,7 +28,7 @@ mod tests {
             EvaluationResult::String("John".to_string()),
             EvaluationResult::String("Bob".to_string()),
         ];
-        name.insert("given".to_string(), EvaluationResult::Collection(given));
+        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false });
         
         // Add family name
         name.insert("family".to_string(), EvaluationResult::String("Doe".to_string()));
@@ -50,7 +50,7 @@ mod tests {
             EvaluationResult::Object(telecom2),
         ];
         
-        patient.insert("telecom".to_string(), EvaluationResult::Collection(telecom));
+        patient.insert("telecom".to_string(), EvaluationResult::Collection { items: telecom, has_undefined_order: false });
         
         // Return as an object
         EvaluationResult::Object(patient)
@@ -68,10 +68,13 @@ mod tests {
         patient2.insert("active".to_string(), EvaluationResult::Boolean(false));
         
         // Return as a collection
-        EvaluationResult::Collection(vec![
-            patient,
-            EvaluationResult::Object(patient2),
-        ])
+        EvaluationResult::Collection {
+            items: vec![
+                patient,
+                EvaluationResult::Object(patient2),
+            ],
+            has_undefined_order: false,
+        }
     }
     
     #[test]
@@ -87,7 +90,7 @@ mod tests {
         
         // Verify we got a collection
         match &result {
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 // Check that resourceType is excluded
                 assert!(!items.iter().any(|item| {
                     if let EvaluationResult::String(s) = item {
@@ -111,8 +114,8 @@ mod tests {
                 }));
                 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::Boolean(b) = item {
-                        *b == true
+                    if let EvaluationResult::Boolean(b_val) = item { // Renamed to avoid confusion
+                        b_val // if b_val is bool, this is equivalent to b_val == true
                     } else {
                         false
                     }
@@ -136,7 +139,7 @@ mod tests {
         
         // Should return children from both patients
         match &collection_result {
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 // Should have at least 5 items (4 from first patient, at least 1 from second)
                 assert!(items.len() >= 5);
             }
@@ -157,7 +160,7 @@ mod tests {
         
         // Verify we got a collection
         match &result {
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 // Descendants should include deep properties like name.given, etc.
                 // So we should have more items than just the 4 direct children
                 assert!(items.len() > 4);
@@ -205,7 +208,7 @@ mod tests {
         
         // Should return descendants from both patients
         match &collection_result {
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 // Should have descendants from both patients
                 assert!(items.len() > 5);
             }
@@ -234,7 +237,7 @@ mod tests {
         
         // Verify we got a collection
         match &result {
-            EvaluationResult::Collection(items) => {
+            EvaluationResult::Collection { items, .. } => {
                 // Should include id and nested
                 assert!(items.len() >= 2);
                 

@@ -111,7 +111,7 @@ mod tests {
         .unwrap();
 
         match result {
-            EvaluationResult::Collection(types) => {
+            EvaluationResult::Collection { items: types, .. } => {
                 assert_eq!(types.len(), 3);
                 assert!(types.contains(&EvaluationResult::String("Integer".to_string())));
                 assert!(types.contains(&EvaluationResult::String("String".to_string())));

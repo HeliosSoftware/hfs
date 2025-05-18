@@ -62,7 +62,7 @@ fn create_patient_context() -> EvaluationContext {
     let mut birthdate_ext_obj = HashMap::new();
     birthdate_ext_obj.insert(
         "extension".to_string(),
-        EvaluationResult::Collection(vec![EvaluationResult::Object(extension_obj.clone())]),
+        EvaluationResult::Collection { items: vec![EvaluationResult::Object(extension_obj.clone())], has_undefined_order: false },
     );
 
     // Add _birthDate to patient
@@ -75,7 +75,7 @@ fn create_patient_context() -> EvaluationContext {
     let mut underscore_birthdate = HashMap::new();
     underscore_birthdate.insert(
         "extension".to_string(),
-        EvaluationResult::Collection(vec![EvaluationResult::Object(extension_obj)]),
+        EvaluationResult::Collection { items: vec![EvaluationResult::Object(extension_obj)], has_undefined_order: false },
     );
 
     // Set as context - both the patient and the _birthDate object for different tests

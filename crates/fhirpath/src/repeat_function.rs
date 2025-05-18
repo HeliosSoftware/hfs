@@ -132,7 +132,7 @@ mod tests {
         let result = repeat_function(&object1, &parsed, &context).unwrap();
         
         // Verify results - we should have both child objects
-        if let EvaluationResult::Collection(items) = result {
+        if let EvaluationResult::Collection { items, .. } = result {
             assert_eq!(items.len(), 2);
             
             // Check that we have both level1 and level2 objects
@@ -216,7 +216,7 @@ mod tests {
         let result = repeat_function(&root, &parsed, &context).unwrap();
         
         // Verify we get only the two distinct objects, not infinite repetitions
-        if let EvaluationResult::Collection(items) = result {
+        if let EvaluationResult::Collection { items, .. } = result {
             assert_eq!(items.len(), 2, "Should find exactly two distinct objects");
         } else {
             panic!("Expected collection result, got: {:?}", result);

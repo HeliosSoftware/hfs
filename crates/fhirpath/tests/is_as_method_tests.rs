@@ -201,12 +201,12 @@ mod tests {
     #[test]
     fn test_oftype_method_form() {
         // Create a collection with mixed types
-        let collection = EvaluationResult::Collection(vec![
+        let collection = EvaluationResult::Collection { items: vec![
             EvaluationResult::Boolean(true),
             EvaluationResult::Integer(42),
             EvaluationResult::Boolean(false),
             EvaluationResult::String("test".to_string()),
-        ]);
+        ], has_undefined_order: false };
 
         // Create a context with the collection
         let mut context = EvaluationContext::new_empty();
@@ -217,10 +217,10 @@ mod tests {
             // Filter for Boolean values
             (
                 "$this.ofType('Boolean')",
-                EvaluationResult::Collection(vec![
+                EvaluationResult::Collection { items: vec![
                     EvaluationResult::Boolean(true),
                     EvaluationResult::Boolean(false),
-                ]),
+                ], has_undefined_order: false },
             ),
             // Filter for String values
             (
@@ -232,10 +232,10 @@ mod tests {
             // Filter with System namespace
             (
                 "$this.ofType('System.Boolean')",
-                EvaluationResult::Collection(vec![
+                EvaluationResult::Collection { items: vec![
                     EvaluationResult::Boolean(true),
                     EvaluationResult::Boolean(false),
-                ]),
+                ], has_undefined_order: false },
             ),
             // Filter with no matches
             ("$this.ofType('Decimal')", EvaluationResult::Empty),

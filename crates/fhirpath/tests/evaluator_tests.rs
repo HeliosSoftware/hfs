@@ -18,7 +18,7 @@ fn eval(input: &str, context: &EvaluationContext) -> Result<EvaluationResult, Ev
 
 // Helper to create a collection result
 fn collection(items: Vec<EvaluationResult>) -> EvaluationResult {
-    EvaluationResult::Collection(items) // Removed normalize() call
+    EvaluationResult::Collection { items, has_undefined_order: false } // Removed normalize() call, assuming ordered for tests
 }
 
 // Removed internal date/time parsing helpers. Use eval() with literals instead.
@@ -426,7 +426,7 @@ fn test_function_existence_distinct() {
     );
     // Order not guaranteed, so check contents
     let result = eval("(1 | 2 | 1 | 3 | 2).distinct()", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -733,10 +733,10 @@ fn test_function_subsetting_tail() {
     ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).tail()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
-        ])
+        ], has_undefined_order: false }
     );
 }
 
@@ -750,18 +750,18 @@ fn test_function_subsetting_skip() {
     ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).skip(0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
-        ])
+        ], has_undefined_order: false }
     );
     assert_eq!(
         eval("(10 | 20 | 30).skip(1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
-        ])
+        ], has_undefined_order: false }
     );
     assert_eq!(
         eval("(10 | 20 | 30).skip(3)", &context).unwrap(), // Add unwrap
@@ -774,11 +774,11 @@ fn test_function_subsetting_skip() {
     // Negative skip is treated as 0
     assert_eq!(
         eval("(10 | 20 | 30).skip(-1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(10),
             EvaluationResult::Integer(20),
             EvaluationResult::Integer(30)
-        ])
+        ], has_undefined_order: false }
     );
     // Non-integer skip should error
     assert!(eval("(10 | 20 | 30).skip('a')", &context).is_err());
@@ -856,7 +856,7 @@ fn test_function_subsetting_intersect() {
     );
     // Order not guaranteed, check contents
     let result = eval("(1 | 2 | 3).intersect((2 | 3 | 4))", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -936,20 +936,20 @@ fn test_function_combining_union() {
     ); // Add unwrap
 
     let r1 = eval("(1 | 2).union({})", &context).unwrap(); // Add unwrap
-    assert!(matches!(&r1, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(v) = r1 {
+    assert!(matches!(&r1, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items: v, .. } = r1 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     let r2 = eval("{}.union(1 | 2)", &context).unwrap(); // Add unwrap
-    assert!(matches!(&r2, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(v) = r2 {
+    assert!(matches!(&r2, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items: v, .. } = r2 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Order not guaranteed, check contents
     let result = eval("(1 | 2 | 3).union(2 | 3 | 4)", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -963,7 +963,7 @@ fn test_function_combining_union() {
         panic!("Expected collection result from union");
     }
     let result = eval("(1 | 2 | 1).union(1 | 3 | 1)", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -989,22 +989,22 @@ fn test_function_combining_combine() {
     ); // Add unwrap
 
     let r1 = eval("(1 | 2).combine({})", &context).unwrap(); // Add unwrap
-    assert!(matches!(&r1, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(v) = r1 {
+    assert!(matches!(&r1, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items: v, .. } = r1 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Use valid syntax (1 | 2) instead of {1 | 2}
     let r2 = eval("{}.combine(1 | 2)", &context).unwrap(); // Add unwrap
-    assert!(matches!(&r2, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(v) = r2 {
+    assert!(matches!(&r2, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items: v, .. } = r2 {
         assert_eq!(v.len(), 2); /* Check items if needed */
     }
 
     // Order not guaranteed, check contents, duplicates preserved
     // Use valid syntax (2 | 3 | 4) instead of {2 | 3 | 4}
     let result = eval("(1 | 2 | 3).combine(2 | 3 | 4)", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -1019,7 +1019,7 @@ fn test_function_combining_combine() {
     }
     // Use valid syntax (1 | 3 | 1) instead of {1 | 3 | 1}
     let result = eval("(1 | 2 | 1).combine(1 | 3 | 1)", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -2426,11 +2426,11 @@ fn test_function_string_to_chars() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abc'.toChars()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::String("a".to_string()),
             EvaluationResult::String("b".to_string()),
             EvaluationResult::String("c".to_string()),
-        ])
+        ], has_undefined_order: false }
     );
     assert_eq!(
         eval("''.toChars()", &context).unwrap(),
@@ -2963,21 +2963,21 @@ fn test_operator_collections_union() {
     assert_eq!(eval("{} | {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
         eval("(1 | 2) | {}", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
-        ])
+        ], has_undefined_order: true } // Order not guaranteed by |
     ); // Order not guaranteed
     assert_eq!(
         eval("{} | (1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![
+        EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2)
-        ])
+        ], has_undefined_order: true } // Order not guaranteed by |
     ); // Order not guaranteed
     // Order not guaranteed, check contents - Union operator produces distinct results
     let result = eval("(1 | 2 | 3) | (2 | 3 | 4)", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Collection(items) = result {
+    if let EvaluationResult::Collection { items, .. } = result {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
@@ -3737,7 +3737,7 @@ fn test_resource_simple_field_access() {
         EvaluationResult::String("1980-05-15".to_string())
     );
     let context_result = eval("%context", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Object(patient_obj) = context_result {
+    if let EvaluationResult::Object(patient_obj) = context_result { // This is correct, %context is a single Patient resource object
         // Check the 'deceased' field within the evaluated object map
         assert_eq!(
             patient_obj.get("deceased"),
@@ -3767,8 +3767,8 @@ fn test_resource_nested_field_access() {
     let context = patient_context();
     // Accessing a field within a list - returns a collection of that field from each list item
     let name_family = eval("name.family", &context).unwrap(); // Add unwrap
-    assert!(matches!(name_family, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(items) = name_family {
+    assert!(matches!(name_family, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items, .. } = name_family {
         assert_eq!(items.len(), 2); // Doe, Smith (usual name has no family)
         assert!(items.contains(&EvaluationResult::String("Doe".to_string())));
         assert!(items.contains(&EvaluationResult::String("Smith".to_string())));
@@ -3776,8 +3776,8 @@ fn test_resource_nested_field_access() {
 
     // Accessing 'name.given' should return a collection of primitive strings
     let name_given = eval("name.given", &context).unwrap(); // Add unwrap
-    assert!(matches!(name_given, EvaluationResult::Collection(_)));
-    if let EvaluationResult::Collection(items) = name_given {
+    assert!(matches!(name_given, EvaluationResult::Collection { .. }));
+    if let EvaluationResult::Collection { items, .. } = name_given {
         assert_eq!(items.len(), 4); // John, Middle, Johnny, Jane
         assert!(items.contains(&EvaluationResult::String("John".to_string())));
         assert!(items.contains(&EvaluationResult::String("Middle".to_string()))); // Now a primitive string
@@ -3788,11 +3788,11 @@ fn test_resource_nested_field_access() {
     // Accessing a field that doesn't exist in all items
     let name_use = eval("name.use", &context).unwrap(); // Add unwrap
     assert!(
-        matches!(name_use, EvaluationResult::Collection(_)),
+        matches!(name_use, EvaluationResult::Collection { .. }),
         "Expected Collection for name.use, got {:?}",
         name_use
     );
-    if let EvaluationResult::Collection(items) = name_use {
+    if let EvaluationResult::Collection { items, .. } = name_use {
         assert_eq!(items.len(), 2, "Expected 2 'use' values, got {:?}", items); // Only official and usual have 'use'
         assert!(items.contains(&EvaluationResult::String("official".to_string())));
         assert!(items.contains(&EvaluationResult::String("usual".to_string())));
@@ -3813,11 +3813,11 @@ fn test_resource_nested_field_access() {
     // Access id on complex type (HumanName) - this should still work
     let name_ids = eval("name.id", &context).unwrap(); // Add unwrap
     assert!(
-        matches!(name_ids, EvaluationResult::Collection(_)), // Expect Collection even if only 2 results
+        matches!(name_ids, EvaluationResult::Collection { .. }), // Expect Collection even if only 2 results
         "Expected Collection for name.id, got {:?}",
         name_ids
     );
-    if let EvaluationResult::Collection(items) = name_ids {
+    if let EvaluationResult::Collection { items, .. } = name_ids {
         assert_eq!(items.len(), 2);
         assert!(items.contains(&EvaluationResult::String("name1".to_string())));
         assert!(items.contains(&EvaluationResult::String("name2".to_string())));
@@ -3835,11 +3835,11 @@ fn test_resource_nested_field_access() {
     // // Access extension (basic check, requires Extension conversion)
     // let bday_ext = eval("birthDate.extension", &context);
     // assert!(
-    //     matches!(bday_ext, EvaluationResult::Collection(_)),
+    //     matches!(bday_ext, EvaluationResult::Collection { .. }),
     //     "Expected Collection for birthDate.extension, got {:?}", // This message belongs inside the assert!
     //     bday_ext
     // );
-    // if let EvaluationResult::Collection(exts) = bday_ext {
+    // if let EvaluationResult::Collection { items: exts, .. } = bday_ext {
     //     assert_eq!(exts.len(), 1);
     //     // Further checks require Extension object structure
     //     // assert_eq!(eval("birthDate.extension.url", &context), EvaluationResult::String("http://example.com/precision".to_string()));
@@ -3867,11 +3867,11 @@ fn test_resource_filtering_and_projection() {
     // .given returns a collection of primitive strings
     assert_eq!(
         eval("name.where(use = 'usual').given", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![EvaluationResult::String("Johnny".to_string())])
+        EvaluationResult::Collection { items: vec![EvaluationResult::String("Johnny".to_string())], has_undefined_order: false }
     );
     assert_eq!(
         eval("name.where(family = 'Smith').given", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection(vec![EvaluationResult::String("Jane".to_string())])
+        EvaluationResult::Collection { items: vec![EvaluationResult::String("Jane".to_string())], has_undefined_order: false }
     );
 
     // Select multiple fields - This expression should error because 'given' is a collection

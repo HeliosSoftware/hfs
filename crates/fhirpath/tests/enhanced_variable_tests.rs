@@ -26,11 +26,11 @@ fn test_enhanced_variable_handling() {
     context.set_variable_result("stringVar", EvaluationResult::String("Hello".to_string()));
     
     // Create a collection variable
-    context.set_variable_result("collectionVar", EvaluationResult::Collection(vec![
+    context.set_variable_result("collectionVar", EvaluationResult::Collection { items: vec![
         EvaluationResult::Integer(1),
         EvaluationResult::Integer(2),
         EvaluationResult::Integer(3),
-    ]));
+    ], has_undefined_order: false });
     
     // Create an object variable
     let mut obj = HashMap::new();

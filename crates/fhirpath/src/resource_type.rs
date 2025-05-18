@@ -755,12 +755,12 @@ mod tests {
     #[test]
     fn test_of_type() {
         // Create a collection with mixed types
-        let collection = EvaluationResult::Collection(vec![
+        let collection = EvaluationResult::Collection { items: vec![
             EvaluationResult::Boolean(true),
             EvaluationResult::Integer(42),
             EvaluationResult::Boolean(false),
             EvaluationResult::String("test".to_string()),
-        ]);
+        ], has_undefined_order: false };
         
         // Create type specifiers
         let bool_type = TypeSpecifier::QualifiedIdentifier("Boolean".to_string(), None);
@@ -768,10 +768,10 @@ mod tests {
         let str_type = TypeSpecifier::QualifiedIdentifier("String".to_string(), None);
         
         // Test filtering with multiple matches - should return a collection
-        let collection_with_only_booleans = EvaluationResult::Collection(vec![
+        let collection_with_only_booleans = EvaluationResult::Collection { items: vec![
             EvaluationResult::Boolean(true),
             EvaluationResult::Boolean(false),
-        ]);
+        ], has_undefined_order: false };
         let bool_result = of_type(&collection, &bool_type).unwrap();
         assert_eq!(bool_result, collection_with_only_booleans);
         

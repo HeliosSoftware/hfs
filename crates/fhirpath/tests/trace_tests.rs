@@ -14,17 +14,17 @@ fn test_trace_function() {
         // Trace with a chain
         ("1.trace('first').trace('second')", EvaluationResult::Integer(1)),
         // Trace with a collection
-        ("(1 | 2 | 3).trace('collection')", EvaluationResult::Collection(vec![
+        ("(1 | 2 | 3).trace('collection')", EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
             EvaluationResult::Integer(3),
-        ])),
+        ], has_undefined_order: false }),
         // Trace with a projection (second parameter)
-        ("(1 | 2 | 3).trace('projection', $this + 1)", EvaluationResult::Collection(vec![
+        ("(1 | 2 | 3).trace('projection', $this + 1)", EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
             EvaluationResult::Integer(3),
-        ])),
+        ], has_undefined_order: false }),
     ];
 
     // Run test cases
