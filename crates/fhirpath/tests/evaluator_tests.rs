@@ -1973,12 +1973,12 @@ fn test_function_string_substring() {
     );
     assert_eq!(
         eval("'abcdefg'.substring(7, 1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Current behavior for out-of-bounds, spec says empty string
+        EvaluationResult::String("".to_string()) // Spec: Start out of bounds returns empty string
     ); // Start out of bounds
-    // Negative start index (spec says error, current code might return Empty or other)
-    assert_eq!(
-        eval("'abcdefg'.substring(-1, 1)", &context).unwrap(), // Assuming it returns Empty if not erroring
-        EvaluationResult::Empty // Change from is_err() to check for Empty
+    // Negative start index (spec says error)
+    assert!(
+        eval("'abcdefg'.substring(-1, 1)", &context).is_err(),
+        "Expected error for substring with negative start index"
     );
     assert_eq!(
         eval("'abcdefg'.substring(3, 0)", &context).unwrap(), // Add unwrap
@@ -2457,7 +2457,7 @@ fn test_function_utility_now() {
     // Check determinism (calling twice gives same result)
     assert_eq!(
         eval("now() = now()", &context).unwrap(), // Use eval helper and unwrap
-        EvaluationResult::Boolean(false) // Current behavior, spec implies true
+        EvaluationResult::Boolean(true) // now() should be stable within one evaluation
     );
 }
 
@@ -4136,11 +4136,11 @@ fn test_comparison_operations() {
         "(1 | 2) < 3",       // Collection vs Singleton
         "1 < (2 | 3)",       // Singleton vs Collection
         "(1 | 2) < (3 | 4)", // Collection vs Collection
-        // Cases that error due to type incompatibility, though spec might suggest Empty
-        "1 < 'a'",
-        "'a' > true",
-        "@2023 = @T10:00",
-        "@2023 < @T10:00",
+        // Cases that error due to type incompatibility
+        "1 < 'a'", // Integer vs String
+        "'a' > true", // String vs Boolean
+        // Note: Comparison of incompatible date/time types like "@2023 = @T10:00"
+        // should result in Empty, not error, per spec. Moved to empty_cases.
     ];
     for input in error_cases {
         assert!(
@@ -4157,8 +4157,9 @@ fn test_comparison_operations() {
         "1 != {}", "{} != 1",  // != with empty -> empty
         "{} = {}",  // = with empty -> empty
         "{} != {}", // != with empty -> empty
-        // Note: Incompatible type comparisons like "1 < 'a'" now moved to error_cases
-        // as the current implementation errors instead of returning Empty.
+        // Comparison of incompatible date/time types should result in Empty
+        "@2023 = @T10:00",
+        "@2023 < @T10:00",
     ];
     for input in empty_cases {
         assert_eq!(
