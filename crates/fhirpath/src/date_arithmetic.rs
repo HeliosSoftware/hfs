@@ -398,7 +398,7 @@ mod tests {
         let quantity = EvaluationResult::Quantity(dec!(30), "minute".to_string());
         
         let result = add_date_time_quantity(&datetime, &quantity).unwrap();
-        assert_eq!(result, EvaluationResult::DateTime("2023-05-15T15:00:45.000".to_string()));
+        assert_eq!(result, EvaluationResult::DateTime("2023-05-15T15:00:45.000Z".to_string()));
     }
     
     #[test]

@@ -18,13 +18,13 @@ fn test_trace_function() {
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
             EvaluationResult::Integer(3),
-        ], has_undefined_order: false }),
+        ], has_undefined_order: true }), // Union operator implies undefined order
         // Trace with a projection (second parameter)
         ("(1 | 2 | 3).trace('projection', $this + 1)", EvaluationResult::Collection { items: vec![
             EvaluationResult::Integer(1),
             EvaluationResult::Integer(2),
             EvaluationResult::Integer(3),
-        ], has_undefined_order: false }),
+        ], has_undefined_order: true }), // Input collection from union has undefined order
     ];
 
     // Run test cases

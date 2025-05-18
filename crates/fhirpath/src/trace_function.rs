@@ -30,7 +30,7 @@ mod tests {
                         EvaluationResult::Integer(2),
                         EvaluationResult::Integer(3),
                     ],
-                    has_undefined_order: false, // Assuming ordered for this literal collection
+                    has_undefined_order: true, // Union operator implies undefined order
                 },
             ),
             // Trace with a projection (second parameter)
@@ -42,7 +42,7 @@ mod tests {
                         EvaluationResult::Integer(2),
                         EvaluationResult::Integer(3),
                     ],
-                    has_undefined_order: false, // Assuming ordered for this literal collection
+                    has_undefined_order: true, // Input collection from union has undefined order
                 },
             ),
         ];
