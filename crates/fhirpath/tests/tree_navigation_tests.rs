@@ -115,7 +115,7 @@ mod tests {
                 
                 assert!(items.iter().any(|item| {
                     if let EvaluationResult::Boolean(b_val) = item { // Renamed to avoid confusion
-                        b_val // if b_val is bool, this is equivalent to b_val == true
+                        *b_val // if b_val is &bool, dereference to get bool
                     } else {
                         false
                     }
