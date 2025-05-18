@@ -4089,10 +4089,13 @@ fn test_boolean_operations() {
     // Test type errors (should error) - These assertions are now correct
     assert!(eval("1 and true", &context).is_err());
     assert!(eval("true and 'a'", &context).is_err());
+    // Test type errors for 'or'
     assert!(eval("1 or true", &context).is_err());
     assert!(eval("true or 'a'", &context).is_err());
+    // Test type errors for 'xor'
     assert!(eval("1 xor true", &context).is_err());
     assert!(eval("true xor 'a'", &context).is_err());
+    // Test type errors for 'implies'
     assert!(eval("1 implies true", &context).is_err());
     assert!(eval("true implies 'a'", &context).is_err());
 }
