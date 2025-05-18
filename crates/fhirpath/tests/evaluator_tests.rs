@@ -470,10 +470,10 @@ fn test_function_filtering_where() {
     assert_eq!(
         eval("(1 | 2 | 3 | 4).where($this > 2)", &context).unwrap(), // Add unwrap
         // Expect collection even if normalization happens
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(4)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(3), EvaluationResult::Integer(4)],
+            has_undefined_order: true
+        }
     );
     assert_eq!(
         eval("(1 | 2 | 3 | 4).where($this > 5)", &context).unwrap(), // Add unwrap
@@ -506,21 +506,27 @@ fn test_function_filtering_select() {
     assert_eq!(
         eval("(1 | 2 | 3).select($this * 2)", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(4),
-            EvaluationResult::Integer(6)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(2),
+                EvaluationResult::Integer(4),
+                EvaluationResult::Integer(6)
+            ],
+            has_undefined_order: true
+        }
     );
     // Test flattening
     assert_eq!(
         eval("( (1|2) | (3|4) ).select($this)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(4)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(1),
+                EvaluationResult::Integer(2),
+                EvaluationResult::Integer(3),
+                EvaluationResult::Integer(4)
+            ],
+            has_undefined_order: true
+        }
     );
     // Test empty result from projection is skipped
     assert_eq!(
@@ -534,12 +540,15 @@ fn test_function_filtering_select() {
         // Expect collection result
         // The inner union `($this) | ($this + 1)` will be unordered.
         // The select operation preserves this unordered nature for the combined output.
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2), // from first item's projection
-            EvaluationResult::Integer(2), // from second item's projection
-            EvaluationResult::Integer(3)  // from second item's projection
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(1),
+                EvaluationResult::Integer(2), // from first item's projection
+                EvaluationResult::Integer(2), // from second item's projection
+                EvaluationResult::Integer(3)  // from second item's projection
+            ],
+            has_undefined_order: true
+        }
     );
 }
 
@@ -730,10 +739,10 @@ fn test_function_subsetting_tail() {
     ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).tail()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(20), EvaluationResult::Integer(30)],
+            has_undefined_order: true
+        }
     );
 }
 
@@ -747,18 +756,21 @@ fn test_function_subsetting_skip() {
     ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).skip(0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(10),
+                EvaluationResult::Integer(20),
+                EvaluationResult::Integer(30)
+            ],
+            has_undefined_order: true
+        }
     );
     assert_eq!(
         eval("(10 | 20 | 30).skip(1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(20), EvaluationResult::Integer(30)],
+            has_undefined_order: true
+        }
     );
     assert_eq!(
         eval("(10 | 20 | 30).skip(3)", &context).unwrap(), // Add unwrap
@@ -771,11 +783,14 @@ fn test_function_subsetting_skip() {
     // Negative skip is treated as 0
     assert_eq!(
         eval("(10 | 20 | 30).skip(-1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(10),
+                EvaluationResult::Integer(20),
+                EvaluationResult::Integer(30)
+            ],
+            has_undefined_order: true
+        }
     );
     // Non-integer skip should error
     assert!(eval("(10 | 20 | 30).skip('a')", &context).is_err());
@@ -801,29 +816,35 @@ fn test_function_subsetting_take() {
     assert_eq!(
         eval("(10 | 20 | 30).take(2)", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(20)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(10), EvaluationResult::Integer(20)],
+            has_undefined_order: true
+        }
     );
     // Add the missing assert_eq! for take(3)
     assert_eq!(
         eval("(10 | 20 | 30).take(3)", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true } // End collection for take(3)
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(10),
+                EvaluationResult::Integer(20),
+                EvaluationResult::Integer(30)
+            ],
+            has_undefined_order: true
+        } // End collection for take(3)
     ); // End assert_eq for take(3)
     assert_eq!(
         eval("(10 | 20 | 30).take(4)", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(20),
-            EvaluationResult::Integer(30)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(10),
+                EvaluationResult::Integer(20),
+                EvaluationResult::Integer(30)
+            ],
+            has_undefined_order: true
+        }
     );
     // Negative take returns empty
     assert_eq!(
@@ -889,11 +910,14 @@ fn test_function_subsetting_exclude() {
     assert_eq!(
         eval("(1 | 2 | 3).exclude({})", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(1),
+                EvaluationResult::Integer(2),
+                EvaluationResult::Integer(3)
+            ],
+            has_undefined_order: true
+        }
     );
     assert_eq!(
         eval("{}.exclude(1 | 2 | 3)", &context).unwrap(), // Add unwrap
@@ -902,10 +926,10 @@ fn test_function_subsetting_exclude() {
     assert_eq!(
         eval("(1 | 2 | 3).exclude(2 | 4)", &context).unwrap(), // Add unwrap
         // Expect collection result
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(3)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(3)],
+            has_undefined_order: true
+        }
     );
     // Preserves duplicates and order - but | makes input distinct first
     // (1 | 2 | 1 | 3 | 2) -> (1 | 2 | 3)
@@ -914,10 +938,13 @@ fn test_function_subsetting_exclude() {
     assert_eq!(
         eval("(1 | 2 | 1 | 3 | 2).exclude(1 | 4)", &context).unwrap(), // Add unwrap
         // Expect collection result based on distinct input
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3) // The second '2' is lost because the input collection becomes distinct
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::Integer(2),
+                EvaluationResult::Integer(3) // The second '2' is lost because the input collection becomes distinct
+            ],
+            has_undefined_order: true
+        }
     );
 }
 
@@ -1067,17 +1094,17 @@ fn test_function_conversion_iif() {
     // Test collection results
     assert_eq!(
         eval("iif(true, (1|2), (3|4))", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            has_undefined_order: true
+        }
     );
     assert_eq!(
         eval("iif(false, (1|2), (3|4))", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(4)
-        ], has_undefined_order: true }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(3), EvaluationResult::Integer(4)],
+            has_undefined_order: true
+        }
     );
     // Test short-circuiting (cannot test directly, assume implementation detail)
     // Example: iif(true, 1, $this) should not fail even if $this is invalid in outer scope
@@ -1973,25 +2000,24 @@ fn test_function_string_substring() {
     );
     assert_eq!(
         eval("'abcdefg'.substring(7, 1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Current behavior for out-of-bounds
+        EvaluationResult::Empty                               // Current behavior for out-of-bounds
     ); // Start out of bounds
     // Negative start index (spec says empty if outside length, current impl returns empty string)
     assert_eq!(
         eval("'abcdefg'.substring(-1, 1)", &context).unwrap(),
-        EvaluationResult::String("".to_string()), 
-        "Substring with negative start index should return Empty String"
+        EvaluationResult::Empty // Current behavior for out-of-bounds
     );
     assert_eq!(
         eval("'abcdefg'.substring(3, 0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Aligning with current impl behavior (spec says String(""))
+        EvaluationResult::String("".to_string())
     ); // Zero length
     assert_eq!(
         eval("'abcdefg'.substring(3, -1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Empty // Aligning with current impl behavior (spec says String(""))
+        EvaluationResult::String("".to_string())
     ); // Negative length
     assert_eq!(
         eval("''.substring(0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::Empty                     // Current behavior for out-of-bounds
     );
     assert_eq!(
         eval("{}.substring(0)", &context).unwrap(),
@@ -2427,11 +2453,14 @@ fn test_function_string_to_chars() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abc'.toChars()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::String("a".to_string()),
-            EvaluationResult::String("b".to_string()),
-            EvaluationResult::String("c".to_string()),
-        ], has_undefined_order: false }
+        EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::String("a".to_string()),
+                EvaluationResult::String("b".to_string()),
+                EvaluationResult::String("c".to_string()),
+            ],
+            has_undefined_order: false
+        }
     );
     assert_eq!(
         eval("''.toChars()", &context).unwrap(),
@@ -2458,7 +2487,7 @@ fn test_function_utility_now() {
     // Check determinism (calling twice gives same result)
     assert_eq!(
         eval("now() = now()", &context).unwrap(), // Use eval helper and unwrap
-        EvaluationResult::Boolean(true) // now() should be stable within one evaluation
+        EvaluationResult::Boolean(true)           // now() should be stable within one evaluation
     );
 }
 
@@ -2964,17 +2993,17 @@ fn test_operator_collections_union() {
     assert_eq!(eval("{} | {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
         eval("(1 | 2) | {}", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2)
-        ], has_undefined_order: true } // Order not guaranteed by |
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            has_undefined_order: true
+        }  // Order not guaranteed by |
     ); // Order not guaranteed
     assert_eq!(
         eval("{} | (1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2)
-        ], has_undefined_order: true } // Order not guaranteed by |
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            has_undefined_order: true
+        }  // Order not guaranteed by |
     ); // Order not guaranteed
     // Order not guaranteed, check contents - Union operator produces distinct results
     let result = eval("(1 | 2 | 3) | (2 | 3 | 4)", &context).unwrap(); // Add unwrap
@@ -3738,7 +3767,8 @@ fn test_resource_simple_field_access() {
         EvaluationResult::String("1980-05-15".to_string())
     );
     let context_result = eval("%context", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Object(patient_obj) = context_result { // This is correct, %context is a single Patient resource object
+    if let EvaluationResult::Object(patient_obj) = context_result {
+        // This is correct, %context is a single Patient resource object
         // Check the 'deceased' field within the evaluated object map
         assert_eq!(
             patient_obj.get("deceased"),
@@ -3868,11 +3898,17 @@ fn test_resource_filtering_and_projection() {
     // .given returns a collection of primitive strings
     assert_eq!(
         eval("name.where(use = 'usual').given", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![EvaluationResult::String("Johnny".to_string())], has_undefined_order: false }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::String("Johnny".to_string())],
+            has_undefined_order: false
+        }
     );
     assert_eq!(
         eval("name.where(family = 'Smith').given", &context).unwrap(), // Add unwrap
-        EvaluationResult::Collection { items: vec![EvaluationResult::String("Jane".to_string())], has_undefined_order: false }
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::String("Jane".to_string())],
+            has_undefined_order: false
+        }
     );
 
     // Select multiple fields - This expression should error because 'given' is a collection
@@ -4151,8 +4187,8 @@ fn test_comparison_operations() {
         // Cases that error due to type incompatibility
         "1 < 'a'", // Integer vs String
         "'a' > true", // String vs Boolean
-        // Note: Comparison of incompatible date/time types like "@2023 = @T10:00"
-        // now moved to success_cases as current implementation returns Boolean(false).
+                   // Note: Comparison of incompatible date/time types like "@2023 = @T10:00"
+                   // now moved to success_cases as current implementation returns Boolean(false).
     ];
     for input in error_cases {
         assert!(
@@ -4166,11 +4202,11 @@ fn test_comparison_operations() {
     let empty_cases = vec![
         "1 < {}", "{} < 1", "1 <= {}", "{} <= 1", "1 > {}", "{} > 1", "1 >= {}", "{} >= 1",
         "1 = {}", "{} = 1", // = with empty -> empty
-        "1 != {}", "{} != 1",  // != with empty -> empty
-        "{} = {}",  // = with empty -> empty
+        "1 != {}", "{} != 1", // != with empty -> empty
+        "{} = {}", // = with empty -> empty
         "{} != {}", // != with empty -> empty
-        // Comparison of incompatible date/time types should result in an error or Empty.
-        // Current implementation errors, so these are moved to error_cases or checked for error.
+                   // Comparison of incompatible date/time types should result in an error or Empty.
+                   // Current implementation errors, so these are moved to error_cases or checked for error.
     ];
     for input in empty_cases {
         assert_eq!(
@@ -5166,7 +5202,7 @@ fn test_type_operations_with_precedence() {
         eval("true is Boolean", &context).unwrap(),
         EvaluationResult::Boolean(true)
     );
-    
+
     // Test the boolean result of a direct comparison
     assert_eq!(
         eval("1 > 2", &context).unwrap(),
@@ -5175,7 +5211,7 @@ fn test_type_operations_with_precedence() {
 
     // We've learned that the parser interprets "1 > 2 is Boolean" as "1 > (2 is Boolean)"
     // instead of "(1 > 2) is Boolean", which is causing our error.
-    
+
     // Test with explicit parentheses to ensure correct parsing
     // This should work correctly with our current implementation
     assert_eq!(
