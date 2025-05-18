@@ -1975,11 +1975,11 @@ fn test_function_string_substring() {
         eval("'abcdefg'.substring(7, 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty // Current behavior for out-of-bounds
     ); // Start out of bounds
-    // Negative start index (spec says empty if outside length, current impl returns empty string)
+    // Negative start index (spec says empty if outside length)
     assert_eq!(
         eval("'abcdefg'.substring(-1, 1)", &context).unwrap(),
-        EvaluationResult::String("".to_string()), // Align with current implementation output
-        "Substring with negative start index should return Empty String"
+        EvaluationResult::Empty, 
+        "Substring with negative start index should return Empty"
     );
     assert_eq!(
         eval("'abcdefg'.substring(3, 0)", &context).unwrap(), // Add unwrap
@@ -4125,12 +4125,8 @@ fn test_comparison_operations() {
         ("'a' <= 'a'", EvaluationResult::Boolean(true)),
         ("@2024 > @2023", EvaluationResult::Boolean(true)),
         ("@T10:00 < @T11:00", EvaluationResult::Boolean(true)),
-        // Incompatible Date/Time comparisons - current impl returns Boolean(false)
-        ("@2023 = @T10:00", EvaluationResult::Boolean(false)),
-        ("@2023 < @T10:00", EvaluationResult::Boolean(false)),
-        ("@2023 > @T10:00", EvaluationResult::Boolean(false)),
-        ("@2023 <= @T10:00", EvaluationResult::Boolean(false)),
-        ("@2023 >= @T10:00", EvaluationResult::Boolean(false)),
+        // Note: Incompatible Date/Time comparisons like "@2023 = @T10:00"
+        // are moved to error_cases as the current implementation errors.
     ];
 
     for (input, expected) in success_cases {
@@ -4151,8 +4147,12 @@ fn test_comparison_operations() {
         // Cases that error due to type incompatibility
         "1 < 'a'", // Integer vs String
         "'a' > true", // String vs Boolean
-        // Note: Comparison of incompatible date/time types like "@2023 = @T10:00"
-        // now moved to success_cases as current implementation returns Boolean(false).
+        // Comparison of incompatible date/time types errors out in current implementation
+        "@2023 = @T10:00",
+        "@2023 < @T10:00",
+        "@2023 > @T10:00",
+        "@2023 <= @T10:00",
+        "@2023 >= @T10:00",
     ];
     for input in error_cases {
         assert!(
