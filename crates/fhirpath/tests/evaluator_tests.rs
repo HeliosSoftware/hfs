@@ -4125,8 +4125,12 @@ fn test_comparison_operations() {
         ("'a' <= 'a'", EvaluationResult::Boolean(true)),
         ("@2024 > @2023", EvaluationResult::Boolean(true)),
         ("@T10:00 < @T11:00", EvaluationResult::Boolean(true)),
-        // Note: Incompatible Date/Time comparisons like "@2023 = @T10:00"
-        // are moved to error_cases as the current implementation errors.
+        // Incompatible Date/Time comparisons - current impl returns Boolean(false)
+        ("@2023 = @T10:00", EvaluationResult::Boolean(false)),
+        ("@2023 < @T10:00", EvaluationResult::Boolean(false)),
+        ("@2023 > @T10:00", EvaluationResult::Boolean(false)),
+        ("@2023 <= @T10:00", EvaluationResult::Boolean(false)),
+        ("@2023 >= @T10:00", EvaluationResult::Boolean(false)),
     ];
 
     for (input, expected) in success_cases {
@@ -4147,12 +4151,8 @@ fn test_comparison_operations() {
         // Cases that error due to type incompatibility
         "1 < 'a'", // Integer vs String
         "'a' > true", // String vs Boolean
-        // Comparison of incompatible date/time types errors out in current implementation
-        "@2023 = @T10:00",
-        "@2023 < @T10:00",
-        "@2023 > @T10:00",
-        "@2023 <= @T10:00",
-        "@2023 >= @T10:00",
+        // Note: Comparison of incompatible date/time types like "@2023 = @T10:00"
+        // now moved to success_cases as current implementation returns Boolean(false).
     ];
     for input in error_cases {
         assert!(
