@@ -2,7 +2,7 @@
 
 # Helios FHIR Server
 
-The Helios FHIR Server is an implementation of the HL7 FHIR standard, built in Rust for high performance and targeted towards clinical analytics workloads.  It can be run on your laptop and can scale to petabyte-scale, serverless cloud clusters.
+The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.org/fhir) standard, built in Rust for high performance and targeted towards clinical analytics workloads.  It can be run on your laptop and can scale to petabyte-scale, serverless cloud clusters.
 
 # Quick Start
 
