@@ -28,7 +28,7 @@ brew install ldd
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 ```
-4.  Modify your `~/bashrc` (Linux) or `~\.zshrc` (Mac) and add:
+4.  Modify your `~/.bashrc` (Linux) or `~/.zshrc` (Mac) and add:
 ````
 export RUST_MIN_STACK=8388608
 ````
@@ -62,3 +62,17 @@ SQL On FHIR
       cargo build --features R4,R4B,R5,R6
       ./target/debug/fhir_gen --all
       cargo test --features R4,R4B,R5,R6
+
+# Documentation
+
+## Product Documentation
+
+TODO
+
+## Source Code Documentation
+
+To view our [rustdoc](https://doc.rust-lang.org/rustdoc/) documentation in a browser, run
+```
+cargo doc --no-deps --open
+```
+# Running Tests
