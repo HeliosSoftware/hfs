@@ -4154,7 +4154,6 @@ fn test_comparison_operations() {
         ("1 != 2", EvaluationResult::Boolean(true)),
         ("'abc' ~ 'ABC'", EvaluationResult::Boolean(true)),
         ("'abc' !~ 'def'", EvaluationResult::Boolean(true)),
-        // Add more specific comparison cases
         ("1.0 < 2", EvaluationResult::Boolean(true)),
         ("2 >= 1.5", EvaluationResult::Boolean(true)),
         ("'b' > 'a'", EvaluationResult::Boolean(true)),
