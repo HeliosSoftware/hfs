@@ -1,4 +1,5 @@
 - Review all READMEs and decide on the outline of yours
+  - https://www.emilyomier.com/blog/argillas-readme
   - https://github.com/neondatabase/neon
   - https://github.com/refinedev/refine#readme
   - https://github.com/astral-sh/uv  
@@ -6,6 +7,16 @@
   - Emily's presentation
   - MP
   - Neon, uv
+
+    -Image
+    -Product Name: Helios FHIR Server
+    -Product tag line:  Build modern healthcare analytics applications.
+    -One sentence product description: The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.org/fhir) standard, built in Rust for high performance and targeted towards clinical analytics workloads.   
+    -Why use Helios FHIR Server?
+    -What do people build using the Helios FHIR Server?
+    -Quick Start
+    -Documentation (if not above)
+
 
 - Finish code review
   - There are some Special Cases in r4_tests.rs that we need to eliminate

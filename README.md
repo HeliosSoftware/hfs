@@ -76,3 +76,6 @@ To view our [rustdoc](https://doc.rust-lang.org/rustdoc/) documentation in a bro
 cargo doc --no-deps --open
 ```
 # Running Tests
+```
+cargo test
+```

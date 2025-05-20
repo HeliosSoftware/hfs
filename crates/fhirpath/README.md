@@ -3,139 +3,178 @@
 This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https://hl7.org/fhirpath/2025Jan/) written in Rust.
 
 ## Table of Contents
- - [About](#-about)
- - [Implementation](#-implementation)
+ - [About FHIRPath](#-about-fhirpath)
+ - [Features Implemented](#-features-implemented)
  - [Performance](#-performance)
- - [Features](#-features)
 
+## About FHIRPath
 
-## About
-FHIRPath is a path based navigation and extraction language, somewhat like XPath.
+FHIRPath is a path-based navigation and extraction language for healthcare data that is used in many different contexts within healthcare IT systems. Here are the main places where FHIRPath is implemented and used:
 
-### Where is FHIRPath Used? 
-FHIRPath is used extensively throughout the FHIR Specification, although, despite it's name, FHIRPath 
-is designed to be model-independent and works with data as an abstract model, allowing it to be used with any model.
+### FHIR Specification and Resource Validation
 
-#### Invariants
+FHIRPath is used to define and express constraints and co-occurrence rules in FHIR resources within the FHIR specification.
 
-#### Search Parameters
+**Example (Validation Invariant):**
+```fhirpath
+reference.startsWith('#').not() or 
+($context.reference.substring(1) in $resource.contained.id)
+```
 
-#### View Definitions
+This invariant ensures that a local reference in a resource actually points to a contained resource that exists, checking that the reference (if it starts with "#") points to a valid contained resource ID.
 
-## Implementation
+**Relevant Specification Link:**
+- [FHIR Validation](https://www.hl7.org/fhir/validation.html)
+- [FHIRPath in FHIR R4](https://www.hl7.org/fhir/R4/fhirpath.html)
 
-The FHIRPath implementation consists of:
+### FHIR Search Parameter Definitions
 
-1. **Parser** - Uses the chumsky parser library to parse FHIRPath expressions into an AST.
-2. **Evaluator** - Evaluates the AST against FHIR resources to produce results.
-3. **Type System** - Handles different data types and conversions between them.
+FHIRPath defines what contents a search parameter refers to in FHIR resources.
 
-### Current Implementation Status
+**Example (Search Parameter Path):**
+```fhirpath
+Patient.name.given
+```
 
-We have been working on key FHIRPath features, with the following status:
+This path is used in a search parameter definition to specify that the search parameter applies to a patient's given names.
 
-1. ✅ **Test Framework** - Enhanced to properly fail on unimplemented features
-   - ✅ Tests now accurately report implementation gaps
-   - ✅ Removed special case handling that artificially made tests pass
-   - ✅ Test suite checks conformance with FHIRPath specification
+**More Complex Example:**
+```fhirpath
+Patient.extension('http://example.org/myExtension').value
+```
 
-2. ✅ **Core Functionality** - Solid foundation of basic operations
-   - ✅ All basic math operations (addition, subtraction, multiplication, division)
-   - ✅ Boolean logic (and, or, xor, not)
-   - ✅ Basic equality and comparison operators
-   - ✅ Existence functions (empty, exists, all, etc.)
-   - 🟡 Collection functions (where, select, first, last, etc.) - Basic functionality, but issues with nested collections
-   - 🟡 Collection navigation and path traversal - Issues with nested collections and context chaining
-   - ✅ Basic type conversion functions
-   - ✅ String manipulation functions
+This path is used to create a search parameter that indexes values from a specific extension.
 
-3. 🟡 **Advanced Functions**
-   - ✅ **Truncate Function** - Implemented to handle numeric values correctly
-   - 🟡 **Aggregate Function** - Basic implementation, issues with variable resolution in complex cases
-   - ✅ **Trace Function** - Implemented with projection support
-   - 🟡 **Repeat Function** - Implemented with cycle detection, needs refinement
-   - ✅ **Math Functions** - Support for round, sqrt, abs, ceiling, floor, etc.
-   - 🟡 **Extension Support** - Basic implementation, issues with primitive type extensions
-   - 🟡 **conformsTo Function** - Basic profile conformance checking, needs refinement
+**Relevant Specification Link:**
+- [Search Parameter Resource](https://www.hl7.org/fhir/searchparameter.html)
+- [FHIRPath Expressions](https://smilecdr.com/docs/fhir_standard/fhirpath_expressions.html)
 
-4. 🟡 **Type System and Reflection**
-   - ✅ **Basic Type Handling** - Type determination and reflection basics
-   - ✅ **Namespace Support** - Framework for System and FHIR namespaces
-   - ✅ **Qualified Types** - Support for qualified types (System.Boolean, FHIR.Patient)
-   - ✅ **Type Operators** - Improved `is` and `as` operators with namespace qualification 
-   - 🟡 **Resource Type Checking** - Basic FHIR type hierarchy support
-   - 🟡 **FHIR Type Hierarchy** - Type hierarchy model in `fhir_type_hierarchy.rs` needs refinement
+### FHIR Implementation Guides
 
-5. 🟡 **Polymorphic Access** - Support for FHIR choice elements
-   - 🟡 Basic choice element resolution (like `value` accessing `valueQuantity`) - Needs better implementation
-   - 🟡 Polymorphic path resolution (like `value.unit` resolving to `valueQuantity.unit`) - Only partially working
-   - ✅ Type operators with polymorphic properties (`value.is(Quantity)`) - Fixed implementation
-   - 🟡 Resource references need better resolution and type checking
+FHIRPath is used to express constraints in implementation guides, particularly for profile definitions.
 
-6. 🟡 **Date/Time Functionality**
-   - 🟡 **Date/Time Arithmetic** - Basic operations between dates and durations (needs improvement)
-   - ✅ **Component Extraction** - Extracting year, month, day, etc. from dates/times
-   - 🟡 **Basic Date/Time Support** - Parsing working, issues with comparison operations
-   - 🟡 **Period and Timing** - Needs better handling of FHIR period and timing types
+**Example (Profile Constraint):**
+```fhirpath
+telecom.where(system='phone').exists() or telecom.where(system='email').exists()
+```
 
-7. ❌ **STU Features**
-   - ❌ **STU Functions** - matchesFull(), lastIndexOf(), etc.
-   - ❌ **Long Integer Type** - Support for Long values and operations
-   - ❌ **Additional String Functions** - STU-defined string operations
-   - ❌ **Variable Definition** - Support for defineVariable() function
+This constraint requires that a resource has at least one telecom with either a phone or email system.
 
-## Implementation Priorities
+**Example (Slicing Discriminator):**
+```fhirpath
+Observation.category
+```
 
-Based on our progress and test results, our current implementation priorities are:
+This path is used as a discriminator for slicing, meaning the category element will define uniqueness in sliced arrays.
 
-1. ✅ **Type System and Is/As Operations** - Completed
-   - ✅ Framework for FHIR type hierarchy with resource inheritance model
-   - ✅ Support for FHIR.Patient, FHIR.boolean and other qualified types
-   - ✅ Namespace-qualified type support (System and FHIR)
-   - ✅ Fixed `.is()` and `.as()` functions with proper type handling
+**Relevant Specification Link:**
+- [Profiling FHIR](https://www.hl7.org/fhir/profiling.html)
+- [StructureDefinition Resource](https://www.hl7.org/fhir/structuredefinition.html)
 
-2. ✅ **Extension Resolution** - Completed
-   - ✅ Fixed extension() function implementation to handle extensions properly
-   - ✅ Added support for primitive type extension access
-   - ✅ Improved URL variable resolution for standard extensions
-   - ✅ Implemented proper extension function dispatch
+### Clinical Decision Support
 
-3. 🟡 **Polymorphic Access for Choice Elements** - In progress
-   - Fix polymorphic property access for choice elements
-   - Fix value[x] resolution for paths like value.unit
-   - ✅ Fixed type checks on choice elements (value.is(Quantity))
+FHIRPath is used in clinical decision support systems, particularly within CDS Hooks and smart apps.
 
-4. 🟡 **Collection Navigation and Nested Path Traversal** - In progress
-   - Fix recursive flattening for nested collections
-   - Fix handling of paths like Patient.name.given to properly collect all nested values
-   - Enhance collection operations (where, select) to properly handle nested collections
-   - Improve collection path traversal to match the FHIRPath specification
+**Example (CDS Hook Prefetch Template):**
+```json
+"prefetch": {
+  "patient": "Patient/{{context.patientId}}",
+  "medications": "MedicationRequest?patient={{context.patientId}}&status=active",
+  "conditions": "Condition?patient={{context.patientId}}&clinicalStatus=active&_fhirpath=code.memberOf('http://example.org/ValueSet/ChronicConditions')"
+}
+```
 
-5. 🟡 **Date/Time Arithmetic Operations** - In progress
-   - Basic implementation in place for date arithmetic
-   - Need to ensure all date arithmetic operations work correctly
-   - Need to add support for duration arithmetic and timezone handling
+This prefetch template uses FHIRPath to filter conditions to only those with codes in a specific value set.
 
-6. ❌ **STU Functions** - Not yet implemented
-   - matchesFull(), lastIndexOf(), defineVariable(), etc.
-   - Need to add parser and runtime support for these functions
+**Example (Clinical Rule):**
+```fhirpath
+Observation.where(code.coding.system='http://loinc.org' and code.coding.code='8480-6')
+  .value.quantity > 140
+```
 
-7. ❌ **Long Integer Type** - Not yet implemented
-   - Need to add parser and runtime support for Long type
+This expression identifies systolic blood pressure observations with values above 140.
 
-8. 🟡 **Quantity Handling and Unit Conversion** - In progress
-   - Fix quantity comparisons with unit conversion
-   - Implement time-valued quantity conversion
-   - Fix quantity arithmetic operations
+**Relevant Specification Link:**
+- [CDS Hooks](https://cds-hooks.hl7.org/)
+- [FHIR Clinical Reasoning Module](https://www.hl7.org/fhir/clinicalreasoning-module.html)
+- [CDS on FHIR](https://build.fhir.org/clinicalreasoning-cds-on-fhir.html)
 
-The test suite now strictly enforces that all FHIRPath features are properly implemented, and we have identified specific implementation gaps that need to be addressed.
+### Terminology Service Integration
 
-## Performance
+FHIRPath provides access to terminology services through a %terminologies object.
 
-Performance results go here...
+**Example (Terminology Service Call):**
+```fhirpath
+%terminologies.validateVS('http://hl7.org/fhir/ValueSet/observation-vitalsignresult', %context)
+```
 
-## Features
+This expression validates that a code is in the vital sign's value set.
 
+**Example (Member Check):**
+```fhirpath
+Observation.code.coding.where(memberOf('http://hl7.org/fhir/ValueSet/observation-vitalsignresult'))
+```
+
+This expression filters coding elements to only those that are members of the specified value set.
+
+**Relevant Specification Link:**
+- [FHIRPath Terminology Services](https://www.hl7.org/fhir/fhirpath.html#txapi)
+- [FHIR Terminology Service](https://www.hl7.org/fhir/terminology-service.html)
+
+###  FHIR Resource Mapping and Transformation
+
+FHIRPath is used to map between different FHIR versions or between FHIR and other formats.
+
+**Example (Mapping Rule):**
+```fhirpath
+source.telecom.where(system='phone').value
+```
+
+This expression might be used in a mapping language to extract phone numbers from a source resource.
+
+**Relevant Specification Link:**
+- [FHIR Mapping Language](https://www.hl7.org/fhir/mapping-language.html)
+
+### SQL on FHIR
+
+The SQL on FHIR specification leverages FHIRPath to define flattened tabular views of FHIR data that can be queried using standard SQL.
+
+**Example ViewDefinition:**
+```json
+{
+  "resourceType": "ViewDefinition",
+  "id": "patient-demographics",
+  "name": "PatientDemographics",
+  "title": "Basic Patient Demographics",
+  "description": "A flattened view of key patient demographic information",
+  "from": {
+    "resourceType": "Patient"
+  },
+  "select": [
+    {
+      "column": [
+        {"name": "id", "path": "getResourceKey()"},
+        {"name": "birth_date", "path": "birthDate"},
+        {"name": "gender", "path": "gender"},
+        {"name": "first_name", "path": "name.where(use='official').given.first()"},
+        {"name": "last_name", "path": "name.where(use='official').family"},
+        {"name": "ssn", "path": "identifier.where(system='http://hl7.org/fhir/sid/us-ssn').value"},
+        {"name": "email", "path": "telecom.where(system='email').value"},
+        {"name": "phone", "path": "telecom.where(system='phone' and use='mobile').value"},
+        {"name": "address_line", "path": "address.where(use='home').line.join(', ')"},
+        {"name": "city", "path": "address.where(use='home').city"},
+        {"name": "state", "path": "address.where(use='home').state"},
+        {"name": "postal_code", "path": "address.where(use='home').postalCode"}
+      ]
+    }
+  ]
+}
+```
+
+**Relevant Specification Link:**
+- [SQL on FHIR](https://build.fhir.org/ig/FHIR/sql-on-fhir-v2/)
+
+## Features Implemented
 
 **Legend:**
 *   ✅ Implemented
@@ -314,6 +353,10 @@ Performance results go here...
 *   [Type Safety / Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation): 🟡 (Runtime checks, errors signaled via Empty/panic)
     
     
+## Performance
+
+Performance results go here...
+
     
 
 
