@@ -107,6 +107,27 @@ cargo build --features R4,R4B,R5,R6
 cargo test --features R4,R4B,R5,R6
 ```
 
+### Tracking Test Failures
+The codebase uses a combination of approaches to track and manage test failures:
+
+```bash
+# List all failing tests (marked with #[ignore])
+cargo test -p fhirpath -- --ignored
+
+# Run a specific failing test
+cargo test -p fhirpath is_as_method_tests::test_is_as_method_operators -- --ignored
+
+# Find specific test failures by category
+cargo test -p fhirpath -- --ignored | grep "date"
+cargo test -p fhirpath -- --ignored | grep "type"
+```
+
+When implementing a fix:
+1. Run the related failing tests to understand the current behavior
+2. Implement your solution
+3. Run the tests again without the --ignored flag to see if your changes fixed the failure
+4. If fixed, update the test to remove the #[ignore] attribute
+
 ## Code Architecture
 
 ### Project Structure
@@ -236,6 +257,13 @@ Based on test failure analysis, these are the highest priority implementation ar
    - Quantity arithmetic
    - Complex quantity operations
 
+### Recent Changes and Focus
+
+Recent changes have been focused on:
+- Fixing comparison operations between different date/time types
+- Correcting test expectations for date operations
+- Resolving edge cases in type comparison operators
+
 ### Specialized Test Files
 
 The project uses specialized test files for different FHIRPath features:
@@ -289,6 +317,22 @@ When implementing a new FHIRPath feature:
 8. **Verify test failures**:
    - The failing_tests.txt file contains a comprehensive list of test failures
    - Check if your implementation resolves any specific failures listed there
+
+### Debugging Type and Date Issues
+
+When working on type system and date/time operations:
+
+1. **Type System Issues**:
+   - Check namespace qualification in type parameters (sometimes "FHIR." prefix is needed)
+   - For `.is()` and `.as()` operations, examine the hierarchy in `fhir_type_hierarchy.rs`
+   - Debug with `trace()` function to inspect runtime type information
+   - For type reflection, confirm the exact output format expected in test assertions
+
+2. **Date/Time Issues**:
+   - Pay attention to precision when comparing dates/times (e.g., @2023 vs @2023-01-01T00:00:00)
+   - Handle timezone information correctly (UTC vs local time)
+   - For date arithmetic operations, verify the expected precision of results
+   - Test date/time equality (`=`) separately from equivalence (`~`) which may have different rules
 
 ### Common Issues and Solutions
 

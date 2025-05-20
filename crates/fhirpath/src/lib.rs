@@ -7,6 +7,7 @@ pub mod evaluator;
 pub mod extension_function;
 pub mod extension_helpers;
 pub mod fhir_type_hierarchy;
+pub mod long_conversion;
 pub mod parser;
 pub mod polymorphic_access;
 pub mod repeat_function;
@@ -31,6 +32,7 @@ pub use fhir_type_hierarchy::{
     is_fhir_complex_type, is_fhir_primitive_type, is_fhir_resource_type, is_system_primitive_type,
 };
 pub use fhirpath_support::EvaluationResult;
+pub use long_conversion::{to_long, converts_to_long};
 pub use parser::{Expression, Invocation, Literal, Term, parser};
 pub use polymorphic_access::{
     access_polymorphic_element, apply_polymorphic_type_operation, is_choice_element,

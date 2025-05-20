@@ -2672,6 +2672,30 @@ fn call_function(
                 _ => EvaluationResult::Boolean(false),
             })
         }
+        "toLong" => {
+            // Converts the input to Long according to FHIRPath rules
+            // Check for singleton first
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "toLong requires a singleton input".to_string(),
+                ));
+            }
+            
+            // Delegate to the implementation in long_conversion module
+            crate::long_conversion::to_long(invocation_base, context)
+        }
+        "convertsToLong" => {
+            // Checks if the input can be converted to Long
+            // Check for singleton first
+            if invocation_base.count() > 1 {
+                return Err(EvaluationError::SingletonEvaluationError(
+                    "convertsToLong requires a singleton input".to_string(),
+                ));
+            }
+            
+            // Delegate to the implementation in long_conversion module
+            crate::long_conversion::converts_to_long(invocation_base, context)
+        }
         "toQuantity" => {
             // Converts the input to Quantity according to FHIRPath rules
             // The result is just the numeric value (Decimal or Integer) as unit handling is complex
@@ -4319,6 +4343,8 @@ fn call_function(
                 "convertsToDateTime",
                 "toTime",
                 "convertsToTime",
+                "toLong",
+                "convertsToLong",
                 "toQuantity",
                 "convertsToQuantity",
                 // Add other handled functions here
