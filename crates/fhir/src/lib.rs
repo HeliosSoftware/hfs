@@ -1,4 +1,46 @@
-use fhirpath_support::{EvaluationResult, IntoEvaluationResult}; // Keep only one import
+//! # FHIR Model Infrastructure
+//!
+//! This module provides the foundational types and infrastructure that support the
+//! generated FHIR specification implementations. It contains hand-coded types that
+//! enable the generated code to handle FHIR's complex requirements for precision,
+//! extensions, and cross-version compatibility.
+//!
+//! ## Architecture
+//!
+//! The FHIR crate is organized as follows:
+//! - **Generated modules** (`r4.rs`, `r4b.rs`, `r5.rs`, `r6.rs`): Complete FHIR type implementations
+//! - **Infrastructure module** (`lib.rs`): Foundational types used by generated code
+//! - **Test modules**: Validation against official FHIR examples
+//!
+//! ## Key Infrastructure Types
+//!
+//! - [`PreciseDecimal`] - High-precision decimal arithmetic preserving original string format
+//! - [`Element<T, Extension>`] - Base container for FHIR elements with extension support
+//! - [`DecimalElement<Extension>`] - Specialized element for decimal values
+//! - [`FhirVersion`] - Version enumeration for multi-version support
+//!
+//! ## Usage Example
+//!
+//! ```rust
+//! use fhir::r5::{Patient, HumanName};
+//! use fhir::PreciseDecimal;
+//! use rust_decimal::Decimal;
+//!
+//! // Create a patient with precise decimal handling
+//! let patient = Patient {
+//!     name: Some(vec![HumanName {
+//!         family: Some("Doe".to_string()),
+//!         given: Some(vec!["John".to_string()]),
+//!         ..Default::default()
+//!     }]),
+//!     ..Default::default()
+//! };
+//!
+//! // Work with precise decimals
+//! let precise = PreciseDecimal::from(Decimal::new(12340, 3)); // 12.340
+//! ```
+
+use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Serialize,
@@ -7,41 +49,124 @@ use serde::{
 };
 use std::marker::PhantomData;
 
-// Store the original string representation and optionally the parsed Decimal value.
+/// High-precision decimal type that preserves original string representation.
+///
+/// FHIR requires that decimal values maintain their original precision and format
+/// when serialized back to JSON. This type stores both the parsed `Decimal` value
+/// for mathematical operations and the original string for serialization.
+///
+/// # FHIR Precision Requirements
+///
+/// FHIR decimal values must:
+/// - Preserve trailing zeros (e.g., "12.340" vs "12.34")
+/// - Maintain original precision during round-trip serialization
+/// - Support high-precision arithmetic without floating-point errors
+/// - Handle edge cases like very large or very small numbers
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::PreciseDecimal;
+/// use rust_decimal::Decimal;
+///
+/// // Create from Decimal (derives string representation)
+/// let precise = PreciseDecimal::from(Decimal::new(12340, 3)); // 12.340
+/// assert_eq!(precise.original_string(), "12.340");
+///
+/// // Create with specific string format
+/// let precise = PreciseDecimal::from_parts(
+///     Some(Decimal::new(1000, 2)), 
+///     "10.00".to_string()
+/// );
+/// assert_eq!(precise.original_string(), "10.00");
+/// ```
 #[derive(Debug, Clone)]
 pub struct PreciseDecimal {
-    // Store None if the original string couldn't be parsed into Decimal (e.g., out of range)
+    /// The parsed decimal value, `None` if parsing failed (e.g., out of range)
     value: Option<Decimal>,
+    /// The original string representation preserving format and precision
     original_string: String,
 }
 
-// Implement comparison based on the numerical value (Option<Decimal>)
+/// Implements equality comparison based on the parsed decimal value.
+///
+/// Two `PreciseDecimal` values are equal if their parsed `Decimal` values are equal,
+/// regardless of their original string representations. This enables mathematical
+/// equality while preserving string format for serialization.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::PreciseDecimal;
+/// use rust_decimal::Decimal;
+///
+/// let a = PreciseDecimal::from_parts(Some(Decimal::new(100, 1)), "10.0".to_string());
+/// let b = PreciseDecimal::from_parts(Some(Decimal::new(1000, 2)), "10.00".to_string());
+/// assert_eq!(a, b); // Same decimal value (10.0 == 10.00)
+/// ```
 impl PartialEq for PreciseDecimal {
     fn eq(&self, other: &Self) -> bool {
-        // Compare the Option<Decimal> values. None == None is true.
+        // Compare parsed decimal values for mathematical equality
         self.value == other.value
     }
 }
+
+/// Marker trait implementation indicating total equality for `PreciseDecimal`.
 impl Eq for PreciseDecimal {}
 
+/// Implements partial ordering based on the parsed decimal value.
+///
+/// Ordering is based on the mathematical value of the decimal, not the string
+/// representation. `None` values (unparseable decimals) are considered less than
+/// any valid decimal value.
 impl PartialOrd for PreciseDecimal {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Compare the Option<Decimal> values. None is considered less than Some(_).
         self.value.partial_cmp(&other.value)
     }
 }
 
+/// Implements total ordering for `PreciseDecimal`.
+///
+/// Provides a consistent ordering for sorting operations. The ordering is based
+/// on the mathematical value: `None` < `Some(smaller_decimal)` < `Some(larger_decimal)`.
 impl Ord for PreciseDecimal {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Compare the Option<Decimal> values. None is considered less than Some(_).
         self.value.cmp(&other.value)
     }
 }
 
-// Provide methods to access the inner value if needed
+// === PreciseDecimal Methods ===
+
 impl PreciseDecimal {
-    /// Creates a new PreciseDecimal from its parts.
-    /// Use this when you have both the parsed value (or know it failed) and the original string.
+    /// Creates a new `PreciseDecimal` from its constituent parts.
+    ///
+    /// This constructor allows explicit control over both the parsed value and the
+    /// original string representation. Use this when you need to preserve a specific
+    /// string format or when parsing has already been attempted.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The parsed decimal value, or `None` if parsing failed
+    /// * `original_string` - The original string representation to preserve
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::PreciseDecimal;
+    /// use rust_decimal::Decimal;
+    ///
+    /// // Create with successful parsing
+    /// let precise = PreciseDecimal::from_parts(
+    ///     Some(Decimal::new(12340, 3)),
+    ///     "12.340".to_string()
+    /// );
+    ///
+    /// // Create with failed parsing (preserves original string)
+    /// let invalid = PreciseDecimal::from_parts(
+    ///     None,
+    ///     "invalid_decimal".to_string()
+    /// );
+    /// ```
     pub fn from_parts(value: Option<Decimal>, original_string: String) -> Self {
         Self {
             value,
@@ -49,23 +174,118 @@ impl PreciseDecimal {
         }
     }
 
-    /// Returns the parsed Decimal value, if parsing was successful.
+    /// Helper method to parse a decimal string with support for scientific notation.
+    ///
+    /// This method handles the complexity of parsing decimal strings that may be in
+    /// scientific notation (with 'E' or 'e' exponents) or regular decimal format.
+    /// It normalizes 'E' to 'e' for consistent parsing while preserving the original
+    /// string representation for serialization.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The string to parse as a decimal
+    ///
+    /// # Returns
+    ///
+    /// `Some(Decimal)` if parsing succeeds, `None` if the string is not a valid decimal.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::PreciseDecimal;
+    /// use rust_decimal::Decimal;
+    ///
+    /// // Regular decimal format
+    /// assert!(PreciseDecimal::parse_decimal_string("123.45").is_some());
+    ///
+    /// // Scientific notation with 'e'
+    /// assert!(PreciseDecimal::parse_decimal_string("1.23e2").is_some());
+    ///
+    /// // Scientific notation with 'E' (normalized to 'e')
+    /// assert!(PreciseDecimal::parse_decimal_string("1.23E2").is_some());
+    ///
+    /// // Invalid format
+    /// assert!(PreciseDecimal::parse_decimal_string("invalid").is_none());
+    /// ```
+    fn parse_decimal_string(s: &str) -> Option<Decimal> {
+        // Normalize 'E' to 'e' for consistent parsing
+        let normalized = s.replace('E', "e");
+        
+        if normalized.contains('e') {
+            // Use scientific notation parsing
+            Decimal::from_scientific(&normalized).ok()
+        } else {
+            // Use regular decimal parsing
+            normalized.parse::<Decimal>().ok()
+        }
+    }
+
+    /// Returns the parsed decimal value if parsing was successful.
+    ///
+    /// This method provides access to the mathematical value for arithmetic
+    /// operations and comparisons. Returns `None` if the original string
+    /// could not be parsed as a valid decimal.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::PreciseDecimal;
+    /// use rust_decimal::Decimal;
+    ///
+    /// let precise = PreciseDecimal::from(Decimal::new(1234, 2)); // 12.34
+    /// assert_eq!(precise.value(), Some(Decimal::new(1234, 2)));
+    ///
+    /// let invalid = PreciseDecimal::from_parts(None, "invalid".to_string());
+    /// assert_eq!(invalid.value(), None);
+    /// ```
     pub fn value(&self) -> Option<Decimal> {
         self.value
     }
 
     /// Returns the original string representation.
+    ///
+    /// This method provides access to the exact string format that was used
+    /// to create this `PreciseDecimal`. This string is used during serialization
+    /// to maintain FHIR's precision requirements.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::PreciseDecimal;
+    /// use rust_decimal::Decimal;
+    ///
+    /// let precise = PreciseDecimal::from_parts(
+    ///     Some(Decimal::new(100, 2)),
+    ///     "1.00".to_string()
+    /// );
+    /// assert_eq!(precise.original_string(), "1.00");
+    /// ```
     pub fn original_string(&self) -> &str {
         &self.original_string
     }
 }
 
-// Implement From<Decimal> to allow easy conversion, deriving the string representation.
+/// Converts a `Decimal` to `PreciseDecimal` with derived string representation.
+///
+/// This implementation allows easy conversion from `rust_decimal::Decimal` values
+/// by automatically generating the string representation using the decimal's
+/// `Display` implementation.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::PreciseDecimal;
+/// use rust_decimal::Decimal;
+///
+/// let decimal = Decimal::new(12345, 3); // 12.345
+/// let precise: PreciseDecimal = decimal.into();
+/// assert_eq!(precise.value(), Some(decimal));
+/// assert_eq!(precise.original_string(), "12.345");
+/// ```
 impl From<Decimal> for PreciseDecimal {
     fn from(value: Decimal) -> Self {
-        // Convert the Decimal to string to store as original_string.
+        // Generate string representation from the decimal value
         let original_string = value.to_string();
-        // When creating from a valid Decimal, the value is Some(value).
         Self {
             value: Some(value),
             original_string,
@@ -73,106 +293,116 @@ impl From<Decimal> for PreciseDecimal {
     }
 }
 
+/// Implements serialization for `PreciseDecimal` preserving original format.
+///
+/// This implementation ensures that the exact original string representation
+/// is preserved during JSON serialization, maintaining FHIR's precision
+/// requirements including trailing zeros and specific formatting.
+///
+/// # FHIR Compliance
+///
+/// FHIR requires that decimal values maintain their original precision when
+/// round-tripped through JSON. This implementation uses `serde_json::RawValue`
+/// to serialize the original string directly as a JSON number.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::PreciseDecimal;
+/// use rust_decimal::Decimal;
+/// use serde_json;
+///
+/// let precise = PreciseDecimal::from_parts(
+///     Some(Decimal::new(1230, 2)),
+///     "12.30".to_string()
+/// );
+/// 
+/// let json = serde_json::to_string(&precise).unwrap();
+/// assert_eq!(json, "12.30"); // Preserves trailing zero
+/// ```
 impl Serialize for PreciseDecimal {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        // Use RawValue to serialize the original string directly as a JSON number.
-        // This ensures the exact string format (including trailing zeros) is preserved.
+        // Use RawValue to preserve exact string format in JSON
         match serde_json::value::RawValue::from_string(self.original_string.clone()) {
             Ok(raw_value) => raw_value.serialize(serializer),
             Err(e) => Err(serde::ser::Error::custom(format!(
-                "Failed to create RawValue from PreciseDecimal original_string '{}': {}",
+                "Failed to serialize PreciseDecimal '{}': {}",
                 self.original_string, e
             ))),
         }
     }
 }
 
-// Removed PreciseDecimalVisitor and its impl block
-
-// Deserialize implementation for PreciseDecimal using intermediate Value
+/// Implements deserialization for `PreciseDecimal` preserving original format.
+///
+/// This implementation deserializes JSON numbers and strings into `PreciseDecimal`
+/// while preserving the exact original string representation. It handles various
+/// JSON formats including scientific notation and nested object structures.
+///
+/// # Supported Formats
+///
+/// - Direct numbers: `12.340`
+/// - String numbers: `"12.340"`
+/// - Scientific notation: `1.234e2` or `1.234E2`
+/// - Nested objects: `{"value": 12.340}` (for macro-generated structures)
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::PreciseDecimal;
+/// use serde_json;
+///
+/// // Deserialize from JSON number
+/// let precise: PreciseDecimal = serde_json::from_str("12.340").unwrap();
+/// assert_eq!(precise.original_string(), "12.34"); // JSON number format
+///
+/// // Deserialize from JSON string
+/// let precise: PreciseDecimal = serde_json::from_str("\"12.340\"").unwrap();
+/// assert_eq!(precise.original_string(), "12.340"); // Preserves string format
+/// ```
 impl<'de> Deserialize<'de> for PreciseDecimal {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Deserialize into an intermediate serde_json::Value first
-        // This allows capturing the original string representation accurately.
+        // Use intermediate Value to capture exact string representation
         let json_value = serde_json::Value::deserialize(deserializer)?;
-
-        // Note: The try_parse helper is removed as primitive handling is now done
-        // directly in DecimalElement::deserialize for potentially better context.
 
         match json_value {
             serde_json::Value::Number(n) => {
-                // Use the number's string representation directly
-                let s = n.to_string();
-                // Replace 'E' with 'e' for parsing
-                let s_for_parsing = s.replace('E', "e");
-                // Use from_scientific if 'e' is present, otherwise parse
-                let parsed_value = if s_for_parsing.contains('e') {
-                    Decimal::from_scientific(&s_for_parsing).ok()
-                } else {
-                    s_for_parsing.parse::<Decimal>().ok()
-                };
-                // Store the ORIGINAL string `s` regardless of parsing success.
-                Ok(PreciseDecimal::from_parts(parsed_value, s))
+                // Extract string representation from JSON number
+                let original_string = n.to_string();
+                let parsed_value = Self::parse_decimal_string(&original_string);
+                Ok(PreciseDecimal::from_parts(parsed_value, original_string))
             }
             serde_json::Value::String(s) => {
-                // Use the string directly
-                // Replace 'E' with 'e' for parsing
-                let s_for_parsing = s.replace('E', "e");
-                // Use from_scientific if 'e' is present, otherwise parse
-                let parsed_value = if s_for_parsing.contains('e') {
-                    Decimal::from_scientific(&s_for_parsing).ok()
-                } else {
-                    s_for_parsing.parse::<Decimal>().ok()
-                };
-                // Store the ORIGINAL string `s` regardless of parsing success.
+                // Use string value directly (preserves exact format)
+                let parsed_value = Self::parse_decimal_string(&s);
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
-            // Handle case where PreciseDecimal might be nested inside an object like {"value": 123.45}
-            // This can happen when deserializing from a Value passed by the macro
+            // Handle nested object format (for macro-generated structures)
             serde_json::Value::Object(map) => {
                 match map.get("value") {
                     Some(serde_json::Value::Number(n)) => {
-                        // Use nested number's string representation
-                        let s = n.to_string();
-                        // Replace 'E' with 'e' for parsing
-                        let s_for_parsing = s.replace('E', "e");
-                        // Use from_scientific if 'e' is present, otherwise parse
-                        let parsed_value = if s_for_parsing.contains('e') {
-                            Decimal::from_scientific(&s_for_parsing).ok()
-                        } else {
-                            s_for_parsing.parse::<Decimal>().ok()
-                        };
-                        Ok(PreciseDecimal::from_parts(parsed_value, s))
+                        let original_string = n.to_string();
+                        let parsed_value = Self::parse_decimal_string(&original_string);
+                        Ok(PreciseDecimal::from_parts(parsed_value, original_string))
                     }
                     Some(serde_json::Value::String(s)) => {
-                        // Use nested string directly (clone needed as s is borrowed)
-                        let s_clone = s.clone(); // Clone s for PreciseDecimal
-                        // Replace 'E' with 'e' for parsing
-                        let s_for_parsing = s_clone.replace('E', "e");
-                        // Use from_scientific if 'e' is present, otherwise parse
-                        let parsed_value = if s_for_parsing.contains('e') {
-                            Decimal::from_scientific(&s_for_parsing).ok()
-                        } else {
-                            s_for_parsing.parse::<Decimal>().ok()
-                        };
-                        Ok(PreciseDecimal::from_parts(parsed_value, s_clone))
+                        let original_string = s.clone();
+                        let parsed_value = Self::parse_decimal_string(&original_string);
+                        Ok(PreciseDecimal::from_parts(parsed_value, original_string))
                     }
-                    // Handle null value field if necessary, otherwise error
                     Some(serde_json::Value::Null) => {
-                        // Decide how to handle {"value": null}. Treat as missing/None?
-                        // For now, let's error, as FHIR doesn't typically represent null decimals this way.
                         Err(de::Error::invalid_value(
                             de::Unexpected::Unit,
                             &"a number or string for decimal value",
-                        )) // Use Unit for null
+                        ))
                     }
-                    None => Err(de::Error::missing_field("value")), // Missing "value" field
+                    None => Err(de::Error::missing_field("value")),
                     _ => Err(de::Error::invalid_type(
                         de::Unexpected::Map,
                         &"a map with a 'value' field containing a number or string",
@@ -208,21 +438,118 @@ pub mod r6;
 
 // Removed the FhirSerde trait definition
 
-/// Enum representing a FHIR resource from any supported version
+/// Multi-version FHIR resource container supporting version-agnostic operations.
+///
+/// This enum provides a unified interface for working with FHIR resources across
+/// different specification versions. It enables applications to handle multiple
+/// FHIR versions simultaneously while maintaining type safety and version-specific
+/// behavior where needed.
+///
+/// # Supported Versions
+///
+/// - **R4**: FHIR 4.0.1 (normative)
+/// - **R4B**: FHIR 4.3.0 (ballot)  
+/// - **R5**: FHIR 5.0.0 (ballot)
+/// - **R6**: FHIR 6.0.0 (draft)
+///
+/// # Feature Flags
+///
+/// Each FHIR version is controlled by a corresponding Cargo feature flag.
+/// Only enabled versions will be available in the enum variants.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::{FhirResource, FhirVersion};
+/// # #[cfg(feature = "R5")]
+/// use fhir::r5::{Patient, HumanName};
+///
+/// # #[cfg(feature = "R5")]
+/// {
+///     // Create an R5 patient
+///     let patient = Patient {
+///         name: Some(vec![HumanName {
+///             family: Some("Doe".to_string()),
+///             given: Some(vec!["John".to_string()]),
+///             ..Default::default()
+///         }]),
+///         ..Default::default()
+///     };
+///
+///     // Wrap in version-agnostic container
+///     let resource = FhirResource::R5(Box::new(patient.into()));
+///     assert_eq!(resource.version(), FhirVersion::R5);
+/// }
+/// ```
+///
+/// # Version Detection
+///
+/// Use the `version()` method to determine which FHIR version a resource uses:
+///
+/// ```rust
+/// # use fhir::{FhirResource, FhirVersion};
+/// # #[cfg(feature = "R4")]
+/// # {
+/// # let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(Default::default())));
+/// match resource.version() {
+///     FhirVersion::R4 => println!("This is an R4 resource"),
+///     FhirVersion::R4B => println!("This is an R4B resource"),
+///     FhirVersion::R5 => println!("This is an R5 resource"),
+///     FhirVersion::R6 => println!("This is an R6 resource"),
+/// }
+/// # }
+/// ```
 #[derive(Debug)]
 pub enum FhirResource {
+    /// FHIR 4.0.1 (normative) resource
     #[cfg(feature = "R4")]
     R4(Box<r4::Resource>),
+    /// FHIR 4.3.0 (ballot) resource
     #[cfg(feature = "R4B")]
     R4B(Box<r4b::Resource>),
+    /// FHIR 5.0.0 (ballot) resource
     #[cfg(feature = "R5")]
     R5(Box<r5::Resource>),
+    /// FHIR 6.0.0 (draft) resource
     #[cfg(feature = "R6")]
     R6(Box<r6::Resource>),
 }
 
 impl FhirResource {
-    /// Returns the FHIR version of the resource
+    /// Returns the FHIR specification version of this resource.
+    ///
+    /// This method provides version detection for multi-version applications,
+    /// enabling version-specific processing logic and compatibility checks.
+    ///
+    /// # Returns
+    ///
+    /// The `FhirVersion` enum variant corresponding to this resource's specification.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::{FhirResource, FhirVersion};
+    /// 
+    /// # #[cfg(feature = "R5")]
+    /// # {
+    /// # let resource = FhirResource::R5(Box::new(fhir::r5::Resource::Patient(Default::default())));
+    /// let version = resource.version();
+    /// assert_eq!(version, FhirVersion::R5);
+    /// 
+    /// // Use version for conditional logic
+    /// match version {
+    ///     FhirVersion::R5 => {
+    ///         println!("Processing R5 resource with latest features");
+    ///     },
+    ///     FhirVersion::R4 => {
+    ///         println!("Processing R4 resource with normative features");
+    ///     },
+    ///     _ => {
+    ///         println!("Processing other FHIR version");
+    ///     }
+    /// }
+    /// # }
+    /// ```
     pub fn version(&self) -> FhirVersion {
         match self {
             #[cfg(feature = "R4")]
@@ -237,21 +564,106 @@ impl FhirResource {
     }
 }
 
-/// Represents a FHIR specification version
+/// Enumeration of supported FHIR specification versions.
+///
+/// This enum represents the different versions of the FHIR (Fast Healthcare
+/// Interoperability Resources) specification that this library supports.
+/// Each version represents a specific release of the FHIR standard with
+/// its own set of features, resources, and compatibility requirements.
+///
+/// # Version Status
+///
+/// - **R4** (4.0.1): Normative version, widely adopted in production
+/// - **R4B** (4.3.0): Ballot version with additional features
+/// - **R5** (5.0.0): Ballot version with significant enhancements
+/// - **R6** (6.0.0): Draft version under active development
+///
+/// # Feature Flags
+///
+/// Each version is controlled by a corresponding Cargo feature flag:
+/// - `R4`: Enables FHIR R4 support
+/// - `R4B`: Enables FHIR R4B support  
+/// - `R5`: Enables FHIR R5 support
+/// - `R6`: Enables FHIR R6 support
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::FhirVersion;
+///
+/// // Version comparison
+/// # #[cfg(all(feature = "R4", feature = "R5"))]
+/// # {
+/// assert_ne!(FhirVersion::R4, FhirVersion::R5);
+/// # }
+///
+/// // String representation
+/// # #[cfg(feature = "R4")]
+/// # {
+/// let version = FhirVersion::R4;
+/// assert_eq!(version.as_str(), "R4");
+/// assert_eq!(version.to_string(), "R4");
+/// # }
+/// ```
+///
+/// # CLI Integration
+///
+/// This enum implements `clap::ValueEnum` for command-line argument parsing:
+///
+/// ```rust,no_run
+/// use clap::Parser;
+/// use fhir::FhirVersion;
+///
+/// #[derive(Parser)]
+/// struct Args {
+///     #[arg(value_enum)]
+///     version: FhirVersion,
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FhirVersion {
+    /// FHIR 4.0.1 (normative) - The current normative version
     #[cfg(feature = "R4")]
     R4,
+    /// FHIR 4.3.0 (ballot) - Intermediate version with additional features
     #[cfg(feature = "R4B")]
     R4B,
+    /// FHIR 5.0.0 (ballot) - Next major version with significant changes
     #[cfg(feature = "R5")]
     R5,
+    /// FHIR 6.0.0 (draft) - Future version under development
     #[cfg(feature = "R6")]
     R6,
 }
 
 impl FhirVersion {
-    /// Returns the string representation of the FHIR version
+    /// Returns the string representation of the FHIR version.
+    ///
+    /// This method provides the standard version identifier as used in
+    /// FHIR documentation, URLs, and configuration files.
+    ///
+    /// # Returns
+    ///
+    /// A static string slice representing the version (e.g., "R4", "R5").
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::FhirVersion;
+    ///
+    /// # #[cfg(feature = "R4")]
+    /// assert_eq!(FhirVersion::R4.as_str(), "R4");
+    /// # #[cfg(feature = "R5")]
+    /// assert_eq!(FhirVersion::R5.as_str(), "R5");
+    /// ```
+    ///
+    /// # Usage
+    ///
+    /// This method is commonly used for:
+    /// - Logging and debugging output
+    /// - Configuration file parsing
+    /// - API endpoint construction
+    /// - Version-specific resource loading
     pub fn as_str(&self) -> &'static str {
         match self {
             #[cfg(feature = "R4")]
@@ -266,12 +678,47 @@ impl FhirVersion {
     }
 }
 
+/// Implements `Display` trait for user-friendly output formatting.
+///
+/// This enables `FhirVersion` to be used in string formatting operations
+/// and provides consistent output across different contexts.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::FhirVersion;
+///
+/// # #[cfg(feature = "R5")]
+/// # {
+/// let version = FhirVersion::R5;
+/// println!("Using FHIR version: {}", version); // Prints: "Using FHIR version: R5"
+/// 
+/// let formatted = format!("fhir-{}.json", version);
+/// assert_eq!(formatted, "fhir-R5.json");
+/// # }
+/// ```
 impl std::fmt::Display for FhirVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
 
+/// Provides a default FHIR version when R4 feature is enabled.
+///
+/// R4 is chosen as the default because it is the current normative version
+/// of the FHIR specification and is widely adopted in production systems.
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::FhirVersion;
+///
+/// # #[cfg(feature = "R4")]
+/// # {
+/// let default_version = FhirVersion::default();
+/// assert_eq!(default_version, FhirVersion::R4);
+/// # }
+/// ```
 #[cfg(feature = "R4")]
 impl Default for FhirVersion {
     fn default() -> Self {
@@ -279,7 +726,34 @@ impl Default for FhirVersion {
     }
 }
 
-// Implement ValueEnum for FhirVersion to support clap
+/// Implements `clap::ValueEnum` for command-line argument parsing.
+///
+/// This implementation enables `FhirVersion` to be used directly as a command-line
+/// argument type with clap, providing automatic parsing, validation, and help text
+/// generation.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use clap::Parser;
+/// use fhir::FhirVersion;
+///
+/// #[derive(Parser)]
+/// struct Args {
+///     /// FHIR specification version to use
+///     #[arg(value_enum, default_value_t = FhirVersion::default())]
+///     version: FhirVersion,
+/// }
+///
+/// // Command line: my-app --version R5
+/// let args = Args::parse();
+/// println!("Using FHIR version: {}", args.version);
+/// ```
+///
+/// # Generated Help Text
+///
+/// When using this enum with clap, the help text will automatically include
+/// all available FHIR versions based on enabled feature flags.
 impl clap::ValueEnum for FhirVersion {
     fn value_variants<'a>() -> &'a [Self] {
         &[
@@ -299,7 +773,12 @@ impl clap::ValueEnum for FhirVersion {
     }
 }
 
-// --- Visitor for Element Object Deserialization ---
+// --- Internal Visitor for Element Object Deserialization ---
+
+/// Internal visitor struct for deserializing Element objects from JSON maps.
+/// 
+/// This visitor handles the complex deserialization logic for Element<V, E> when
+/// the JSON input is an object containing id, extension, and value fields.
 struct ElementObjectVisitor<V, E>(PhantomData<(V, E)>);
 
 impl<'de, V, E> Visitor<'de> for ElementObjectVisitor<V, E>
@@ -358,11 +837,63 @@ where
     }
 }
 
-// Note: Cannot add Copy if V or E are not Copy (like String, Vec)
+/// Generic element container supporting FHIR's extension mechanism.
+///
+/// In FHIR, most primitive elements can be extended with additional metadata
+/// through the `id` and `extension` fields. This container type provides
+/// the infrastructure to support this pattern across all FHIR data types.
+///
+/// # Type Parameters
+///
+/// * `V` - The value type (e.g., `String`, `i32`, `PreciseDecimal`)
+/// * `E` - The extension type (typically the generated `Extension` struct)
+///
+/// # FHIR Element Structure
+///
+/// FHIR elements can appear in three forms:
+/// 1. **Primitive value**: Just the value itself (e.g., `"text"`, `42`)
+/// 2. **Extended primitive**: An object with `value`, `id`, and/or `extension` fields
+/// 3. **Extension-only**: An object with just `id` and/or `extension` (no value)
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::{Element, r5::Extension};
+///
+/// // Simple primitive value
+/// let simple: Element<String, Extension> = Element {
+///     value: Some("Hello World".to_string()),
+///     id: None,
+///     extension: None,
+/// };
+///
+/// // Extended primitive with ID
+/// let with_id: Element<String, Extension> = Element {
+///     value: Some("Hello World".to_string()),
+///     id: Some("text-element-1".to_string()),
+///     extension: None,
+/// };
+///
+/// // Extension-only element (no value)
+/// let extension_only: Element<String, Extension> = Element {
+///     value: None,
+///     id: Some("disabled-element".to_string()),
+///     extension: Some(vec![/* extensions */]),
+/// };
+/// ```
+///
+/// # Serialization Behavior
+///
+/// - If only `value` is present: serializes as the primitive value directly
+/// - If `id` or `extension` are present: serializes as an object with all fields
+/// - If everything is `None`: serializes as `null`
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Element<V, E> {
+    /// Optional element identifier for referencing within the resource
     pub id: Option<String>,
+    /// Optional extensions providing additional metadata
     pub extension: Option<Vec<E>>,
+    /// The actual primitive value
     pub value: Option<V>,
 }
 
@@ -615,38 +1146,130 @@ where
     }
 }
 
-// Add Clone and Default derives
+/// Specialized element container for FHIR decimal values with precision preservation.
+///
+/// This type combines the generic `Element` pattern with `PreciseDecimal` to provide
+/// a complete solution for FHIR decimal elements that require both extension support
+/// and precision preservation during serialization round-trips.
+///
+/// # Type Parameters
+///
+/// * `E` - The extension type (typically the generated `Extension` struct)
+///
+/// # FHIR Decimal Requirements
+///
+/// FHIR decimal elements must:
+/// - Preserve original string precision (e.g., "12.30" vs "12.3")
+/// - Support mathematical operations using `Decimal` arithmetic
+/// - Handle extension metadata through `id` and `extension` fields
+/// - Serialize back to the exact original format when possible
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir::{DecimalElement, PreciseDecimal, r5::Extension};
+/// use rust_decimal::Decimal;
+///
+/// // Create from a Decimal value
+/// let decimal_elem = DecimalElement::<Extension>::new(Decimal::new(1234, 2)); // 12.34
+///
+/// // Create with extensions
+/// let extended_decimal = DecimalElement {
+///     value: Some(PreciseDecimal::from_parts(
+///         Some(Decimal::new(12300, 3)),
+///         "12.300".to_string()
+///     )),
+///     id: Some("precision-example".to_string()),
+///     extension: Some(vec![/* extensions */]),
+/// };
+///
+/// // Access the mathematical value
+/// if let Some(precise) = &extended_decimal.value {
+///     if let Some(decimal_val) = precise.value() {
+///         println!("Mathematical value: {}", decimal_val);
+///     }
+///     println!("Original format: {}", precise.original_string());
+/// }
+/// ```
+///
+/// # Serialization Behavior
+///
+/// - **Value only**: Serializes as a JSON number preserving original precision
+/// - **With extensions**: Serializes as an object with `value`, `id`, and `extension` fields
+/// - **No value**: Serializes as an object with just the extension fields, or `null` if empty
+///
+/// # Integration with FHIRPath
+///
+/// When used with FHIRPath evaluation, `DecimalElement` returns:
+/// - The `Decimal` value for mathematical operations
+/// - An object representation when extension metadata is accessed
+/// - Empty collection when the element has no value or extensions
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
-// Remove serde attributes as they are not used without derive
 pub struct DecimalElement<E> {
+    /// Optional element identifier for referencing within the resource
     pub id: Option<String>,
+    /// Optional extensions providing additional metadata
     pub extension: Option<Vec<E>>,
-    // Use the PreciseDecimal wrapper for the value field
+    /// The decimal value with precision preservation
     pub value: Option<PreciseDecimal>,
 }
 
 impl<E> DecimalElement<E> {
-    /// Creates a new DecimalElement with the given value, setting id and extension to None.
-    /// The original string representation is derived automatically from the Decimal value.
+    /// Creates a new `DecimalElement` with the specified decimal value.
     ///
-    /// # Example
+    /// This constructor creates a simple decimal element with no extensions or ID,
+    /// containing only the decimal value. The original string representation is
+    /// automatically derived from the `Decimal` value's `Display` implementation.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - The `Decimal` value to store
+    ///
+    /// # Returns
+    ///
+    /// A new `DecimalElement` with the value set and `id`/`extension` as `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use fhir::{DecimalElement, r5::Extension};
+    /// use rust_decimal::Decimal;
+    ///
+    /// // Create a simple decimal element
+    /// let element = DecimalElement::<Extension>::new(Decimal::new(12345, 3)); // 12.345
+    ///
+    /// // Verify the structure
+    /// assert!(element.id.is_none());
+    /// assert!(element.extension.is_none());
+    /// assert!(element.value.is_some());
+    ///
+    /// // Access the decimal value
+    /// if let Some(precise_decimal) = &element.value {
+    ///     assert_eq!(precise_decimal.value(), Some(Decimal::new(12345, 3)));
+    ///     assert_eq!(precise_decimal.original_string(), "12.345");
+    /// }
     /// ```
-    /// # use fhir::r4::Decimal; // Assuming Decimal is DecimalElement<Extension>
-    /// # use rust_decimal_macros::dec;
-    /// let decimal_value = dec!(123.45);
-    /// let fhir_decimal = Decimal::new(decimal_value);
-    /// assert_eq!(fhir_decimal.value.as_ref().map(|pd| pd.value()), Some(Some(decimal_value)));
-    /// assert_eq!(fhir_decimal.value.map(|pd| pd.original_string().to_string()), Some("123.45".to_string()));
-    /// assert!(fhir_decimal.id.is_none());
-    /// assert!(fhir_decimal.extension.is_none());
+    ///
+    /// # Usage in FHIR Resources
+    ///
+    /// This method is typically used when creating FHIR elements programmatically:
+    ///
+    /// ```rust
+    /// use fhir::{DecimalElement, r5::{Extension, Observation}};
+    /// use rust_decimal::Decimal;
+    ///
+    /// let temperature = DecimalElement::<Extension>::new(Decimal::new(3672, 2)); // 36.72
+    /// 
+    /// // Would be used in an Observation like:
+    /// // observation.value_quantity.value = Some(temperature);
     /// ```
     pub fn new(value: Decimal) -> Self {
-        // Use the From<Decimal> impl for PreciseDecimal to create it,
-        // which automatically handles storing the original string representation.
+        // Convert the Decimal to PreciseDecimal, which automatically handles
+        // storing the original string representation via the From trait
         let precise_value = PreciseDecimal::from(value);
         Self {
             id: None,
-            extension: None, // Assuming E is typically Vec<Extension> or similar, default should be None
+            extension: None,
             value: Some(precise_value),
         }
     }

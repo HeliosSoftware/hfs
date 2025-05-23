@@ -1,6 +1,6 @@
 # fhir_gen
 
-The **fhir_gen** crate is a foundational code generation module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into idiomatic Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions.
+The **fhir_gen** crate is module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions.
 
 ## Purpose and Scope
 
