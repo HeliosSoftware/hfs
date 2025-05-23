@@ -1,3 +1,35 @@
+//! # FHIR Code Generator
+//!
+//! This crate provides functionality to generate Rust code from FHIR StructureDefinitions.
+//! It transforms official FHIR specification JSON files into idiomatic Rust types with
+//! proper serialization/deserialization support.
+//!
+//! ## Overview
+//!
+//! The code generator performs the following steps:
+//! 1. Loads FHIR specification files from `resources/{VERSION}/`
+//! 2. Parses StructureDefinitions using minimal bootstrap types
+//! 3. Analyzes type hierarchies and detects circular dependencies
+//! 4. Generates strongly-typed Rust structs and enums
+//! 5. Outputs version-specific modules (e.g., `r4.rs`, `r5.rs`)
+//!
+//! ## Example Usage
+//!
+//! ```rust
+//! use fhir_gen::process_fhir_version;
+//! use fhir::FhirVersion;
+//! use std::path::PathBuf;
+//!
+//! let output_dir = PathBuf::from("output");
+//! 
+//! // Generate code for R5
+//! process_fhir_version(Some(FhirVersion::R5), &output_dir)?;
+//! 
+//! // Generate code for all versions
+//! process_fhir_version(None, &output_dir)?;
+//! # Ok::<(), std::io::Error>(())
+//! ```
+
 pub mod initial_fhir_model;
 
 use crate::initial_fhir_model::{Bundle, Resource};
@@ -11,6 +43,39 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Processes a single FHIR version and generates corresponding Rust code.
+///
+/// This function loads all JSON specification files for the given FHIR version,
+/// parses the StructureDefinitions, and generates Rust code for all valid types.
+///
+/// # Arguments
+///
+/// * `version` - The FHIR version to process (R4, R4B, R5, or R6)
+/// * `output_path` - Directory where the generated Rust files will be written
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an `io::Error` if file operations fail.
+///
+/// # Generated Output
+///
+/// Creates a single `.rs` file named after the version (e.g., `r4.rs`) containing:
+/// - Type definitions for all FHIR resources and data types
+/// - Choice type enums for polymorphic elements
+/// - A unified Resource enum for all resource types
+/// - Proper serialization/deserialization attributes
+///
+/// # Example
+///
+/// ```rust
+/// use fhir_gen::process_single_version;
+/// use fhir::FhirVersion;
+/// use std::path::PathBuf;
+///
+/// let output_dir = PathBuf::from("generated");
+/// process_single_version(&FhirVersion::R5, &output_dir)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
     let version_dir = resources_dir.join(version.as_str());
@@ -44,6 +109,47 @@ use crate::{Element, DecimalElement};\n\n",
     Ok(())
 }
 
+/// Processes one or more FHIR versions and generates corresponding Rust code.
+///
+/// This is the main entry point for the code generation process. It can either
+/// process a specific FHIR version or all available versions based on enabled features.
+///
+/// # Arguments
+///
+/// * `version` - Optional specific FHIR version to process. If `None`, processes all
+///   versions that are enabled via Cargo features
+/// * `output_path` - Directory where generated Rust files will be written
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success. If processing multiple versions, continues even if
+/// individual versions fail (with warnings), returning `Ok(())` as long as the
+/// overall process completes.
+///
+/// # Feature Dependencies
+///
+/// The versions processed depend on which Cargo features are enabled:
+/// - `R4` - FHIR Release 4 (default)
+/// - `R4B` - FHIR Release 4B  
+/// - `R5` - FHIR Release 5
+/// - `R6` - FHIR Release 6
+///
+/// # Examples
+///
+/// ```rust
+/// use fhir_gen::process_fhir_version;
+/// use fhir::FhirVersion;
+/// use std::path::PathBuf;
+///
+/// let output_dir = PathBuf::from("crates/fhir/src");
+///
+/// // Process only R5
+/// process_fhir_version(Some(FhirVersion::R5), &output_dir)?;
+///
+/// // Process all enabled versions
+/// process_fhir_version(None, &output_dir)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub fn process_fhir_version(
     version: Option<FhirVersion>,
     output_path: impl AsRef<Path>,
@@ -71,6 +177,30 @@ pub fn process_fhir_version(
     }
 }
 
+/// Recursively visits directories to find relevant JSON specification files.
+///
+/// This function traverses the resource directory structure and collects all JSON files
+/// that contain FHIR definitions, while filtering out files that aren't needed for
+/// code generation (like concept maps and value sets).
+///
+/// # Arguments
+///
+/// * `dir` - Root directory to search for JSON files
+///
+/// # Returns
+///
+/// Returns a vector of `PathBuf`s pointing to relevant JSON specification files,
+/// or an `io::Error` if directory traversal fails.
+///
+/// # Filtering Logic
+///
+/// Only includes JSON files that:
+/// - Have a `.json` extension
+/// - Do not contain "conceptmap" in the filename
+/// - Do not contain "valueset" in the filename
+///
+/// This filtering focuses the code generation on structural definitions rather
+/// than terminology content.
 fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut json_files = Vec::new();
     if dir.is_dir() {
@@ -94,22 +224,97 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(json_files)
 }
 
+/// Parses a JSON file containing FHIR StructureDefinitions into a Bundle.
+///
+/// This function reads a JSON file and deserializes it into a FHIR Bundle containing
+/// StructureDefinitions and other FHIR resources used for code generation.
+///
+/// # Arguments
+///
+/// * `path` - Path to the JSON file to parse
+///
+/// # Returns
+///
+/// Returns a `Bundle` on success, or a `serde_json::Error` if parsing fails.
+///
+/// # File Format
+///
+/// Expects JSON files in the standard FHIR Bundle format with entries containing
+/// StructureDefinition resources, as provided by the official FHIR specification.
 fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
     let file = File::open(path).map_err(|e| serde_json::Error::io(e))?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
 }
 
+/// Determines if a StructureDefinition should be included in code generation.
+///
+/// This function filters StructureDefinitions to only include those that represent
+/// concrete types that should have Rust code generated for them.
+///
+/// # Arguments
+///
+/// * `def` - The StructureDefinition to evaluate
+///
+/// # Returns
+///
+/// Returns `true` if the StructureDefinition should be processed for code generation.
+///
+/// # Criteria
+///
+/// A StructureDefinition is considered valid if:
+/// - Kind is "complex-type", "primitive-type", or "resource"
+/// - Derivation is "specialization" (concrete implementations)
+/// - Abstract is `false` (not an abstract base type)
 fn is_valid_structure_definition(def: &StructureDefinition) -> bool {
     (def.kind == "complex-type" || def.kind == "primitive-type" || def.kind == "resource")
         && def.derivation.as_deref() == Some("specialization")
         && def.r#abstract == false
 }
 
+/// Checks if a StructureDefinition represents a FHIR primitive type.
+///
+/// Primitive types are handled differently in code generation, typically being
+/// mapped to Rust primitive types or type aliases rather than full structs.
+///
+/// # Arguments
+///
+/// * `def` - The StructureDefinition to check
+///
+/// # Returns
+///
+/// Returns `true` if this is a primitive type definition.
 fn is_primitive_type(def: &StructureDefinition) -> bool {
     def.kind == "primitive-type"
 }
 
+/// Generates Rust code from a Bundle of FHIR StructureDefinitions.
+///
+/// This is the main code generation function that processes all StructureDefinitions
+/// in a Bundle and writes the corresponding Rust code to a file.
+///
+/// # Arguments
+///
+/// * `bundle` - FHIR Bundle containing StructureDefinitions and other resources
+/// * `output_path` - Path to the output Rust file
+///
+/// # Returns
+///
+/// Returns `Ok(())` on success, or an `io::Error` if file operations fail.
+///
+/// # Process Overview
+///
+/// 1. **First Pass**: Collects all ElementDefinitions and detects circular dependencies
+/// 2. **Second Pass**: Generates Rust code for each valid StructureDefinition
+/// 3. **Final Step**: Generates a unified Resource enum and helper implementations
+///
+/// # Generated Code Includes
+///
+/// - Struct definitions for complex types and resources
+/// - Enum definitions for choice types (polymorphic elements)
+/// - A Resource enum containing all resource types
+/// - From<T> implementations for primitive type conversions
+/// - Proper derive macros for serialization and FHIR-specific functionality
 fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()> {
     // First collect all ElementDefinitions across all StructureDefinitions
     // Also collect all Resource names
@@ -220,6 +425,25 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
     Ok(())
 }
 
+/// Generates a Rust enum containing all FHIR resource types.
+///
+/// This function creates a single enum that can represent any FHIR resource,
+/// using serde's tag-based deserialization to automatically route JSON to
+/// the correct variant based on the "resourceType" field.
+///
+/// # Arguments
+///
+/// * `resources` - Vector of resource type names to include in the enum
+///
+/// # Returns
+///
+/// Returns a string containing the Rust enum definition.
+///
+/// # Generated Features
+///
+/// - Tagged enum with `#[serde(tag = "resourceType")]` for automatic routing
+/// - All standard derives for functionality and compatibility
+/// - Each variant contains the corresponding resource struct
 fn generate_resource_enum(resources: Vec<String>) -> String {
     let mut output = String::new();
     // Add Clone to the derives for the Resource enum
@@ -235,6 +459,28 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
     output
 }
 
+/// Converts a FHIR field name to a valid Rust identifier.
+///
+/// This function transforms FHIR field names into valid Rust identifiers by:
+/// - Converting camelCase to snake_case
+/// - Escaping Rust keywords with the `r#` prefix
+///
+/// # Arguments
+///
+/// * `input` - The original FHIR field name
+///
+/// # Returns
+///
+/// Returns a string that is a valid Rust identifier.
+///
+/// # Examples
+///
+/// ```rust
+/// # use fhir_gen::make_rust_safe;
+/// assert_eq!(make_rust_safe("birthDate"), "birth_date");
+/// assert_eq!(make_rust_safe("type"), "r#type");
+/// assert_eq!(make_rust_safe("abstract"), "r#abstract");
+/// ```
 fn make_rust_safe(input: &str) -> String {
     let snake_case = input
         .chars()
@@ -253,6 +499,26 @@ fn make_rust_safe(input: &str) -> String {
     }
 }
 
+/// Capitalizes the first letter of a string.
+///
+/// This utility function is used to convert FHIR type names to proper Rust
+/// type names that follow PascalCase conventions.
+///
+/// # Arguments
+///
+/// * `s` - The string to capitalize
+///
+/// # Returns
+///
+/// Returns a new string with the first character capitalized.
+///
+/// # Examples
+///
+/// ```rust
+/// # use fhir_gen::capitalize_first_letter;
+/// assert_eq!(capitalize_first_letter("patient"), "Patient");
+/// assert_eq!(capitalize_first_letter("humanName"), "HumanName");
+/// ```
 fn capitalize_first_letter(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -261,6 +527,25 @@ fn capitalize_first_letter(s: &str) -> String {
     }
 }
 
+/// Converts a FHIR StructureDefinition to Rust code.
+///
+/// This function is the main entry point for converting a single StructureDefinition
+/// into its corresponding Rust representation, handling both primitive and complex types.
+///
+/// # Arguments
+///
+/// * `sd` - The StructureDefinition to convert
+/// * `cycles` - Set of detected circular dependencies that need special handling
+///
+/// # Returns
+///
+/// Returns a string containing the generated Rust code for this structure.
+///
+/// # Type Handling
+///
+/// - **Primitive types**: Generates type aliases using `Element<T, Extension>`
+/// - **Complex types**: Generates full struct definitions with all fields
+/// - **Resources**: Generates structs that can be included in the Resource enum
 fn structure_definition_to_rust(
     sd: &StructureDefinition,
     cycles: &std::collections::HashSet<(String, String)>,
@@ -282,7 +567,31 @@ fn structure_definition_to_rust(
     output
 }
 
-// Keep this in sync with extract_inner_element_type in fhir_macro/src/lib.rs
+/// Generates Rust type aliases for FHIR primitive types.
+///
+/// FHIR primitive types are mapped to appropriate Rust types and wrapped in
+/// the `Element<T, Extension>` container to handle FHIR's extension mechanism.
+///
+/// # Arguments
+///
+/// * `sd` - The StructureDefinition for the primitive type
+///
+/// # Returns
+///
+/// Returns a string containing the type alias definition.
+///
+/// # Type Mappings
+///
+/// - `boolean` → `Element<bool, Extension>`
+/// - `integer` → `Element<i32, Extension>`
+/// - `decimal` → `DecimalElement<Extension>` (special handling for precision)
+/// - `string`/`code`/`uri` → `Element<String, Extension>`
+/// - Date/time types → `Element<String, Extension>` (ISO format strings)
+///
+/// # Note
+///
+/// This function must be kept in sync with `extract_inner_element_type` in
+/// `fhir_macro/src/lib.rs` to ensure consistent type handling.
 fn generate_primitive_type(sd: &StructureDefinition) -> String {
     let type_name = &sd.name;
     let mut output = String::new();
@@ -324,6 +633,33 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
     output
 }
 
+/// Detects circular dependencies between FHIR types.
+///
+/// This function analyzes ElementDefinitions to find circular references between
+/// types where both directions have a cardinality of 1 (max="1"). Such cycles
+/// would cause infinite-sized structs in Rust, so they need to be broken with
+/// `Box<T>` pointers.
+///
+/// # Arguments
+///
+/// * `elements` - All ElementDefinitions to analyze for cycles
+///
+/// # Returns
+///
+/// Returns a set of tuples representing detected cycles. Each tuple contains
+/// the two type names that form a cycle.
+///
+/// # Cycle Detection Logic
+///
+/// 1. Builds a dependency graph of type relationships with max="1"
+/// 2. Finds bidirectional dependencies (A → B and B → A)
+/// 3. Adds special cases like Bundle → Resource for known problematic cycles
+///
+/// # Example
+///
+/// If `Identifier` has a field of type `Reference` and `Reference` has a field
+/// of type `Identifier`, both with max="1", this creates a cycle that must be
+/// broken by boxing one of the references.
 fn detect_struct_cycles(
     elements: &Vec<&ElementDefinition>,
 ) -> std::collections::HashSet<(String, String)> {
@@ -374,6 +710,31 @@ fn detect_struct_cycles(
     cycles
 }
 
+/// Processes ElementDefinitions to generate Rust struct and enum definitions.
+///
+/// This function groups related ElementDefinitions by their parent path and generates
+/// the corresponding Rust types, including handling of choice types (polymorphic elements).
+///
+/// # Arguments
+///
+/// * `elements` - Slice of ElementDefinitions to process
+/// * `output` - Mutable string to append generated code to
+/// * `processed_types` - Set tracking which types have already been generated
+/// * `cycles` - Set of detected circular dependencies requiring Box<T> handling
+///
+/// # Process Overview
+///
+/// 1. **Grouping**: Groups elements by their parent path (e.g., "Patient.name")
+/// 2. **Choice Types**: Generates enums for choice elements ending in "\[x\]"
+/// 3. **Structs**: Generates struct definitions with all fields
+/// 4. **Deduplication**: Ensures each type is only generated once
+///
+/// # Generated Code Features
+///
+/// - Derives for Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default
+/// - Choice type enums with proper serde renaming
+/// - Cycle-breaking with Box<T> where needed
+/// - Optional wrapping for elements with min=0
 fn process_elements(
     elements: &[ElementDefinition],
     output: &mut String,
@@ -493,6 +854,27 @@ fn process_elements(
     }
 }
 
+/// Generates a Rust field definition from a FHIR ElementDefinition.
+///
+/// This function converts a single FHIR element into a Rust struct field,
+/// handling type mapping, cardinality, choice types, and circular references.
+///
+/// # Arguments
+///
+/// * `element` - The ElementDefinition to convert
+/// * `type_name` - Name of the parent type containing this element
+/// * `output` - Mutable string to append the field definition to
+/// * `cycles` - Set of circular dependencies requiring Box<T> handling
+/// * `elements` - All elements (used for resolving content references)
+///
+/// # Field Generation Features
+///
+/// - **Type Mapping**: Maps FHIR types to appropriate Rust types
+/// - **Cardinality**: Wraps in `Option<T>` for min=0, `Vec<T>` for max="*"
+/// - **Choice Types**: Uses generated enum types for polymorphic elements
+/// - **Cycle Breaking**: Adds `Box<T>` for circular references
+/// - **Serde Attributes**: Adds rename and flatten attributes as needed
+/// - **Content References**: Resolves `#id` references to other elements
 fn generate_element_definition(
     element: &ElementDefinition,
     type_name: &String,
@@ -620,6 +1002,29 @@ fn generate_element_definition(
     }
 }
 
+/// Generates a Rust type name from a FHIR element path.
+///
+/// This function converts dotted FHIR paths into appropriate Rust type names
+/// using PascalCase conventions.
+///
+/// # Arguments
+///
+/// * `path` - The FHIR element path (e.g., "Patient.name.given")
+///
+/// # Returns
+///
+/// Returns a PascalCase type name suitable for Rust.
+///
+/// # Examples
+///
+/// - "Patient" → "Patient"
+/// - "Patient.name" → "PatientName"
+/// - "Observation.value.quantity" → "ObservationValueQuantity"
+///
+/// # Note
+///
+/// The first path segment becomes the base name, and subsequent segments
+/// are capitalized and concatenated to create a compound type name.
 fn generate_type_name(path: &str) -> String {
     let parts: Vec<&str> = path.split('.').collect();
     if !parts.is_empty() {

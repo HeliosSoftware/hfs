@@ -131,10 +131,10 @@ pub enum TypeSpecifier {
     /// A qualified identifier representing a type, possibly with a namespace
     ///
     /// The first String is either:
-    /// - The namespace (when Option<String> is Some), or
-    /// - The type name (when Option<String> is None)
+    /// - The namespace (when `Option<String>` is Some), or
+    /// - The type name (when `Option<String>` is None)
     ///
-    /// The Option<String> is:
+    /// The `Option<String>` is:
     /// - Some(type_name) when a namespace is provided, or
     /// - None when it's a simple type without a namespace
     ///
