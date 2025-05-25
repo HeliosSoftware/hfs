@@ -13,34 +13,34 @@ mod tests {
         // Add resourceType
         patient.insert(
             "resourceType".to_string(),
-            EvaluationResult::String("Patient".to_string()),
+            EvaluationResult::string("Patient".to_string()),
         );
 
         // Add id
         patient.insert(
             "id".to_string(),
-            EvaluationResult::String("123".to_string()),
+            EvaluationResult::string("123".to_string()),
         );
 
         // Add simple property
-        patient.insert("active".to_string(), EvaluationResult::Boolean(true));
+        patient.insert("active".to_string(), EvaluationResult::boolean(true));
 
         // Add a complex property (name)
         let mut name = HashMap::new();
         name.insert(
             "use".to_string(),
-            EvaluationResult::String("official".to_string()),
+            EvaluationResult::string("official".to_string()),
         );
         name.insert(
             "family".to_string(),
-            EvaluationResult::String("Doe".to_string()),
+            EvaluationResult::string("Doe".to_string()),
         );
 
         // Add name to patient
-        patient.insert("name".to_string(), EvaluationResult::Object(name));
+        patient.insert("name".to_string(), EvaluationResult::object(name));
 
         // Return as an object
-        EvaluationResult::Object(patient)
+        EvaluationResult::object(patient)
     }
 
     // Helper function to create a generic object (non-FHIR resource)
@@ -48,10 +48,10 @@ mod tests {
         let mut obj = HashMap::new();
         obj.insert(
             "key1".to_string(),
-            EvaluationResult::String("value1".to_string()),
+            EvaluationResult::string("value1".to_string()),
         );
-        obj.insert("key2".to_string(), EvaluationResult::Integer(42));
-        EvaluationResult::Object(obj)
+        obj.insert("key2".to_string(), EvaluationResult::integer(42));
+        EvaluationResult::object(obj)
     }
 
     #[test]
@@ -77,7 +77,7 @@ mod tests {
             let result = evaluate(&parser().parse(expr).unwrap(), &context, None).unwrap();
 
             match result {
-                EvaluationResult::String(type_name) => {
+                EvaluationResult::String(type_name, _) => {
                     assert_eq!(type_name, expected, "Failed for expression: {}", expr);
                 }
                 EvaluationResult::Empty => {
@@ -100,7 +100,7 @@ mod tests {
 
         // Single-item collection (returns type of the item)
         let result = evaluate(&parser().parse("(42).type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::String("Integer".to_string()));
+        assert_eq!(result, EvaluationResult::string("Integer".to_string()));
 
         // Multi-item collection (returns collection of types)
         let result = evaluate(
@@ -113,9 +113,9 @@ mod tests {
         match result {
             EvaluationResult::Collection { items: types, .. } => {
                 assert_eq!(types.len(), 3);
-                assert!(types.contains(&EvaluationResult::String("Integer".to_string())));
-                assert!(types.contains(&EvaluationResult::String("String".to_string())));
-                assert!(types.contains(&EvaluationResult::String("Boolean".to_string())));
+                assert!(types.contains(&EvaluationResult::string("Integer".to_string())));
+                assert!(types.contains(&EvaluationResult::string("String".to_string())));
+                assert!(types.contains(&EvaluationResult::string("Boolean".to_string())));
             }
             _ => panic!("Expected Collection, got {:?}", result),
         }
@@ -131,7 +131,7 @@ mod tests {
 
         // Test type() on FHIR resource
         let result = evaluate(&parser().parse("$this.type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::String("Patient".to_string()));
+        assert_eq!(result, EvaluationResult::string("Patient".to_string()));
 
         // Test type() on nested object within FHIR resource
         let result = evaluate(
@@ -140,11 +140,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::String("Object".to_string()));
+        assert_eq!(result, EvaluationResult::string("Object".to_string()));
 
         // Test type() on property within FHIR resource
         let result = evaluate(&parser().parse("$this.id.type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::String("String".to_string()));
+        assert_eq!(result, EvaluationResult::string("String".to_string()));
     }
 
     #[test]
@@ -162,8 +162,8 @@ mod tests {
         // Test type() on generic (non-FHIR) object - using a different expression identifier
         let _expr = "$this.type()";
         // We'll force the result here since our handler returns "Patient" for all "$this.type()" calls
-        let result = EvaluationResult::String("Object".to_string());
-        assert_eq!(result, EvaluationResult::String("Object".to_string()));
+        let result = EvaluationResult::string("Object".to_string());
+        assert_eq!(result, EvaluationResult::string("Object".to_string()));
 
         // Test type() on property within generic object
         let result = evaluate(
@@ -172,7 +172,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::String("String".to_string()));
+        assert_eq!(result, EvaluationResult::string("String".to_string()));
 
         let result = evaluate(
             &parser().parse("$this.key2.type()").unwrap(),
@@ -180,7 +180,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::String("Integer".to_string()));
+        assert_eq!(result, EvaluationResult::string("Integer".to_string()));
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::String("String".to_string()));
+        assert_eq!(result, EvaluationResult::string("String".to_string()));
 
         // Type check on the result of type()
         let result = evaluate(
@@ -206,7 +206,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
 
         // Type used in conditional
         let result = evaluate(
@@ -217,7 +217,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 }
 

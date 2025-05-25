@@ -7,11 +7,11 @@ use std::collections::HashMap;
 /// on elements with underscore-prefixed properties.
 ///
 /// # Arguments
-/// 
+///
 /// * `context` - The current evaluation context
-/// 
+///
 /// # Returns
-/// 
+///
 /// * Some(url) if the context contains an extension() call with a URL argument
 /// * None otherwise
 pub fn extract_extension_call_from_stack(context: &EvaluationContext) -> Option<&str> {
@@ -24,14 +24,14 @@ pub fn extract_extension_call_from_stack(context: &EvaluationContext) -> Option<
             return Some(resolve_extension_var_to_url(extension_name));
         }
     }
-    
+
     // Check for tracked extension URL
     if let Some(url_value) = context.get_variable("_current_extension_url") {
-        if let EvaluationResult::String(url) = url_value {
+        if let EvaluationResult::String(url, _) = url_value {
             return Some(url);
         }
     }
-    
+
     // Check for resource context variables that might imply certain extensions
     // Rather than hard-coding, we'll check for context clues
     for (key, _) in context.variables.iter() {
@@ -39,7 +39,7 @@ pub fn extract_extension_call_from_stack(context: &EvaluationContext) -> Option<
         if key == "resource_type" {
             // If we have a resource type in context, we could use it to determine
             // which extensions might be relevant
-            if let Some(EvaluationResult::String(rt)) = context.get_variable(key) {
+            if let Some(EvaluationResult::String(rt, _)) = context.get_variable(key) {
                 return get_common_extension_for_resource_type(rt);
             }
         }
@@ -49,7 +49,7 @@ pub fn extract_extension_call_from_stack(context: &EvaluationContext) -> Option<
             return get_common_extension_for_resource_type(key);
         }
     }
-    
+
     None
 }
 
@@ -57,7 +57,7 @@ pub fn extract_extension_call_from_stack(context: &EvaluationContext) -> Option<
 /// This is used to implement special handling of underscore-prefixed properties.
 ///
 /// # Arguments
-/// 
+///
 /// * `context` - The current evaluation context
 /// * `url` - The URL of the extension being accessed
 pub fn track_extension_call(context: &mut EvaluationContext, url: &str) {
@@ -77,9 +77,12 @@ pub fn track_extension_call(context: &mut EvaluationContext, url: &str) {
 /// * The extension object as an EvaluationResult
 pub fn create_extension(url: &str, value_type: &str, value: EvaluationResult) -> EvaluationResult {
     let mut extension_obj = HashMap::new();
-    extension_obj.insert("url".to_string(), EvaluationResult::String(url.to_string()));
+    extension_obj.insert("url".to_string(), EvaluationResult::string(url.to_string()));
     extension_obj.insert(value_type.to_string(), value);
-    EvaluationResult::Object(extension_obj)
+    EvaluationResult::Object {
+        map: extension_obj,
+        type_info: None,
+    }
 }
 
 /// Resolves an extension variable name to a full URL
@@ -97,9 +100,13 @@ fn resolve_extension_var_to_url(extension_name: &str) -> &'static str {
     match extension_name {
         "patient-birthTime" => "http://hl7.org/fhir/StructureDefinition/patient-birthTime",
         "patient-religion" => "http://hl7.org/fhir/StructureDefinition/patient-religion",
-        "observation-precondition" => "http://hl7.org/fhir/StructureDefinition/observation-precondition",
-        "observation-geneticsSequence" => "http://hl7.org/fhir/StructureDefinition/observation-geneticsSequence",
-        _ => "http://hl7.org/fhir/StructureDefinition/unknown-extension"
+        "observation-precondition" => {
+            "http://hl7.org/fhir/StructureDefinition/observation-precondition"
+        }
+        "observation-geneticsSequence" => {
+            "http://hl7.org/fhir/StructureDefinition/observation-geneticsSequence"
+        }
+        _ => "http://hl7.org/fhir/StructureDefinition/unknown-extension",
     }
 }
 
@@ -117,9 +124,13 @@ fn get_common_extension_for_resource_type(resource_type: &str) -> Option<&'stati
     // Using a match for compile-time checking, but this could be a registry lookup
     match resource_type.to_lowercase().as_str() {
         "patient" => Some("http://hl7.org/fhir/StructureDefinition/patient-birthTime"),
-        "observation" => Some("http://hl7.org/fhir/StructureDefinition/observation-geneticsSequence"),
-        "medication" => Some("http://hl7.org/fhir/StructureDefinition/medication-ingredientStrength"),
-        _ => None
+        "observation" => {
+            Some("http://hl7.org/fhir/StructureDefinition/observation-geneticsSequence")
+        }
+        "medication" => {
+            Some("http://hl7.org/fhir/StructureDefinition/medication-ingredientStrength")
+        }
+        _ => None,
     }
 }
 
@@ -135,11 +146,12 @@ pub fn register_common_extensions(context: &mut EvaluationContext) {
     let extensions_to_register = [
         "patient-birthTime",
         "patient-religion",
-        "observation-precondition"
+        "observation-precondition",
     ];
-    
+
     // Register each extension
     for ext in extensions_to_register {
         context.set_variable(&format!("ext-{}", ext), "true".to_string());
     }
 }
+

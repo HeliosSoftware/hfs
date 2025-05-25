@@ -18,12 +18,12 @@ fn test_polymorphic_value_unit() {
     // First verify simple path access works
     let expr_direct = "value.unit";
     let result_direct = run_expression(&context, expr_direct);
-    assert_eq!(result_direct, EvaluationResult::String("lbs".to_string()));
+    assert_eq!(result_direct, EvaluationResult::string("lbs".to_string()));
 
     // For now, we use %context to work around the resource type prefix issue
     let expr_context = "%context.value.unit";
     let result_context = run_expression(&context, expr_context);
-    assert_eq!(result_context, EvaluationResult::String("lbs".to_string()));
+    assert_eq!(result_context, EvaluationResult::string("lbs".to_string()));
 }
 
 /// Tests that the 'is' operator correctly identifies choice element types
@@ -35,12 +35,12 @@ fn test_polymorphic_is_quantity() {
     // Test using context to access value - use operator syntax
     let expr = "%context.value is Quantity";
     let result = run_expression(&context, expr);
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 
     // Also test negative case
     let expr_neg = "%context.value is Period";
     let result_neg = run_expression(&context, expr_neg);
-    assert_eq!(result_neg, EvaluationResult::Boolean(false));
+    assert_eq!(result_neg, EvaluationResult::boolean(false));
 }
 
 /// Tests that the 'as' operator correctly filters choice elements by type
@@ -52,7 +52,7 @@ fn test_polymorphic_as_quantity() {
     // Test with context
     let expr = "%context.value.as(Quantity).unit";
     let result = run_expression(&context, expr);
-    assert_eq!(result, EvaluationResult::String("lbs".to_string()));
+    assert_eq!(result, EvaluationResult::string("lbs".to_string()));
 }
 
 /// Evaluates a FHIRPath expression and returns the result

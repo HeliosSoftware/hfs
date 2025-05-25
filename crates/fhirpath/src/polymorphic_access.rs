@@ -65,7 +65,11 @@ pub fn access_polymorphic_element(
 
             // Process each matching field
             for (_, value) in &matches {
-                if let EvaluationResult::Object(inner_obj) = value {
+                if let EvaluationResult::Object {
+                    map: inner_obj,
+                    type_info: None,
+                } = value
+                {
                     // Recursively resolve the rest of the path
                     if let Some(result) = access_polymorphic_element(inner_obj, rest) {
                         return Some(result);
@@ -82,7 +86,11 @@ pub fn access_polymorphic_element(
                     if let Some(c) = key.chars().nth(first_part.len()) {
                         if c.is_uppercase() {
                             // This is a potential choice element with type suffix
-                            if let EvaluationResult::Object(inner_obj) = value {
+                            if let EvaluationResult::Object {
+                                map: inner_obj,
+                                type_info: None,
+                            } = value
+                            {
                                 // Try to resolve the rest of the path
                                 if let Some(result) = access_polymorphic_element(inner_obj, rest) {
                                     return Some(result);
@@ -95,7 +103,11 @@ pub fn access_polymorphic_element(
         } else {
             // Regular path (not a choice element)
             if let Some(value) = obj.get(first_part) {
-                if let EvaluationResult::Object(inner_obj) = value {
+                if let EvaluationResult::Object {
+                    map: inner_obj,
+                    type_info: None,
+                } = value
+                {
                     return access_polymorphic_element(inner_obj, rest);
                 }
             }
@@ -153,7 +165,7 @@ fn get_polymorphic_fields(
     // Special case for Observation resources with value field
     if base_name == "value" {
         // Check if this is an Observation with valueQuantity
-        if obj.get("resourceType") == Some(&EvaluationResult::String("Observation".to_string())) {
+        if obj.get("resourceType") == Some(&EvaluationResult::string("Observation".to_string())) {
             // Prioritize valueQuantity for Observation resources
             if let Some(value_quantity) = obj.get("valueQuantity") {
                 // Add at the beginning to prioritize over other matches
@@ -349,10 +361,10 @@ pub fn apply_polymorphic_type_operation(
         // For Empty values, we can't perform type operations but we can do some operation-specific handling
         if op == "is" && type_name == "Empty" {
             // Empty.is(Empty) is true
-            return Ok(EvaluationResult::Boolean(true));
+            return Ok(EvaluationResult::boolean(true));
         } else if op == "is" {
             // Empty is not any other type
-            return Ok(EvaluationResult::Boolean(false));
+            return Ok(EvaluationResult::boolean(false));
         } else if op == "as" {
             // Casting Empty to any type remains Empty
             return Ok(EvaluationResult::Empty);
@@ -374,7 +386,11 @@ pub fn apply_polymorphic_type_operation(
         // 2. Polymorphic access that needs to be checked (like Observation.value which should match valueQuantity)
 
         // First handle direct FHIR resource type checks
-        if let EvaluationResult::Object(obj) = value {
+        if let EvaluationResult::Object {
+            map: obj,
+            type_info: None,
+        } = value
+        {
             // For polymorphic value checks (like value.is(Quantity))
             // We need to handle both:
             // - Direct check on a quantity-like object
@@ -388,7 +404,7 @@ pub fn apply_polymorphic_type_operation(
                 {
                     return if op == "is" {
                         // This looks like a Quantity, so return true
-                        Ok(EvaluationResult::Boolean(true))
+                        Ok(EvaluationResult::boolean(true))
                     } else {
                         // op == "as"
                         // Return the object itself since it already has the expected Quantity structure
@@ -399,7 +415,7 @@ pub fn apply_polymorphic_type_operation(
                 // Check if this object has a valueQuantity field (for parent objects)
                 if obj.contains_key("valueQuantity") {
                     return if op == "is" {
-                        Ok(EvaluationResult::Boolean(true))
+                        Ok(EvaluationResult::boolean(true))
                     } else {
                         // op == "as"
                         // Return the valueQuantity field
@@ -412,10 +428,10 @@ pub fn apply_polymorphic_type_operation(
                 }
 
                 // Check if this resource is an Observation with a valueQuantity field
-                if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
+                if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
                     if resource_type == "Observation" && obj.contains_key("valueQuantity") {
                         return if op == "is" {
-                            Ok(EvaluationResult::Boolean(true))
+                            Ok(EvaluationResult::boolean(true))
                         } else {
                             // op == "as"
                             // Return the valueQuantity field
@@ -430,11 +446,11 @@ pub fn apply_polymorphic_type_operation(
             }
 
             // Check resource type - handle FHIR resource type checking generically
-            if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
+            if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
                 // For direct resource type checks (like Patient.is(Patient)), use case-insensitive comparison
                 if resource_type.to_lowercase() == type_name.to_lowercase() {
                     return if op == "is" {
-                        Ok(EvaluationResult::Boolean(true))
+                        Ok(EvaluationResult::boolean(true))
                     } else {
                         // op == "as"
                         Ok(value.clone())
@@ -446,7 +462,7 @@ pub fn apply_polymorphic_type_operation(
                     && crate::resource_type::is_fhir_domain_resource(resource_type)
                 {
                     return if op == "is" {
-                        Ok(EvaluationResult::Boolean(true))
+                        Ok(EvaluationResult::boolean(true))
                     } else {
                         // op == "as"
                         Ok(value.clone())
@@ -456,7 +472,7 @@ pub fn apply_polymorphic_type_operation(
                 // All FHIR resources are Resource types
                 if type_name.to_lowercase() == "resource" {
                     return if op == "is" {
-                        Ok(EvaluationResult::Boolean(true))
+                        Ok(EvaluationResult::boolean(true))
                     } else {
                         // op == "as"
                         Ok(value.clone())
@@ -469,7 +485,10 @@ pub fn apply_polymorphic_type_operation(
         match op {
             "is" => {
                 match value {
-                    EvaluationResult::Object(obj) => {
+                    EvaluationResult::Object {
+                        map: obj,
+                        type_info: _,
+                    } => {
                         // Check for boolean-like properties in FHIR resources without hardcoding specific fields
                         if type_name.to_lowercase() == "boolean" {
                             // Check for properties with names often used for boolean flags in FHIR
@@ -486,16 +505,16 @@ pub fn apply_polymorphic_type_operation(
                                     || key.to_lowercase().contains("status")
                                     || key.to_lowercase().contains("is")
                                 {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
 
                             // If this object contains a boolean field (other than resourceType), it's likely a boolean property
                             for (key, value) in obj.iter() {
                                 if key != "resourceType"
-                                    && matches!(value, EvaluationResult::Boolean(_))
+                                    && matches!(value, EvaluationResult::Boolean(_, _))
                                 {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
 
@@ -505,13 +524,13 @@ pub fn apply_polymorphic_type_operation(
                                 // Look for clues that this is a boolean property
                                 // Often FHIR properties are wrapped in objects with few fields
                                 if obj.contains_key("id") || obj.contains_key("extension") {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
 
                                 // Special case for the 'active' property itself
                                 if obj.keys().len() <= 2 {
                                     // If it's a very small object, it's likely a primitive boolean property
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
                         }
@@ -527,16 +546,16 @@ pub fn apply_polymorphic_type_operation(
 
                                 // Check value type - date values could be stored as strings or as Date type
                                 match val {
-                                    EvaluationResult::Date(_) => {
-                                        return Ok(EvaluationResult::Boolean(true));
+                                    EvaluationResult::Date(_, None) => {
+                                        return Ok(EvaluationResult::boolean(true));
                                     }
-                                    EvaluationResult::String(s) => {
+                                    EvaluationResult::String(s, _) => {
                                         // Check if string looks like a date (YYYY-MM-DD)
                                         if s.len() >= 10
                                             && s.chars().nth(4) == Some('-')
                                             && s.chars().nth(7) == Some('-')
                                         {
-                                            return Ok(EvaluationResult::Boolean(true));
+                                            return Ok(EvaluationResult::boolean(true));
                                         }
                                     }
                                     _ => {}
@@ -547,7 +566,7 @@ pub fn apply_polymorphic_type_operation(
                                     || key.to_lowercase().contains("time")
                                     || key.to_lowercase().contains("birth")
                                 {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
                         }
@@ -557,7 +576,7 @@ pub fn apply_polymorphic_type_operation(
                             if key.ends_with(type_name) && key.len() > type_name.len() {
                                 let base_name = &key[0..(key.len() - type_name.len())];
                                 if is_choice_element(base_name) {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
                         }
@@ -565,96 +584,98 @@ pub fn apply_polymorphic_type_operation(
                         // Check for specific cases like "value" -> valueQuantity for Observation.value.is(Quantity)
                         if obj.contains_key("value") && type_name == "Quantity" {
                             // Check if the value field looks like a Quantity
-                            if let Some(EvaluationResult::Object(value_obj)) = obj.get("value") {
+                            if let Some(EvaluationResult::Object { map: value_obj, .. }) =
+                                obj.get("value")
+                            {
                                 if value_obj.contains_key("value") && value_obj.contains_key("unit")
                                 {
-                                    return Ok(EvaluationResult::Boolean(true));
+                                    return Ok(EvaluationResult::boolean(true));
                                 }
                             }
 
                             // Also check for valueQuantity
                             if obj.contains_key("valueQuantity") {
-                                return Ok(EvaluationResult::Boolean(true));
+                                return Ok(EvaluationResult::boolean(true));
                             }
                         }
 
                         // Try matching the value's type directly
                         // For native types mapped to FHIR primitive types
-                        if let Some(EvaluationResult::String(value_type)) = obj.get("type") {
+                        if let Some(EvaluationResult::String(value_type, _)) = obj.get("type") {
                             if value_type == type_name {
-                                return Ok(EvaluationResult::Boolean(true));
+                                return Ok(EvaluationResult::boolean(true));
                             }
                         }
 
                         // No match found
-                        Ok(EvaluationResult::Boolean(false))
+                        Ok(EvaluationResult::boolean(false))
                     }
                     // Match native types to FHIRPath types
-                    EvaluationResult::Boolean(_) => {
+                    EvaluationResult::Boolean(_, _) => {
                         // Check for qualifiers like "System.Boolean" and "FHIR.boolean"
                         let is_boolean_type = type_name == "Boolean"
                             || type_name == "boolean"
                             || type_name.ends_with(".Boolean")
                             || type_name.ends_with(".boolean");
-                        Ok(EvaluationResult::Boolean(is_boolean_type))
+                        Ok(EvaluationResult::boolean(is_boolean_type))
                     }
-                    EvaluationResult::Integer(_) => {
+                    EvaluationResult::Integer(_, _) => {
                         // Check for qualifiers like "System.Integer" and "FHIR.integer"
                         let is_integer_type = type_name == "Integer"
                             || type_name == "integer"
                             || type_name.ends_with(".Integer")
                             || type_name.ends_with(".integer");
-                        Ok(EvaluationResult::Boolean(is_integer_type))
+                        Ok(EvaluationResult::boolean(is_integer_type))
                     }
-                    EvaluationResult::Decimal(_) => {
+                    EvaluationResult::Decimal(_, _) => {
                         // Check for qualifiers like "System.Decimal" and "FHIR.decimal"
                         let is_decimal_type = type_name == "Decimal"
                             || type_name == "decimal"
                             || type_name.ends_with(".Decimal")
                             || type_name.ends_with(".decimal");
-                        Ok(EvaluationResult::Boolean(is_decimal_type))
+                        Ok(EvaluationResult::boolean(is_decimal_type))
                     }
-                    EvaluationResult::String(_) => {
+                    EvaluationResult::String(_, _) => {
                         // Check for qualifiers like "System.String" and "FHIR.string"
                         let is_string_type = type_name == "String"
                             || type_name == "string"
                             || type_name.ends_with(".String")
                             || type_name.ends_with(".string");
-                        Ok(EvaluationResult::Boolean(is_string_type))
+                        Ok(EvaluationResult::boolean(is_string_type))
                     }
-                    EvaluationResult::Date(_) => {
+                    EvaluationResult::Date(_, _) => {
                         // Check for qualifiers like "System.Date" and "FHIR.date"
                         let is_date_type = type_name == "Date"
                             || type_name == "date"
                             || type_name.ends_with(".Date")
                             || type_name.ends_with(".date");
-                        Ok(EvaluationResult::Boolean(is_date_type))
+                        Ok(EvaluationResult::boolean(is_date_type))
                     }
-                    EvaluationResult::DateTime(_) => {
+                    EvaluationResult::DateTime(_, _) => {
                         // Check for qualifiers like "System.DateTime" and "FHIR.dateTime"
                         let is_datetime_type = type_name == "DateTime"
                             || type_name == "dateTime"
                             || type_name.ends_with(".DateTime")
                             || type_name.ends_with(".dateTime");
-                        Ok(EvaluationResult::Boolean(is_datetime_type))
+                        Ok(EvaluationResult::boolean(is_datetime_type))
                     }
-                    EvaluationResult::Time(_) => {
+                    EvaluationResult::Time(_, _) => {
                         // Check for qualifiers like "System.Time" and "FHIR.time"
                         let is_time_type = type_name == "Time"
                             || type_name == "time"
                             || type_name.ends_with(".Time")
                             || type_name.ends_with(".time");
-                        Ok(EvaluationResult::Boolean(is_time_type))
+                        Ok(EvaluationResult::boolean(is_time_type))
                     }
-                    EvaluationResult::Quantity(_, _) => {
+                    EvaluationResult::Quantity(_, _, _) => {
                         // Check for qualifiers like "System.Quantity" and "FHIR.Quantity"
                         let is_quantity_type =
                             type_name == "Quantity" || type_name.ends_with(".Quantity");
-                        Ok(EvaluationResult::Boolean(is_quantity_type))
+                        Ok(EvaluationResult::boolean(is_quantity_type))
                     }
                     // These cases should never happen due to earlier checks
-                    EvaluationResult::Empty => Ok(EvaluationResult::Boolean(false)),
-                    EvaluationResult::Collection { .. } => Ok(EvaluationResult::Boolean(false)),
+                    EvaluationResult::Empty => Ok(EvaluationResult::boolean(false)),
+                    EvaluationResult::Collection { .. } => Ok(EvaluationResult::boolean(false)),
                 }
             }
             "as" => {
@@ -663,8 +684,8 @@ pub fn apply_polymorphic_type_operation(
                 let is_type_result =
                     apply_polymorphic_type_operation(value, "is", type_name, namespace)?;
                 match is_type_result {
-                    EvaluationResult::Boolean(true) => Ok(value.clone()),
-                    EvaluationResult::Boolean(false) => Ok(EvaluationResult::Empty),
+                    EvaluationResult::Boolean(true, _) => Ok(value.clone()),
+                    EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::Empty),
                     EvaluationResult::Empty => Ok(EvaluationResult::Empty), // 'is' on Empty can be Empty
                     _ => Err(EvaluationError::TypeError(format!(
                         "'is' operation returned non-Boolean: {:?}",
@@ -755,37 +776,40 @@ mod tests {
         // Add resourceType
         obs.insert(
             "resourceType".to_string(),
-            EvaluationResult::String("Observation".to_string()),
+            EvaluationResult::string("Observation".to_string()),
         );
 
         // Add id
         obs.insert(
             "id".to_string(),
-            EvaluationResult::String("123".to_string()),
+            EvaluationResult::string("123".to_string()),
         );
 
         // Add valueQuantity
         let mut quantity = HashMap::new();
         quantity.insert(
             "value".to_string(),
-            EvaluationResult::Decimal(rust_decimal::Decimal::from(185)),
+            EvaluationResult::decimal(rust_decimal::Decimal::from(185)),
         );
         quantity.insert(
             "unit".to_string(),
-            EvaluationResult::String("lbs".to_string()),
+            EvaluationResult::string("lbs".to_string()),
         );
         quantity.insert(
             "system".to_string(),
-            EvaluationResult::String("http://unitsofmeasure.org".to_string()),
+            EvaluationResult::string("http://unitsofmeasure.org".to_string()),
         );
         quantity.insert(
             "code".to_string(),
-            EvaluationResult::String("lb_av".to_string()),
+            EvaluationResult::string("lb_av".to_string()),
         );
 
         obs.insert(
             "valueQuantity".to_string(),
-            EvaluationResult::Object(quantity),
+            EvaluationResult::Object {
+                map: quantity,
+                type_info: None,
+            },
         );
 
         obs
@@ -799,10 +823,14 @@ mod tests {
         let value = access_polymorphic_element(&obs, "value").unwrap();
 
         // Verify that it correctly finds valueQuantity
-        if let EvaluationResult::Object(quantity) = &value {
+        if let EvaluationResult::Object {
+            map: quantity,
+            type_info: None,
+        } = &value
+        {
             assert_eq!(
                 quantity.get("unit").unwrap(),
-                &EvaluationResult::String("lbs".to_string())
+                &EvaluationResult::string("lbs".to_string())
             );
         } else {
             panic!("Expected Object result, got {:?}", value);
@@ -817,10 +845,14 @@ mod tests {
         let value = filter_by_type(&obs, "value", "Quantity").unwrap();
 
         // Verify that it correctly finds valueQuantity
-        if let EvaluationResult::Object(quantity) = &value {
+        if let EvaluationResult::Object {
+            map: quantity,
+            type_info: None,
+        } = &value
+        {
             assert_eq!(
                 quantity.get("unit").unwrap(),
-                &EvaluationResult::String("lbs".to_string())
+                &EvaluationResult::string("lbs".to_string())
             );
         } else {
             panic!("Expected Object result, got {:?}", value);
@@ -854,17 +886,20 @@ mod tests {
         // we'll now recognize a valueQuantity object as a Quantity type
         let result =
             apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true)); // Now tests for true
+        assert_eq!(result, EvaluationResult::boolean(true)); // Now tests for true
 
         // Test is(String) on valueQuantity object directly
         let result =
             apply_polymorphic_type_operation(&value_quantity, "is", "String", None).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
 
         // Test is() on the Observation object itself
-        let obj = EvaluationResult::Object(obs);
+        let obj = EvaluationResult::Object {
+            map: obs,
+            type_info: None,
+        };
         let result = apply_polymorphic_type_operation(&obj, "is", "Observation", None).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -876,7 +911,7 @@ mod tests {
         let result =
             apply_polymorphic_type_operation(&value_quantity, "is", "Quantity", None).unwrap();
         // The valueQuantity looks like a Quantity type now, so is(Quantity) should be true
-        assert_eq!(result, EvaluationResult::Boolean(true)); // Updated to true
+        assert_eq!(result, EvaluationResult::boolean(true)); // Updated to true
 
         // Now since is(Quantity) is true, as(Quantity) should return the original value
         let result =
@@ -888,15 +923,18 @@ mod tests {
         assert_eq!(value_quantity_direct, value_quantity);
 
         // Test with an Observation object
-        let obj = EvaluationResult::Object(obs.clone());
+        let obj = EvaluationResult::Object {
+            map: obs.clone(),
+            type_info: None,
+        };
 
         // Testing valueQuantity field indirectly via Quantity
         // In our updated implementation, Observation.is(Quantity) should return true if it contains a valueQuantity
         let result = apply_polymorphic_type_operation(&obj, "is", "Quantity", None).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true)); // Should return true because it contains valueQuantity
+        assert_eq!(result, EvaluationResult::boolean(true)); // Should return true because it contains valueQuantity
 
         // Test for a wrong type
         let result = apply_polymorphic_type_operation(&obj, "is", "NonExistentType", None).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 }

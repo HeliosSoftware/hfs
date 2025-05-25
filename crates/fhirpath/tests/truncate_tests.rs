@@ -15,24 +15,24 @@ fn eval(input: &str) -> Result<EvaluationResult, EvaluationError> {
 #[test]
 fn test_truncate_integer() {
     // Integer truncation (should return the same integer)
-    assert_eq!(eval("101.truncate()").unwrap(), EvaluationResult::Integer(101));
-    assert_eq!(eval("0.truncate()").unwrap(), EvaluationResult::Integer(0));
-    assert_eq!(eval("(-42).truncate()").unwrap(), EvaluationResult::Integer(-42));
+    assert_eq!(eval("101.truncate()").unwrap(), EvaluationResult::integer(101));
+    assert_eq!(eval("0.truncate()").unwrap(), EvaluationResult::integer(0));
+    assert_eq!(eval("(-42).truncate()").unwrap(), EvaluationResult::integer(-42));
 }
 
 #[test]
 fn test_truncate_decimal() {
     // Decimal truncation (should return only the integer part)
-    assert_eq!(eval("101.5.truncate()").unwrap(), EvaluationResult::Integer(101));
-    assert_eq!(eval("1.00000001.truncate()").unwrap(), EvaluationResult::Integer(1));
-    assert_eq!(eval("(-1.56).truncate()").unwrap(), EvaluationResult::Integer(-1));
-    assert_eq!(eval("(-0.99).truncate()").unwrap(), EvaluationResult::Integer(0));
+    assert_eq!(eval("101.5.truncate()").unwrap(), EvaluationResult::integer(101));
+    assert_eq!(eval("1.00000001.truncate()").unwrap(), EvaluationResult::integer(1));
+    assert_eq!(eval("(-1.56).truncate()").unwrap(), EvaluationResult::integer(-1));
+    assert_eq!(eval("(-0.99).truncate()").unwrap(), EvaluationResult::integer(0));
 }
 
 #[test]
 fn test_truncate_collection() {
     // Collection with single item (should work like scalar)
-    assert_eq!(eval("5.7.truncate()").unwrap(), EvaluationResult::Integer(5));
+    assert_eq!(eval("5.7.truncate()").unwrap(), EvaluationResult::integer(5));
     
     // Empty collection (should return empty)
     assert_eq!(eval("{}.truncate()").unwrap(), EvaluationResult::Empty);

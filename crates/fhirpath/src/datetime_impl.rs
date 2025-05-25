@@ -114,20 +114,24 @@ pub fn compare_date_time_values(
 ) -> Option<Ordering> {
     match (left, right) {
         // Direct comparisons of same types
-        (EvaluationResult::Date(d1), EvaluationResult::Date(d2)) => compare_dates(d1, d2),
-        (EvaluationResult::Time(t1), EvaluationResult::Time(t2)) => compare_times(t1, t2),
-        (EvaluationResult::DateTime(dt1), EvaluationResult::DateTime(dt2)) => {
+        (EvaluationResult::Date(d1, None), EvaluationResult::Date(d2, None)) => {
+            compare_dates(d1, d2)
+        }
+        (EvaluationResult::Time(t1, None), EvaluationResult::Time(t2, None)) => {
+            compare_times(t1, t2)
+        }
+        (EvaluationResult::DateTime(dt1, None), EvaluationResult::DateTime(dt2, None)) => {
             compare_datetimes(dt1, dt2)
         }
 
         // Date vs DateTime comparison
-        (EvaluationResult::Date(d), EvaluationResult::DateTime(dt)) => {
+        (EvaluationResult::Date(d, None), EvaluationResult::DateTime(dt, None)) => {
             // Convert date to datetime with time 00:00:00 for comparison
             let d_normalized = normalize_date(d);
             let d_as_dt = format!("{}T00:00:00", d_normalized);
             compare_datetimes(&d_as_dt, dt)
         }
-        (EvaluationResult::DateTime(dt), EvaluationResult::Date(d)) => {
+        (EvaluationResult::DateTime(dt, None), EvaluationResult::Date(d, None)) => {
             // Convert date to datetime with time 00:00:00 for comparison
             let d_normalized = normalize_date(d);
             let d_as_dt = format!("{}T00:00:00", d_normalized);
@@ -135,7 +139,7 @@ pub fn compare_date_time_values(
         }
 
         // Handle string-based date/time formats
-        (EvaluationResult::String(s1), EvaluationResult::String(s2)) => {
+        (EvaluationResult::String(s1, _), EvaluationResult::String(s2, _)) => {
             if s1.starts_with('@') && s2.starts_with('@') {
                 // Both are date literals
                 let value1 = s1.trim_start_matches('@');
@@ -166,29 +170,29 @@ pub fn compare_date_time_values(
 
         // Handle other conversions
         // String vs Date
-        (EvaluationResult::String(s_val), EvaluationResult::Date(d_val)) => {
+        (EvaluationResult::String(s_val, _), EvaluationResult::Date(d_val, _)) => {
             // Attempt to parse s_val as a date and compare with d_val
             compare_dates(s_val, d_val)
         }
-        (EvaluationResult::Date(d_val), EvaluationResult::String(s_val)) => {
+        (EvaluationResult::Date(d_val, _), EvaluationResult::String(s_val, _)) => {
             // Attempt to parse s_val as a date and compare with d_val
             compare_dates(d_val, s_val)
         }
         // String vs DateTime
-        (EvaluationResult::String(s_val), EvaluationResult::DateTime(dt_val)) => {
+        (EvaluationResult::String(s_val, _), EvaluationResult::DateTime(dt_val, _)) => {
             // Attempt to parse s_val as a datetime and compare with dt_val
             compare_datetimes(s_val, dt_val)
         }
-        (EvaluationResult::DateTime(dt_val), EvaluationResult::String(s_val)) => {
+        (EvaluationResult::DateTime(dt_val, _), EvaluationResult::String(s_val, _)) => {
             // Attempt to parse s_val as a datetime and compare with dt_val
             compare_datetimes(dt_val, s_val)
         }
         // String vs Time
-        (EvaluationResult::String(s_val), EvaluationResult::Time(t_val)) => {
+        (EvaluationResult::String(s_val, _), EvaluationResult::Time(t_val, _)) => {
             // Attempt to parse s_val as a time and compare with t_val
             compare_times(s_val, t_val)
         }
-        (EvaluationResult::Time(t_val), EvaluationResult::String(s_val)) => {
+        (EvaluationResult::Time(t_val, _), EvaluationResult::String(s_val, _)) => {
             // Attempt to parse s_val as a time and compare with t_val
             compare_times(t_val, s_val)
         }
@@ -201,9 +205,9 @@ pub fn compare_date_time_values(
 /// Implements the type() function for dates, times, and datetimes
 pub fn get_type_info(value: &EvaluationResult) -> (String, String) {
     match value {
-        EvaluationResult::Date(_) => ("System".to_string(), "Date".to_string()),
-        EvaluationResult::DateTime(_) => ("System".to_string(), "DateTime".to_string()),
-        EvaluationResult::Time(_) => ("System".to_string(), "Time".to_string()),
+        EvaluationResult::Date(_, None) => ("System".to_string(), "Date".to_string()),
+        EvaluationResult::DateTime(_, None) => ("System".to_string(), "DateTime".to_string()),
+        EvaluationResult::Time(_, None) => ("System".to_string(), "Time".to_string()),
         _ => ("".to_string(), "".to_string()), // Not a date/time type
     }
 }
@@ -231,8 +235,8 @@ pub fn is_date_time_type(
 /// Converts a value to a date representation if possible
 pub fn to_date(value: &EvaluationResult) -> Option<String> {
     match value {
-        EvaluationResult::Date(d) => Some(d.clone()),
-        EvaluationResult::DateTime(dt) => {
+        EvaluationResult::Date(d, _) => Some(d.clone()),
+        EvaluationResult::DateTime(dt, _) => {
             // Extract date part from datetime
             let parts: Vec<&str> = dt.split('T').collect();
             if !parts.is_empty() {
@@ -241,7 +245,7 @@ pub fn to_date(value: &EvaluationResult) -> Option<String> {
                 None
             }
         }
-        EvaluationResult::String(s) => {
+        EvaluationResult::String(s, _) => {
             // Try to interpret as a date
             if parse_date(s).is_some() {
                 Some(s.clone())
@@ -263,12 +267,12 @@ pub fn to_date(value: &EvaluationResult) -> Option<String> {
 /// Converts a value to a datetime representation if possible
 pub fn to_datetime(value: &EvaluationResult) -> Option<String> {
     match value {
-        EvaluationResult::DateTime(dt) => Some(dt.clone()),
-        EvaluationResult::Date(d) => {
+        EvaluationResult::DateTime(dt, _) => Some(dt.clone()),
+        EvaluationResult::Date(d, _) => {
             // Extend date to datetime
             Some(format!("{}T00:00:00", d))
         }
-        EvaluationResult::String(s) => {
+        EvaluationResult::String(s, _) => {
             // Check if it's already a datetime format
             if s.contains('T') {
                 if parse_datetime(s).is_some() {
@@ -292,8 +296,8 @@ pub fn to_datetime(value: &EvaluationResult) -> Option<String> {
 /// Converts a value to a time representation if possible
 pub fn to_time(value: &EvaluationResult) -> Option<String> {
     match value {
-        EvaluationResult::Time(t) => Some(t.clone()),
-        EvaluationResult::DateTime(dt) => {
+        EvaluationResult::Time(t, _) => Some(t.clone()),
+        EvaluationResult::DateTime(dt, _) => {
             // Extract time part from datetime
             let parts: Vec<&str> = dt.split('T').collect();
             if parts.len() > 1 {
@@ -302,7 +306,7 @@ pub fn to_time(value: &EvaluationResult) -> Option<String> {
                 None
             }
         }
-        EvaluationResult::String(s) => {
+        EvaluationResult::String(s, _) => {
             // Try to interpret as a time
             if s.starts_with('T') {
                 let time_part = &s[1..]; // Remove leading 'T'
@@ -402,17 +406,17 @@ mod tests {
     #[test]
     fn test_to_date() {
         assert_eq!(
-            to_date(&EvaluationResult::Date("2015-01-01".to_string())),
+            to_date(&EvaluationResult::date("2015-01-01".to_string())),
             Some("2015-01-01".to_string())
         );
         assert_eq!(
-            to_date(&EvaluationResult::DateTime(
+            to_date(&EvaluationResult::datetime(
                 "2015-01-01T14:30:00".to_string()
             )),
             Some("2015-01-01".to_string())
         );
         assert_eq!(
-            to_date(&EvaluationResult::String("2015-01-01".to_string())),
+            to_date(&EvaluationResult::string("2015-01-01".to_string())),
             Some("2015-01-01".to_string())
         );
     }
@@ -420,17 +424,17 @@ mod tests {
     #[test]
     fn test_to_datetime() {
         assert_eq!(
-            to_datetime(&EvaluationResult::DateTime(
+            to_datetime(&EvaluationResult::datetime(
                 "2015-01-01T14:30:00".to_string()
             )),
             Some("2015-01-01T14:30:00".to_string())
         );
         assert_eq!(
-            to_datetime(&EvaluationResult::Date("2015-01-01".to_string())),
+            to_datetime(&EvaluationResult::date("2015-01-01".to_string())),
             Some("2015-01-01T00:00:00".to_string())
         );
         assert_eq!(
-            to_datetime(&EvaluationResult::String("2015-01-01".to_string())),
+            to_datetime(&EvaluationResult::string("2015-01-01".to_string())),
             Some("2015-01-01T00:00:00".to_string())
         );
     }

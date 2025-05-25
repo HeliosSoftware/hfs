@@ -26,81 +26,81 @@ fn test_expression_literals() {
     // Boolean
     assert_eq!(
         eval("true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // String
     assert_eq!(
         eval("'hello'", &context).unwrap(),
-        EvaluationResult::String("hello".to_string())
+        EvaluationResult::string("hello".to_string())
     );
     assert_eq!(
         eval("'urn:oid:1.2.3'", &context).unwrap(),
-        EvaluationResult::String("urn:oid:1.2.3".to_string())
+        EvaluationResult::string("urn:oid:1.2.3".to_string())
     );
     // Integer - Should now be parsed as Integer
     assert_eq!(
         eval("123", &context).unwrap(),
-        EvaluationResult::Integer(123)
+        EvaluationResult::integer(123)
     );
-    assert_eq!(eval("0", &context).unwrap(), EvaluationResult::Integer(0));
-    assert_eq!(eval("-5", &context).unwrap(), EvaluationResult::Integer(-5));
+    assert_eq!(eval("0", &context).unwrap(), EvaluationResult::integer(0));
+    assert_eq!(eval("-5", &context).unwrap(), EvaluationResult::integer(-5));
     // Decimal - Requires a decimal point
     assert_eq!(
         eval("123.45", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(123.45)) // Use Decimal
+        EvaluationResult::decimal("123.45".parse().unwrap()) // Use Decimal
     );
     assert_eq!(
         eval("0.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(0.0))
+        EvaluationResult::decimal(rust_decimal::Decimal::from(0))
     );
     // Date
     assert_eq!(
         eval("@2015-02-04", &context).unwrap(),
-        EvaluationResult::Date("2015-02-04".to_string())
+        EvaluationResult::date("2015-02-04".to_string())
     );
     assert_eq!(
         eval("@2015-02", &context).unwrap(),
-        EvaluationResult::Date("2015-02".to_string())
+        EvaluationResult::date("2015-02".to_string())
     ); // Test partial date parsing
     assert_eq!(
         eval("@2015", &context).unwrap(),
-        EvaluationResult::Date("2015".to_string())
+        EvaluationResult::date("2015".to_string())
     ); // Test partial date parsing
     // DateTime - Use eval directly
     assert_eq!(
         eval("@2015-02-04T14:34:28+09:00", &context).unwrap(),
-        EvaluationResult::DateTime("2015-02-04T14:34:28+09:00".to_string())
+        EvaluationResult::datetime("2015-02-04T14:34:28+09:00".to_string())
     );
     assert_eq!(
         eval("@2015-02-04T14:34:28Z", &context).unwrap(),
-        EvaluationResult::DateTime("2015-02-04T14:34:28Z".to_string())
+        EvaluationResult::datetime("2015-02-04T14:34:28Z".to_string())
     );
     // Time - Use eval directly
     assert_eq!(
         eval("@T14:34:28", &context).unwrap(),
-        EvaluationResult::Time("14:34:28".to_string())
+        EvaluationResult::time("14:34:28".to_string())
     );
     assert_eq!(
         eval("@T14:30", &context).unwrap(),
-        EvaluationResult::Time("14:30".to_string())
+        EvaluationResult::time("14:30".to_string())
     );
     // Quantity - Should now parse and evaluate as Quantity
     assert_eq!(
         eval("10 'mg'", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(10), "mg".to_string())
+        EvaluationResult::quantity(rust_decimal::Decimal::from(10), "mg".to_string())
     );
     assert_eq!(
         eval("4.5 'km'", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(4.5), "km".to_string())
+        EvaluationResult::quantity("4.5".parse().unwrap(), "km".to_string())
     );
     // Quantity with date/time unit
     assert_eq!(
         eval("100 days", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(100), "days".to_string())
+        EvaluationResult::quantity(rust_decimal::Decimal::from(100), "days".to_string())
     );
 
     // Empty Collection (Null literal)
@@ -114,7 +114,7 @@ fn test_expression_singleton_evaluation() {
     // Single item collection evaluates to the item
     assert_eq!(
         eval("('hello')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("hello".to_string())
+        EvaluationResult::string("hello".to_string())
     );
     // Empty collection evaluates to empty
     assert_eq!(
@@ -137,15 +137,15 @@ fn test_function_existence_empty() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.empty()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'test'.empty()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1 | 2).empty()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)            // Negation of ({} ~ {}) -> !true -> false
+        EvaluationResult::boolean(false)            // Negation of ({} ~ {}) -> !true -> false
     );
 }
 
@@ -155,28 +155,28 @@ fn test_function_existence_exists() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.exists()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'test'.exists()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).exists()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // With criteria
     assert_eq!(
         eval("(1 | 2 | 3).exists($this > 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 3).exists($this > 5)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("{}.exists($this > 5)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -186,19 +186,19 @@ fn test_function_existence_all() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.all($this > 1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Empty collection is true
     assert_eq!(
         eval("(1 | 2 | 3).all($this > 0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 3).all($this > 1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1 | 2 | 3).all($this.toString() = '1')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test with non-boolean criteria - should error
     assert!(eval("(1 | 2 | 3).all($this)", &context).is_err());
@@ -210,23 +210,23 @@ fn test_function_existence_all_true() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.allTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true).allTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | true).allTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | false).allTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(false | false).allTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test with non-boolean - should error
     assert!(eval("(true | 1).allTrue()", &context).is_err());
@@ -238,23 +238,23 @@ fn test_function_existence_any_true() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.anyTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(true).anyTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | true).anyTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | false).anyTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(false | false).anyTrue()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test with non-boolean - should error
     assert!(eval("(false | 1).anyTrue()", &context).is_err());
@@ -266,23 +266,23 @@ fn test_function_existence_all_false() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.allFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(false).allFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(false | false).allFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | false).allFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(true | true).allFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test with non-boolean - should error
     assert!(eval("(false | 1).allFalse()", &context).is_err());
@@ -294,23 +294,23 @@ fn test_function_existence_any_false() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.anyFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(false).anyFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(false | false).anyFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | false).anyFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(true | true).anyFalse()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test with non-boolean - should error
     assert!(eval("(true | 1).anyFalse()", &context).is_err());
@@ -322,31 +322,31 @@ fn test_function_existence_subset_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.subsetOf({})", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("{}.subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 3).subsetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1 | 2).subsetOf({})", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1 | 2).subsetOf(1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -356,31 +356,31 @@ fn test_function_existence_superset_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.supersetOf({})", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).supersetOf({})", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).supersetOf(1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2).supersetOf(1 | 2 | 3)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("{}.supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1).supersetOf(1 | 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -390,20 +390,20 @@ fn test_function_existence_count() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.count()", &context).unwrap(),
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     ); // Add unwrap
     assert_eq!(
         eval("'test'.count()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     assert_eq!(
         eval("(1 | 2 | 3).count()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(3)
+        EvaluationResult::integer(3)
     );
     // Add test for duplicates - | operator creates distinct collection (1 | 2)
     assert_eq!(
         eval("(1 | 2 | 1).count()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(2) // Expect 2 because (1 | 2 | 1) becomes (1 | 2)
+        EvaluationResult::integer(2) // Expect 2 because (1 | 2 | 1) becomes (1 | 2)
     );
 }
 
@@ -417,7 +417,7 @@ fn test_function_existence_distinct() {
     ); // Add unwrap
     assert_eq!(
         eval("(1).distinct()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     // Order not guaranteed, so check contents
     let result = eval("(1 | 2 | 1 | 3 | 2).distinct()", &context).unwrap(); // Add unwrap
@@ -425,7 +425,7 @@ fn test_function_existence_distinct() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -442,19 +442,19 @@ fn test_function_existence_is_distinct() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("{}.isDistinct()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1).isDistinct()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 3).isDistinct()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 1).isDistinct()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true) // Expect true because (1 | 2 | 1) becomes (1 | 2) which IS distinct
+        EvaluationResult::boolean(true) // Expect true because (1 | 2 | 1) becomes (1 | 2) which IS distinct
     );
 }
 
@@ -471,8 +471,9 @@ fn test_function_filtering_where() {
         eval("(1 | 2 | 3 | 4).where($this > 2)", &context).unwrap(), // Add unwrap
         // Expect collection even if normalization happens
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(3), EvaluationResult::Integer(4)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(3), EvaluationResult::integer(4)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     assert_eq!(
@@ -482,13 +483,13 @@ fn test_function_filtering_where() {
     assert_eq!(
         eval("('a' | 'b' | 'c').where($this = 'b')", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
-        EvaluationResult::String("b".to_string())
+        EvaluationResult::string("b".to_string())
     );
     // Test empty result from criteria is ignored
     assert_eq!(
         eval("(1 | 2 | {}).where($this > 1)", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
-        EvaluationResult::Integer(2)
+        EvaluationResult::integer(2)
     );
     // Test criteria evaluating to non-boolean (should error per spec)
     assert!(eval("(1 | 2 | 3).where($this)", &context).is_err());
@@ -508,11 +509,12 @@ fn test_function_filtering_select() {
         // Expect collection result
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(4),
-                EvaluationResult::Integer(6)
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(4),
+                EvaluationResult::integer(6)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Test flattening
@@ -520,19 +522,20 @@ fn test_function_filtering_select() {
         eval("( (1|2) | (3|4) ).select($this)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
-                EvaluationResult::Integer(4)
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
+                EvaluationResult::integer(4)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Test empty result from projection is skipped
     assert_eq!(
         eval("(1 | 2 | 3).select(iif($this > 2, $this, {}))", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
-        EvaluationResult::Integer(3)
+        EvaluationResult::integer(3)
     );
     // Test projection resulting in collection
     assert_eq!(
@@ -542,12 +545,13 @@ fn test_function_filtering_select() {
         // The select operation preserves this unordered nature for the combined output.
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2), // from first item's projection
-                EvaluationResult::Integer(2), // from second item's projection
-                EvaluationResult::Integer(3)  // from second item's projection
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2), // from first item's projection
+                EvaluationResult::integer(2), // from second item's projection
+                EvaluationResult::integer(3)  // from second item's projection
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
 }
@@ -559,19 +563,19 @@ fn test_function_filtering_of_type() {
     // Simple types - expect single item results due to normalization
     assert_eq!(
         eval("(1 | 'a' | true).ofType(Integer)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     assert_eq!(
         eval("(1 | 'a' | true).ofType(String)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("a".to_string())
+        EvaluationResult::string("a".to_string())
     );
     assert_eq!(
         eval("(1 | 'a' | true).ofType(Boolean)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 'a' | true | 1.5).ofType(Decimal)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.5))
+        EvaluationResult::decimal(dec!(1.5))
     );
     assert_eq!(
         eval("{}.ofType(Integer)", &context).unwrap(), // Add unwrap
@@ -579,7 +583,7 @@ fn test_function_filtering_of_type() {
     );
     assert_eq!(
         eval("(1 | 'a' | true).ofType(System.Integer)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
 
     // Complex types (requires resource context and proper object representation)
@@ -605,37 +609,37 @@ fn test_function_filtering_of_type() {
     // Evaluate against the implicit %context which is the collection of resources
     let result_patient = eval("%context.ofType(Patient)", &ctx_res).unwrap(); // Add unwrap
     assert!(
-        matches!(&result_patient, EvaluationResult::Object(_)),
+        matches!(&result_patient, EvaluationResult::Object { .. }),
         "Expected Object, got {:?}",
         result_patient
     );
-    if let EvaluationResult::Object(fields) = result_patient {
+    if let EvaluationResult::Object { map: fields, .. } = result_patient {
         // Now result_patient is EvaluationResult
         assert_eq!(
             fields.get("id"), // Patient.id has no extensions, should be primitive String
-            Some(&EvaluationResult::String("p1".to_string()))
+            Some(&EvaluationResult::string("p1".to_string()))
         );
         // Patient.active should evaluate to its primitive value directly
-        assert_eq!(fields.get("active"), Some(&EvaluationResult::Boolean(true)));
+        assert_eq!(fields.get("active"), Some(&EvaluationResult::boolean(true)));
         // To access the id, we would need Patient.active.id() or similar (not tested here)
     }
 
     let result_obs = eval("%context.ofType(Observation)", &ctx_res).unwrap(); // Add unwrap
     assert!(
-        matches!(&result_obs, EvaluationResult::Object(_)),
+        matches!(&result_obs, EvaluationResult::Object { .. }),
         "Expected Object, got {:?}",
         result_obs
     );
-    if let EvaluationResult::Object(fields) = result_obs {
+    if let EvaluationResult::Object { map: fields, .. } = result_obs {
         // Now result_obs is EvaluationResult
         assert_eq!(
             fields.get("id"),
-            Some(&EvaluationResult::String("o1".to_string()))
+            Some(&EvaluationResult::string("o1".to_string()))
         );
         // Check status field - Observation.status has no extensions, should be primitive String
         assert_eq!(
             fields.get("status"),
-            Some(&EvaluationResult::String("final".to_string()))
+            Some(&EvaluationResult::string("final".to_string()))
         );
     }
 
@@ -653,15 +657,15 @@ fn test_function_subsetting_indexer() {
     assert_eq!(eval("{}[0]", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30)[0]", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     );
     assert_eq!(
         eval("(10 | 20 | 30)[1]", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(20)
+        EvaluationResult::integer(20)
     );
     assert_eq!(
         eval("(10 | 20 | 30)[2]", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(30)
+        EvaluationResult::integer(30)
     );
     assert_eq!(
         eval("(10 | 20 | 30)[3]", &context).unwrap(),
@@ -683,7 +687,7 @@ fn test_function_subsetting_single() {
     ); // Add unwrap
     assert_eq!(
         eval("(10).single()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     );
     // Multiple items should error per spec
     assert!(eval("(10 | 20).single()", &context).is_err());
@@ -699,11 +703,11 @@ fn test_function_subsetting_first() {
     ); // Add unwrap
     assert_eq!(
         eval("(10).first()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     );
     assert_eq!(
         eval("(10 | 20 | 30).first()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     );
 }
 
@@ -717,11 +721,11 @@ fn test_function_subsetting_last() {
     ); // Add unwrap
     assert_eq!(
         eval("(10).last()", &context).unwrap(),
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     ); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30).last()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(30)
+        EvaluationResult::integer(30)
     );
 }
 
@@ -740,8 +744,9 @@ fn test_function_subsetting_tail() {
     assert_eq!(
         eval("(10 | 20 | 30).tail()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(20), EvaluationResult::Integer(30)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(20), EvaluationResult::integer(30)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
 }
@@ -758,18 +763,20 @@ fn test_function_subsetting_skip() {
         eval("(10 | 20 | 30).skip(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(10),
-                EvaluationResult::Integer(20),
-                EvaluationResult::Integer(30)
+                EvaluationResult::integer(10),
+                EvaluationResult::integer(20),
+                EvaluationResult::integer(30)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     assert_eq!(
         eval("(10 | 20 | 30).skip(1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(20), EvaluationResult::Integer(30)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(20), EvaluationResult::integer(30)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     assert_eq!(
@@ -785,11 +792,12 @@ fn test_function_subsetting_skip() {
         eval("(10 | 20 | 30).skip(-1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(10),
-                EvaluationResult::Integer(20),
-                EvaluationResult::Integer(30)
+                EvaluationResult::integer(10),
+                EvaluationResult::integer(20),
+                EvaluationResult::integer(30)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Non-integer skip should error
@@ -811,14 +819,15 @@ fn test_function_subsetting_take() {
     assert_eq!(
         eval("(10 | 20 | 30).take(1)", &context).unwrap(), // Add unwrap
         // Expect single item result due to normalization
-        EvaluationResult::Integer(10)
+        EvaluationResult::integer(10)
     );
     assert_eq!(
         eval("(10 | 20 | 30).take(2)", &context).unwrap(), // Add unwrap
         // Expect collection result
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(10), EvaluationResult::Integer(20)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(10), EvaluationResult::integer(20)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Add the missing assert_eq! for take(3)
@@ -827,11 +836,12 @@ fn test_function_subsetting_take() {
         // Expect collection result
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(10),
-                EvaluationResult::Integer(20),
-                EvaluationResult::Integer(30)
+                EvaluationResult::integer(10),
+                EvaluationResult::integer(20),
+                EvaluationResult::integer(30)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         } // End collection for take(3)
     ); // End assert_eq for take(3)
     assert_eq!(
@@ -839,11 +849,12 @@ fn test_function_subsetting_take() {
         // Expect collection result
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(10),
-                EvaluationResult::Integer(20),
-                EvaluationResult::Integer(30)
+                EvaluationResult::integer(10),
+                EvaluationResult::integer(20),
+                EvaluationResult::integer(30)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Negative take returns empty
@@ -878,7 +889,7 @@ fn test_function_subsetting_intersect() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -894,7 +905,7 @@ fn test_function_subsetting_intersect() {
     // Check if the result is the single integer 1, handling normalization
     assert_eq!(
         result,
-        EvaluationResult::Integer(1),
+        EvaluationResult::integer(1),
         "Intersect result mismatch"
     );
 }
@@ -912,11 +923,12 @@ fn test_function_subsetting_exclude() {
         // Expect collection result
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3)
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3)
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     assert_eq!(
@@ -927,8 +939,9 @@ fn test_function_subsetting_exclude() {
         eval("(1 | 2 | 3).exclude(2 | 4)", &context).unwrap(), // Add unwrap
         // Expect collection result
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(3)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(3)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Preserves duplicates and order - but | makes input distinct first
@@ -940,10 +953,11 @@ fn test_function_subsetting_exclude() {
         // Expect collection result based on distinct input
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3) // The second '2' is lost because the input collection becomes distinct
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3) // The second '2' is lost because the input collection becomes distinct
             ],
-            has_undefined_order: true
+            has_undefined_order: true,
+            type_info: None,
         }
     );
 }
@@ -977,7 +991,7 @@ fn test_function_combining_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -991,7 +1005,7 @@ fn test_function_combining_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1032,7 +1046,7 @@ fn test_function_combining_combine() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1047,7 +1061,7 @@ fn test_function_combining_combine() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Use pattern matching
             })
             .collect();
@@ -1069,19 +1083,19 @@ fn test_function_conversion_iif() {
     // Requires expression passing
     assert_eq!(
         eval("iif(true, 'a', 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("a".to_string())
+        EvaluationResult::string("a".to_string())
     );
     assert_eq!(
         eval("iif(false, 'a', 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("b".to_string())
+        EvaluationResult::string("b".to_string())
     );
     assert_eq!(
         eval("iif({}, 'a', 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("b".to_string())
+        EvaluationResult::string("b".to_string())
     ); // Empty condition is false
     assert_eq!(
         eval("iif(true, 'a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("a".to_string())
+        EvaluationResult::string("a".to_string())
     ); // Omitted otherwise
     assert_eq!(
         eval("iif(false, 'a')", &context).unwrap(),
@@ -1095,15 +1109,17 @@ fn test_function_conversion_iif() {
     assert_eq!(
         eval("iif(true, (1|2), (3|4))", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     assert_eq!(
         eval("iif(false, (1|2), (3|4))", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(3), EvaluationResult::Integer(4)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(3), EvaluationResult::integer(4)],
+            has_undefined_order: true,
+            type_info: None,
         }
     );
     // Test short-circuiting (cannot test directly, assume implementation detail)
@@ -1120,63 +1136,63 @@ fn test_function_conversion_to_boolean() {
     ); // Add unwrap
     assert_eq!(
         eval("true.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("0.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1.0.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("0.0.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'true'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'false'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'T'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Case-insensitive
     assert_eq!(
         eval("'f'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Case-insensitive
     assert_eq!(
         eval("'yes'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'no'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'1'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'0'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'1.0'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'0.0'.toBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("2.toBoolean()", &context).unwrap(),
@@ -1204,39 +1220,39 @@ fn test_function_conversion_converts_to_boolean() {
     );
     assert_eq!(
         eval("true.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("0.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1.0.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("0.0.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'true'.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'false'.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("2.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Invalid decimal
     assert_eq!(
         eval("'abc'.convertsToBoolean()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Invalid string
     // Test multi-item collection - should error
     assert!(eval("(true | false).convertsToBoolean()", &context).is_err());
@@ -1252,27 +1268,27 @@ fn test_function_conversion_to_integer() {
     ); // Add unwrap
     assert_eq!(
         eval("123.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(123)
+        EvaluationResult::integer(123)
     );
     assert_eq!(
         eval("'456'.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(456)
+        EvaluationResult::integer(456)
     );
     assert_eq!(
         eval("'+789'.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(789)
+        EvaluationResult::integer(789)
     );
     assert_eq!(
         eval("'-12'.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(-12)
+        EvaluationResult::integer(-12)
     );
     assert_eq!(
         eval("true.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     assert_eq!(
         eval("false.toInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     );
     // Decimal conversion to Integer (truncates) - FHIRPath spec says Empty if not integer representable
     assert_eq!(
@@ -1305,28 +1321,28 @@ fn test_function_conversion_converts_to_integer() {
     );
     assert_eq!(
         eval("123.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'456'.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Decimal conversion check
     assert_eq!(
         eval("123.45.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)                       // Per spec
+        EvaluationResult::boolean(false)                       // Per spec
     );
     assert_eq!(
         eval("123.0.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abc'.convertsToInteger()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Invalid string
     // Test multi-item collection - should error
     assert!(eval("(1 | 2).convertsToInteger()", &context).is_err());
@@ -1342,35 +1358,35 @@ fn test_function_conversion_to_decimal() {
     ); // Add unwrap
     assert_eq!(
         eval("123.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.0))      // Integer to Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(123.0)) // Integer to Decimal (explicit .0)
     );
     assert_eq!(
         eval("123.45.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(123.45))        // Decimal to Decimal
+        EvaluationResult::decimal(dec!(123.45))  // Decimal to Decimal
     );
     assert_eq!(
         eval("'456.78'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(456.78))          // String to Decimal
+        EvaluationResult::decimal(dec!(456.78))  // String to Decimal
     );
     assert_eq!(
         eval("'+12.3'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(12.3))           // String with sign
+        EvaluationResult::decimal(dec!(12.3))  // String with sign
     );
     assert_eq!(
         eval("'-45.6'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(-45.6))          // String with sign
+        EvaluationResult::decimal(dec!(-45.6))  // String with sign
     );
     assert_eq!(
         eval("'789'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(789.0))        // Integer string -> Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(789.0)) // Integer string -> Decimal (explicit .0)
     );
     assert_eq!(
         eval("true.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.0))         // Boolean to Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(1.0)) // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
         eval("false.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(0.0))          // Boolean to Decimal (explicit .0)
+        EvaluationResult::decimal(rust_decimal::Decimal::from(0)) // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
         eval("'abc'.toDecimal()", &context).unwrap(),
@@ -1390,23 +1406,23 @@ fn test_function_conversion_converts_to_decimal() {
     );
     assert_eq!(
         eval("123.convertsToDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("123.45.convertsToDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'456.78'.convertsToDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true.convertsToDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abc'.convertsToDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Invalid string
     // Test multi-item collection - should error
     assert!(eval("(1.0 | 2.0).convertsToDecimal()", &context).is_err());
@@ -1422,51 +1438,51 @@ fn test_function_conversion_to_string() {
     ); // Add unwrap
     assert_eq!(
         eval("'abc'.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abc".to_string())
+        EvaluationResult::string("abc".to_string())
     );
     assert_eq!(
         eval("123.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("123".to_string())
+        EvaluationResult::string("123".to_string())
     );
     assert_eq!(
         eval("123.45.toString()", &context).unwrap(), // Add unwrap
         // Removed duplicate eval call, compare directly to expected result
-        EvaluationResult::String("123.45".to_string()) // Decimal to string
+        EvaluationResult::string("123.45".to_string()) // Decimal to string
     );
     assert_eq!(
         eval("true.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("true".to_string())
+        EvaluationResult::string("true".to_string())
     );
     assert_eq!(
         eval("false.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("false".to_string())
+        EvaluationResult::string("false".to_string())
     );
     assert_eq!(
         eval("@2023-10-27.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("2023-10-27".to_string())
+        EvaluationResult::string("2023-10-27".to_string())
     );
     assert_eq!(
         eval("@T10:30:00.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("10:30:00".to_string())
+        EvaluationResult::string("10:30:00".to_string())
     );
     assert_eq!(
         eval("@2023-10-27T10:30Z.toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("2023-10-27T10:30Z".to_string())  // Expect output without seconds
+        EvaluationResult::string("2023-10-27T10:30Z".to_string())  // Expect output without seconds
     );
     // Quantity to string
     assert_eq!(
         eval("5.5 'mg'.toString()", &context).unwrap(),
-        EvaluationResult::String("5.5 'mg'".to_string()) // Expect "value 'unit'"
+        EvaluationResult::string("5.5 'mg'".to_string()) // Expect "value 'unit'"
     );
     assert_eq!(
         eval("100 days.toString()", &context).unwrap(),
-        EvaluationResult::String("100 'days'".to_string()) // Expect "value 'unit'"
+        EvaluationResult::string("100 'days'".to_string()) // Expect "value 'unit'"
     );
     // Collection to string - should error per spec
     assert!(eval("(1|2).toString()", &context).is_err());
     assert_eq!(
         eval("(1).toString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("1".to_string())
+        EvaluationResult::string("1".to_string())
     ); // Single-item collection -> item string
 }
 
@@ -1480,40 +1496,40 @@ fn test_function_conversion_converts_to_string() {
     );
     assert_eq!(
         eval("'abc'.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("123.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("123.45.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@T10:30:00.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Quantity conversion (evaluator returns Decimal or Integer)
     assert_eq!(
         eval("5.5 'mg'.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("5 'mg'.convertsToString()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Object/Collection are not convertible according to the function's logic,
     // but the function should error if the input is a multi-item collection.
@@ -1532,27 +1548,27 @@ fn test_function_conversion_to_date() {
     ); // Add unwrap
     assert_eq!(
         eval("@2023-10-27.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023-10-27".to_string())
+        EvaluationResult::date("2023-10-27".to_string())
     );
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023-10-27".to_string())
+        EvaluationResult::date("2023-10-27".to_string())
     ); // DateTime to Date
     assert_eq!(
         eval("'2023-10-27'.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023-10-27".to_string())
+        EvaluationResult::date("2023-10-27".to_string())
     ); // String to Date
     assert_eq!(
         eval("'2023-10'.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023-10".to_string())
+        EvaluationResult::date("2023-10".to_string())
     ); // Partial date string
     assert_eq!(
         eval("'2023'.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023".to_string())
+        EvaluationResult::date("2023".to_string())
     ); // Partial date string
     assert_eq!(
         eval("'2023-10-27T10:30:00Z'.toDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Date("2023-10-27".to_string())
+        EvaluationResult::date("2023-10-27".to_string())
     ); // DateTime string to Date
     assert_eq!(
         eval("'invalid-date'.toDate()", &context).unwrap(), // Add unwrap
@@ -1580,39 +1596,39 @@ fn test_function_conversion_converts_to_date() {
     );
     assert_eq!(
         eval("@2023-10-27.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10-27'.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10'.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023'.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10-27T10:30:00Z'.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'invalid-date'.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("123.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true.convertsToDate()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test multi-item collection - should error
     assert!(eval("(@2023 | @2024).convertsToDate()", &context).is_err());
@@ -1628,27 +1644,27 @@ fn test_function_conversion_to_date_time() {
     ); // Add unwrap
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023-10-27T10:30:00Z".to_string())
+        EvaluationResult::datetime("2023-10-27T10:30:00Z".to_string())
     );
     assert_eq!(
         eval("@2023-10-27.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023-10-27".to_string())
+        EvaluationResult::datetime("2023-10-27".to_string())
     ); // Date to DateTime (no time part)
     assert_eq!(
         eval("'2023-10-27T10:30:00Z'.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023-10-27T10:30:00Z".to_string())
+        EvaluationResult::datetime("2023-10-27T10:30:00Z".to_string())
     ); // String to DateTime
     assert_eq!(
         eval("'2023-10-27'.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023-10-27".to_string())
+        EvaluationResult::datetime("2023-10-27".to_string())
     ); // Date string to DateTime
     assert_eq!(
         eval("'2023-10'.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023-10".to_string())
+        EvaluationResult::datetime("2023-10".to_string())
     ); // Partial date string
     assert_eq!(
         eval("'2023'.toDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::DateTime("2023".to_string())
+        EvaluationResult::datetime("2023".to_string())
     ); // Partial date string
     assert_eq!(
         eval("'invalid-datetime'.toDateTime()", &context).unwrap(), // Add unwrap
@@ -1676,39 +1692,39 @@ fn test_function_conversion_converts_to_date_time() {
     );
     assert_eq!(
         eval("@2023-10-27T10:30:00Z.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10-27T10:30:00Z'.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10-27'.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023-10'.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'2023'.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'invalid-datetime'.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("123.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true.convertsToDateTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test multi-item collection - should error
     assert!(eval("(@2023 | @2024).convertsToDateTime()", &context).is_err());
@@ -1724,19 +1740,19 @@ fn test_function_conversion_to_time() {
     ); // Add unwrap
     assert_eq!(
         eval("@T10:30:00.toTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Time("10:30:00".to_string())
+        EvaluationResult::time("10:30:00".to_string())
     );
     assert_eq!(
         eval("'10:30:00'.toTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Time("10:30:00".to_string())
+        EvaluationResult::time("10:30:00".to_string())
     ); // String to Time
     assert_eq!(
         eval("'10:30'.toTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Time("10:30".to_string())
+        EvaluationResult::time("10:30".to_string())
     ); // Partial time string
     assert_eq!(
         eval("'10'.toTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Time("10".to_string())
+        EvaluationResult::time("10".to_string())
     ); // Partial time string
     assert_eq!(
         eval("'invalid-time'.toTime()", &context).unwrap(), // Add unwrap
@@ -1772,39 +1788,39 @@ fn test_function_conversion_converts_to_time() {
     );
     assert_eq!(
         eval("@T10:30:00.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'10:30:00'.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'10:30'.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'10'.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'invalid-time'.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("123.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("@2023-10-27.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("@2023-10-27T10:30Z.convertsToTime()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Test multi-item collection - should error
     assert!(eval("(@T10 | @T11).convertsToTime()", &context).is_err());
@@ -1821,34 +1837,34 @@ fn test_function_conversion_to_quantity() {
     // Boolean to Quantity
     assert_eq!(
         eval("true.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(1.0), "1".to_string()) // Expect Quantity 1.0 '1'
+        EvaluationResult::quantity(dec!(1.0), "1".to_string()) // Expect Quantity 1.0 '1'
     );
     assert_eq!(
         eval("false.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(0.0), "1".to_string()) // Expect Quantity 0.0 '1'
+        EvaluationResult::quantity(dec!(0.0), "1".to_string()) // Expect Quantity 0.0 '1'
     );
     // Integer to Quantity
     assert_eq!(
         eval("123.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(123), "1".to_string()) // Expect Quantity 123 '1'
+        EvaluationResult::quantity(rust_decimal::Decimal::from(123), "1".to_string()) // Expect Quantity 123 '1'
     );
     // Decimal to Quantity
     assert_eq!(
         eval("123.45.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(123.45), "1".to_string()) // Expect Quantity 123.45 '1'
+        EvaluationResult::quantity(dec!(123.45), "1".to_string()) // Expect Quantity 123.45 '1'
     );
     // String to Quantity (parses number and unit)
     assert_eq!(
         eval("'5.5 mg'.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(5.5), "mg".to_string()) // Expect Quantity
+        EvaluationResult::quantity(dec!(5.5), "mg".to_string()) // Expect Quantity
     );
     assert_eq!(
         eval("'100'.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(100), "1".to_string()) // Expect Quantity with unit '1'
+        EvaluationResult::quantity(rust_decimal::Decimal::from(100), "1".to_string()) // Expect Quantity with unit '1'
     );
     assert_eq!(
         eval("'100 days'.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(100), "days".to_string()) // Expect Quantity
+        EvaluationResult::quantity(rust_decimal::Decimal::from(100), "days".to_string()) // Expect Quantity
     );
     assert_eq!(
         eval("'invalid'.toQuantity()", &context).unwrap(), // Add unwrap
@@ -1865,11 +1881,11 @@ fn test_function_conversion_to_quantity() {
     // Quantity literal to Quantity (should return the quantity itself)
     assert_eq!(
         eval("5.5 'mg'.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(5.5), "mg".to_string())
+        EvaluationResult::quantity(dec!(5.5), "mg".to_string())
     );
     assert_eq!(
         eval("100 days.toQuantity()", &context).unwrap(),
-        EvaluationResult::Quantity(dec!(100), "days".to_string())
+        EvaluationResult::quantity(rust_decimal::Decimal::from(100), "days".to_string())
     );
     // Test multi-item collection - should error
     assert!(eval("(1 | 2).toQuantity()", &context).is_err());
@@ -1885,48 +1901,48 @@ fn test_function_conversion_converts_to_quantity() {
     );
     assert_eq!(
         eval("true.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("123.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("123.45.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'5.5 mg'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'100'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'100 days'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'invalid'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)                           // Not a number
+        EvaluationResult::boolean(false)                           // Not a number
     );
     assert_eq!(
         eval("'5.5 invalid-unit'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)                                    // Invalid unit part
+        EvaluationResult::boolean(false)                                    // Invalid unit part
     );
     assert_eq!(
         eval("'5.5 mg extra'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)                                // Too many parts
+        EvaluationResult::boolean(false)                                // Too many parts
     );
     // Quantity literal conversion (these use the Quantity literal parser, not string conversion)
     assert_eq!(
         eval("5.5 'mg'.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("100 days.convertsToQuantity()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Test multi-item collection - should error
     assert!(eval("(1 | 2).convertsToQuantity()", &context).is_err()); // This assertion is now correct
@@ -1939,31 +1955,31 @@ fn test_function_string_index_of() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.indexOf('bc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     assert_eq!(
         eval("'abcdefg'.indexOf('x')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(-1)
+        EvaluationResult::integer(-1)
     );
     assert_eq!(
         eval("'abcdefg'.indexOf('abc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     );
     assert_eq!(
         eval("'abcabc'.indexOf('bc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     ); // First occurrence
     assert_eq!(
         eval("'abcdefg'.indexOf('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     );
     assert_eq!(
         eval("''.indexOf('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(-1)
+        EvaluationResult::integer(-1)
     );
     assert_eq!(
         eval("''.indexOf('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     );
     assert_eq!(
         eval("{}.indexOf('a')", &context).unwrap(),
@@ -1984,19 +2000,19 @@ fn test_function_string_substring() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.substring(0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abcdefg".to_string())
+        EvaluationResult::string("abcdefg".to_string())
     );
     assert_eq!(
         eval("'abcdefg'.substring(3)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("defg".to_string())
+        EvaluationResult::string("defg".to_string())
     );
     assert_eq!(
         eval("'abcdefg'.substring(1, 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("bc".to_string())
+        EvaluationResult::string("bc".to_string())
     );
     assert_eq!(
         eval("'abcdefg'.substring(6, 2)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("g".to_string())
+        EvaluationResult::string("g".to_string())
     );
     assert_eq!(
         eval("'abcdefg'.substring(7, 1)", &context).unwrap(), // Add unwrap
@@ -2009,11 +2025,11 @@ fn test_function_string_substring() {
     );
     assert_eq!(
         eval("'abcdefg'.substring(3, 0)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     ); // Zero length
     assert_eq!(
         eval("'abcdefg'.substring(3, -1)", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     ); // Negative length
     assert_eq!(
         eval("''.substring(0)", &context).unwrap(), // Add unwrap
@@ -2041,35 +2057,35 @@ fn test_function_string_starts_with() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.startsWith('abc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.startsWith('ab')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.startsWith('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.startsWith('bc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'abcdefg'.startsWith('abcdefg')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.startsWith('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("''.startsWith('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("''.startsWith('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("{}.startsWith('a')", &context).unwrap(), // Add unwrap
@@ -2090,35 +2106,35 @@ fn test_function_string_ends_with() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.endsWith('efg')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.endsWith('fg')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.endsWith('g')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.endsWith('ef')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'abcdefg'.endsWith('abcdefg')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.endsWith('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("''.endsWith('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("''.endsWith('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("{}.endsWith('a')", &context).unwrap(),
@@ -2139,40 +2155,40 @@ fn test_function_string_contains() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.contains('cde')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.contains('abc')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.contains('efg')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abcdefg'.contains('ace')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'abcdefg'.contains('x')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'abcdefg'.contains('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("''.contains('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("''.contains('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Spec: {} contains X -> false (where X is not empty)
     assert_eq!(
         eval("{}.contains('a')", &context).unwrap(),
-        EvaluationResult::Boolean(false) // This remains false per spec
+        EvaluationResult::boolean(false) // This remains false per spec
     );
     assert_eq!(
         eval("'abc'.contains({})", &context).unwrap(), // Add unwrap
@@ -2189,19 +2205,19 @@ fn test_function_string_upper() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.upper()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("ABCDEFG".to_string())
+        EvaluationResult::string("ABCDEFG".to_string())
     );
     assert_eq!(
         eval("'AbCdEfG'.upper()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("ABCDEFG".to_string())
+        EvaluationResult::string("ABCDEFG".to_string())
     );
     assert_eq!(
         eval("'123'.upper()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("123".to_string())
+        EvaluationResult::string("123".to_string())
     );
     assert_eq!(
         eval("''.upper()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     );
     assert_eq!(
         eval("{}.upper()", &context).unwrap(),
@@ -2219,19 +2235,19 @@ fn test_function_string_lower() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'ABCDEFG'.lower()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abcdefg".to_string())
+        EvaluationResult::string("abcdefg".to_string())
     );
     assert_eq!(
         eval("'aBcDeFg'.lower()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abcdefg".to_string())
+        EvaluationResult::string("abcdefg".to_string())
     );
     assert_eq!(
         eval("'123'.lower()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("123".to_string())
+        EvaluationResult::string("123".to_string())
     );
     assert_eq!(
         eval("''.lower()", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     );
     assert_eq!(
         eval("{}.lower()", &context).unwrap(),
@@ -2249,31 +2265,31 @@ fn test_function_string_replace() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.replace('cde', '123')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("ab123fg".to_string())
+        EvaluationResult::string("ab123fg".to_string())
     );
     assert_eq!(
         eval("'abcabc'.replace('bc', 'XY')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("aXYaXY".to_string())
+        EvaluationResult::string("aXYaXY".to_string())
     ); // All instances
     assert_eq!(
         eval("'abcdefg'.replace('xyz', '123')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abcdefg".to_string())
+        EvaluationResult::string("abcdefg".to_string())
     ); // Pattern not found
     assert_eq!(
         eval("'abcdefg'.replace('cde', '')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abfg".to_string())
+        EvaluationResult::string("abfg".to_string())
     ); // Empty substitution
     assert_eq!(
         eval("'abc'.replace('', 'x')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("xaxbxcx".to_string())
+        EvaluationResult::string("xaxbxcx".to_string())
     ); // Empty pattern
     assert_eq!(
         eval("''.replace('a', 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     );
     assert_eq!(
         eval("'abc'.replace('', '')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abc".to_string())
+        EvaluationResult::string("abc".to_string())
     );
     assert_eq!(
         eval("{}.replace('a', 'b')", &context).unwrap(), // Add unwrap
@@ -2304,53 +2320,53 @@ fn test_function_string_matches() {
     // Basic matching
     assert_eq!(
         eval("'abc'.matches('b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abc'.matches('^b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'abc'.matches('bc$')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abc'.matches('^abc$')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'abc'.matches('x')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Regex features (basic)
     assert_eq!(
         eval("'123'.matches('\\\\d+')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Need double escape for Rust string literal then FHIRPath string literal
     assert_eq!(
         eval("'abc'.matches('\\\\d+')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a.c'.matches('a.c')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // '.' matches any char
     assert_eq!(
         eval("'axc'.matches('a.c')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Empty cases
     assert_eq!(
         eval("'abc'.matches('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Empty regex matches
     assert_eq!(
         eval("''.matches('a')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("''.matches('')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("{}.matches('a')", &context).unwrap(),
@@ -2376,30 +2392,30 @@ fn test_function_string_replace_matches() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abc123def'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abc#def".to_string())
+        EvaluationResult::string("abc#def".to_string())
     );
     assert_eq!(
         eval("'abc123def456'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abc#def#".to_string())
+        EvaluationResult::string("abc#def#".to_string())
     ); // All matches
     assert_eq!(
         eval("'abc'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("abc".to_string())
+        EvaluationResult::string("abc".to_string())
     ); // No match
     // Groups (example from spec)
     let expr = "'11/30/1972'.replaceMatches('\\\\b(?<month>\\\\d{1,2})/(?<day>\\\\d{1,2})/(?<year>\\\\d{2,4})\\\\b', '${day}-${month}-${year}')";
     assert_eq!(
         eval(expr, &context).unwrap(), // Add unwrap
-        EvaluationResult::String("30-11-1972".to_string())
+        EvaluationResult::string("30-11-1972".to_string())
     );
     // Empty cases
     assert_eq!(
         eval("'abc'.replaceMatches('', '#')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("#a#b#c#".to_string())
+        EvaluationResult::string("#a#b#c#".to_string())
     ); // Empty regex matches everywhere
     assert_eq!(
         eval("''.replaceMatches('a', '#')", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     );
     assert_eq!(
         eval("{}.replaceMatches('a', '#')", &context).unwrap(), // Add unwrap
@@ -2431,11 +2447,11 @@ fn test_function_string_length() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'abcdefg'.length()", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(7)
+        EvaluationResult::integer(7)
     );
     assert_eq!(
         eval("''.length()", &context).unwrap(),
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     ); // Add unwrap
     assert_eq!(
         eval("{}.length()", &context).unwrap(),
@@ -2455,11 +2471,12 @@ fn test_function_string_to_chars() {
         eval("'abc'.toChars()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::String("a".to_string()),
-                EvaluationResult::String("b".to_string()),
-                EvaluationResult::String("c".to_string()),
+                EvaluationResult::string("a".to_string()),
+                EvaluationResult::string("b".to_string()),
+                EvaluationResult::string("c".to_string()),
             ],
-            has_undefined_order: false
+            has_undefined_order: false,
+            type_info: None,
         }
     );
     assert_eq!(
@@ -2483,11 +2500,11 @@ fn test_function_utility_now() {
     let context = EvaluationContext::new_empty();
     let result = eval("now()", &context).unwrap(); // Add unwrap
     // Check it's a DateTime, format might vary slightly
-    assert!(matches!(result, EvaluationResult::DateTime(_)));
+    assert!(matches!(result, EvaluationResult::DateTime(_, _)));
     // Check determinism (calling twice gives same result)
     assert_eq!(
         eval("now() = now()", &context).unwrap(), // Use eval helper and unwrap
-        EvaluationResult::Boolean(true)           // now() should be stable within one evaluation
+        EvaluationResult::boolean(true)           // now() should be stable within one evaluation
     );
 }
 
@@ -2497,12 +2514,12 @@ fn test_function_utility_time_of_day() {
     let context = EvaluationContext::new_empty();
     let result = eval("timeOfDay()", &context).unwrap(); // Add unwrap
     // Check it's a Time
-    assert!(matches!(result, EvaluationResult::Time(_)));
+    assert!(matches!(result, EvaluationResult::Time(_, _)));
     // Check determinism
     let expr = parser().parse("timeOfDay() = timeOfDay()").unwrap();
     assert_eq!(
         evaluate(&expr, &context, None).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }
 
@@ -2512,12 +2529,12 @@ fn test_function_utility_today() {
     let context = EvaluationContext::new_empty();
     let result = eval("today()", &context).unwrap(); // Add unwrap
     // Check it's a Date
-    assert!(matches!(result, EvaluationResult::Date(_)));
+    assert!(matches!(result, EvaluationResult::Date(_, _)));
     // Check determinism
     let expr = parser().parse("today() = today()").unwrap();
     assert_eq!(
         evaluate(&expr, &context, None).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }
 
@@ -2531,78 +2548,78 @@ fn test_operator_equality_equals() {
     // Primitives
     assert_eq!(
         eval("1 = 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 = 2", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 = 1.0", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Integer vs Decimal equality
     assert_eq!(
         eval("1.0 = 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal vs Integer equality
     assert_eq!(
         eval("1.0 = 1.0", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 = 2.0", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' = 'a'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'a' = 'b'", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true = true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true = false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Dates/Times (assuming string representation for now)
     assert_eq!(
         eval("@2023-10-27 = @2023-10-27", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27 = @2023-10-28", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("@T10:30 = @T10:30", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@T10:30 = @T11:00", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Collections
     assert_eq!(
         eval("(1|2) = (1|2)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Test: Order matters for '='
     assert_eq!(
         eval("(1|2) = (2|1)", &context).unwrap(),
-        EvaluationResult::Boolean(false) // This assertion is correct per spec
+        EvaluationResult::boolean(false) // This assertion is correct per spec
     );
     assert_eq!(
         eval("(1|2) = (1|2|3)", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Different count
     assert_eq!(
         eval("(1|1) = (1|1)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Empty propagation - Per spec, comparison with empty results in empty
     assert_eq!(eval("{} = {}", &context).unwrap(), EvaluationResult::Empty);
@@ -2617,102 +2634,102 @@ fn test_operator_equality_equivalent() {
     // Primitives
     assert_eq!(
         eval("1 ~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 ~ 2", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 ~ 1.0", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Integer vs Decimal equivalence
     assert_eq!(
         eval("1.0 ~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal vs Integer equivalence
     assert_eq!(
         eval("1.0 ~ 1.0", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal vs Decimal
     assert_eq!(
         eval("1.0 ~ 2.0", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' ~ 'a'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'a' ~ 'A'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Case-insensitive
     assert_eq!(
         eval("'a' ~ 'b'", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a b' ~ 'a   b'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Whitespace normalized
     assert_eq!(
         eval("true ~ true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true ~ false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Dates/Times (assuming string representation for now)
     assert_eq!(
         eval("@2023-10-27 ~ @2023-10-27", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27 ~ @2023-10-28", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("@T10:30 ~ @T10:30", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@T10:30 ~ @T11:00", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Collections
     assert_eq!(
         eval("(1|2) ~ (1|2)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1|2) ~ (2|1)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Order doesn't matter
     assert_eq!(
         eval("(1|2) ~ (1|2|3)", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Different count
     assert_eq!(
         eval("(1|1) ~ (1)", &context).unwrap(), // (1|1) becomes (1). (1) ~ (1) is true.
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1|2|1) ~ (1|1|2)", &context).unwrap(), // (1|2|1) becomes (1|2). (1|1|2) becomes (1|2). (1|2) ~ (1|2) is true.
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Empty comparison - Corrected based on spec for '~'
     assert_eq!(
         eval("{} ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -2722,19 +2739,19 @@ fn test_operator_equality_not_equals() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("1 != 2", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 != 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1|2) != (1|3)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1|2) != (1|2)", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Empty propagation - Per spec, comparison with empty results in empty
     assert_eq!(eval("{} != {}", &context).unwrap(), EvaluationResult::Empty);
@@ -2748,36 +2765,36 @@ fn test_operator_equality_not_equivalent() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("1 !~ 2", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 !~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' !~ 'A'", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(1|2) !~ (1|3)", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1|2) !~ (2|1)", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Empty comparison - Corrected based on spec for '!~'
     assert_eq!(
         eval("{} !~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 !~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("{} !~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }
 
@@ -2789,89 +2806,89 @@ fn test_operator_comparison() {
     // >, <, >=, <=
     assert_eq!(
         eval("2 > 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 > 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 > 2", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 < 2", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 < 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("2 < 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 >= 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("2 >= 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 >= 2", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 <= 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 <= 2", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("2 <= 1", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // String comparison
     assert_eq!(
         eval("'b' > 'a'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'a' > 'a'", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' > 'b'", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' < 'b'", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Implicit conversion
     assert_eq!(
         eval("2 > 1.5", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1.5 < 2", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal < Integer
     assert_eq!(
         eval("2 > 1.5", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Integer > Decimal
     assert_eq!(
         eval("1 <= 1.0", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Integer <= Decimal
     assert_eq!(
         eval("1.0 >= 1", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Decimal >= Integer
     // Empty propagation
     assert_eq!(eval("1 > {}", &context).unwrap(), EvaluationResult::Empty);
@@ -2880,19 +2897,19 @@ fn test_operator_comparison() {
     // Date/Time (assuming string representation)
     assert_eq!(
         eval("@2023-10-27 > @2023-10-26", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@2023-10-27 < @2023-10-28", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@T10:30 >= @T10:30", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("@T10:30 <= @T11:00", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }
 
@@ -2903,40 +2920,40 @@ fn test_operator_types_is() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("1 is Integer", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1 is String", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' is String", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'a' is Integer", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true is Boolean", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("1.0 is Decimal", &context).unwrap(),
-        EvaluationResult::Boolean(true) // Check Decimal type
+        EvaluationResult::boolean(true) // Check Decimal type
     );
     assert_eq!(
         eval("@2023 is Date", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Assuming parser tags type
     assert_eq!(
         eval("{} is Integer", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Empty is not Integer
     // Test 'System' namespace explicitly if needed by implementation
     assert_eq!(
         eval("1 is System.Integer", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }
 
@@ -2946,15 +2963,15 @@ fn test_operator_types_as() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("1 as Integer", &context).unwrap(),
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     ); // Add unwrap
     assert_eq!(
         eval("'a' as String", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("a".to_string())
+        EvaluationResult::string("a".to_string())
     );
     assert_eq!(
         eval("1.0 as Decimal", &context).unwrap(), // Add unwrap
-        EvaluationResult::Decimal(dec!(1.0))
+        EvaluationResult::decimal(dec!(1.0))
     ); // 'as' Decimal
     assert_eq!(
         eval("1 as String", &context).unwrap(),
@@ -2979,7 +2996,7 @@ fn test_operator_types_as() {
     // Test 'System' namespace explicitly
     assert_eq!(
         eval("1 as System.Integer", &context).unwrap(), // Add unwrap
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     );
     // Test multi-item collection - should error
     assert!(eval("(1 | 2) as Integer", &context).is_err());
@@ -2994,15 +3011,17 @@ fn test_operator_collections_union() {
     assert_eq!(
         eval("(1 | 2) | {}", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
+            has_undefined_order: true,
+            type_info: None,
         }  // Order not guaranteed by |
     ); // Order not guaranteed
     assert_eq!(
         eval("{} | (1 | 2)", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
-            has_undefined_order: true
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
+            has_undefined_order: true,
+            type_info: None,
         }  // Order not guaranteed by |
     ); // Order not guaranteed
     // Order not guaranteed, check contents - Union operator produces distinct results
@@ -3011,7 +3030,7 @@ fn test_operator_collections_union() {
         let mut actual_items: Vec<i64> = items
             .into_iter()
             .map(|item| match item {
-                EvaluationResult::Integer(i) => i,
+                EvaluationResult::Integer(i, _) => i,
                 _ => panic!("Expected integers, got {:?}", item), // Improved panic message
             })
             .collect();
@@ -3028,23 +3047,23 @@ fn test_operator_collections_in() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("1 in (1 | 2 | 3)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("4 in (1 | 2 | 3)", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("'a' in ('a' | 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("'c' in ('a' | 'b')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 in {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Add unwrap
     assert_eq!(
         eval("{} in (1 | 2)", &context).unwrap(),
@@ -3061,23 +3080,23 @@ fn test_operator_collections_contains() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("(1 | 2 | 3) contains 1", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("(1 | 2 | 3) contains 4", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("('a' | 'b') contains 'a'", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("('a' | 'b') contains 'c'", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("{} contains 1", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Empty collection contains item
     assert_eq!(
         eval("(1 | 2) contains {}", &context).unwrap(), // Add unwrap
@@ -3098,19 +3117,19 @@ fn test_operator_boolean_and() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("true and true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true and false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("false and true", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("false and false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Empty propagation
     assert_eq!(
@@ -3123,11 +3142,11 @@ fn test_operator_boolean_and() {
     );
     assert_eq!(
         eval("false and {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Short circuit? Spec says no guarantee, but table shows false.
     assert_eq!(
         eval("{} and false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     ); // Table shows false.
     assert_eq!(
         eval("{} and {}", &context).unwrap(),
@@ -3141,28 +3160,28 @@ fn test_operator_boolean_or() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("true or true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true or false", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false or true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false or false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Empty propagation
     assert_eq!(
         eval("true or {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Table shows true.
     assert_eq!(
         eval("{} or true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Table shows true.
     assert_eq!(
         eval("false or {}", &context).unwrap(),
@@ -3181,19 +3200,19 @@ fn test_operator_boolean_xor() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("true xor true", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("true xor false", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false xor true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false xor false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     // Empty propagation
     assert_eq!(
@@ -3224,19 +3243,19 @@ fn test_operator_boolean_implies() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("true implies true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("true implies false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("false implies true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("false implies false", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // Empty propagation
     assert_eq!(
@@ -3245,11 +3264,11 @@ fn test_operator_boolean_implies() {
     );
     assert_eq!(
         eval("{} implies true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Table shows true
     assert_eq!(
         eval("false implies {}", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Short circuit
     assert_eq!(
         eval("{} implies false", &context).unwrap(),
@@ -3267,11 +3286,11 @@ fn test_function_boolean_not() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("true.not()", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("false.not()", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(eval("{}.not()", &context).unwrap(), EvaluationResult::Empty);
 }
@@ -3283,19 +3302,19 @@ fn test_operator_math_multiply() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("2 * 3", &context).unwrap(),
-        EvaluationResult::Integer(6) // Result is Integer
+        EvaluationResult::integer(6) // Result is Integer
     );
     assert_eq!(
         eval("2.5 * 2", &context).unwrap(), // Decimal * Integer -> Decimal
-        EvaluationResult::Decimal(dec!(5.0))
+        EvaluationResult::decimal(dec!(5.0))
     ); // Decimal * Integer -> Decimal
     assert_eq!(
         eval("2 * 2.5", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(5.0))
+        EvaluationResult::decimal(dec!(5.0))
     ); // Integer * Decimal -> Decimal
     assert_eq!(
         eval("2.5 * 2.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(5.0))
+        EvaluationResult::decimal(dec!(5.0))
     ); // Decimal * Decimal -> Decimal
     // Empty propagation
     assert_eq!(eval("2 * {}", &context).unwrap(), EvaluationResult::Empty);
@@ -3308,23 +3327,23 @@ fn test_operator_math_divide() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("6 / 2", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(3.0)) // Integer / Integer -> Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(3.0)) // Integer / Integer -> Decimal (explicit .0)
     );
     assert_eq!(
         eval("7 / 2", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(3.5))
+        EvaluationResult::decimal(dec!(3.5))
     ); // Integer / Integer -> Decimal
     assert_eq!(
         eval("5.0 / 2", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(2.5))
+        EvaluationResult::decimal(dec!(2.5))
     ); // Decimal / Integer -> Decimal
     assert_eq!(
         eval("5 / 2.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(2.5))
+        EvaluationResult::decimal(dec!(2.5))
     ); // Integer / Decimal -> Decimal
     assert_eq!(
         eval("5.0 / 2.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(2.5))
+        EvaluationResult::decimal(dec!(2.5))
     ); // Decimal / Decimal -> Decimal
     // Divide by zero - Expect Empty
     assert_eq!(eval("5 / 0", &context).unwrap(), EvaluationResult::Empty);
@@ -3342,28 +3361,28 @@ fn test_operator_math_add() {
     // Numbers
     assert_eq!(
         eval("1 + 2", &context).unwrap(),
-        EvaluationResult::Integer(3) // Integer + Integer -> Integer (per spec example)
+        EvaluationResult::integer(3) // Integer + Integer -> Integer (per spec example)
     );
     assert_eq!(
         eval("1.5 + 2", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(3.5))
+        EvaluationResult::decimal(dec!(3.5))
     ); // Decimal + Integer -> Decimal
     assert_eq!(
         eval("1 + 2.5", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(3.5))
+        EvaluationResult::decimal(dec!(3.5))
     ); // Integer + Decimal -> Decimal
     assert_eq!(
         eval("1.5 + 2.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(3.5))
+        EvaluationResult::decimal(dec!(3.5))
     ); // Decimal + Decimal -> Decimal
     // Strings
     assert_eq!(
         eval("'a' + 'b'", &context).unwrap(),
-        EvaluationResult::String("ab".to_string())
+        EvaluationResult::string("ab".to_string())
     );
     assert_eq!(
         eval("'a' + ' ' + 'b'", &context).unwrap(),
-        EvaluationResult::String("a b".to_string())
+        EvaluationResult::string("a b".to_string())
     );
     // Empty propagation
     assert_eq!(eval("1 + {}", &context).unwrap(), EvaluationResult::Empty);
@@ -3379,20 +3398,20 @@ fn test_operator_math_subtract() {
     // Integer - Integer -> Integer
     assert_eq!(
         eval("5 - 3", &context).unwrap(),
-        EvaluationResult::Integer(2) // Integer - Integer -> Integer
+        EvaluationResult::integer(2) // Integer - Integer -> Integer
     );
     // Decimal involved -> Decimal result
     assert_eq!(
         eval("5.5 - 3", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(2.5))
+        EvaluationResult::decimal(dec!(2.5))
     ); // Decimal - Integer -> Decimal
     assert_eq!(
         eval("5 - 3.5", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(1.5))
+        EvaluationResult::decimal(dec!(1.5))
     ); // Integer - Decimal -> Decimal
     assert_eq!(
         eval("5.5 - 3.0", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(2.5))
+        EvaluationResult::decimal(dec!(2.5))
     ); // Decimal - Decimal -> Decimal
     // Empty propagation
     assert_eq!(eval("5 - {}", &context).unwrap(), EvaluationResult::Empty);
@@ -3405,24 +3424,24 @@ fn test_operator_math_div() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("5 div 2", &context).unwrap(),
-        EvaluationResult::Integer(2)
+        EvaluationResult::integer(2)
     ); // Integer div Integer -> Integer
     assert_eq!(
         eval("6 div 2", &context).unwrap(),
-        EvaluationResult::Integer(3)
+        EvaluationResult::integer(3)
     );
     assert_eq!(
         eval("-5 div 2", &context).unwrap(),
-        EvaluationResult::Integer(-2)
+        EvaluationResult::integer(-2)
     );
     // Decimal div Decimal -> Integer (truncates)
     assert_eq!(
         eval("5.5 div 2.1", &context).unwrap(),
-        EvaluationResult::Integer(2)
+        EvaluationResult::integer(2)
     );
     assert_eq!(
         eval("-5.5 div 2.1", &context).unwrap(),
-        EvaluationResult::Integer(-2)
+        EvaluationResult::integer(-2)
     );
     // Mixed types for div -> Error
     assert!(eval("5.5 div 2", &context).is_err()); // Mixed types still error
@@ -3444,24 +3463,24 @@ fn test_operator_math_mod() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("5 mod 2", &context).unwrap(),
-        EvaluationResult::Integer(1)
+        EvaluationResult::integer(1)
     ); // Integer mod Integer -> Integer
     assert_eq!(
         eval("6 mod 2", &context).unwrap(),
-        EvaluationResult::Integer(0)
+        EvaluationResult::integer(0)
     );
     assert_eq!(
         eval("-5 mod 2", &context).unwrap(),
-        EvaluationResult::Integer(-1)
+        EvaluationResult::integer(-1)
     ); // Result has sign of dividend
     // Decimal mod Decimal -> Decimal
     assert_eq!(
         eval("5.5 mod 2.1", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(1.3))
+        EvaluationResult::decimal(dec!(1.3))
     );
     assert_eq!(
         eval("-5.5 mod 2.1", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(-1.3)) // Result has sign of dividend
+        EvaluationResult::decimal(dec!(-1.3)) // Result has sign of dividend
     );
     // Mixed types for mod -> Error
     assert!(eval("5.5 mod 2", &context).is_err()); // Mixed types still error
@@ -3483,28 +3502,28 @@ fn test_operator_math_string_concat() {
     let context = EvaluationContext::new_empty();
     assert_eq!(
         eval("'a' & 'b'", &context).unwrap(),
-        EvaluationResult::String("ab".to_string())
+        EvaluationResult::string("ab".to_string())
     );
     assert_eq!(
         eval("'a' & ' ' & 'b'", &context).unwrap(),
-        EvaluationResult::String("a b".to_string())
+        EvaluationResult::string("a b".to_string())
     );
     // Empty treated as empty string
     assert_eq!(
         eval("'a' & {}", &context).unwrap(),
-        EvaluationResult::String("a".to_string())
+        EvaluationResult::string("a".to_string())
     );
     assert_eq!(
         eval("{} & 'b'", &context).unwrap(),
-        EvaluationResult::String("b".to_string())
+        EvaluationResult::string("b".to_string())
     );
     assert_eq!(
         eval("{} & {}", &context).unwrap(),
-        EvaluationResult::String("".to_string())
+        EvaluationResult::string("".to_string())
     );
     assert_eq!(
         eval("'a' & {} & 'c'", &context).unwrap(),
-        EvaluationResult::String("ac".to_string())
+        EvaluationResult::string("ac".to_string())
     );
 }
 
@@ -3516,58 +3535,58 @@ fn test_operator_precedence() {
     // 1 + (2 * 3) = 1 + 6 = 7 (Integer + Integer -> Integer)
     assert_eq!(
         eval("1 + 2 * 3", &context).unwrap(),
-        EvaluationResult::Integer(7) // <-- Correct expectation
+        EvaluationResult::integer(7) // <-- Correct expectation
     );
     // (1 + 2) * 3 = 3 * 3 = 9 (Integer + Integer -> Integer, then Integer * Integer -> Integer)
     assert_eq!(
         eval("(1 + 2) * 3", &context).unwrap(),
-        EvaluationResult::Integer(9) // <-- Correct expectation
+        EvaluationResult::integer(9) // <-- Correct expectation
     );
     // (5 - 2) + 1 = 3 + 1 = 4 (Subtraction -> Integer, then Integer + Integer -> Integer)
     assert_eq!(
         eval("5 - 2 + 1", &context).unwrap(),
-        EvaluationResult::Integer(4) // Corrected expectation
+        EvaluationResult::integer(4) // Corrected expectation
     );
     // (10 / 2) * 5 = 5.0 * 5 = 25.0 (Division -> Decimal, then Decimal * Integer -> Decimal)
     assert_eq!(
         eval("10 / 2 * 5", &context).unwrap(),
-        EvaluationResult::Decimal(dec!(25.0))
+        EvaluationResult::decimal(dec!(25.0))
     );
     // (10 div 3) * 2 = 3 * 2 = 6 (div -> Integer, then Integer * Integer -> Integer)
     assert_eq!(
         eval("10 div 3 * 2", &context).unwrap(),
-        EvaluationResult::Integer(6)
+        EvaluationResult::integer(6)
     );
     // (10 mod 3) + 1 = 1 + 1 = 2 (mod -> Integer, then Integer + Integer -> Integer)
     assert_eq!(
         eval("10 mod 3 + 1", &context).unwrap(),
-        EvaluationResult::Integer(2) // <-- Correct expectation
+        EvaluationResult::integer(2) // <-- Correct expectation
     );
     assert_eq!(
         eval("true or false and false", &context).unwrap(), // 'and' before 'or'
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // 'and' before 'or'
     assert_eq!(
         eval("(true or false) and false", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("(true or false) and false", &context).unwrap(), // Parentheses
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
     assert_eq!(
         eval("1 < 2 and 3 > 2", &context).unwrap(), // Comparison before 'and'
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     // (-1) + 5 = 4 (Unary minus, then Integer + Integer -> Integer)
     assert_eq!(
         eval("-1 + 5", &context).unwrap(),
-        EvaluationResult::Integer(4) // <-- Correct expectation
+        EvaluationResult::integer(4) // <-- Correct expectation
     );
     // -(1 + 5) = -(6) = -6 (Addition -> Integer, then Unary minus)
     assert_eq!(
         eval("-(1 + 5)", &context).unwrap(),
-        EvaluationResult::Integer(-6) // <-- Correct expectation
+        EvaluationResult::integer(-6) // <-- Correct expectation
     );
     // assert_eq!(eval("Patient.name[0].given", &context), EvaluationResult::Empty); // Indexer before path (needs context)
     // Add more complex precedence tests as needed
@@ -3586,20 +3605,20 @@ fn test_environment_variables() {
 
     assert_eq!(
         eval("%name", &context).unwrap(),
-        EvaluationResult::String("John Doe".to_string())
+        EvaluationResult::string("John Doe".to_string())
     );
     assert_eq!(
         eval("%age + 1", &context).unwrap(),
-        EvaluationResult::Integer(43)
+        EvaluationResult::integer(43)
     );
     // Convert %myVar (string "true") to boolean before using 'and'
     assert_eq!(
         eval("%myVar.toBoolean() and true", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
     assert_eq!(
         eval("%`my-Var`", &context).unwrap(),
-        EvaluationResult::String("special".to_string())
+        EvaluationResult::string("special".to_string())
     );
 
     // Accessing undefined variable should return error
@@ -3621,13 +3640,16 @@ fn test_environment_variables() {
         !matches!(context_var_result, EvaluationResult::Empty), // Now context_var_result is EvaluationResult
         "%context should be set"
     );
-    assert!(matches!(context_var_result, EvaluationResult::Object(_))); // Now context_var_result is EvaluationResult
+    assert!(matches!(
+        context_var_result,
+        EvaluationResult::Object { .. }
+    )); // Now context_var_result is EvaluationResult
 
     // Test accessing %context implicitly at start of path
-    // assert_eq!(eval("id", &ctx_res).unwrap(), EvaluationResult::String("p1".to_string())); // Requires member access
+    // assert_eq!(eval("id", &ctx_res).unwrap(), EvaluationResult::string("p1".to_string())); // Requires member access
 
     // Test accessing %context explicitly
-    // assert_eq!(eval("%context.id", &ctx_res).unwrap(), EvaluationResult::String("p1".to_string())); // Requires member access
+    // assert_eq!(eval("%context.id", &ctx_res).unwrap(), EvaluationResult::string("p1".to_string())); // Requires member access
 }
 
 // --- Resource Access Tests ---
@@ -3754,25 +3776,28 @@ fn test_resource_simple_field_access() {
     let context = patient_context();
     assert_eq!(
         eval("id", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("p1".to_string())
+        EvaluationResult::string("p1".to_string())
     );
     // Accessing 'active' should now return the primitive boolean directly
     assert_eq!(
         eval("active", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     ); // Add unwrap
     // Accessing 'birthDate' should now return the primitive string directly
     assert_eq!(
         eval("birthDate", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("1980-05-15".to_string())
+        EvaluationResult::string("1980-05-15".to_string())
     );
     let context_result = eval("%context", &context).unwrap(); // Add unwrap
-    if let EvaluationResult::Object(patient_obj) = context_result {
+    if let EvaluationResult::Object {
+        map: patient_obj, ..
+    } = context_result
+    {
         // This is correct, %context is a single Patient resource object
         // Check the 'deceased' field within the evaluated object map
         assert_eq!(
             patient_obj.get("deceased"),
-            Some(&EvaluationResult::Boolean(false)),
+            Some(&EvaluationResult::boolean(false)),
             "Deceased field mismatch in evaluated patient object"
         );
     } else {
@@ -3801,8 +3826,8 @@ fn test_resource_nested_field_access() {
     assert!(matches!(name_family, EvaluationResult::Collection { .. }));
     if let EvaluationResult::Collection { items, .. } = name_family {
         assert_eq!(items.len(), 2); // Doe, Smith (usual name has no family)
-        assert!(items.contains(&EvaluationResult::String("Doe".to_string())));
-        assert!(items.contains(&EvaluationResult::String("Smith".to_string())));
+        assert!(items.contains(&EvaluationResult::string("Doe".to_string())));
+        assert!(items.contains(&EvaluationResult::string("Smith".to_string())));
     }
 
     // Accessing 'name.given' should return a collection of primitive strings
@@ -3810,10 +3835,10 @@ fn test_resource_nested_field_access() {
     assert!(matches!(name_given, EvaluationResult::Collection { .. }));
     if let EvaluationResult::Collection { items, .. } = name_given {
         assert_eq!(items.len(), 4); // John, Middle, Johnny, Jane
-        assert!(items.contains(&EvaluationResult::String("John".to_string())));
-        assert!(items.contains(&EvaluationResult::String("Middle".to_string()))); // Now a primitive string
-        assert!(items.contains(&EvaluationResult::String("Johnny".to_string())));
-        assert!(items.contains(&EvaluationResult::String("Jane".to_string())));
+        assert!(items.contains(&EvaluationResult::string("John".to_string())));
+        assert!(items.contains(&EvaluationResult::string("Middle".to_string()))); // Now a primitive string
+        assert!(items.contains(&EvaluationResult::string("Johnny".to_string())));
+        assert!(items.contains(&EvaluationResult::string("Jane".to_string())));
     }
 
     // Accessing a field that doesn't exist in all items
@@ -3825,20 +3850,20 @@ fn test_resource_nested_field_access() {
     );
     if let EvaluationResult::Collection { items, .. } = name_use {
         assert_eq!(items.len(), 2, "Expected 2 'use' values, got {:?}", items); // Only official and usual have 'use'
-        assert!(items.contains(&EvaluationResult::String("official".to_string())));
-        assert!(items.contains(&EvaluationResult::String("usual".to_string())));
+        assert!(items.contains(&EvaluationResult::string("official".to_string())));
+        assert!(items.contains(&EvaluationResult::string("usual".to_string())));
     }
 
     // TODO: Re-enable these tests when .id access on primitives is implemented
     // // Access element id - 'active' should allow .id access
     // assert_eq!(
     //     eval("active.id", &context),
-    //     EvaluationResult::String("active-id".to_string())
+    //     EvaluationResult::string("active-id".to_string())
     // );
     // // Access element id - 'birthDate' should allow .id access
     // assert_eq!(
     //     eval("birthDate.id", &context),
-    //     EvaluationResult::String("birthdate-id".to_string())
+    //     EvaluationResult::string("birthdate-id".to_string())
     // );
 
     // Access id on complex type (HumanName) - this should still work
@@ -3850,17 +3875,17 @@ fn test_resource_nested_field_access() {
     );
     if let EvaluationResult::Collection { items, .. } = name_ids {
         assert_eq!(items.len(), 2);
-        assert!(items.contains(&EvaluationResult::String("name1".to_string())));
-        assert!(items.contains(&EvaluationResult::String("name2".to_string())));
+        assert!(items.contains(&EvaluationResult::string("name1".to_string())));
+        assert!(items.contains(&EvaluationResult::string("name2".to_string())));
     }
     // TODO: Re-enable this test when .id access on primitives is implemented
     // let given_ids = eval("name.given.id", &context); // (empty for John), given2-id, (empty for Johnny), (empty for Jane)
     // assert!(
-    //     matches!(given_ids, EvaluationResult::String(_)),
+    //     matches!(given_ids, EvaluationResult::string(_)),
     //     "Expected String for name.given.id, got {:?}",
     //     given_ids
     // ); // Only one ID present
-    // assert_eq!(given_ids, EvaluationResult::String("given2-id".to_string()));
+    // assert_eq!(given_ids, EvaluationResult::string("given2-id".to_string()));
 
     // TODO: Re-enable these tests when .extension access on primitives is implemented
     // // Access extension (basic check, requires Extension conversion)
@@ -3873,8 +3898,8 @@ fn test_resource_nested_field_access() {
     // if let EvaluationResult::Collection { items: exts, .. } = bday_ext {
     //     assert_eq!(exts.len(), 1);
     //     // Further checks require Extension object structure
-    //     // assert_eq!(eval("birthDate.extension.url", &context), EvaluationResult::String("http://example.com/precision".to_string()));
-    //     // assert_eq!(eval("birthDate.extension.valueString", &context), EvaluationResult::String("day".to_string()));
+    //     // assert_eq!(eval("birthDate.extension.url", &context), EvaluationResult::string("http://example.com/precision".to_string()));
+    //     // assert_eq!(eval("birthDate.extension.valueString", &context), EvaluationResult::string("day".to_string()));
     // }
 }
 
@@ -3885,7 +3910,7 @@ fn test_resource_filtering_and_projection() {
     // Where on a list field
     let official_name = eval("name.where(use = 'official')", &context).unwrap(); // Add unwrap
     assert!(
-        matches!(official_name, EvaluationResult::Object(_)),
+        matches!(official_name, EvaluationResult::Object { .. }),
         "Expected Object for official name, got {:?}",
         official_name
     ); // Should return the HumanName object
@@ -3893,21 +3918,23 @@ fn test_resource_filtering_and_projection() {
     // Select from the filtered list
     assert_eq!(
         eval("name.where(use = 'official').family", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("Doe".to_string())                     // Expect primitive string
+        EvaluationResult::string("Doe".to_string())                     // Expect primitive string
     );
     // .given returns a collection of primitive strings
     assert_eq!(
         eval("name.where(use = 'usual').given", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::String("Johnny".to_string())],
-            has_undefined_order: false
+            items: vec![EvaluationResult::string("Johnny".to_string())],
+            has_undefined_order: false,
+            type_info: None
         }
     );
     assert_eq!(
         eval("name.where(family = 'Smith').given", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
-            items: vec![EvaluationResult::String("Jane".to_string())],
-            has_undefined_order: false
+            items: vec![EvaluationResult::string("Jane".to_string())],
+            has_undefined_order: false,
+            type_info: None
         }
     );
 
@@ -3922,13 +3949,13 @@ fn test_resource_filtering_and_projection() {
     // Select on a non-list field (acts on the single item) - birthDate is now primitive
     assert_eq!(
         eval("birthDate.select($this.toString())", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("1980-05-15".to_string())
+        EvaluationResult::string("1980-05-15".to_string())
     );
 
     // Where on root context - 'active' is now primitive
     assert_eq!(
         eval("%context.where(active = true).id", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("p1".to_string())
+        EvaluationResult::string("p1".to_string())
     );
     assert_eq!(
         eval("%context.where(active = false).id", &context).unwrap(), // Add unwrap
@@ -3954,37 +3981,37 @@ fn test_resource_oftype() {
 
     let patients = eval("%context.ofType(Patient)", &context).unwrap(); // Add unwrap
     assert!(
-        matches!(patients, EvaluationResult::Object(_)),
+        matches!(patients, EvaluationResult::Object { .. }),
         "Expected Object for Patient, got {:?}",
         patients
     ); // Only one patient
-    if let EvaluationResult::Object(fields) = patients {
+    if let EvaluationResult::Object { map: fields, .. } = patients {
         assert_eq!(
             fields.get("resourceType"),
-            Some(&EvaluationResult::String("Patient".to_string()))
+            Some(&EvaluationResult::string("Patient".to_string()))
         );
         // Accessing 'id' on the Patient object should return the primitive string
         assert_eq!(
             fields.get("id"),
-            Some(&EvaluationResult::String("p1".to_string()))
+            Some(&EvaluationResult::string("p1".to_string()))
         );
     }
 
     let observations = eval("%context.ofType(Observation)", &context).unwrap(); // Add unwrap
     assert!(
-        matches!(observations, EvaluationResult::Object(_)),
+        matches!(observations, EvaluationResult::Object { .. }),
         "Expected Object for Observation, got {:?}",
         observations
     ); // Only one observation
-    if let EvaluationResult::Object(fields) = observations {
+    if let EvaluationResult::Object { map: fields, .. } = observations {
         assert_eq!(
             fields.get("resourceType"),
-            Some(&EvaluationResult::String("Observation".to_string()))
+            Some(&EvaluationResult::string("Observation".to_string()))
         );
         // Accessing 'id' on the Observation object should return the primitive string
         assert_eq!(
             fields.get("id"),
-            Some(&EvaluationResult::String("o1".to_string()))
+            Some(&EvaluationResult::string("o1".to_string()))
         );
     }
 
@@ -4001,19 +4028,40 @@ fn test_arithmetic_operations() {
 
     // --- Success Cases ---
     let success_cases = vec![
-        ("1 + 2", EvaluationResult::Integer(3)), // Addition -> Integer
-        ("5 - 3", EvaluationResult::Integer(2)), // Subtraction -> Integer
-        ("2 * 3", EvaluationResult::Integer(6)), // Integer Multiplication -> Integer
-        ("6 / 2", EvaluationResult::Decimal(dec!(3.0))), // Division -> Decimal
-        ("7 / 2", EvaluationResult::Decimal(dec!(3.5))), // Division -> Decimal
-        ("7 div 2", EvaluationResult::Integer(3)), // Integer div -> Integer
-        ("7 mod 2", EvaluationResult::Integer(1)), // Integer mod -> Integer
-        ("5.5 + 2.1", EvaluationResult::Decimal(dec!(7.6))), // Decimal Add -> Decimal
-        ("5.5 - 2.1", EvaluationResult::Decimal(dec!(3.4))), // Decimal Sub -> Decimal
-        ("5.5 * 2.0", EvaluationResult::Decimal(dec!(11.0))), // Decimal Mult -> Decimal
-        ("5.5 / 2.0", EvaluationResult::Decimal(dec!(2.75))), // Decimal Div -> Decimal
-        ("5.5 div 2.1", EvaluationResult::Integer(2)), // Decimal div -> Integer
-        ("5.5 mod 2.1", EvaluationResult::Decimal(dec!(1.3))), // Decimal mod -> Decimal
+        ("1 + 2", EvaluationResult::integer(3)), // Addition -> Integer
+        ("5 - 3", EvaluationResult::integer(2)), // Subtraction -> Integer
+        ("2 * 3", EvaluationResult::integer(6)), // Integer Multiplication -> Integer
+        (
+            "6 / 2",
+            EvaluationResult::decimal(dec!(3.0)),
+        ), // Division -> Decimal
+        (
+            "7 / 2",
+            EvaluationResult::decimal(dec!(3.5)),
+        ), // Division -> Decimal
+        ("7 div 2", EvaluationResult::integer(3)), // Integer div -> Integer
+        ("7 mod 2", EvaluationResult::integer(1)), // Integer mod -> Integer
+        (
+            "5.5 + 2.1",
+            EvaluationResult::decimal(dec!(7.6)),
+        ), // Decimal Add -> Decimal
+        (
+            "5.5 - 2.1",
+            EvaluationResult::decimal(dec!(3.4)),
+        ), // Decimal Sub -> Decimal
+        (
+            "5.5 * 2.0",
+            EvaluationResult::decimal(dec!(11.0)),
+        ), // Decimal Mult -> Decimal
+        (
+            "5.5 / 2.0",
+            EvaluationResult::decimal(dec!(2.75)),
+        ), // Decimal Div -> Decimal
+        ("5.5 div 2.1", EvaluationResult::integer(2)), // Decimal div -> Integer
+        (
+            "5.5 mod 2.1",
+            EvaluationResult::decimal(dec!(1.3)),
+        ), // Decimal mod -> Decimal
     ];
 
     for (input, expected) in success_cases {
@@ -4067,7 +4115,7 @@ fn test_arithmetic_operations() {
     ];
     for input in empty_cases {
         let expected_result = if input == "@2023 = @T10:00" || input == "@2023 < @T10:00" {
-            EvaluationResult::Boolean(false) // Current behavior for these specific cases
+            EvaluationResult::boolean(false) // Current behavior for these specific cases
         } else {
             EvaluationResult::Empty
         };
@@ -4083,22 +4131,22 @@ fn test_arithmetic_operations() {
 #[test]
 fn test_boolean_operations() {
     let test_cases = vec![
-        ("true and true", EvaluationResult::Boolean(true)),
-        ("true and false", EvaluationResult::Boolean(false)),
-        ("true or false", EvaluationResult::Boolean(true)),
-        ("false or false", EvaluationResult::Boolean(false)),
-        ("true xor false", EvaluationResult::Boolean(true)),
-        ("true xor true", EvaluationResult::Boolean(false)),
-        ("false implies true", EvaluationResult::Boolean(true)),
-        ("true implies false", EvaluationResult::Boolean(false)),
+        ("true and true", EvaluationResult::boolean(true)),
+        ("true and false", EvaluationResult::boolean(false)),
+        ("true or false", EvaluationResult::boolean(true)),
+        ("false or false", EvaluationResult::boolean(false)),
+        ("true xor false", EvaluationResult::boolean(true)),
+        ("true xor true", EvaluationResult::boolean(false)),
+        ("false implies true", EvaluationResult::boolean(true)),
+        ("true implies false", EvaluationResult::boolean(false)),
         // Test empty propagation (should return Empty, not error)
         ("true and {}", EvaluationResult::Empty),
         ("{} and true", EvaluationResult::Empty),
-        ("false and {}", EvaluationResult::Boolean(false)), // Spec table
-        ("{} and false", EvaluationResult::Boolean(false)), // Spec table
+        ("false and {}", EvaluationResult::boolean(false)), // Spec table
+        ("{} and false", EvaluationResult::boolean(false)), // Spec table
         ("{} and {}", EvaluationResult::Empty),
-        ("true or {}", EvaluationResult::Boolean(true)), // Spec table
-        ("{} or true", EvaluationResult::Boolean(true)), // Spec table
+        ("true or {}", EvaluationResult::boolean(true)), // Spec table
+        ("{} or true", EvaluationResult::boolean(true)), // Spec table
         ("false or {}", EvaluationResult::Empty),
         ("{} or false", EvaluationResult::Empty),
         ("{} or {}", EvaluationResult::Empty),
@@ -4108,8 +4156,8 @@ fn test_boolean_operations() {
         ("{} xor false", EvaluationResult::Empty),
         ("{} xor {}", EvaluationResult::Empty),
         ("true implies {}", EvaluationResult::Empty),
-        ("{} implies true", EvaluationResult::Boolean(true)), // Spec table
-        ("false implies {}", EvaluationResult::Boolean(true)), // Spec table
+        ("{} implies true", EvaluationResult::boolean(true)), // Spec table
+        ("false implies {}", EvaluationResult::boolean(true)), // Spec table
         ("{} implies false", EvaluationResult::Empty),
         ("{} implies {}", EvaluationResult::Empty),
     ];
@@ -4146,21 +4194,21 @@ fn test_comparison_operations() {
 
     // --- Success Cases ---
     let success_cases = vec![
-        ("1 < 2", EvaluationResult::Boolean(true)),
-        ("2 <= 2", EvaluationResult::Boolean(true)),
-        ("3 > 2", EvaluationResult::Boolean(true)),
-        ("3 >= 3", EvaluationResult::Boolean(true)),
-        ("1 = 1", EvaluationResult::Boolean(true)),
-        ("1 != 2", EvaluationResult::Boolean(true)),
-        ("'abc' ~ 'ABC'", EvaluationResult::Boolean(true)),
-        ("'abc' !~ 'def'", EvaluationResult::Boolean(true)),
-        ("1.0 < 2", EvaluationResult::Boolean(true)),
-        ("2 >= 1.5", EvaluationResult::Boolean(true)),
-        ("'b' > 'a'", EvaluationResult::Boolean(true)),
-        ("'a' <= 'a'", EvaluationResult::Boolean(true)),
-        ("@2024 > @2023", EvaluationResult::Boolean(true)),
-        ("@T10:00 < @T11:00", EvaluationResult::Boolean(true)),
-        ("@2023 = @T10:00", EvaluationResult::Boolean(false)),
+        ("1 < 2", EvaluationResult::boolean(true)),
+        ("2 <= 2", EvaluationResult::boolean(true)),
+        ("3 > 2", EvaluationResult::boolean(true)),
+        ("3 >= 3", EvaluationResult::boolean(true)),
+        ("1 = 1", EvaluationResult::boolean(true)),
+        ("1 != 2", EvaluationResult::boolean(true)),
+        ("'abc' ~ 'ABC'", EvaluationResult::boolean(true)),
+        ("'abc' !~ 'def'", EvaluationResult::boolean(true)),
+        ("1.0 < 2", EvaluationResult::boolean(true)),
+        ("2 >= 1.5", EvaluationResult::boolean(true)),
+        ("'b' > 'a'", EvaluationResult::boolean(true)),
+        ("'a' <= 'a'", EvaluationResult::boolean(true)),
+        ("@2024 > @2023", EvaluationResult::boolean(true)),
+        ("@T10:00 < @T11:00", EvaluationResult::boolean(true)),
+        ("@2023 = @T10:00", EvaluationResult::boolean(false)),
     ];
 
     for (input, expected) in success_cases {
@@ -4212,28 +4260,28 @@ fn test_comparison_operations() {
     // Specific checks for ~ and !~ with empty
     assert_eq!(
         eval("1 ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false), // Spec: X ~ {} -> false
+        EvaluationResult::boolean(false), // Spec: X ~ {} -> false
         "Failed for input: 1 ~ {{}}"      // Correct assertion message
     );
     assert_eq!(
         eval("{} ~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(false) // Spec: {} ~ X -> false
+        EvaluationResult::boolean(false) // Spec: {} ~ X -> false
     );
     assert_eq!(
         eval("{} ~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true) // Spec: {} ~ {} -> true
+        EvaluationResult::boolean(true) // Spec: {} ~ {} -> true
     );
     assert_eq!(
         eval("1 !~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(true) // Negation of (1 ~ {}) -> !false -> true
+        EvaluationResult::boolean(true) // Negation of (1 ~ {}) -> !false -> true
     );
     assert_eq!(
         eval("{} !~ 1", &context).unwrap(),
-        EvaluationResult::Boolean(true) // Negation of ({} ~ 1) -> !false -> true
+        EvaluationResult::boolean(true) // Negation of ({} ~ 1) -> !false -> true
     );
     assert_eq!(
         eval("{} !~ {}", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -4249,11 +4297,11 @@ fn test_variable_access() {
     // --- Success Cases ---
     let success_cases = vec![
         // Access variables directly
-        ("%name", EvaluationResult::String("John Doe".to_string())),
+        ("%name", EvaluationResult::string("John Doe".to_string())),
         // Accessing %age should return the string value stored
-        ("%age", EvaluationResult::String("42".to_string())),
+        ("%age", EvaluationResult::string("42".to_string())),
         // Test conversion within expression
-        ("%age.toInteger()", EvaluationResult::Integer(42)),
+        ("%age.toInteger()", EvaluationResult::integer(42)),
     ];
 
     for (input, expected) in success_cases {
@@ -4284,22 +4332,22 @@ fn test_string_operations() {
         // String contains operation with function call syntax
         (
             "'Hello, World!'.contains('World')",
-            EvaluationResult::Boolean(true),
+            EvaluationResult::boolean(true),
         ),
         (
             "'Hello, World!'.contains('Goodbye')",
-            EvaluationResult::Boolean(false),
+            EvaluationResult::boolean(false),
         ),
         (
             "%message.contains('World')",
-            EvaluationResult::Boolean(true),
+            EvaluationResult::boolean(true),
         ),
         // Test contains with non-string argument (should error)
-        // ("'abc'.contains(1)", EvaluationResult::Boolean(false)), // Old expectation
+        // ("'abc'.contains(1)", EvaluationResult::boolean(false)), // Old expectation
         // Test contains with empty argument (should return empty)
         ("'abc'.contains({})", EvaluationResult::Empty),
         // Test contains on empty string ({} contains X -> false)
-        ("{}.contains('a')", EvaluationResult::Boolean(false)),
+        ("{}.contains('a')", EvaluationResult::boolean(false)),
     ];
 
     for (input, expected) in test_cases {
@@ -4329,23 +4377,23 @@ fn test_functions() {
     // Test collection functions
     let success_cases = vec![
         // Empty collection
-        ("{}.count()", EvaluationResult::Integer(0)),
-        ("{}.empty()", EvaluationResult::Boolean(true)),
-        ("{}.exists()", EvaluationResult::Boolean(false)),
+        ("{}.count()", EvaluationResult::integer(0)),
+        ("{}.empty()", EvaluationResult::boolean(true)),
+        ("{}.exists()", EvaluationResult::boolean(false)),
         // Single item
-        ("'test'.count()", EvaluationResult::Integer(1)),
-        ("'test'.empty()", EvaluationResult::Boolean(false)),
-        ("'test'.exists()", EvaluationResult::Boolean(true)),
+        ("'test'.count()", EvaluationResult::integer(1)),
+        ("'test'.empty()", EvaluationResult::boolean(false)),
+        ("'test'.exists()", EvaluationResult::boolean(true)),
         // String functions
-        ("'Hello'.count()", EvaluationResult::Integer(1)),
-        ("'Hello'.length()", EvaluationResult::Integer(5)),
+        ("'Hello'.count()", EvaluationResult::integer(1)),
+        ("'Hello'.length()", EvaluationResult::integer(5)),
         (
             "'Hello, World!'.contains('World')",
-            EvaluationResult::Boolean(true),
+            EvaluationResult::boolean(true),
         ),
         (
             "'Hello, World!'.contains('Goodbye')",
-            EvaluationResult::Boolean(false),
+            EvaluationResult::boolean(false),
         ),
     ];
 
@@ -4373,12 +4421,12 @@ fn test_direct_string_operations() {
     // Test string operations through the parser instead of direct function calls
     assert_eq!(
         eval("'Hello, World!'.contains('World')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 
     assert_eq!(
         eval("'Hello, World!'.contains('Goodbye')", &context).unwrap(), // Add unwrap
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 }
 
@@ -4421,7 +4469,7 @@ fn test_resource_access() {
     // Test accessing the resource id
     assert_eq!(
         eval("id", &context).unwrap(), // Add unwrap
-        EvaluationResult::String("theid".to_string())
+        EvaluationResult::string("theid".to_string())
     ); // Expect the primitive string value of the id
 }
 
@@ -4433,69 +4481,117 @@ fn test_math_functions() {
     // --- Success Cases for round() ---
     let round_cases = vec![
         // Basic rounding - no precision specified
-        ("1.round()", EvaluationResult::Integer(1)),
-        ("1.5.round()", EvaluationResult::Integer(2)),
-        ("1.4.round()", EvaluationResult::Integer(1)),
-        ("(-1.5).round()", EvaluationResult::Integer(-2)), // Traditional rounding
-        ("(-1.4).round()", EvaluationResult::Integer(-1)),
+        ("1.round()", EvaluationResult::integer(1)),
+        ("1.5.round()", EvaluationResult::integer(2)),
+        ("1.4.round()", EvaluationResult::integer(1)),
+        ("(-1.5).round()", EvaluationResult::integer(-2)), // Traditional rounding
+        ("(-1.4).round()", EvaluationResult::integer(-1)),
         // Rounding with precision
-        ("3.14159.round(2)", EvaluationResult::Decimal(dec!(3.14))),
-        ("3.14159.round(4)", EvaluationResult::Decimal(dec!(3.1416))),
-        ("10.round(2)", EvaluationResult::Decimal(dec!(10.00))),
+        (
+            "3.14159.round(2)",
+            EvaluationResult::decimal(dec!(3.14)),
+        ),
+        (
+            "3.14159.round(4)",
+            EvaluationResult::decimal(dec!(3.1416)),
+        ),
+        (
+            "10.round(2)",
+            EvaluationResult::decimal(dec!(10.00)),
+        ),
         // Rounding quantities
         (
             "5.5 'mg'.round()",
-            EvaluationResult::Quantity(dec!(6), "mg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(6), "mg".to_string()),
         ),
         (
             "5.5 'mg'.round(1)",
-            EvaluationResult::Quantity(dec!(5.5), "mg".to_string()),
+            EvaluationResult::quantity(dec!(5.5), "mg".to_string()),
         ),
         // Integer inputs (should remain unchanged when rounding to whole numbers)
-        ("5.round()", EvaluationResult::Integer(5)),
-        ("5.round(0)", EvaluationResult::Integer(5)),
-        ("5.round(2)", EvaluationResult::Decimal(dec!(5.00))),
+        ("5.round()", EvaluationResult::integer(5)),
+        ("5.round(0)", EvaluationResult::integer(5)),
+        (
+            "5.round(2)",
+            EvaluationResult::decimal(dec!(5.00)),
+        ),
     ];
 
     // --- Success Cases for sqrt() ---
     let sqrt_cases = vec![
         // Square root of perfect squares
-        ("4.sqrt()", EvaluationResult::Decimal(dec!(2.0))),
-        ("9.sqrt()", EvaluationResult::Decimal(dec!(3.0))),
-        ("16.sqrt()", EvaluationResult::Decimal(dec!(4.0))),
-        ("25.sqrt()", EvaluationResult::Decimal(dec!(5.0))),
-        ("100.sqrt()", EvaluationResult::Decimal(dec!(10.0))),
+        (
+            "4.sqrt()",
+            EvaluationResult::decimal(dec!(2.0)),
+        ),
+        (
+            "9.sqrt()",
+            EvaluationResult::decimal(dec!(3.0)),
+        ),
+        (
+            "16.sqrt()",
+            EvaluationResult::decimal(dec!(4.0)),
+        ),
+        (
+            "25.sqrt()",
+            EvaluationResult::decimal(dec!(5.0)),
+        ),
+        (
+            "100.sqrt()",
+            EvaluationResult::decimal(dec!(10.0)),
+        ),
         // Square root of decimal values
-        ("2.25.sqrt()", EvaluationResult::Decimal(dec!(1.5))),
-        ("0.25.sqrt()", EvaluationResult::Decimal(dec!(0.5))),
+        (
+            "2.25.sqrt()",
+            EvaluationResult::decimal(dec!(1.5)),
+        ),
+        (
+            "0.25.sqrt()",
+            EvaluationResult::decimal(dec!(0.5)),
+        ),
         // Square root of 0
-        ("0.sqrt()", EvaluationResult::Decimal(dec!(0.0))),
+        (
+            "0.sqrt()",
+            EvaluationResult::decimal(dec!(0.0)),
+        ),
         // Integer values converted to decimals for sqrt
-        ("81.sqrt()", EvaluationResult::Decimal(dec!(9.0))),
+        (
+            "81.sqrt()",
+            EvaluationResult::decimal(dec!(9.0)),
+        ),
         // Quantities
         (
             "4.0 'mg'.sqrt()",
-            EvaluationResult::Quantity(dec!(2.0), "mg".to_string()),
+            EvaluationResult::quantity(dec!(2.0), "mg".to_string()),
         ),
     ];
 
     // --- Success Cases for abs() ---
     let abs_cases = vec![
         // Integer values
-        ("0.abs()", EvaluationResult::Integer(0)),
-        ("5.abs()", EvaluationResult::Integer(5)),
-        ("(-5).abs()", EvaluationResult::Integer(5)),
+        ("0.abs()", EvaluationResult::integer(0)),
+        ("5.abs()", EvaluationResult::integer(5)),
+        ("(-5).abs()", EvaluationResult::integer(5)),
         // Decimal values
-        ("0.0.abs()", EvaluationResult::Decimal(dec!(0.0))),
-        ("5.5.abs()", EvaluationResult::Decimal(dec!(5.5))),
-        ("(-5.5).abs()", EvaluationResult::Decimal(dec!(5.5))),
+        (
+            "0.0.abs()",
+            EvaluationResult::decimal(dec!(0.0)),
+        ),
+        (
+            "5.5.abs()",
+            EvaluationResult::decimal(dec!(5.5)),
+        ),
+        (
+            "(-5.5).abs()",
+            EvaluationResult::decimal(dec!(5.5)),
+        ),
         // Skip i64::MIN test case due to string formatting and lifetime issues
         // We already know the implementation handles this correctly
 
         // Quantities
         (
             "5.5 'mg'.abs()",
-            EvaluationResult::Quantity(dec!(5.5), "mg".to_string()),
+            EvaluationResult::quantity(dec!(5.5), "mg".to_string()),
         ),
         // Skip negative quantity in parentheses - it's a parser issue not a function issue
         // ("(-5.5 'mg').abs()", EvaluationResult::Quantity(dec!(5.5), "mg".to_string())),
@@ -4504,147 +4600,222 @@ fn test_math_functions() {
     // --- Success Cases for ceiling() ---
     let ceiling_cases = vec![
         // Integer values (remain unchanged)
-        ("0.ceiling()", EvaluationResult::Integer(0)),
-        ("5.ceiling()", EvaluationResult::Integer(5)),
-        ("(-5).ceiling()", EvaluationResult::Integer(-5)),
+        ("0.ceiling()", EvaluationResult::integer(0)),
+        ("5.ceiling()", EvaluationResult::integer(5)),
+        ("(-5).ceiling()", EvaluationResult::integer(-5)),
         // Decimal values
-        ("0.0.ceiling()", EvaluationResult::Integer(0)),
-        ("1.5.ceiling()", EvaluationResult::Integer(2)),
-        ("1.1.ceiling()", EvaluationResult::Integer(2)),
-        ("(-1.1).ceiling()", EvaluationResult::Integer(-1)), // Negative numbers ceiling behavior
-        ("(-1.9).ceiling()", EvaluationResult::Integer(-1)),
+        ("0.0.ceiling()", EvaluationResult::integer(0)),
+        ("1.5.ceiling()", EvaluationResult::integer(2)),
+        ("1.1.ceiling()", EvaluationResult::integer(2)),
+        ("(-1.1).ceiling()", EvaluationResult::integer(-1)), // Negative numbers ceiling behavior
+        ("(-1.9).ceiling()", EvaluationResult::integer(-1)),
         // Quantities
         (
             "5.5 'mg'.ceiling()",
-            EvaluationResult::Quantity(dec!(6), "mg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(6), "mg".to_string()),
         ),
         (
             "1.1 'kg'.ceiling()",
-            EvaluationResult::Quantity(dec!(2), "kg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(2), "kg".to_string()),
         ),
     ];
 
     // --- Success Cases for floor() ---
     let floor_cases = vec![
         // Integer values (remain unchanged)
-        ("0.floor()", EvaluationResult::Integer(0)),
-        ("5.floor()", EvaluationResult::Integer(5)),
-        ("(-5).floor()", EvaluationResult::Integer(-5)),
+        ("0.floor()", EvaluationResult::integer(0)),
+        ("5.floor()", EvaluationResult::integer(5)),
+        ("(-5).floor()", EvaluationResult::integer(-5)),
         // Decimal values
-        ("0.0.floor()", EvaluationResult::Integer(0)),
-        ("1.5.floor()", EvaluationResult::Integer(1)),
-        ("2.1.floor()", EvaluationResult::Integer(2)),
-        ("(-2.1).floor()", EvaluationResult::Integer(-3)), // Negative numbers floor behavior
-        ("(-2.9).floor()", EvaluationResult::Integer(-3)),
+        ("0.0.floor()", EvaluationResult::integer(0)),
+        ("1.5.floor()", EvaluationResult::integer(1)),
+        ("2.1.floor()", EvaluationResult::integer(2)),
+        ("(-2.1).floor()", EvaluationResult::integer(-3)), // Negative numbers floor behavior
+        ("(-2.9).floor()", EvaluationResult::integer(-3)),
         // Quantities
         (
             "5.5 'mg'.floor()",
-            EvaluationResult::Quantity(dec!(5), "mg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(5), "mg".to_string()),
         ),
         (
             "2.1 'kg'.floor()",
-            EvaluationResult::Quantity(dec!(2), "kg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(2), "kg".to_string()),
         ),
     ];
 
     // --- Success Cases for exp() ---
     let exp_cases = vec![
         // Integer values
-        ("0.exp()", EvaluationResult::Decimal(dec!(1.0))), // e^0 = 1
-        ("1.exp()", EvaluationResult::Decimal(dec!(2.718282))), // Approximate e
-        ("(-1).exp()", EvaluationResult::Decimal(dec!(0.367879))), // Approximate 1/e
+        (
+            "0.exp()",
+            EvaluationResult::decimal(dec!(1.0)),
+        ), // e^0 = 1
+        (
+            "1.exp()",
+            EvaluationResult::decimal(dec!(2.718282)),
+        ), // Approximate e
+        (
+            "(-1).exp()",
+            EvaluationResult::decimal(dec!(0.367879)),
+        ), // Approximate 1/e
         // Decimal values
-        ("0.0.exp()", EvaluationResult::Decimal(dec!(1.0))), // e^0 = 1
-        ("0.5.exp()", EvaluationResult::Decimal(dec!(1.648721))), // Approximate e^0.5
-        ("(-0.5).exp()", EvaluationResult::Decimal(dec!(0.606531))), // Approximate e^-0.5
+        (
+            "0.0.exp()",
+            EvaluationResult::decimal(dec!(1.0)),
+        ), // e^0 = 1
+        (
+            "0.5.exp()",
+            EvaluationResult::decimal(dec!(1.648721)),
+        ), // Approximate e^0.5
+        (
+            "(-0.5).exp()",
+            EvaluationResult::decimal(dec!(0.606531)),
+        ), // Approximate e^-0.5
         // Quantities
         (
             "0 'mg'.exp()",
-            EvaluationResult::Quantity(dec!(1.0), "mg".to_string()),
+            EvaluationResult::quantity(dec!(1.0), "mg".to_string()),
         ),
     ];
 
     // --- Success Cases for ln() ---
     let ln_cases = vec![
         // Integer values
-        ("1.ln()", EvaluationResult::Decimal(dec!(0.0))), // ln(1) = 0
-        ("2.ln()", EvaluationResult::Decimal(dec!(0.693147))), // Approximate ln(2)
-        ("10.ln()", EvaluationResult::Decimal(dec!(2.302585))), // Approximate ln(10)
+        (
+            "1.ln()",
+            EvaluationResult::decimal(dec!(0.0)),
+        ), // ln(1) = 0
+        (
+            "2.ln()",
+            EvaluationResult::decimal(dec!(0.693147)),
+        ), // Approximate ln(2)
+        (
+            "10.ln()",
+            EvaluationResult::decimal(dec!(2.302585)),
+        ), // Approximate ln(10)
         // Decimal values
-        ("1.0.ln()", EvaluationResult::Decimal(dec!(0.0))), // ln(1) = 0
-        ("2.718282.ln()", EvaluationResult::Decimal(dec!(1.0))), // Approximate ln(e) = 1
-        ("0.5.ln()", EvaluationResult::Decimal(dec!(-0.693147))), // Approximate ln(0.5)
+        (
+            "1.0.ln()",
+            EvaluationResult::decimal(dec!(0.0)),
+        ), // ln(1) = 0
+        (
+            "2.718282.ln()",
+            EvaluationResult::decimal(dec!(1.0)),
+        ), // Approximate ln(e) = 1
+        (
+            "0.5.ln()",
+            EvaluationResult::decimal(dec!(-0.693147)),
+        ), // Approximate ln(0.5)
         // Quantities
         (
             "1 'mg'.ln()",
-            EvaluationResult::Quantity(dec!(0.0), "mg".to_string()),
+            EvaluationResult::quantity(dec!(0.0), "mg".to_string()),
         ),
         (
             "2.718282 'kg'.ln()",
-            EvaluationResult::Quantity(dec!(1.0), "kg".to_string()),
+            EvaluationResult::quantity(dec!(1.0), "kg".to_string()),
         ),
     ];
 
     // --- Success Cases for log() ---
     let log_cases = vec![
         // Integer values with integer base
-        ("16.log(2)", EvaluationResult::Decimal(dec!(4.0))), // log_2(16) = 4
-        ("100.log(10)", EvaluationResult::Decimal(dec!(2.0))), // log_10(100) = 2
-        ("8.log(2)", EvaluationResult::Decimal(dec!(3.0))),  // log_2(8) = 3
+        (
+            "16.log(2)",
+            EvaluationResult::decimal(dec!(4.0)),
+        ), // log_2(16) = 4
+        (
+            "100.log(10)",
+            EvaluationResult::decimal(dec!(2.0)),
+        ), // log_10(100) = 2
+        (
+            "8.log(2)",
+            EvaluationResult::decimal(dec!(3.0)),
+        ), // log_2(8) = 3
         // Decimal values with decimal base
-        ("16.0.log(2.0)", EvaluationResult::Decimal(dec!(4.0))), // log_2(16) = 4
-        ("100.0.log(10.0)", EvaluationResult::Decimal(dec!(2.0))), // log_10(100) = 2
-        ("4.0.log(2.0)", EvaluationResult::Decimal(dec!(2.0))),  // log_2(4) = 2
+        (
+            "16.0.log(2.0)",
+            EvaluationResult::decimal(dec!(4.0)),
+        ), // log_2(16) = 4
+        (
+            "100.0.log(10.0)",
+            EvaluationResult::decimal(dec!(2.0)),
+        ), // log_10(100) = 2
+        (
+            "4.0.log(2.0)",
+            EvaluationResult::decimal(dec!(2.0)),
+        ), // log_2(4) = 2
         // Logarithm with base 'e' (should equal natural log)
         (
             "10.log(2.718282)",
-            EvaluationResult::Decimal(dec!(2.302585)),
+            EvaluationResult::decimal(dec!(2.302585)),
         ), // log_e(10) ≈ ln(10)
         // Fractional results
-        ("10.log(3)", EvaluationResult::Decimal(dec!(2.095903))), // log_3(10) ≈ 2.095903
+        (
+            "10.log(3)",
+            EvaluationResult::decimal(dec!(2.095903)),
+        ), // log_3(10) ≈ 2.095903
         // Quantities
         (
             "16 'mg'.log(2)",
-            EvaluationResult::Quantity(dec!(4.0), "mg".to_string()),
+            EvaluationResult::quantity(dec!(4.0), "mg".to_string()),
         ),
         (
             "100 'kg'.log(10)",
-            EvaluationResult::Quantity(dec!(2.0), "kg".to_string()),
+            EvaluationResult::quantity(dec!(2.0), "kg".to_string()),
         ),
     ];
 
     // --- Success Cases for power() ---
     let power_cases = vec![
         // Integer base with integer exponent
-        ("2.power(3)", EvaluationResult::Integer(8)), // 2^3 = 8
-        ("3.power(2)", EvaluationResult::Integer(9)), // 3^2 = 9
-        ("10.power(2)", EvaluationResult::Integer(100)), // 10^2 = 100
+        ("2.power(3)", EvaluationResult::integer(8)), // 2^3 = 8
+        ("3.power(2)", EvaluationResult::integer(9)), // 3^2 = 9
+        ("10.power(2)", EvaluationResult::integer(100)), // 10^2 = 100
         // Integer base with decimal exponent - we expect Integer when the result is integral
-        ("4.power(0.5)", EvaluationResult::Integer(2)), // 4^0.5 = 2 (square root)
-        ("8.power(1.0/3.0)", EvaluationResult::Decimal(dec!(2.0))), // 8^(1/3) = 2 (cube root) - expect Decimal due to float exponent
+        ("4.power(0.5)", EvaluationResult::integer(2)), // 4^0.5 = 2 (square root)
+        (
+            "8.power(1.0/3.0)",
+            EvaluationResult::decimal(dec!(2.0)),
+        ), // 8^(1/3) = 2 (cube root) - expect Decimal due to float exponent
         // Decimal base with integer exponent
-        ("2.5.power(2)", EvaluationResult::Decimal(dec!(6.25))), // 2.5^2 = 6.25
-        ("0.5.power(3)", EvaluationResult::Decimal(dec!(0.125))), // 0.5^3 = 0.125
+        (
+            "2.5.power(2)",
+            EvaluationResult::decimal(dec!(6.25)),
+        ), // 2.5^2 = 6.25
+        (
+            "0.5.power(3)",
+            EvaluationResult::decimal(dec!(0.125)),
+        ), // 0.5^3 = 0.125
         // Decimal base with decimal exponent
-        ("4.0.power(0.5)", EvaluationResult::Integer(2)), // 4^0.5 = 2
-        ("27.0.power(1.0/3.0)", EvaluationResult::Decimal(dec!(3.0))), // 27^(1/3) = 3 - expect Decimal
+        ("4.0.power(0.5)", EvaluationResult::integer(2)), // 4^0.5 = 2
+        (
+            "27.0.power(1.0/3.0)",
+            EvaluationResult::decimal(dec!(3.0)),
+        ), // 27^(1/3) = 3 - expect Decimal
         // Special cases
-        ("0.power(0)", EvaluationResult::Integer(1)), // 0^0 = 1 (by convention)
-        ("0.power(5)", EvaluationResult::Integer(0)), // 0^5 = 0
-        ("1.power(1000)", EvaluationResult::Integer(1)), // 1^1000 = 1
-        ("(-1).power(2)", EvaluationResult::Integer(1)), // (-1)^2 = 1
-        ("(-1).power(3)", EvaluationResult::Integer(-1)), // (-1)^3 = -1
+        ("0.power(0)", EvaluationResult::integer(1)), // 0^0 = 1 (by convention)
+        ("0.power(5)", EvaluationResult::integer(0)), // 0^5 = 0
+        ("1.power(1000)", EvaluationResult::integer(1)), // 1^1000 = 1
+        ("(-1).power(2)", EvaluationResult::integer(1)), // (-1)^2 = 1
+        ("(-1).power(3)", EvaluationResult::integer(-1)), // (-1)^3 = -1
         // Negative exponents
-        ("2.power(-1)", EvaluationResult::Decimal(dec!(0.5))), // 2^-1 = 1/2 = 0.5
-        ("4.power(-0.5)", EvaluationResult::Decimal(dec!(0.5))), // 4^-0.5 = 1/√4 = 0.5
+        (
+            "2.power(-1)",
+            EvaluationResult::decimal(dec!(0.5)),
+        ), // 2^-1 = 1/2 = 0.5
+        (
+            "4.power(-0.5)",
+            EvaluationResult::decimal(dec!(0.5)),
+        ), // 4^-0.5 = 1/√4 = 0.5
         // Quantities
         (
             "2 'mg'.power(3)",
-            EvaluationResult::Quantity(dec!(8), "mg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(8), "mg".to_string()),
         ),
         (
             "4 'kg'.power(0.5)",
-            EvaluationResult::Quantity(dec!(2), "kg".to_string()),
+            EvaluationResult::quantity(rust_decimal::Decimal::from(2), "kg".to_string()),
         ),
     ];
 
@@ -4663,7 +4834,7 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual), EvaluationResult::Decimal(expected)) => {
+            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
                 // Check that the difference is very small (within 1e-10)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.0000000001").unwrap();
@@ -4678,8 +4849,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit),
-                EvaluationResult::Quantity(expected_val, expected_unit),
+                EvaluationResult::Quantity(actual_val, actual_unit, None),
+                EvaluationResult::Quantity(expected_val, expected_unit, None),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4741,7 +4912,7 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual), EvaluationResult::Decimal(expected)) => {
+            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4756,8 +4927,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit),
-                EvaluationResult::Quantity(expected_val, expected_unit),
+                EvaluationResult::Quantity(actual_val, actual_unit, None),
+                EvaluationResult::Quantity(expected_val, expected_unit, None),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4792,7 +4963,7 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual), EvaluationResult::Decimal(expected)) => {
+            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4807,8 +4978,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit),
-                EvaluationResult::Quantity(expected_val, expected_unit),
+                EvaluationResult::Quantity(actual_val, actual_unit, None),
+                EvaluationResult::Quantity(expected_val, expected_unit, None),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4843,7 +5014,7 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual), EvaluationResult::Decimal(expected)) => {
+            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4858,8 +5029,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit),
-                EvaluationResult::Quantity(expected_val, expected_unit),
+                EvaluationResult::Quantity(actual_val, actual_unit, None),
+                EvaluationResult::Quantity(expected_val, expected_unit, None),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4894,7 +5065,7 @@ fn test_math_functions() {
 
         // Special handling for Decimal and Quantity types
         match (&result, &expected) {
-            (EvaluationResult::Decimal(actual), EvaluationResult::Decimal(expected)) => {
+            (EvaluationResult::Decimal(actual, _), EvaluationResult::Decimal(expected, _)) => {
                 // Check that the difference is very small (within reasonable error margin)
                 let diff = (*actual - *expected).abs();
                 let epsilon = Decimal::from_str_exact("0.000001").unwrap();
@@ -4909,8 +5080,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit),
-                EvaluationResult::Quantity(expected_val, expected_unit),
+                EvaluationResult::Quantity(actual_val, actual_unit, None),
+                EvaluationResult::Quantity(expected_val, expected_unit, None),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -5192,13 +5363,13 @@ fn test_type_operations_with_precedence() {
     // Let's start with a simpler test to confirm basic type checking
     assert_eq!(
         eval("true is Boolean", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 
     // Test the boolean result of a direct comparison
     assert_eq!(
         eval("1 > 2", &context).unwrap(),
-        EvaluationResult::Boolean(false)
+        EvaluationResult::boolean(false)
     );
 
     // We've learned that the parser interprets "1 > 2 is Boolean" as "1 > (2 is Boolean)"
@@ -5208,12 +5379,12 @@ fn test_type_operations_with_precedence() {
     // This should work correctly with our current implementation
     assert_eq!(
         eval("(1 > 2) is Boolean", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 
     // Test type checking with union operations using parentheses
     assert_eq!(
         eval("(1 | 1) is Integer", &context).unwrap(),
-        EvaluationResult::Boolean(true)
+        EvaluationResult::boolean(true)
     );
 }

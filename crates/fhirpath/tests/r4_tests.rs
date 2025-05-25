@@ -45,10 +45,10 @@ fn run_fhir_r4_test(
                     eval_result.clone()
                 };
 
-                if let EvaluationResult::Boolean(b_val) = single_item_value {
-                    EvaluationResult::Boolean(b_val) // Preserve original boolean value
+                if let EvaluationResult::Boolean(b_val, None) = single_item_value {
+                    EvaluationResult::Boolean(b_val, None) // Preserve original boolean value
                 } else {
-                    EvaluationResult::Boolean(true) // Non-boolean single item becomes true in boolean context
+                    EvaluationResult::Boolean(true, None) // Non-boolean single item becomes true in boolean context
                 }
             }
             _ => {
@@ -92,7 +92,7 @@ fn run_fhir_r4_test(
     // for more complex types and approximate equality for decimals
     for (i, (actual, expected)) in result_vec.iter().zip(expected.iter()).enumerate() {
         match (actual, expected) {
-            (EvaluationResult::Boolean(a), EvaluationResult::Boolean(b)) => {
+            (EvaluationResult::Boolean(a, None), EvaluationResult::Boolean(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "Boolean result {} doesn't match: expected {:?}, got {:?}",
@@ -100,7 +100,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => {
+            (EvaluationResult::Integer(a, None), EvaluationResult::Integer(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "Integer result {} doesn't match: expected {:?}, got {:?}",
@@ -108,7 +108,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::String(a), EvaluationResult::String(b)) => {
+            (EvaluationResult::String(a, None), EvaluationResult::String(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "String result {} doesn't match: expected {:?}, got {:?}",
@@ -116,7 +116,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::Decimal(a), EvaluationResult::Decimal(b)) => {
+            (EvaluationResult::Decimal(a, None), EvaluationResult::Decimal(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "Decimal result {} doesn't match: expected {} ({}), got {} ({})",
@@ -125,8 +125,8 @@ fn run_fhir_r4_test(
                 }
             }
             (
-                EvaluationResult::Quantity(a_val, a_unit),
-                EvaluationResult::Quantity(b_val, b_unit),
+                EvaluationResult::Quantity(a_val, a_unit, None),
+                EvaluationResult::Quantity(b_val, b_unit, None),
             ) => {
                 if a_val != b_val || a_unit != b_unit {
                     return Err(format!(
@@ -136,7 +136,7 @@ fn run_fhir_r4_test(
                 }
             }
             // Date types which are currently stored as strings
-            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => {
+            (EvaluationResult::Date(a, None), EvaluationResult::Date(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "Date result {} doesn't match: expected {:?}, got {:?}",
@@ -144,7 +144,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => {
+            (EvaluationResult::DateTime(a, None), EvaluationResult::DateTime(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "DateTime result {} doesn't match: expected {:?}, got {:?}",
@@ -152,7 +152,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => {
+            (EvaluationResult::Time(a, None), EvaluationResult::Time(b, None)) => {
                 if a != b {
                     return Err(format!(
                         "Time result {} doesn't match: expected {:?}, got {:?}",
@@ -162,7 +162,7 @@ fn run_fhir_r4_test(
             }
             // Special case for FHIR types that are stored differently but might be equivalent
             // String vs. Code compatibility (since code is stored as String in our implementation)
-            (EvaluationResult::String(a), EvaluationResult::Date(b)) => {
+            (EvaluationResult::String(a, None), EvaluationResult::Date(b, None)) => {
                 // A String can be equal to a Date in certain contexts
                 if a != b {
                     return Err(format!(
@@ -171,7 +171,7 @@ fn run_fhir_r4_test(
                     ));
                 }
             }
-            (EvaluationResult::Date(a), EvaluationResult::String(b)) => {
+            (EvaluationResult::Date(a, None), EvaluationResult::String(b, None)) => {
                 // A Date can be equal to a String in certain contexts
                 if a != b {
                     return Err(format!(
@@ -233,8 +233,8 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     if json_filename == "patient-example.json" {
         // Clone relevant information before modifying the context
         let patient_data = if let Some(this) = &context.this {
-            if let EvaluationResult::Object(obj) = this {
-                if obj.get("resourceType") == Some(&EvaluationResult::String("Patient".to_string()))
+            if let EvaluationResult::Object { map: obj, .. } = this {
+                if obj.get("resourceType") == Some(&EvaluationResult::String("Patient".to_string(), None))
                 {
                     // Extract the birth date and _birthDate if available
                     let birthdate = obj.get("birthDate").cloned();
@@ -263,11 +263,11 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                 // Add resourceType
                 patient_map.insert(
                     "resourceType".to_string(),
-                    EvaluationResult::String("Patient".to_string()),
+                    EvaluationResult::String("Patient".to_string(), None),
                 );
 
                 // Add active for type tests
-                if let EvaluationResult::Object(obj) = &patient_obj {
+                if let EvaluationResult::Object { map: obj, .. } = &patient_obj {
                     if let Some(active) = obj.get("active") {
                         patient_map.insert("active".to_string(), active.clone());
                     }
@@ -278,7 +278,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                 patient_map.insert("_birthDate".to_string(), birthdate_ext.clone());
 
                 // Set this enhanced context for the "Patient" variable
-                context.set_variable_result("Patient", EvaluationResult::Object(patient_map));
+                context.set_variable_result("Patient", EvaluationResult::object(patient_map));
             }
         }
     }
@@ -286,9 +286,9 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     else if json_filename == "observation-example.json" {
         // Clone relevant information before modifying the context
         let observation_data = if let Some(this) = &context.this {
-            if let EvaluationResult::Object(obj) = this {
+            if let EvaluationResult::Object { map: obj, .. } = this {
                 if obj.get("resourceType")
-                    == Some(&EvaluationResult::String("Observation".to_string()))
+                    == Some(&EvaluationResult::String("Observation".to_string(), None))
                 {
                     // Extract valueQuantity if available
                     let value_quantity = obj.get("valueQuantity").cloned();
@@ -312,7 +312,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
             if let Some(value_quantity) = value_quantity_opt {
                 let mut observation_map = HashMap::new();
                 // Clone the original object
-                if let EvaluationResult::Object(obj) = &observation_obj {
+                if let EvaluationResult::Object { map: obj, .. } = &observation_obj {
                     for (key, value) in obj {
                         observation_map.insert(key.clone(), value.clone());
                     }
@@ -324,7 +324,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                     );
 
                     // Extract the unit from valueQuantity for easy testing
-                    if let Some(EvaluationResult::Object(vq)) = obj.get("valueQuantity") {
+                    if let Some(EvaluationResult::Object { map: vq, .. }) = obj.get("valueQuantity") {
                         if let Some(unit) = vq.get("unit") {
                             println!("  DEBUG: Found unit in valueQuantity: {:?}", unit);
                         }
@@ -335,7 +335,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                 observation_map.insert("value".to_string(), value_quantity.clone());
 
                 // When it's a valueQuantity, if the quantity has a unit, extract it to a value.unit property
-                if let EvaluationResult::Object(vq) = &value_quantity {
+                if let EvaluationResult::Object { map: vq, .. } = &value_quantity {
                     if let Some(unit) = vq.get("unit") {
                         // Create a special direct map from value.unit for testing
                         observation_map.insert("value.unit".to_string(), unit.clone());
@@ -344,7 +344,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
 
                 // Create context with enhanced observation
                 context
-                    .set_variable_result("Observation", EvaluationResult::Object(observation_map));
+                    .set_variable_result("Observation", EvaluationResult::object(observation_map));
             }
         }
     }
@@ -359,20 +359,20 @@ fn test_truncate() {
     // --- Success Cases for truncate() ---
     let truncate_cases = vec![
         // Integer inputs (should remain unchanged)
-        ("5.truncate()", EvaluationResult::Integer(5)),
-        ("0.truncate()", EvaluationResult::Integer(0)),
-        ("(-5).truncate()", EvaluationResult::Integer(-5)),
+        ("5.truncate()", EvaluationResult::integer(5)),
+        ("0.truncate()", EvaluationResult::integer(0)),
+        ("(-5).truncate()", EvaluationResult::integer(-5)),
         // Decimal inputs with fractional parts
-        ("5.5.truncate()", EvaluationResult::Integer(5)),
-        ("5.9.truncate()", EvaluationResult::Integer(5)),
-        ("(-5.5).truncate()", EvaluationResult::Integer(-5)),
-        ("(-5.9).truncate()", EvaluationResult::Integer(-5)),
-        ("0.1.truncate()", EvaluationResult::Integer(0)),
-        ("(-0.1).truncate()", EvaluationResult::Integer(0)),
+        ("5.5.truncate()", EvaluationResult::integer(5)),
+        ("5.9.truncate()", EvaluationResult::integer(5)),
+        ("(-5.5).truncate()", EvaluationResult::integer(-5)),
+        ("(-5.9).truncate()", EvaluationResult::integer(-5)),
+        ("0.1.truncate()", EvaluationResult::integer(0)),
+        ("(-0.1).truncate()", EvaluationResult::integer(0)),
         // Large numbers that still fit in Integer
         (
             "9223372036854775807.99.truncate()",
-            EvaluationResult::Integer(9223372036854775807),
+            EvaluationResult::integer(9223372036854775807),
         ), // max i64
 
            // Remove Quantity inputs for now due to parsing issues
@@ -408,33 +408,33 @@ fn test_basic_fhirpath_expressions() {
 
     // Test some basic expressions
     let test_cases = vec![
-        ("true", EvaluationResult::Boolean(true)),
-        ("false", EvaluationResult::Boolean(false)),
-        ("1", EvaluationResult::Integer(1)),
-        ("'hello'", EvaluationResult::String("hello".to_string())),
-        ("1 + 1", EvaluationResult::Integer(2)),
-        ("1 - 1", EvaluationResult::Integer(0)),
-        ("2 * 3", EvaluationResult::Integer(6)),
+        ("true", EvaluationResult::Boolean(true, None)),
+        ("false", EvaluationResult::Boolean(false, None)),
+        ("1", EvaluationResult::integer(1)),
+        ("'hello'", EvaluationResult::String("hello".to_string(), None)),
+        ("1 + 1", EvaluationResult::integer(2)),
+        ("1 - 1", EvaluationResult::integer(0)),
+        ("2 * 3", EvaluationResult::integer(6)),
         (
             "10 / 2",
-            EvaluationResult::Decimal(rust_decimal_macros::dec!(5)),
+            EvaluationResult::decimal(Decimal::from(5)),
         ),
-        ("10 div 3", EvaluationResult::Integer(3)),
-        ("10 mod 3", EvaluationResult::Integer(1)),
-        ("true and true", EvaluationResult::Boolean(true)),
-        ("true and false", EvaluationResult::Boolean(false)),
-        ("true or false", EvaluationResult::Boolean(true)),
-        ("false or false", EvaluationResult::Boolean(false)),
-        ("true xor false", EvaluationResult::Boolean(true)),
-        ("true xor true", EvaluationResult::Boolean(false)),
-        ("1 < 2", EvaluationResult::Boolean(true)),
-        ("1 <= 1", EvaluationResult::Boolean(true)),
-        ("1 > 2", EvaluationResult::Boolean(false)),
-        ("2 >= 2", EvaluationResult::Boolean(true)),
-        ("1 = 1", EvaluationResult::Boolean(true)),
-        ("1 != 2", EvaluationResult::Boolean(true)),
-        ("'hello' = 'hello'", EvaluationResult::Boolean(true)),
-        ("'hello' != 'world'", EvaluationResult::Boolean(true)),
+        ("10 div 3", EvaluationResult::integer(3)),
+        ("10 mod 3", EvaluationResult::integer(1)),
+        ("true and true", EvaluationResult::Boolean(true, None)),
+        ("true and false", EvaluationResult::Boolean(false, None)),
+        ("true or false", EvaluationResult::Boolean(true, None)),
+        ("false or false", EvaluationResult::Boolean(false, None)),
+        ("true xor false", EvaluationResult::Boolean(true, None)),
+        ("true xor true", EvaluationResult::Boolean(false, None)),
+        ("1 < 2", EvaluationResult::Boolean(true, None)),
+        ("1 <= 1", EvaluationResult::Boolean(true, None)),
+        ("1 > 2", EvaluationResult::Boolean(false, None)),
+        ("2 >= 2", EvaluationResult::Boolean(true, None)),
+        ("1 = 1", EvaluationResult::Boolean(true, None)),
+        ("1 != 2", EvaluationResult::Boolean(true, None)),
+        ("'hello' = 'hello'", EvaluationResult::Boolean(true, None)),
+        ("'hello' != 'world'", EvaluationResult::Boolean(true, None)),
     ];
 
     let mut passed = 0;
@@ -484,14 +484,14 @@ fn test_patient_active_type() {
     let mut patient = HashMap::new();
     patient.insert(
         "resourceType".to_string(),
-        EvaluationResult::String("Patient".to_string()),
+        EvaluationResult::String("Patient".to_string(), None),
     );
-    patient.insert("active".to_string(), EvaluationResult::Boolean(true));
+    patient.insert("active".to_string(), EvaluationResult::Boolean(true, None));
 
     // Create a test context with this Patient
     let mut context = EvaluationContext::new_empty();
-    context.set_this(EvaluationResult::Object(patient.clone()));
-    context.set_variable_result("Patient", EvaluationResult::Object(patient));
+    context.set_this(EvaluationResult::object(patient.clone()));
+    context.set_variable_result("Patient", EvaluationResult::object(patient));
 
     println!("\nDiagnostic information for Patient.active type operations:");
 
@@ -777,18 +777,16 @@ fn test_r4_test_suite() {
                         "url".to_string(),
                         EvaluationResult::String(
                             "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
+                            None,
                         ),
                     );
                     extension_obj.insert(
                         "valueDateTime".to_string(),
-                        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string()),
+                        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string(), None),
                     );
 
                     // Create the extensions collection
-                    let extensions = EvaluationResult::Collection {
-                        items: vec![EvaluationResult::Object(extension_obj)],
-                        has_undefined_order: false,
-                    };
+                    let extensions = EvaluationResult::Collection { items: vec![EvaluationResult::object(extension_obj)], has_undefined_order: false, type_info: None };
 
                     // Create the underscore object
                     let mut underscore_obj = HashMap::new();
@@ -796,23 +794,23 @@ fn test_r4_test_suite() {
 
                     // Get the patient object
                     if let Some(this) = &context.this {
-                        if let EvaluationResult::Object(obj) = this {
+                        if let EvaluationResult::Object { map: obj, .. } = this {
                             let mut new_obj = obj.clone();
 
                             // Make sure birthDate is an Object, not a String
                             // First check the current birthDate value
                             let mut birthdate_obj = HashMap::new();
-                            if let Some(EvaluationResult::String(date_str)) =
+                            if let Some(EvaluationResult::String(date_str, None)) =
                                 new_obj.get("birthDate")
                             {
                                 // Convert birthDate String to Object with value property
                                 birthdate_obj.insert(
                                     "value".to_string(),
-                                    EvaluationResult::String(date_str.clone()),
+                                    EvaluationResult::String(date_str.clone(), None),
                                 );
                                 new_obj.insert(
                                     "birthDate".to_string(),
-                                    EvaluationResult::Object(birthdate_obj),
+                                    EvaluationResult::object(birthdate_obj),
                                 );
                                 println!(
                                     "  DEBUG: Converted birthDate from String to Object for extension access"
@@ -820,7 +818,7 @@ fn test_r4_test_suite() {
                             }
 
                             // Now add _birthDate with extension
-                            let underscore_birthdate = EvaluationResult::Object(underscore_obj);
+                            let underscore_birthdate = EvaluationResult::object(underscore_obj);
                             new_obj.insert("_birthDate".to_string(), underscore_birthdate);
 
                             // Add debug output
@@ -832,20 +830,20 @@ fn test_r4_test_suite() {
                             // Update the context this - first clone it for the Patient variable
                             context.set_variable_result(
                                 "Patient",
-                                EvaluationResult::Object(new_obj.clone()),
+                                EvaluationResult::object(new_obj.clone()),
                             );
 
                             // Then use it for the this context
-                            context.set_this(EvaluationResult::Object(new_obj));
+                            context.set_this(EvaluationResult::object(new_obj));
 
                             // Debug verification
                             if let Some(this_val) = &context.this {
-                                if let EvaluationResult::Object(obj) = this_val {
+                                if let EvaluationResult::Object { map: obj, .. } = this_val {
                                     if let Some(birthdate_ext) = obj.get("_birthDate") {
                                         println!("  DEBUG: _birthDate is present in context.this");
 
                                         // Check for extensions
-                                        if let EvaluationResult::Object(bd_obj) = birthdate_ext {
+                                        if let EvaluationResult::Object { map: bd_obj, .. } = birthdate_ext {
                                             if let Some(exts) = bd_obj.get("extension") {
                                                 println!(
                                                     "  DEBUG: _birthDate.extension is present"
@@ -881,8 +879,8 @@ fn test_r4_test_suite() {
             for (output_type, output_value) in &test.outputs {
                 match output_type.as_str() {
                     "boolean" => match output_value.as_str() {
-                        "true" => expected_results.push(EvaluationResult::Boolean(true)),
-                        "false" => expected_results.push(EvaluationResult::Boolean(false)),
+                        "true" => expected_results.push(EvaluationResult::Boolean(true, None)),
+                        "false" => expected_results.push(EvaluationResult::Boolean(false, None)),
                         _ => {
                             println!(
                                 "  SKIP: {} - Invalid boolean value: {}",
@@ -893,7 +891,7 @@ fn test_r4_test_suite() {
                         }
                     },
                     "integer" => match output_value.parse::<i64>() {
-                        Ok(val) => expected_results.push(EvaluationResult::Integer(val)),
+                        Ok(val) => expected_results.push(EvaluationResult::integer(val)),
                         Err(_) => {
                             println!(
                                 "  SKIP: {} - Invalid integer value: {}",
@@ -904,22 +902,22 @@ fn test_r4_test_suite() {
                         }
                     },
                     "string" => {
-                        expected_results.push(EvaluationResult::String(output_value.clone()));
+                        expected_results.push(EvaluationResult::String(output_value.clone(), None));
                     }
                     // Support for additional FHIR types that are stored as strings in our implementation
                     "date" => {
                         // Currently dates are stored as strings in our implementation
-                        expected_results.push(EvaluationResult::Date(output_value.clone()));
+                        expected_results.push(EvaluationResult::Date(output_value.clone(), None));
                     }
                     "dateTime" => {
-                        expected_results.push(EvaluationResult::DateTime(output_value.clone()));
+                        expected_results.push(EvaluationResult::DateTime(output_value.clone(), None));
                     }
                     "time" => {
-                        expected_results.push(EvaluationResult::Time(output_value.clone()));
+                        expected_results.push(EvaluationResult::Time(output_value.clone(), None));
                     }
                     "code" => {
                         // FHIR code type is also just a string in our implementation
-                        expected_results.push(EvaluationResult::String(output_value.clone()));
+                        expected_results.push(EvaluationResult::String(output_value.clone(), None));
                     }
                     "Quantity" => {
                         // Parse "value 'unit'" format, e.g., "1 '1'" or "10.5 'mg'"
@@ -937,6 +935,7 @@ fn test_r4_test_suite() {
                                         expected_results.push(EvaluationResult::Quantity(
                                             decimal_val,
                                             unit_str.to_string(),
+                                            None,
                                         ));
                                     }
                                     Err(_) => {

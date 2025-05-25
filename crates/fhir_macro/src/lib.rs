@@ -2419,13 +2419,24 @@ fn generate_fhirpath_struct_impl(
     });
 
 
+    // Determine the type name to use for type info
+    // For now, we'll use the struct name as the type name
+    let type_name_str = name.to_string();
+    
     quote! {
         impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
             fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
                 // Use fully qualified path for HashMap
                 let mut map = std::collections::HashMap::new();
+                
                 #(#field_conversions)* // Expand the field conversion logic
-                fhirpath_support::EvaluationResult::Object(map)
+                
+                // Return a typed object with FHIR type information
+                fhirpath_support::EvaluationResult::typed_object(
+                    map,
+                    "FHIR",
+                    &#type_name_str
+                )
             }
         }
     }
@@ -2452,7 +2463,7 @@ fn generate_fhirpath_enum_impl(
                 // For unit variants, return the variant name as a string (like a code)
                 // This is likely for status codes etc., not the Resource enum
                 quote! {
-                    Self::#variant_name => fhirpath_support::EvaluationResult::String(#variant_name_str.to_string()),
+                    Self::#variant_name => fhirpath_support::EvaluationResult::string(#variant_name_str.to_string()),
                 }
             }
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
@@ -2462,11 +2473,11 @@ fn generate_fhirpath_enum_impl(
                     quote! {
                         Self::#variant_name(value) => {
                             let mut result = value.into_evaluation_result(); // Call on inner Box<ResourceStruct>
-                            if let fhirpath_support::EvaluationResult::Object(ref mut map) = result {
+                            if let fhirpath_support::EvaluationResult::Object { ref mut map, .. } = result {
                                 // Insert the resourceType field using the variant name
                                 map.insert(
                                     "resourceType".to_string(),
-                                    fhirpath_support::EvaluationResult::String(#variant_name_str.to_string())
+                                    fhirpath_support::EvaluationResult::string(#variant_name_str.to_string())
                                 );
                             }
                             // Return the (potentially modified) result
@@ -2513,5 +2524,91 @@ fn generate_fhirpath_enum_impl(
             }
         }
     }
+}
+
+/// Derive macro for TypeInfo trait.
+///
+/// This macro generates implementations of the TypeInfo trait for FHIR types,
+/// providing type namespace and name information needed by the FHIRPath type() function.
+///
+/// # Attributes
+///
+/// - `#[type_info(namespace = "FHIR", name = "boolean")]` - Specifies custom namespace and name
+/// - If not specified, defaults are inferred from the type name
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// #[derive(TypeInfo)]
+/// #[type_info(namespace = "FHIR", name = "boolean")]
+/// pub struct Boolean(pub Element<bool, Extension>);
+///
+/// #[derive(TypeInfo)]
+/// pub struct Patient {
+///     // fields...
+/// }
+/// ```
+#[proc_macro_derive(TypeInfo, attributes(type_info))]
+pub fn type_info_derive(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let generics = &input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Extract type_info attributes if present
+    let (namespace, type_name) = extract_type_info_attributes(&input.attrs, &name);
+
+    let expanded = quote! {
+        impl #impl_generics fhirpath_support::TypeInfo for #name #ty_generics #where_clause {
+            fn type_namespace() -> &'static str {
+                #namespace
+            }
+            
+            fn type_name() -> &'static str {
+                #type_name
+            }
+        }
+    };
+
+    TokenStream::from(expanded)
+}
+
+/// Extracts namespace and name from type_info attributes.
+fn extract_type_info_attributes(attrs: &[syn::Attribute], type_name: &Ident) -> (String, String) {
+    for attr in attrs {
+        if attr.path().is_ident("type_info") {
+            if let Ok(list) =
+                attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+            {
+                let mut namespace = None;
+                let mut name = None;
+                
+                for meta in list {
+                    if let Meta::NameValue(nv) = meta {
+                        if nv.path.is_ident("namespace") {
+                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                if let Lit::Str(lit_str) = expr_lit.lit {
+                                    namespace = Some(lit_str.value());
+                                }
+                            }
+                        } else if nv.path.is_ident("name") {
+                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                if let Lit::Str(lit_str) = expr_lit.lit {
+                                    name = Some(lit_str.value());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if let (Some(ns), Some(n)) = (namespace, name) {
+                    return (format!("\"{}\"", ns), format!("\"{}\"", n));
+                }
+            }
+        }
+    }
+    
+    // Default: Assume FHIR namespace and use the type name
+    ("\"FHIR\"".to_string(), format!("\"{}\"", type_name))
 }
 

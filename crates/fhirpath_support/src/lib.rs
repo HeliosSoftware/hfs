@@ -35,11 +35,14 @@
 //! assert_eq!(collection.count(), 3);
 //! ```
 
-use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use rust_decimal::prelude::*;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+mod type_info;
+pub use type_info::TypeInfoResult;
 
 /// Universal conversion trait for transforming values into FHIRPath evaluation results.
 ///
@@ -125,6 +128,7 @@ pub trait IntoEvaluationResult {
 /// let collection = EvaluationResult::Collection {
 ///     items,
 ///     has_undefined_order: false,
+///     type_info: None
 /// };
 ///
 /// assert_eq!(collection.count(), 2);
@@ -142,43 +146,43 @@ pub enum EvaluationResult {
     ///
     /// Results from boolean expressions, existence checks, and logical operations.
     /// Also used for FHIR boolean fields.
-    Boolean(bool),
+    Boolean(bool, Option<TypeInfoResult>),
     /// Text string value.
     ///
     /// Used for FHIR string, code, uri, canonical, id, and other text-based types.
     /// Also results from string manipulation functions and conversions.
-    String(String),
+    String(String, Option<TypeInfoResult>),
     /// High-precision decimal number.
     ///
     /// Uses `rust_decimal::Decimal` for precise arithmetic without floating-point
     /// errors. Required for FHIR's decimal type and mathematical operations.
-    Decimal(Decimal),
+    Decimal(Decimal, Option<TypeInfoResult>),
     /// Whole number value.
     ///
     /// Used for FHIR integer, positiveInt, unsignedInt types and counting operations.
     /// Also results from indexing and length functions.
-    Integer(i64),
+    Integer(i64, Option<TypeInfoResult>),
     /// Date value in ISO format.
     ///
     /// Stores date as string in YYYY-MM-DD format. Handles FHIR date fields
     /// and results from date extraction functions.
-    Date(String),
+    Date(String, Option<TypeInfoResult>),
     /// DateTime value in ISO format.
     ///
     /// Stores datetime as string in ISO 8601 format with optional timezone.
     /// Handles FHIR dateTime and instant fields.
-    DateTime(String),
+    DateTime(String, Option<TypeInfoResult>),
     /// Time value in ISO format.
     ///
     /// Stores time as string in HH:MM:SS format. Handles FHIR time fields
     /// and results from time extraction functions.
-    Time(String),
+    Time(String, Option<TypeInfoResult>),
     /// Quantity with value and unit.
     ///
     /// Represents measurements with units (e.g., "5.4 mg", "10 years").
     /// First element is the numeric value, second is the unit string.
     /// Used for FHIR Quantity, Age, Duration, Distance, Count, and Money types.
-    Quantity(Decimal, String),
+    Quantity(Decimal, String, Option<TypeInfoResult>),
     /// Ordered collection of evaluation results.
     ///
     /// Represents arrays, lists, and multi-valued FHIR elements. Collections
@@ -194,13 +198,23 @@ pub enum EvaluationResult {
         items: Vec<EvaluationResult>,
         /// Whether the original source order was undefined
         has_undefined_order: bool,
+        /// Optional type information
+        type_info: Option<TypeInfoResult>,
     },
     /// Key-value object representing complex FHIR types.
     ///
     /// Used for FHIR resources, data types, and backbone elements. Keys are
     /// field names and values are the corresponding evaluation results.
     /// Enables property access via FHIRPath dot notation.
-    Object(HashMap<String, EvaluationResult>),
+    ///
+    /// The optional type_namespace and type_name fields preserve type information
+    /// for the FHIRPath type() function.
+    Object {
+        /// The object's properties
+        map: HashMap<String, EvaluationResult>,
+        /// Optional type information
+        type_info: Option<TypeInfoResult>,
+    },
 }
 
 /// Comprehensive error type for FHIRPath evaluation failures.
@@ -232,7 +246,7 @@ pub enum EvaluationResult {
 /// let error = EvaluationError::TypeError(
 ///     "Cannot add String and Integer".to_string()
 /// );
-/// 
+///
 /// // Display the error
 /// println!("{}", error); // "Type Error: Cannot add String and Integer"
 /// ```
@@ -352,8 +366,12 @@ impl std::fmt::Display for EvaluationError {
             EvaluationError::DivisionByZero => write!(f, "Division by zero"),
             EvaluationError::ArithmeticOverflow => write!(f, "Arithmetic overflow"),
             EvaluationError::InvalidRegex(msg) => write!(f, "Invalid Regex: {}", msg),
-            EvaluationError::InvalidTypeSpecifier(msg) => write!(f, "Invalid Type Specifier: {}", msg),
-            EvaluationError::SingletonEvaluationError(msg) => write!(f, "Singleton Evaluation Error: {}", msg),
+            EvaluationError::InvalidTypeSpecifier(msg) => {
+                write!(f, "Invalid Type Specifier: {}", msg)
+            }
+            EvaluationError::SingletonEvaluationError(msg) => {
+                write!(f, "Singleton Evaluation Error: {}", msg)
+            }
             EvaluationError::SemanticError(msg) => write!(f, "Semantic Error: {}", msg),
             EvaluationError::Other(msg) => write!(f, "Evaluation Error: {}", msg),
         }
@@ -388,26 +406,41 @@ impl PartialEq for EvaluationResult {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (EvaluationResult::Empty, EvaluationResult::Empty) => true,
-            (EvaluationResult::Boolean(a), EvaluationResult::Boolean(b)) => a == b,
-            (EvaluationResult::String(a), EvaluationResult::String(b)) => a == b,
-            (EvaluationResult::Decimal(a), EvaluationResult::Decimal(b)) => {
+            (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => a == b,
+            (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => a == b,
+            (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => {
                 // Normalize decimals to handle precision differences (e.g., 1.0 == 1.00)
                 a.normalize() == b.normalize()
             }
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => a == b,
-            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => a == b,
-            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => a == b,
-            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => a == b,
-            (EvaluationResult::Quantity(val_a, unit_a), EvaluationResult::Quantity(val_b, unit_b)) => {
+            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a == b,
+            (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a == b,
+            (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a == b,
+            (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a == b,
+            (
+                EvaluationResult::Quantity(val_a, unit_a, _),
+                EvaluationResult::Quantity(val_b, unit_b, _),
+            ) => {
                 // Quantities are equal if both value and unit match (normalized values)
                 val_a.normalize() == val_b.normalize() && unit_a == unit_b
             }
-            (EvaluationResult::Collection { items: a_items, has_undefined_order: a_undef }, 
-             EvaluationResult::Collection { items: b_items, has_undefined_order: b_undef }) => {
+            (
+                EvaluationResult::Collection {
+                    items: a_items,
+                    has_undefined_order: a_undef,
+                    ..
+                },
+                EvaluationResult::Collection {
+                    items: b_items,
+                    has_undefined_order: b_undef,
+                    ..
+                },
+            ) => {
                 // Collections are equal if both order flags and items match
                 a_undef == b_undef && a_items == b_items
             }
-            (EvaluationResult::Object(a), EvaluationResult::Object(b)) => a == b,
+            (EvaluationResult::Object { map: a, .. }, EvaluationResult::Object { map: b, .. }) => {
+                a == b
+            }
             _ => false,
         }
     }
@@ -452,46 +485,59 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Empty, _) => Ordering::Less,
             (_, EvaluationResult::Empty) => Ordering::Greater,
 
-            (EvaluationResult::Boolean(a), EvaluationResult::Boolean(b)) => a.cmp(b),
-            (EvaluationResult::Boolean(_), _) => Ordering::Less,
-            (_, EvaluationResult::Boolean(_)) => Ordering::Greater,
+            (EvaluationResult::Boolean(a, _), EvaluationResult::Boolean(b, _)) => a.cmp(b),
+            (EvaluationResult::Boolean(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Boolean(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => a.cmp(b),
-            (EvaluationResult::Integer(_), _) => Ordering::Less,
-            (_, EvaluationResult::Integer(_)) => Ordering::Greater,
+            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a.cmp(b),
+            (EvaluationResult::Integer(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Integer(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::Decimal(a), EvaluationResult::Decimal(b)) => a.cmp(b),
-            (EvaluationResult::Decimal(_), _) => Ordering::Less,
-            (_, EvaluationResult::Decimal(_)) => Ordering::Greater,
+            (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => a.cmp(b),
+            (EvaluationResult::Decimal(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Decimal(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::String(a), EvaluationResult::String(b)) => a.cmp(b),
-            (EvaluationResult::String(_), _) => Ordering::Less,
-            (_, EvaluationResult::String(_)) => Ordering::Greater,
+            (EvaluationResult::String(a, _), EvaluationResult::String(b, _)) => a.cmp(b),
+            (EvaluationResult::String(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::String(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::Date(a), EvaluationResult::Date(b)) => a.cmp(b),
-            (EvaluationResult::Date(_), _) => Ordering::Less,
-            (_, EvaluationResult::Date(_)) => Ordering::Greater,
+            (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a.cmp(b),
+            (EvaluationResult::Date(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Date(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::DateTime(a), EvaluationResult::DateTime(b)) => a.cmp(b),
-            (EvaluationResult::DateTime(_), _) => Ordering::Less,
-            (_, EvaluationResult::DateTime(_)) => Ordering::Greater,
+            (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a.cmp(b),
+            (EvaluationResult::DateTime(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::DateTime(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::Time(a), EvaluationResult::Time(b)) => a.cmp(b),
-            (EvaluationResult::Time(_), _) => Ordering::Less,
-            (_, EvaluationResult::Time(_)) => Ordering::Greater,
+            (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a.cmp(b),
+            (EvaluationResult::Time(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Time(_, _)) => Ordering::Greater,
 
-            (EvaluationResult::Quantity(val_a, unit_a), EvaluationResult::Quantity(val_b, unit_b)) => {
+            (
+                EvaluationResult::Quantity(val_a, unit_a, _),
+                EvaluationResult::Quantity(val_b, unit_b, _),
+            ) => {
                 // Order by value first, then by unit string
                 match val_a.cmp(val_b) {
                     Ordering::Equal => unit_a.cmp(unit_b),
                     other => other,
                 }
             }
-            (EvaluationResult::Quantity(_, _), _) => Ordering::Less,
-            (_, EvaluationResult::Quantity(_, _)) => Ordering::Greater,
+            (EvaluationResult::Quantity(_, _, _), _) => Ordering::Less,
+            (_, EvaluationResult::Quantity(_, _, _)) => Ordering::Greater,
 
-            (EvaluationResult::Collection { items: a_items, has_undefined_order: a_undef }, 
-             EvaluationResult::Collection { items: b_items, has_undefined_order: b_undef }) => {
+            (
+                EvaluationResult::Collection {
+                    items: a_items,
+                    has_undefined_order: a_undef,
+                    ..
+                },
+                EvaluationResult::Collection {
+                    items: b_items,
+                    has_undefined_order: b_undef,
+                    ..
+                },
+            ) => {
                 // Order by undefined_order flag first (false < true), then by items
                 match a_undef.cmp(b_undef) {
                     Ordering::Equal => {
@@ -504,7 +550,7 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Collection { .. }, _) => Ordering::Less,
             (_, EvaluationResult::Collection { .. }) => Ordering::Greater,
 
-            (EvaluationResult::Object(a), EvaluationResult::Object(b)) => {
+            (EvaluationResult::Object { map: a, .. }, EvaluationResult::Object { map: b, .. }) => {
                 // Compare objects by sorted keys, then by values
                 let mut a_keys: Vec<_> = a.keys().collect();
                 let mut b_keys: Vec<_> = b.keys().collect();
@@ -524,8 +570,7 @@ impl Ord for EvaluationResult {
                     }
                     non_equal => non_equal,
                 }
-            }
-            // Note: Object is the last variant, so no additional arms needed
+            } // Note: Object is the last variant, so no additional arms needed
         }
     }
 }
@@ -559,20 +604,24 @@ impl Hash for EvaluationResult {
         match self {
             // Empty has no additional data to hash
             EvaluationResult::Empty => {}
-            EvaluationResult::Boolean(b) => b.hash(state),
-            EvaluationResult::String(s) => s.hash(state),
+            EvaluationResult::Boolean(b, _) => b.hash(state),
+            EvaluationResult::String(s, _) => s.hash(state),
             // Hash normalized decimal for consistency with equality
-            EvaluationResult::Decimal(d) => d.normalize().hash(state),
-            EvaluationResult::Integer(i) => i.hash(state),
-            EvaluationResult::Date(d) => d.hash(state),
-            EvaluationResult::DateTime(dt) => dt.hash(state),
-            EvaluationResult::Time(t) => t.hash(state),
-            EvaluationResult::Quantity(val, unit) => {
+            EvaluationResult::Decimal(d, _) => d.normalize().hash(state),
+            EvaluationResult::Integer(i, _) => i.hash(state),
+            EvaluationResult::Date(d, _) => d.hash(state),
+            EvaluationResult::DateTime(dt, _) => dt.hash(state),
+            EvaluationResult::Time(t, _) => t.hash(state),
+            EvaluationResult::Quantity(val, unit, _) => {
                 // Hash both normalized value and unit
                 val.normalize().hash(state);
                 unit.hash(state);
             }
-            EvaluationResult::Collection { items, has_undefined_order } => {
+            EvaluationResult::Collection {
+                items,
+                has_undefined_order,
+                ..
+            } => {
                 // Hash order flag and items
                 has_undefined_order.hash(state);
                 items.len().hash(state);
@@ -580,8 +629,9 @@ impl Hash for EvaluationResult {
                     item.hash(state);
                 }
             }
-            EvaluationResult::Object(map) => {
+            EvaluationResult::Object { map, .. } => {
                 // Hash objects with sorted keys for deterministic results
+                // Note: We don't hash type_namespace/type_name to maintain compatibility
                 let mut keys: Vec<_> = map.keys().collect();
                 keys.sort();
                 keys.len().hash(state);
@@ -594,10 +644,165 @@ impl Hash for EvaluationResult {
     }
 }
 
-
 // === EvaluationResult Methods ===
 
 impl EvaluationResult {
+    // === Constructor Methods ===
+
+    /// Creates a Boolean result with System type.
+    pub fn boolean(value: bool) -> Self {
+        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("System", "Boolean")))
+    }
+
+    /// Creates a Boolean result with FHIR type.
+    pub fn fhir_boolean(value: bool) -> Self {
+        EvaluationResult::Boolean(value, Some(TypeInfoResult::new("FHIR", "boolean")))
+    }
+
+    /// Creates a String result with System type.
+    pub fn string(value: String) -> Self {
+        EvaluationResult::String(value, Some(TypeInfoResult::new("System", "String")))
+    }
+
+    /// Creates a String result with FHIR type.
+    pub fn fhir_string(value: String, fhir_type: &str) -> Self {
+        EvaluationResult::String(value, Some(TypeInfoResult::new("FHIR", fhir_type)))
+    }
+
+    /// Creates an Integer result with System type.
+    pub fn integer(value: i64) -> Self {
+        EvaluationResult::Integer(value, Some(TypeInfoResult::new("System", "Integer")))
+    }
+
+    /// Creates an Integer result with FHIR type.
+    pub fn fhir_integer(value: i64) -> Self {
+        EvaluationResult::Integer(value, Some(TypeInfoResult::new("FHIR", "integer")))
+    }
+
+    /// Creates a Decimal result with System type.
+    pub fn decimal(value: Decimal) -> Self {
+        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("System", "Decimal")))
+    }
+
+    /// Creates a Decimal result with FHIR type.
+    pub fn fhir_decimal(value: Decimal) -> Self {
+        EvaluationResult::Decimal(value, Some(TypeInfoResult::new("FHIR", "decimal")))
+    }
+
+    /// Creates a Date result with System type.
+    pub fn date(value: String) -> Self {
+        EvaluationResult::Date(value, Some(TypeInfoResult::new("System", "Date")))
+    }
+
+    /// Creates a DateTime result with System type.
+    pub fn datetime(value: String) -> Self {
+        EvaluationResult::DateTime(value, Some(TypeInfoResult::new("System", "DateTime")))
+    }
+
+    /// Creates a Time result with System type.
+    pub fn time(value: String) -> Self {
+        EvaluationResult::Time(value, Some(TypeInfoResult::new("System", "Time")))
+    }
+
+    /// Creates a Quantity result with System type.
+    pub fn quantity(value: Decimal, unit: String) -> Self {
+        EvaluationResult::Quantity(value, unit, Some(TypeInfoResult::new("System", "Quantity")))
+    }
+
+    /// Creates a Collection result.
+    pub fn collection(items: Vec<EvaluationResult>) -> Self {
+        EvaluationResult::Collection {
+            items,
+            has_undefined_order: false,
+            type_info: None,
+        }
+    }
+
+    /// Creates an Object variant with just the map, no type information.
+    pub fn object(map: HashMap<String, EvaluationResult>) -> Self {
+        EvaluationResult::Object {
+            map,
+            type_info: None,
+        }
+    }
+
+    /// Creates an Object variant with type information.
+    pub fn typed_object(
+        map: HashMap<String, EvaluationResult>,
+        type_namespace: &str,
+        type_name: &str,
+    ) -> Self {
+        EvaluationResult::Object {
+            map,
+            type_info: Some(TypeInfoResult::new(type_namespace, type_name)),
+        }
+    }
+
+    // === Value Extraction Methods ===
+
+    /// Extracts the boolean value if this is a Boolean variant.
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self {
+            EvaluationResult::Boolean(val, _) => Some(*val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the string value if this is a String variant.
+    pub fn as_string(&self) -> Option<&String> {
+        match self {
+            EvaluationResult::String(val, _) => Some(val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the integer value if this is an Integer variant.
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            EvaluationResult::Integer(val, _) => Some(*val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the decimal value if this is a Decimal variant.
+    pub fn as_decimal(&self) -> Option<Decimal> {
+        match self {
+            EvaluationResult::Decimal(val, _) => Some(*val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the date value if this is a Date variant.
+    pub fn as_date(&self) -> Option<&String> {
+        match self {
+            EvaluationResult::Date(val, _) => Some(val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the datetime value if this is a DateTime variant.
+    pub fn as_datetime(&self) -> Option<&String> {
+        match self {
+            EvaluationResult::DateTime(val, _) => Some(val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the time value if this is a Time variant.
+    pub fn as_time(&self) -> Option<&String> {
+        match self {
+            EvaluationResult::Time(val, _) => Some(val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the quantity value if this is a Quantity variant.
+    pub fn as_quantity(&self) -> Option<(Decimal, &String)> {
+        match self {
+            EvaluationResult::Quantity(val, unit, _) => Some((*val, unit)),
+            _ => None,
+        }
+    }
     /// Checks if this result represents a collection.
     ///
     /// Returns `true` only for the `Collection` variant, not for other
@@ -683,11 +888,11 @@ impl EvaluationResult {
     pub fn to_boolean(&self) -> bool {
         match self {
             EvaluationResult::Empty => false,
-            EvaluationResult::Boolean(b) => *b,
-            EvaluationResult::String(s) => !s.is_empty(),
-            EvaluationResult::Decimal(d) => !d.is_zero(),
-            EvaluationResult::Integer(i) => *i != 0,
-            EvaluationResult::Quantity(q, _) => !q.is_zero(), // Truthy if value is non-zero
+            EvaluationResult::Boolean(b, _) => *b,
+            EvaluationResult::String(s, _) => !s.is_empty(),
+            EvaluationResult::Decimal(d, _) => !d.is_zero(),
+            EvaluationResult::Integer(i, _) => *i != 0,
+            EvaluationResult::Quantity(q, _, _) => !q.is_zero(), // Truthy if value is non-zero
             EvaluationResult::Collection { items, .. } => !items.is_empty(),
             _ => true, // Date, DateTime, Time, Object are always truthy
         }
@@ -725,14 +930,14 @@ impl EvaluationResult {
     pub fn to_string_value(&self) -> String {
         match self {
             EvaluationResult::Empty => "".to_string(),
-            EvaluationResult::Boolean(b) => b.to_string(),
-            EvaluationResult::String(s) => s.clone(),
-            EvaluationResult::Decimal(d) => d.to_string(),
-            EvaluationResult::Integer(i) => i.to_string(),
-            EvaluationResult::Date(d) => d.clone(), // Return stored string
-            EvaluationResult::DateTime(dt) => dt.clone(), // Return stored string
-            EvaluationResult::Time(t) => t.clone(), // Return stored string
-            EvaluationResult::Quantity(val, unit) => {
+            EvaluationResult::Boolean(b, _) => b.to_string(),
+            EvaluationResult::String(s, _) => s.clone(),
+            EvaluationResult::Decimal(d, _) => d.to_string(),
+            EvaluationResult::Integer(i, _) => i.to_string(),
+            EvaluationResult::Date(d, _) => d.clone(), // Return stored string
+            EvaluationResult::DateTime(dt, _) => dt.clone(), // Return stored string
+            EvaluationResult::Time(t, _) => t.clone(), // Return stored string
+            EvaluationResult::Quantity(val, unit, _) => {
                 // Format as "value 'unit'" per FHIRPath specification
                 format!("{} '{}'", val, unit)
             }
@@ -745,14 +950,15 @@ impl EvaluationResult {
                     // Multiple items: return bracketed comma-separated list
                     format!(
                         "[{}]",
-                        items.iter()
+                        items
+                            .iter()
                             .map(|r| r.to_string_value())
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
                 }
             }
-            EvaluationResult::Object(_) => "[object]".to_string(),
+            EvaluationResult::Object { .. } => "[object]".to_string(),
         }
     }
 
@@ -793,12 +999,14 @@ impl EvaluationResult {
     /// ```
     pub fn to_boolean_for_logic(&self) -> Result<EvaluationResult, EvaluationError> {
         match self {
-            EvaluationResult::Boolean(b) => Ok(EvaluationResult::Boolean(*b)),
-            EvaluationResult::String(s) => {
+            EvaluationResult::Boolean(b, type_info) => {
+                Ok(EvaluationResult::Boolean(*b, type_info.clone()))
+            }
+            EvaluationResult::String(s, _) => {
                 // Convert string to boolean based on recognized values
                 Ok(match s.to_lowercase().as_str() {
-                    "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::Boolean(true),
-                    "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::Boolean(false),
+                    "true" | "t" | "yes" | "1" | "1.0" => EvaluationResult::boolean(true),
+                    "false" | "f" | "no" | "0" | "0.0" => EvaluationResult::boolean(false),
                     _ => EvaluationResult::Empty, // Unrecognized strings become Empty
                 })
             }
@@ -807,18 +1015,19 @@ impl EvaluationResult {
                     0 => Ok(EvaluationResult::Empty),
                     1 => items[0].to_boolean_for_logic(), // Recursive conversion
                     n => Err(EvaluationError::SingletonEvaluationError(format!(
-                        "Boolean logic requires singleton collection, found {} items", n
-                    )))
+                        "Boolean logic requires singleton collection, found {} items",
+                        n
+                    ))),
                 }
             }
             // Per FHIRPath spec section 5.2: other types evaluate to Empty for logical operators
-            EvaluationResult::Integer(_)
-            | EvaluationResult::Decimal(_)
-            | EvaluationResult::Date(_)
-            | EvaluationResult::DateTime(_)
-            | EvaluationResult::Time(_)
-            | EvaluationResult::Quantity(_, _)
-            | EvaluationResult::Object(_) => Ok(EvaluationResult::Empty),
+            EvaluationResult::Integer(_, _)
+            | EvaluationResult::Decimal(_, _)
+            | EvaluationResult::Date(_, _)
+            | EvaluationResult::DateTime(_, _)
+            | EvaluationResult::Time(_, _)
+            | EvaluationResult::Quantity(_, _, _)
+            | EvaluationResult::Object { .. } => Ok(EvaluationResult::Empty),
             EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         }
     }
@@ -838,7 +1047,10 @@ impl EvaluationResult {
     /// assert!(!EvaluationResult::Integer(42).is_string_or_empty());
     /// ```
     pub fn is_string_or_empty(&self) -> bool {
-        matches!(self, EvaluationResult::String(_) | EvaluationResult::Empty)
+        matches!(
+            self,
+            EvaluationResult::String(_, _) | EvaluationResult::Empty
+        )
     }
 
     /// Returns the type name of this evaluation result.
@@ -854,7 +1066,7 @@ impl EvaluationResult {
     /// assert_eq!(EvaluationResult::Empty.type_name(), "Empty");
     /// assert_eq!(EvaluationResult::String("test".to_string()).type_name(), "String");
     /// assert_eq!(EvaluationResult::Integer(42).type_name(), "Integer");
-    /// 
+    ///
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![],
     ///     has_undefined_order: false,
@@ -864,16 +1076,16 @@ impl EvaluationResult {
     pub fn type_name(&self) -> &'static str {
         match self {
             EvaluationResult::Empty => "Empty",
-            EvaluationResult::Boolean(_) => "Boolean",
-            EvaluationResult::String(_) => "String",
-            EvaluationResult::Decimal(_) => "Decimal",
-            EvaluationResult::Integer(_) => "Integer",
-            EvaluationResult::Date(_) => "Date",
-            EvaluationResult::DateTime(_) => "DateTime",
-            EvaluationResult::Time(_) => "Time",
-            EvaluationResult::Quantity(_, _) => "Quantity",
+            EvaluationResult::Boolean(_, _) => "Boolean",
+            EvaluationResult::String(_, _) => "String",
+            EvaluationResult::Decimal(_, _) => "Decimal",
+            EvaluationResult::Integer(_, _) => "Integer",
+            EvaluationResult::Date(_, _) => "Date",
+            EvaluationResult::DateTime(_, _) => "DateTime",
+            EvaluationResult::Time(_, _) => "Time",
+            EvaluationResult::Quantity(_, _, _) => "Quantity",
             EvaluationResult::Collection { .. } => "Collection",
-            EvaluationResult::Object(_) => "Object",
+            EvaluationResult::Object { .. } => "Object",
         }
     }
 }
@@ -889,7 +1101,7 @@ impl EvaluationResult {
 /// This is the most direct conversion for text values in the FHIRPath system.
 impl IntoEvaluationResult for String {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::String(self.clone())
+        EvaluationResult::string(self.clone())
     }
 }
 
@@ -898,7 +1110,7 @@ impl IntoEvaluationResult for String {
 /// Enables direct use of Rust boolean values in FHIRPath expressions.
 impl IntoEvaluationResult for bool {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Boolean(*self)
+        EvaluationResult::boolean(*self)
     }
 }
 
@@ -907,7 +1119,7 @@ impl IntoEvaluationResult for bool {
 /// Automatically promotes to `i64` for consistent integer handling.
 impl IntoEvaluationResult for i32 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Integer(*self as i64)
+        EvaluationResult::integer(*self as i64)
     }
 }
 
@@ -916,7 +1128,7 @@ impl IntoEvaluationResult for i32 {
 /// This is the primary integer type used in FHIRPath evaluation.
 impl IntoEvaluationResult for i64 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Integer(*self)
+        EvaluationResult::integer(*self)
     }
 }
 
@@ -927,7 +1139,7 @@ impl IntoEvaluationResult for i64 {
 impl IntoEvaluationResult for f64 {
     fn into_evaluation_result(&self) -> EvaluationResult {
         Decimal::from_f64(*self)
-            .map(EvaluationResult::Decimal)
+            .map(EvaluationResult::decimal)
             .unwrap_or(EvaluationResult::Empty)
     }
 }
@@ -937,7 +1149,7 @@ impl IntoEvaluationResult for f64 {
 /// This is the preferred conversion for precise decimal values in FHIR.
 impl IntoEvaluationResult for Decimal {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::Decimal(*self)
+        EvaluationResult::decimal(*self)
     }
 }
 
@@ -975,9 +1187,10 @@ where
             .iter()
             .map(|item| item.into_evaluation_result())
             .collect();
-        EvaluationResult::Collection { 
-            items: collection, 
-            has_undefined_order: false 
+        EvaluationResult::Collection {
+            items: collection,
+            has_undefined_order: false,
+            type_info: None,
         }
     }
 }

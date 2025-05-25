@@ -11,49 +11,49 @@ mod tests {
         let mut patient = HashMap::new();
         
         // Add resourceType
-        patient.insert("resourceType".to_string(), EvaluationResult::String("Patient".to_string()));
+        patient.insert("resourceType".to_string(), EvaluationResult::string("Patient".to_string()));
         
         // Add id
-        patient.insert("id".to_string(), EvaluationResult::String("123".to_string()));
+        patient.insert("id".to_string(), EvaluationResult::string("123".to_string()));
         
         // Add simple property
-        patient.insert("active".to_string(), EvaluationResult::Boolean(true));
+        patient.insert("active".to_string(), EvaluationResult::boolean(true));
         
         // Add a complex property (name)
         let mut name = HashMap::new();
-        name.insert("use".to_string(), EvaluationResult::String("official".to_string()));
+        name.insert("use".to_string(), EvaluationResult::string("official".to_string()));
         
         // Add given names as a collection
         let given = vec![
-            EvaluationResult::String("John".to_string()),
-            EvaluationResult::String("Bob".to_string()),
+            EvaluationResult::string("John".to_string()),
+            EvaluationResult::string("Bob".to_string()),
         ];
-        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false });
+        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false, type_info: None });
         
         // Add family name
-        name.insert("family".to_string(), EvaluationResult::String("Doe".to_string()));
+        name.insert("family".to_string(), EvaluationResult::string("Doe".to_string()));
         
         // Add name to patient
-        patient.insert("name".to_string(), EvaluationResult::Object(name));
+        patient.insert("name".to_string(), EvaluationResult::object(name));
         
         // Add a telecom collection
         let mut telecom1 = HashMap::new();
-        telecom1.insert("system".to_string(), EvaluationResult::String("phone".to_string()));
-        telecom1.insert("value".to_string(), EvaluationResult::String("555-1234".to_string()));
+        telecom1.insert("system".to_string(), EvaluationResult::string("phone".to_string()));
+        telecom1.insert("value".to_string(), EvaluationResult::string("555-1234".to_string()));
         
         let mut telecom2 = HashMap::new();
-        telecom2.insert("system".to_string(), EvaluationResult::String("email".to_string()));
-        telecom2.insert("value".to_string(), EvaluationResult::String("john.doe@example.com".to_string()));
+        telecom2.insert("system".to_string(), EvaluationResult::string("email".to_string()));
+        telecom2.insert("value".to_string(), EvaluationResult::string("john.doe@example.com".to_string()));
         
         let telecom = vec![
-            EvaluationResult::Object(telecom1),
-            EvaluationResult::Object(telecom2),
+            EvaluationResult::object(telecom1),
+            EvaluationResult::object(telecom2),
         ];
         
-        patient.insert("telecom".to_string(), EvaluationResult::Collection { items: telecom, has_undefined_order: false });
+        patient.insert("telecom".to_string(), EvaluationResult::Collection { items: telecom, has_undefined_order: false, type_info: None });
         
         // Return as an object
-        EvaluationResult::Object(patient)
+        EvaluationResult::object(patient)
     }
     
     // Helper function to create a collection of objects
@@ -63,17 +63,18 @@ mod tests {
         
         // Create a second patient
         let mut patient2 = HashMap::new();
-        patient2.insert("resourceType".to_string(), EvaluationResult::String("Patient".to_string()));
-        patient2.insert("id".to_string(), EvaluationResult::String("456".to_string()));
-        patient2.insert("active".to_string(), EvaluationResult::Boolean(false));
+        patient2.insert("resourceType".to_string(), EvaluationResult::string("Patient".to_string()));
+        patient2.insert("id".to_string(), EvaluationResult::string("456".to_string()));
+        patient2.insert("active".to_string(), EvaluationResult::boolean(false));
         
         // Return as a collection
         EvaluationResult::Collection {
             items: vec![
                 patient,
-                EvaluationResult::Object(patient2),
+                EvaluationResult::object(patient2),
             ],
             has_undefined_order: false,
+            type_info: None,
         }
     }
     
@@ -93,7 +94,7 @@ mod tests {
             EvaluationResult::Collection { items, .. } => {
                 // Check that resourceType is excluded
                 assert!(!items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "Patient"
                     } else {
                         false
@@ -106,7 +107,7 @@ mod tests {
                 
                 // Check for specific expected values
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "123"
                     } else {
                         false
@@ -114,7 +115,7 @@ mod tests {
                 }));
                 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::Boolean(b_val) = item { // Renamed to avoid confusion
+                    if let EvaluationResult::Boolean(b_val, _) = item { // Renamed to avoid confusion
                         *b_val // if b_val is &bool, dereference to get bool
                     } else {
                         false
@@ -126,7 +127,7 @@ mod tests {
         
         // Test children() on a primitive type (should return Empty)
         let mut primitive_context = EvaluationContext::new_empty();
-        primitive_context.set_this(EvaluationResult::String("test".to_string()));
+        primitive_context.set_this(EvaluationResult::string("test".to_string()));
         
         let primitive_result = evaluate(&parser().parse("$this.children()").unwrap(), &primitive_context, None).unwrap();
         assert_eq!(primitive_result, EvaluationResult::Empty);
@@ -167,7 +168,7 @@ mod tests {
                 
                 // Check for specific expected values in the deep structure
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "official" // name.use value
                     } else {
                         false
@@ -175,7 +176,7 @@ mod tests {
                 }));
                 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "John" // One of the name.given values
                     } else {
                         false
@@ -183,7 +184,7 @@ mod tests {
                 }));
                 
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "555-1234" // telecom[0].value
                     } else {
                         false
@@ -195,7 +196,7 @@ mod tests {
         
         // Test descendants() on a primitive type (should return Empty)
         let mut primitive_context = EvaluationContext::new_empty();
-        primitive_context.set_this(EvaluationResult::String("test".to_string()));
+        primitive_context.set_this(EvaluationResult::string("test".to_string()));
         
         let primitive_result = evaluate(&parser().parse("$this.descendants()").unwrap(), &primitive_context, None).unwrap();
         assert_eq!(primitive_result, EvaluationResult::Empty);
@@ -220,17 +221,17 @@ mod tests {
     fn test_children_with_resource_paths() {
         // Create a simple object to test with
         let mut simple_obj = HashMap::new();
-        simple_obj.insert("resourceType".to_string(), EvaluationResult::String("SimpleObject".to_string()));
-        simple_obj.insert("id".to_string(), EvaluationResult::String("123".to_string()));
+        simple_obj.insert("resourceType".to_string(), EvaluationResult::string("SimpleObject".to_string()));
+        simple_obj.insert("id".to_string(), EvaluationResult::string("123".to_string()));
         
         // Create a nested object
         let mut nested = HashMap::new();
-        nested.insert("nestedValue".to_string(), EvaluationResult::String("nested".to_string()));
-        simple_obj.insert("nested".to_string(), EvaluationResult::Object(nested));
+        nested.insert("nestedValue".to_string(), EvaluationResult::string("nested".to_string()));
+        simple_obj.insert("nested".to_string(), EvaluationResult::object(nested));
         
         // Setup context
         let mut test_context = EvaluationContext::new_empty();
-        test_context.set_this(EvaluationResult::Object(simple_obj));
+        test_context.set_this(EvaluationResult::object(simple_obj));
         
         // Test children() function 
         let result = evaluate(&parser().parse("$this.children()").unwrap(), &test_context, None).unwrap();
@@ -243,7 +244,7 @@ mod tests {
                 
                 // Check that we get the id value
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::String(s) = item {
+                    if let EvaluationResult::String(s, _) = item {
                         s == "123" // id value
                     } else {
                         false
@@ -252,7 +253,7 @@ mod tests {
                 
                 // Check that we get the nested object
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::Object(_) = item {
+                    if let EvaluationResult::Object { map: _, .. } = item {
                         true
                     } else {
                         false

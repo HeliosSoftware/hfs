@@ -3,7 +3,7 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 use rust_decimal::prelude::ToPrimitive;
 
 /// Implementation of the FHIRPath `toLong()` function.
-/// 
+///
 /// This function attempts to convert its input to a Long (64-bit integer) value.
 /// According to the FHIRPath specification, various input types can be converted to Long:
 /// - Integer values are returned as is
@@ -21,7 +21,7 @@ use rust_decimal::prelude::ToPrimitive;
 /// or `EvaluationResult::Empty` if conversion failed
 pub fn to_long(
     input: &EvaluationResult,
-    _context: &EvaluationContext
+    _context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     match input {
         // Collection handling: if it contains exactly one item, convert that item
@@ -32,44 +32,40 @@ pub fn to_long(
             } else {
                 Ok(EvaluationResult::Empty)
             }
-        },
-        
+        }
+
         // Integer is already a 64-bit integer in our implementation, so just return it
-        EvaluationResult::Integer(i) => Ok(EvaluationResult::Integer(*i)),
-        
+        EvaluationResult::Integer(i, _) => Ok(EvaluationResult::integer(*i)),
+
         // Decimal is converted to Long by truncating the fractional part
         // Return Empty if conversion fails (e.g., overflow)
-        EvaluationResult::Decimal(d) => {
-            match d.to_i64() {
-                Some(i) => Ok(EvaluationResult::Integer(i)),
-                None => Ok(EvaluationResult::Empty)
-            }
+        EvaluationResult::Decimal(d, _) => match d.to_i64() {
+            Some(i) => Ok(EvaluationResult::integer(i)),
+            None => Ok(EvaluationResult::Empty),
         },
-        
+
         // Boolean: true -> 1, false -> 0
-        EvaluationResult::Boolean(b) => {
+        EvaluationResult::Boolean(b, _) => {
             if *b {
-                Ok(EvaluationResult::Integer(1))
+                Ok(EvaluationResult::integer(1))
             } else {
-                Ok(EvaluationResult::Integer(0))
+                Ok(EvaluationResult::integer(0))
             }
-        },
-        
+        }
+
         // String: attempt to parse as a Long
-        EvaluationResult::String(s) => {
-            match s.parse::<i64>() {
-                Ok(i) => Ok(EvaluationResult::Integer(i)),
-                Err(_) => Ok(EvaluationResult::Empty)
-            }
+        EvaluationResult::String(s, _) => match s.parse::<i64>() {
+            Ok(i) => Ok(EvaluationResult::integer(i)),
+            Err(_) => Ok(EvaluationResult::Empty),
         },
-        
+
         // All other types: return Empty
-        _ => Ok(EvaluationResult::Empty)
+        _ => Ok(EvaluationResult::Empty),
     }
 }
 
 /// Implementation of the FHIRPath `convertsToLong()` function.
-/// 
+///
 /// This function determines whether a value can be successfully converted to a Long value.
 /// It follows the same conversion rules as `toLong()` but returns a Boolean result
 /// indicating success or failure instead of the converted value.
@@ -79,11 +75,11 @@ pub fn to_long(
 /// * `_context` - The evaluation context (not used in this implementation)
 ///
 /// # Returns
-/// `EvaluationResult::Boolean(true)` if conversion would succeed, 
-/// `EvaluationResult::Boolean(false)` otherwise
+/// `EvaluationResult::boolean(true)` if conversion would succeed,
+/// `EvaluationResult::boolean(false)` otherwise
 pub fn converts_to_long(
     input: &EvaluationResult,
-    _context: &EvaluationContext
+    _context: &EvaluationContext,
 ) -> Result<EvaluationResult, EvaluationError> {
     match input {
         // Collection handling: if it contains exactly one item, check that item
@@ -92,28 +88,24 @@ pub fn converts_to_long(
             if items.len() == 1 {
                 converts_to_long(&items[0], _context)
             } else {
-                Ok(EvaluationResult::Boolean(false))
+                Ok(EvaluationResult::boolean(false))
             }
-        },
-        
+        }
+
         // Integer is already a 64-bit integer in our implementation, so always convertible
-        EvaluationResult::Integer(_) => Ok(EvaluationResult::Boolean(true)),
-        
+        EvaluationResult::Integer(_, _) => Ok(EvaluationResult::boolean(true)),
+
         // Decimal is convertible if it can fit in an i64
-        EvaluationResult::Decimal(d) => {
-            Ok(EvaluationResult::Boolean(d.to_i64().is_some()))
-        },
-        
+        EvaluationResult::Decimal(d, _) => Ok(EvaluationResult::boolean(d.to_i64().is_some())),
+
         // Boolean is always convertible
-        EvaluationResult::Boolean(_) => Ok(EvaluationResult::Boolean(true)),
-        
+        EvaluationResult::Boolean(_, _) => Ok(EvaluationResult::boolean(true)),
+
         // String is convertible if it can be parsed as an i64
-        EvaluationResult::String(s) => {
-            Ok(EvaluationResult::Boolean(s.parse::<i64>().is_ok()))
-        },
-        
+        EvaluationResult::String(s, _) => Ok(EvaluationResult::boolean(s.parse::<i64>().is_ok())),
+
         // All other types are not convertible
-        _ => Ok(EvaluationResult::Boolean(false))
+        _ => Ok(EvaluationResult::boolean(false)),
     }
 }
 
@@ -126,177 +118,202 @@ pub fn converts_to_long(
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
-    
+
     #[test]
     fn test_to_long_integer() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with Integer values
-        let result = to_long(&EvaluationResult::Integer(42), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
-        
-        let result = to_long(&EvaluationResult::Integer(-42), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(-42));
-        
-        let result = to_long(&EvaluationResult::Integer(0), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(0));
+        let result = to_long(&EvaluationResult::integer(42), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(42));
+
+        let result = to_long(&EvaluationResult::integer(-42), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(-42));
+
+        let result = to_long(&EvaluationResult::integer(0), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(0));
     }
-    
+
     #[test]
     fn test_to_long_decimal() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with Decimal values
-        let result = to_long(&EvaluationResult::Decimal(dec!(42.75)), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
-        
-        let result = to_long(&EvaluationResult::Decimal(dec!(-42.75)), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(-42));
-        
-        let result = to_long(&EvaluationResult::Decimal(dec!(0.999)), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(0));
+        let result = to_long(&EvaluationResult::decimal(dec!(42.75)), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(42));
+
+        let result = to_long(&EvaluationResult::decimal(dec!(-42.75)), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(-42));
+
+        let result = to_long(&EvaluationResult::decimal(dec!(0.999)), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(0));
     }
-    
+
     #[test]
     fn test_to_long_boolean() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with Boolean values
-        let result = to_long(&EvaluationResult::Boolean(true), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(1));
-        
-        let result = to_long(&EvaluationResult::Boolean(false), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(0));
+        let result = to_long(&EvaluationResult::boolean(true), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(1));
+
+        let result = to_long(&EvaluationResult::boolean(false), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(0));
     }
-    
+
     #[test]
     fn test_to_long_string() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with String values
-        let result = to_long(&EvaluationResult::String("42".to_string()), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
-        
-        let result = to_long(&EvaluationResult::String("-42".to_string()), &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(-42));
-        
+        let result = to_long(&EvaluationResult::string("42".to_string()), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(42));
+
+        let result = to_long(&EvaluationResult::string("-42".to_string()), &context).unwrap();
+        assert_eq!(result, EvaluationResult::integer(-42));
+
         // Test with invalid String value
-        let result = to_long(&EvaluationResult::String("not a number".to_string()), &context).unwrap();
+        let result = to_long(
+            &EvaluationResult::string("not a number".to_string()),
+            &context,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
-        let result = to_long(&EvaluationResult::String("42.5".to_string()), &context).unwrap();
+
+        let result = to_long(&EvaluationResult::string("42.5".to_string()), &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
-    
+
     #[test]
     fn test_to_long_collection() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with single-item Collection
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(42)],
+            items: vec![EvaluationResult::integer(42)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = to_long(&collection, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
-        
+        assert_eq!(result, EvaluationResult::integer(42));
+
         // Test with multi-item Collection
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(42), EvaluationResult::Integer(43)],
+            items: vec![EvaluationResult::integer(42), EvaluationResult::integer(43)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = to_long(&collection, &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
+
         // Test with empty Collection
         let collection = EvaluationResult::Collection {
             items: vec![],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = to_long(&collection, &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
-    
+
     #[test]
     fn test_to_long_other_types() {
         let context = EvaluationContext::new_empty();
-        
+
         // Test with other types that should return Empty
-        let result = to_long(&EvaluationResult::Date("2022-01-01".to_string()), &context).unwrap();
+        let result = to_long(&EvaluationResult::date("2022-01-01".to_string()), &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
-        let result = to_long(&EvaluationResult::DateTime("2022-01-01T12:00:00".to_string()), &context).unwrap();
+
+        let result = to_long(
+            &EvaluationResult::datetime("2022-01-01T12:00:00".to_string()),
+            &context,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
-        let result = to_long(&EvaluationResult::Time("12:00:00".to_string()), &context).unwrap();
+
+        let result = to_long(&EvaluationResult::time("12:00:00".to_string()), &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
+
         let result = to_long(&EvaluationResult::Empty, &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
-        
+
         let map = std::collections::HashMap::new();
-        let result = to_long(&EvaluationResult::Object(map), &context).unwrap();
+        let result = to_long(
+            &EvaluationResult::Object {
+                map,
+                type_info: None,
+            },
+            &context,
+        )
+        .unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
-    
+
     #[test]
     fn test_converts_to_long() {
         let context = EvaluationContext::new_empty();
-        
+
         // Types that should convert
         assert_eq!(
-            converts_to_long(&EvaluationResult::Integer(42), &context).unwrap(),
-            EvaluationResult::Boolean(true)
+            converts_to_long(&EvaluationResult::integer(42), &context).unwrap(),
+            EvaluationResult::boolean(true)
         );
-        
+
         assert_eq!(
-            converts_to_long(&EvaluationResult::Decimal(dec!(42.75)), &context).unwrap(),
-            EvaluationResult::Boolean(true)
+            converts_to_long(&EvaluationResult::decimal(dec!(42.75)), &context).unwrap(),
+            EvaluationResult::boolean(true)
         );
-        
+
         assert_eq!(
-            converts_to_long(&EvaluationResult::Boolean(true), &context).unwrap(),
-            EvaluationResult::Boolean(true)
+            converts_to_long(&EvaluationResult::boolean(true), &context).unwrap(),
+            EvaluationResult::boolean(true)
         );
-        
+
         assert_eq!(
-            converts_to_long(&EvaluationResult::String("42".to_string()), &context).unwrap(),
-            EvaluationResult::Boolean(true)
+            converts_to_long(&EvaluationResult::string("42".to_string()), &context).unwrap(),
+            EvaluationResult::boolean(true)
         );
-        
+
         // Types that should not convert
         assert_eq!(
-            converts_to_long(&EvaluationResult::String("not a number".to_string()), &context).unwrap(),
-            EvaluationResult::Boolean(false)
+            converts_to_long(
+                &EvaluationResult::string("not a number".to_string()),
+                &context
+            )
+            .unwrap(),
+            EvaluationResult::boolean(false)
         );
-        
+
         assert_eq!(
-            converts_to_long(&EvaluationResult::Date("2022-01-01".to_string()), &context).unwrap(),
-            EvaluationResult::Boolean(false)
+            converts_to_long(&EvaluationResult::date("2022-01-01".to_string()), &context).unwrap(),
+            EvaluationResult::boolean(false)
         );
-        
+
         assert_eq!(
             converts_to_long(&EvaluationResult::Empty, &context).unwrap(),
-            EvaluationResult::Boolean(false)
+            EvaluationResult::boolean(false)
         );
-        
+
         // Collections
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(42)],
+            items: vec![EvaluationResult::integer(42)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(
             converts_to_long(&collection, &context).unwrap(),
-            EvaluationResult::Boolean(true)
+            EvaluationResult::boolean(true)
         );
-        
+
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(42), EvaluationResult::Integer(43)],
+            items: vec![EvaluationResult::integer(42), EvaluationResult::integer(43)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(
             converts_to_long(&collection, &context).unwrap(),
-            EvaluationResult::Boolean(false)
+            EvaluationResult::boolean(false)
         );
     }
 }
+

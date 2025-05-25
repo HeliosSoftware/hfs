@@ -32,7 +32,7 @@ pub fn subset_of_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     let self_items = match invocation_base {
         EvaluationResult::Collection { items, .. } => items,
-        EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Empty set is subset of anything
+        EvaluationResult::Empty => return Ok(EvaluationResult::boolean(true)), // Empty set is subset of anything
         single => &[single.clone()][..], // Treat single item as slice
     };
     
@@ -48,7 +48,7 @@ pub fn subset_of_function(
     // Check if every item in self_items is present in other_set
     let is_subset = self_items.iter().all(|item| other_set.contains(item));
     
-    Ok(EvaluationResult::Boolean(is_subset))
+    Ok(EvaluationResult::boolean(is_subset))
 }
 
 /// Implements the FHIRPath `supersetOf` function
@@ -87,7 +87,7 @@ pub fn superset_of_function(
     
     let other_items = match other_collection {
         EvaluationResult::Collection { items, .. } => items,
-        EvaluationResult::Empty => return Ok(EvaluationResult::Boolean(true)), // Anything is superset of empty set
+        EvaluationResult::Empty => return Ok(EvaluationResult::boolean(true)), // Anything is superset of empty set
         single => &[single.clone()][..],
     };
 
@@ -97,7 +97,7 @@ pub fn superset_of_function(
     // Check if every item in other_items is present in self_set
     let is_superset = other_items.iter().all(|item| self_set.contains(item));
     
-    Ok(EvaluationResult::Boolean(is_superset))
+    Ok(EvaluationResult::boolean(is_superset))
 }
 
 #[cfg(test)]
@@ -109,28 +109,30 @@ mod tests {
         // Create test collections
         let collection1 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         let collection2 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Test [1, 2].subsetOf([1, 2, 3]) should be true
         let result = subset_of_function(&collection1, &collection2).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Test [1, 2, 3].subsetOf([1, 2]) should be false
         let result = subset_of_function(&collection2, &collection1).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
@@ -139,43 +141,45 @@ mod tests {
         let empty = EvaluationResult::Empty;
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         // Test [].subsetOf([1, 2]) should be true (empty set is subset of anything)
         let result = subset_of_function(&empty, &collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Test [1, 2].subsetOf([]) should be false
         let result = subset_of_function(&collection, &empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
     fn test_subset_of_with_single_items() {
         // Create test items
-        let item1 = EvaluationResult::Integer(1);
+        let item1 = EvaluationResult::integer(1);
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         // Test 1.subsetOf([1, 2]) should be true
         let result = subset_of_function(&item1, &collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Create a single item not in the collection
-        let item3 = EvaluationResult::Integer(3);
+        let item3 = EvaluationResult::integer(3);
         
         // Test 3.subsetOf([1, 2]) should be false
         let result = subset_of_function(&item3, &collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
@@ -183,28 +187,30 @@ mod tests {
         // Create test collections
         let collection1 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         let collection2 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Test [1, 2, 3].supersetOf([1, 2]) should be true
         let result = superset_of_function(&collection2, &collection1).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Test [1, 2].supersetOf([1, 2, 3]) should be false
         let result = superset_of_function(&collection1, &collection2).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
@@ -213,43 +219,45 @@ mod tests {
         let empty = EvaluationResult::Empty;
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         // Test [1, 2].supersetOf([]) should be true (any set is superset of empty set)
         let result = superset_of_function(&collection, &empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Test [].supersetOf([1, 2]) should be false
         let result = superset_of_function(&empty, &collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
     fn test_superset_of_with_single_items() {
         // Create test items
-        let item1 = EvaluationResult::Integer(1);
+        let item1 = EvaluationResult::integer(1);
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         // Test [1, 2].supersetOf(1) should be true
         let result = superset_of_function(&collection, &item1).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Create a single item not in the collection
-        let item3 = EvaluationResult::Integer(3);
+        let item3 = EvaluationResult::integer(3);
         
         // Test [1, 2].supersetOf(3) should be false
         let result = superset_of_function(&collection, &item3).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
     
     #[test]
@@ -257,26 +265,28 @@ mod tests {
         // Create identical collections
         let collection1 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         let collection2 = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         
         // Test [1, 2].subsetOf([1, 2]) should be true
         let result = subset_of_function(&collection1, &collection2).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
         
         // Test [1, 2].supersetOf([1, 2]) should be true
         let result = superset_of_function(&collection1, &collection2).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 }

@@ -10,21 +10,21 @@ fn test_trace_function() {
     // Basic test cases
     let trace_cases = vec![
         // Basic trace with literal
-        ("1.trace('test')", EvaluationResult::Integer(1)),
+        ("1.trace('test')", EvaluationResult::integer(1)),
         // Trace with a chain
-        ("1.trace('first').trace('second')", EvaluationResult::Integer(1)),
+        ("1.trace('first').trace('second')", EvaluationResult::integer(1)),
         // Trace with a collection
         ("(1 | 2 | 3).trace('collection')", EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
-        ], has_undefined_order: true }), // Union operator implies undefined order
+            EvaluationResult::integer(1),
+            EvaluationResult::integer(2),
+            EvaluationResult::integer(3),
+        ], has_undefined_order: true, type_info: None }), // Union operator implies undefined order
         // Trace with a projection (second parameter)
         ("(1 | 2 | 3).trace('projection', $this + 1)", EvaluationResult::Collection { items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
-        ], has_undefined_order: true }), // Input collection from union has undefined order
+            EvaluationResult::integer(1),
+            EvaluationResult::integer(2),
+            EvaluationResult::integer(3),
+        ], has_undefined_order: true, type_info: None }), // Input collection from union has undefined order
     ];
 
     // Run test cases

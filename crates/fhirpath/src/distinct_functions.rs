@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 /// Implements the FHIRPath isDistinct() function
 ///
-/// The isDistinct() function returns true if all items in the input collection 
-/// are distinct (not equal to each other). Returns true for empty collections 
+/// The isDistinct() function returns true if all items in the input collection
+/// are distinct (not equal to each other). Returns true for empty collections
 /// and single-item collections.
 ///
 /// # Arguments
@@ -31,7 +31,7 @@ pub fn is_distinct_function(
 
     // Empty or single-item collections are always distinct
     if items.len() <= 1 {
-        return Ok(EvaluationResult::Boolean(true));
+        return Ok(EvaluationResult::boolean(true));
     }
 
     // Check all pairs of items for equality
@@ -40,13 +40,13 @@ pub fn is_distinct_function(
             // Compare items[i] and items[j] for equality
             // We need to use simple_equality_check here since compare_equality is private
             if simple_equality_check(&items[i], &items[j]) {
-                return Ok(EvaluationResult::Boolean(false)); // Found a duplicate
+                return Ok(EvaluationResult::boolean(false)); // Found a duplicate
             }
         }
     }
 
     // No duplicates found
-    Ok(EvaluationResult::Boolean(true))
+    Ok(EvaluationResult::boolean(true))
 }
 
 /// Implements the FHIRPath distinct() function
@@ -78,14 +78,14 @@ pub fn distinct_function(
             if items.len() == 1 {
                 return Ok(items[0].clone());
             }
-            
+
             // Extract items for processing
             let items = items.clone();
-            
+
             // Use a set to track unique items
             let mut distinct_set = HashSet::new();
             let mut distinct_items = Vec::new(); // Maintain original order of first appearance
-            
+
             // Process each item in the collection
             for item in items {
                 // If the item is new (not in the distinct_set), add it to our results
@@ -93,11 +93,11 @@ pub fn distinct_function(
                     distinct_items.push(item);
                 }
             }
-            
+
             // Return the distinct items as a collection
             // distinct() output order is not guaranteed by spec, so mark as undefined
             Ok(normalize_collection_result(distinct_items, true))
-        },
+        }
         // For single (non-collection) items, return as is
         single_item => Ok(single_item.clone()),
     }
@@ -122,6 +122,7 @@ pub fn normalize_collection_result(
         if let EvaluationResult::Collection {
             items: inner_items,
             has_undefined_order: inner_undef_order,
+            type_info: None,
         } = single_item
         {
             // If the single item was a collection, re-wrap it, preserving its order status.
@@ -129,6 +130,7 @@ pub fn normalize_collection_result(
             EvaluationResult::Collection {
                 items: inner_items,
                 has_undefined_order: inner_undef_order,
+                type_info: None,
             }
         } else {
             single_item // Not a collection, or already handled.
@@ -137,29 +139,40 @@ pub fn normalize_collection_result(
         EvaluationResult::Collection {
             items,
             has_undefined_order: items_have_undefined_order,
+            type_info: None,
         }
     }
 }
 
 /// A simplified equality check for comparing items
-/// 
-/// This is a simple implementation for equality checks 
+///
+/// This is a simple implementation for equality checks
 /// as we can't access the private compare_equality function directly.
 fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
     match (a, b) {
         // Direct equality for simple types
-        (EvaluationResult::Boolean(a_val), EvaluationResult::Boolean(b_val)) => a_val == b_val,
-        (EvaluationResult::Integer(a_val), EvaluationResult::Integer(b_val)) => a_val == b_val,
-        (EvaluationResult::Decimal(a_val), EvaluationResult::Decimal(b_val)) => a_val == b_val,
-        (EvaluationResult::String(a_val), EvaluationResult::String(b_val)) => a_val == b_val,
-        
-        // Quantity comparison with same units
-        (EvaluationResult::Quantity(a_val, a_unit), EvaluationResult::Quantity(b_val, b_unit)) => {
-            a_val == b_val && a_unit == b_unit
+        (EvaluationResult::Boolean(a_val, _), EvaluationResult::Boolean(b_val, _)) => {
+            a_val == b_val
         }
-        
+        (EvaluationResult::Integer(a_val, _), EvaluationResult::Integer(b_val, _)) => {
+            a_val == b_val
+        }
+        (EvaluationResult::Decimal(a_val, _), EvaluationResult::Decimal(b_val, _)) => {
+            a_val == b_val
+        }
+        (EvaluationResult::String(a_val, _), EvaluationResult::String(b_val, _)) => a_val == b_val,
+
+        // Quantity comparison with same units
+        (
+            EvaluationResult::Quantity(a_val, a_unit, None),
+            EvaluationResult::Quantity(b_val, b_unit, None),
+        ) => a_val == b_val && a_unit == b_unit,
+
         // Object comparison by checking all keys/values are equal
-        (EvaluationResult::Object(a_map), EvaluationResult::Object(b_map)) => {
+        (
+            EvaluationResult::Object { map: a_map, .. },
+            EvaluationResult::Object { map: b_map, .. },
+        ) => {
             if a_map.len() != b_map.len() {
                 return false;
             }
@@ -174,18 +187,24 @@ fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
             }
             true
         }
-        
+
         // Collection comparison
-        (EvaluationResult::Collection { items: a_items, .. }, EvaluationResult::Collection { items: b_items, .. }) => {
+        (
+            EvaluationResult::Collection { items: a_items, .. },
+            EvaluationResult::Collection { items: b_items, .. },
+        ) => {
             if a_items.len() != b_items.len() {
                 return false;
             }
-            a_items.iter().zip(b_items.iter()).all(|(a, b)| simple_equality_check(a, b))
+            a_items
+                .iter()
+                .zip(b_items.iter())
+                .all(|(a, b)| simple_equality_check(a, b))
         }
-        
+
         // Special cases
         (EvaluationResult::Empty, EvaluationResult::Empty) => true,
-        
+
         // Default: not equal
         _ => false,
     }
@@ -196,10 +215,14 @@ mod tests {
     use super::*;
 
     // Helper to create a test collection
-    fn create_test_collection(items: Vec<EvaluationResult>, has_undefined_order: bool) -> EvaluationResult {
+    fn create_test_collection(
+        items: Vec<EvaluationResult>,
+        has_undefined_order: bool,
+    ) -> EvaluationResult {
         EvaluationResult::Collection {
             items,
             has_undefined_order,
+            type_info: None,
         }
     }
 
@@ -214,16 +237,16 @@ mod tests {
         let empty = EvaluationResult::Empty;
         let context = create_test_context();
         let result = is_distinct_function(&empty, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
     fn test_is_distinct_single_item() {
         // Test isDistinct() on a single item
-        let single = EvaluationResult::Integer(42);
+        let single = EvaluationResult::integer(42);
         let context = create_test_context();
         let result = is_distinct_function(&single, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -231,15 +254,15 @@ mod tests {
         // Test isDistinct() on a collection with all unique items
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             false,
         );
         let context = create_test_context();
         let result = is_distinct_function(&collection, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -247,15 +270,15 @@ mod tests {
         // Test isDistinct() on a collection with duplicates
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(1), // Duplicate
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(1), // Duplicate
             ],
             false,
         );
         let context = create_test_context();
         let result = is_distinct_function(&collection, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -269,9 +292,9 @@ mod tests {
     #[test]
     fn test_distinct_single_item() {
         // Test distinct() on a single item
-        let single = EvaluationResult::Integer(42);
+        let single = EvaluationResult::integer(42);
         let result = distinct_function(&single).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
+        assert_eq!(result, EvaluationResult::integer(42));
     }
 
     #[test]
@@ -279,22 +302,27 @@ mod tests {
         // Test distinct() on a collection with all unique items
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             false,
         );
         let result = distinct_function(&collection).unwrap();
-        
+
         // The result should be a collection with the same items
         // but has_undefined_order should be true (according to the spec)
-        if let EvaluationResult::Collection { items, has_undefined_order } = result {
+        if let EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+            ..
+        } = result
+        {
             assert_eq!(items.len(), 3);
             assert!(has_undefined_order); // This should be true as per spec
-            assert!(items.contains(&EvaluationResult::Integer(1)));
-            assert!(items.contains(&EvaluationResult::Integer(2)));
-            assert!(items.contains(&EvaluationResult::Integer(3)));
+            assert!(items.contains(&EvaluationResult::integer(1)));
+            assert!(items.contains(&EvaluationResult::integer(2)));
+            assert!(items.contains(&EvaluationResult::integer(3)));
         } else {
             panic!("Expected Collection result");
         }
@@ -305,25 +333,30 @@ mod tests {
         // Test distinct() on a collection with duplicates
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(1), // Duplicate
-                EvaluationResult::Integer(3),
-                EvaluationResult::Integer(2), // Duplicate
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(1), // Duplicate
+                EvaluationResult::integer(3),
+                EvaluationResult::integer(2), // Duplicate
             ],
             false,
         );
         let result = distinct_function(&collection).unwrap();
-        
+
         // The result should have unique items only
-        if let EvaluationResult::Collection { items, has_undefined_order } = result {
+        if let EvaluationResult::Collection {
+            items,
+            has_undefined_order,
+            ..
+        } = result
+        {
             assert_eq!(items.len(), 3);
             assert!(has_undefined_order); // This should be true as per spec
-            
+
             // First occurrences should be preserved in order
-            assert_eq!(items[0], EvaluationResult::Integer(1));
-            assert_eq!(items[1], EvaluationResult::Integer(2));
-            assert_eq!(items[2], EvaluationResult::Integer(3));
+            assert_eq!(items[0], EvaluationResult::integer(1));
+            assert_eq!(items[1], EvaluationResult::integer(2));
+            assert_eq!(items[2], EvaluationResult::integer(3));
         } else {
             panic!("Expected Collection result");
         }
@@ -339,38 +372,34 @@ mod tests {
     #[test]
     fn test_normalize_collection_single() {
         // Test normalize_collection_result with single item
-        let result = normalize_collection_result(vec![EvaluationResult::Integer(42)], false);
-        assert_eq!(result, EvaluationResult::Integer(42));
+        let result = normalize_collection_result(vec![EvaluationResult::integer(42)], false);
+        assert_eq!(result, EvaluationResult::integer(42));
     }
 
     #[test]
     fn test_normalize_collection_multiple() {
         // Test normalize_collection_result with multiple items
-        let items = vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-        ];
+        let items = vec![EvaluationResult::integer(1), EvaluationResult::integer(2)];
         let result = normalize_collection_result(items.clone(), true);
         assert_eq!(
             result,
             EvaluationResult::Collection {
                 items,
                 has_undefined_order: true,
+                type_info: None,
             }
         );
     }
-    
+
     #[test]
     fn test_normalize_collection_nested() {
         // Test normalize_collection_result with a single nested collection
         let inner_collection = EvaluationResult::Collection {
-            items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-            ],
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             has_undefined_order: true,
+            type_info: None,
         };
-        
+
         let result = normalize_collection_result(vec![inner_collection.clone()], false);
         assert_eq!(result, inner_collection);
     }
@@ -378,32 +407,33 @@ mod tests {
     #[test]
     fn test_simple_equality_integers() {
         assert!(simple_equality_check(
-            &EvaluationResult::Integer(42),
-            &EvaluationResult::Integer(42)
+            &EvaluationResult::integer(42),
+            &EvaluationResult::integer(42)
         ));
         assert!(!simple_equality_check(
-            &EvaluationResult::Integer(42),
-            &EvaluationResult::Integer(43)
+            &EvaluationResult::integer(42),
+            &EvaluationResult::integer(43)
         ));
     }
 
     #[test]
     fn test_simple_equality_strings() {
         assert!(simple_equality_check(
-            &EvaluationResult::String("test".to_string()),
-            &EvaluationResult::String("test".to_string())
+            &EvaluationResult::string("test".to_string()),
+            &EvaluationResult::string("test".to_string())
         ));
         assert!(!simple_equality_check(
-            &EvaluationResult::String("test".to_string()),
-            &EvaluationResult::String("different".to_string())
+            &EvaluationResult::string("test".to_string()),
+            &EvaluationResult::string("different".to_string())
         ));
     }
 
     #[test]
     fn test_simple_equality_different_types() {
         assert!(!simple_equality_check(
-            &EvaluationResult::Integer(42),
-            &EvaluationResult::String("42".to_string())
+            &EvaluationResult::integer(42),
+            &EvaluationResult::string("42".to_string())
         ));
     }
 }
+

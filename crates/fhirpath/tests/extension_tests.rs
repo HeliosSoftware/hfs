@@ -36,51 +36,49 @@ fn create_patient_context() -> EvaluationContext {
     // Add resourceType
     patient_obj.insert(
         "resourceType".to_string(),
-        EvaluationResult::String("Patient".to_string()),
+        EvaluationResult::string("Patient".to_string()),
     );
 
     // Add birthDate
     patient_obj.insert(
         "birthDate".to_string(),
-        EvaluationResult::String("1974-12-25".to_string()),
+        EvaluationResult::string("1974-12-25".to_string()),
     );
 
     // Create the extension object
     let mut extension_obj = HashMap::new();
     extension_obj.insert(
         "url".to_string(),
-        EvaluationResult::String(
-            "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
-        ),
+        EvaluationResult::string("http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string()),
     );
     extension_obj.insert(
         "valueDateTime".to_string(),
-        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string()),
+        EvaluationResult::string("1974-12-25T14:35:45-05:00".to_string()),
     );
 
     // Create _birthDate object
     let mut birthdate_ext_obj = HashMap::new();
     birthdate_ext_obj.insert(
         "extension".to_string(),
-        EvaluationResult::Collection { items: vec![EvaluationResult::Object(extension_obj.clone())], has_undefined_order: false },
+        EvaluationResult::Collection { items: vec![EvaluationResult::object(extension_obj.clone())], has_undefined_order: false, type_info: None },
     );
 
     // Add _birthDate to patient
     patient_obj.insert(
         "_birthDate".to_string(),
-        EvaluationResult::Object(birthdate_ext_obj),
+        EvaluationResult::object(birthdate_ext_obj),
     );
 
     // Create a separate underscore_birthdate for testing direct access
     let mut underscore_birthdate = HashMap::new();
     underscore_birthdate.insert(
         "extension".to_string(),
-        EvaluationResult::Collection { items: vec![EvaluationResult::Object(extension_obj)], has_undefined_order: false },
+        EvaluationResult::Collection { items: vec![EvaluationResult::object(extension_obj)], has_undefined_order: false, type_info: None },
     );
 
     // Set as context - both the patient and the _birthDate object for different tests
-    ctx.set_this(EvaluationResult::Object(patient_obj));
-    ctx.set_variable_result("_birthDate", EvaluationResult::Object(underscore_birthdate));
+    ctx.set_this(EvaluationResult::object(patient_obj));
+    ctx.set_variable_result("_birthDate", EvaluationResult::object(underscore_birthdate));
 
     // Add a variable for the extension URL
     ctx.set_variable(
@@ -99,7 +97,7 @@ fn test_direct_extension_access() {
     let result = eval("%_birthDate.extension[0].url", &ctx);
     assert_eq!(
         result,
-        EvaluationResult::String(
+        EvaluationResult::string(
             "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string()
         )
     );
@@ -107,7 +105,7 @@ fn test_direct_extension_access() {
     let result = eval("%_birthDate.extension[0].valueDateTime", &ctx);
     assert_eq!(
         result,
-        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string())
+        EvaluationResult::string("1974-12-25T14:35:45-05:00".to_string())
     );
 }
 
@@ -120,7 +118,7 @@ fn test_extension_function_with_hardcoded_url() {
         "%_birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').exists()",
         &ctx,
     );
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 
     let result = eval(
         "%_birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').valueDateTime",
@@ -128,7 +126,7 @@ fn test_extension_function_with_hardcoded_url() {
     );
     assert_eq!(
         result,
-        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string())
+        EvaluationResult::string("1974-12-25T14:35:45-05:00".to_string())
     );
 
     // Test with a URL that doesn't exist
@@ -136,7 +134,7 @@ fn test_extension_function_with_hardcoded_url() {
         "%_birthDate.extension('http://example.org/non-existent').exists()",
         &ctx,
     );
-    assert_eq!(result, EvaluationResult::Boolean(false));
+    assert_eq!(result, EvaluationResult::boolean(false));
 }
 
 #[test]
@@ -148,7 +146,7 @@ fn test_extension_function_with_variable() {
         "%_birthDate.extension(%`ext-patient-birthTime`).exists()",
         &ctx,
     );
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 
     let result = eval(
         "%_birthDate.extension(%`ext-patient-birthTime`).valueDateTime",
@@ -156,7 +154,7 @@ fn test_extension_function_with_variable() {
     );
     assert_eq!(
         result,
-        EvaluationResult::String("1974-12-25T14:35:45-05:00".to_string())
+        EvaluationResult::string("1974-12-25T14:35:45-05:00".to_string())
     );
 }
 
@@ -172,11 +170,11 @@ fn test_underscore_property_access() {
         "birthDate.extension('http://hl7.org/fhir/StructureDefinition/patient-birthTime').exists()",
         &ctx,
     );
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 
     let result = eval(
         "birthDate.extension(%`ext-patient-birthTime`).exists()",
         &ctx,
     );
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 }

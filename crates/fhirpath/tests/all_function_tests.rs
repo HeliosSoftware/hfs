@@ -3,7 +3,6 @@ use fhirpath::parser::parser;
 use fhirpath::EvaluationResult;
 use std::collections::HashMap;
 use chumsky::Parser;
-use rust_decimal_macros::dec;
 
 /// Helper function to create a nested collection structure for testing
 fn create_nested_collection() -> EvaluationResult {
@@ -13,34 +12,38 @@ fn create_nested_collection() -> EvaluationResult {
     // Inner collection 1: [1, 2]
     let inner1 = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
+            EvaluationResult::integer(1),
+            EvaluationResult::integer(2),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     // Inner collection 2: [3, 4, 5]
     let inner2 = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(4),
-            EvaluationResult::Integer(5),
+            EvaluationResult::integer(3),
+            EvaluationResult::integer(4),
+            EvaluationResult::integer(5),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     // Inner collection 3: [6]
     let inner3 = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(6),
+            EvaluationResult::integer(6),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     // Outer collection containing the inner collections
     EvaluationResult::Collection {
         items: vec![inner1, inner2, inner3],
         has_undefined_order: false,
+        type_info: None,
     }
 }
 
@@ -50,39 +53,40 @@ fn create_complex_object() -> EvaluationResult {
     
     // First observation with a value of 120
     let mut obs1 = HashMap::new();
-    obs1.insert("resourceType".to_string(), EvaluationResult::String("Observation".to_string()));
-    obs1.insert("status".to_string(), EvaluationResult::String("final".to_string()));
-    obs1.insert("value".to_string(), EvaluationResult::Integer(120));
+    obs1.insert("resourceType".to_string(), EvaluationResult::string("Observation".to_string()));
+    obs1.insert("status".to_string(), EvaluationResult::string("final".to_string()));
+    obs1.insert("value".to_string(), EvaluationResult::integer(120));
     
     // Second observation with a value of 80
     let mut obs2 = HashMap::new();
-    obs2.insert("resourceType".to_string(), EvaluationResult::String("Observation".to_string()));
-    obs2.insert("status".to_string(), EvaluationResult::String("final".to_string()));
-    obs2.insert("value".to_string(), EvaluationResult::Integer(80));
+    obs2.insert("resourceType".to_string(), EvaluationResult::string("Observation".to_string()));
+    obs2.insert("status".to_string(), EvaluationResult::string("final".to_string()));
+    obs2.insert("value".to_string(), EvaluationResult::integer(80));
     
     // Third observation with a missing value
     let mut obs3 = HashMap::new();
-    obs3.insert("resourceType".to_string(), EvaluationResult::String("Observation".to_string()));
-    obs3.insert("status".to_string(), EvaluationResult::String("cancelled".to_string()));
+    obs3.insert("resourceType".to_string(), EvaluationResult::string("Observation".to_string()));
+    obs3.insert("status".to_string(), EvaluationResult::string("cancelled".to_string()));
     
     // Patient resource with observations
     let mut patient = HashMap::new();
-    patient.insert("resourceType".to_string(), EvaluationResult::String("Patient".to_string()));
-    patient.insert("id".to_string(), EvaluationResult::String("123".to_string()));
+    patient.insert("resourceType".to_string(), EvaluationResult::string("Patient".to_string()));
+    patient.insert("id".to_string(), EvaluationResult::string("123".to_string()));
     
     // Create a collection of observations
     let observations = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Object(obs1),
-            EvaluationResult::Object(obs2),
-            EvaluationResult::Object(obs3),
+            EvaluationResult::object(obs1),
+            EvaluationResult::object(obs2),
+            EvaluationResult::object(obs3),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     patient.insert("observations".to_string(), observations);
     
-    EvaluationResult::Object(patient)
+    EvaluationResult::object(patient)
 }
 
 #[test]
@@ -90,13 +94,14 @@ fn test_all_with_simple_criteria() {
     // Create a simple collection [1, 2, 3, 4, 5]
     let collection = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
-            EvaluationResult::Integer(4),
-            EvaluationResult::Integer(5),
+            EvaluationResult::integer(1),
+            EvaluationResult::integer(2),
+            EvaluationResult::integer(3),
+            EvaluationResult::integer(4),
+            EvaluationResult::integer(5),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     let mut context = EvaluationContext::new_empty();
@@ -107,14 +112,14 @@ fn test_all_with_simple_criteria() {
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
     
     // Test: all elements are < 3
     let expr_str = "$this.all($this < 3)";
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(false));
+    assert_eq!(result, EvaluationResult::boolean(false));
 }
 
 #[test]
@@ -130,7 +135,7 @@ fn test_all_with_nested_collections() {
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
     
     // Test: all elements in inner collections are positive
     // This might be problematic because it requires nested collection traversal
@@ -140,7 +145,7 @@ fn test_all_with_nested_collections() {
     
     // This assertion may fail if the implementation doesn't handle nested all() correctly
     match result {
-        Ok(EvaluationResult::Boolean(true)) => (), // Expected correct behavior
+        Ok(EvaluationResult::Boolean(true, _)) => (), // Expected correct behavior
         _ => panic!("Failed to evaluate nested all() expression: {:?}", result),
     }
 }
@@ -158,7 +163,7 @@ fn test_all_with_complex_object_paths() {
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
     
     // Test: all observations have a value
     // This should fail because obs3 doesn't have a value
@@ -166,7 +171,7 @@ fn test_all_with_complex_object_paths() {
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(false));
+    assert_eq!(result, EvaluationResult::boolean(false));
     
     // Test: all final observations have a value
     // This involves a more complex criteria with multiple conditions
@@ -175,7 +180,7 @@ fn test_all_with_complex_object_paths() {
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
     // This assertion may fail if the implementation can't handle complex boolean logic
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
 }
 
 #[test]
@@ -183,11 +188,12 @@ fn test_all_with_type_operations() {
     // This test may fail due to issues with type operations
     let collection = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Decimal(dec!(2.5)),
-            EvaluationResult::String("3".to_string()),
+            EvaluationResult::integer(1),
+            EvaluationResult::decimal("2.5".parse().unwrap()),
+            EvaluationResult::string("3".to_string()),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     let mut context = EvaluationContext::new_empty();
@@ -198,7 +204,7 @@ fn test_all_with_type_operations() {
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(true));
+    assert_eq!(result, EvaluationResult::boolean(true));
     
     // Test: check using is/as operators with all()
     let expr_str = "$this.all($this is decimal or $this is integer or $this is string)";
@@ -207,7 +213,7 @@ fn test_all_with_type_operations() {
     
     // Check if we get a boolean result
     match result {
-        Ok(EvaluationResult::Boolean(_)) => (), // Expect any boolean result (we don't care about the value, just that it evaluates)
+        Ok(EvaluationResult::Boolean(_, _)) => (), // Expect any boolean result (we don't care about the value, just that it evaluates)
         _ => panic!("Failed to evaluate type operation with all() - result not a boolean: {:?}", result),
     }
 }
@@ -217,31 +223,33 @@ fn test_all_with_variable_references() {
     // This test may fail due to issues with variable resolution
     let collection = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(5),
-            EvaluationResult::Integer(10),
-            EvaluationResult::Integer(15),
+            EvaluationResult::integer(5),
+            EvaluationResult::integer(10),
+            EvaluationResult::integer(15),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     let mut context = EvaluationContext::new_empty();
     context.set_this(collection.clone());
-    context.set_variable_result("threshold", EvaluationResult::Integer(7));
+    context.set_variable_result("threshold", EvaluationResult::integer(7));
     
     // Test: all values are greater than the threshold variable
     let expr_str = "$this.all($this > %threshold)";
     let expr = parser().parse(expr_str).unwrap();
     let result = fhirpath::evaluate(&expr, &context, None).unwrap();
     
-    assert_eq!(result, EvaluationResult::Boolean(false));
+    assert_eq!(result, EvaluationResult::boolean(false));
     
     // Test with more complex variable use and path navigation
     context.set_variable_result("limits", EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(4),
-            EvaluationResult::Integer(12),
+            EvaluationResult::integer(4),
+            EvaluationResult::integer(12),
         ],
         has_undefined_order: false,
+        type_info: None,
     });
     
     // Test: all values are greater than the first limit
@@ -252,7 +260,7 @@ fn test_all_with_variable_references() {
     
     // Check if we get a boolean result
     match result {
-        Ok(EvaluationResult::Boolean(_)) => (), // Expect any boolean result
+        Ok(EvaluationResult::Boolean(_, _)) => (), // Expect any boolean result
         _ => panic!("Failed to evaluate all() with variable references - result not a boolean: {:?}", result),
     }
 }
@@ -262,11 +270,12 @@ fn test_all_with_non_boolean_result() {
     // This test should fail when criteria produces non-boolean results
     let collection = EvaluationResult::Collection {
         items: vec![
-            EvaluationResult::Integer(1),
-            EvaluationResult::Integer(2),
-            EvaluationResult::Integer(3),
+            EvaluationResult::integer(1),
+            EvaluationResult::integer(2),
+            EvaluationResult::integer(3),
         ],
         has_undefined_order: false,
+        type_info: None,
     };
     
     let mut context = EvaluationContext::new_empty();

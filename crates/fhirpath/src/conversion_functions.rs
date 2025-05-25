@@ -32,18 +32,18 @@ pub fn to_decimal_function(
     // Handle each type according to FHIRPath rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Boolean(b) => {
-            EvaluationResult::Decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
+        EvaluationResult::Boolean(b, _) => {
+            EvaluationResult::decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
         }
-        EvaluationResult::Integer(i) => EvaluationResult::Decimal(Decimal::from(*i)),
-        EvaluationResult::Decimal(d) => EvaluationResult::Decimal(*d),
-        EvaluationResult::String(s) => {
+        EvaluationResult::Integer(i, _) => EvaluationResult::decimal(Decimal::from(*i)),
+        EvaluationResult::Decimal(d, _) => EvaluationResult::decimal(*d),
+        EvaluationResult::String(s, _) => {
             // Try parsing as Decimal
             s.parse::<Decimal>()
-                .map(EvaluationResult::Decimal)
+                .map(EvaluationResult::decimal)
                 .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
         }
-        EvaluationResult::Quantity(val, _) => EvaluationResult::Decimal(*val),
+        EvaluationResult::Quantity(val, _, None) => EvaluationResult::decimal(*val),
         // Collections are handled by the count check above
         EvaluationResult::Collection { .. } => unreachable!(),
         // Other types are not convertible to Decimal
@@ -78,21 +78,21 @@ pub fn to_integer_function(
     // Handle each type according to FHIRPath rules
     Ok(match invocation_base {
         EvaluationResult::Empty => EvaluationResult::Empty,
-        EvaluationResult::Boolean(b) => EvaluationResult::Integer(if *b { 1 } else { 0 }),
-        EvaluationResult::Integer(i) => EvaluationResult::Integer(*i),
-        EvaluationResult::String(s) => {
+        EvaluationResult::Boolean(b, _) => EvaluationResult::integer(if *b { 1 } else { 0 }),
+        EvaluationResult::Integer(i, _) => EvaluationResult::integer(*i),
+        EvaluationResult::String(s, _) => {
             // Try parsing as i64
             s.parse::<i64>()
-                .map(EvaluationResult::Integer)
+                .map(EvaluationResult::integer)
                 .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
         }
         // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
-        EvaluationResult::Decimal(_) => EvaluationResult::Empty,
+        EvaluationResult::Decimal(_, _) => EvaluationResult::Empty,
         // Quantity to Integer (returns value if integer, else empty)
-        EvaluationResult::Quantity(val, _) => {
+        EvaluationResult::Quantity(val, _, None) => {
             if val.is_integer() {
                 val.to_i64()
-                    .map(EvaluationResult::Integer)
+                    .map(EvaluationResult::integer)
                     .unwrap_or(EvaluationResult::Empty)
             } else {
                 EvaluationResult::Empty
@@ -120,28 +120,28 @@ mod tests {
     #[test]
     fn test_to_decimal_boolean() {
         // Test toDecimal on Boolean values
-        let true_val = EvaluationResult::Boolean(true);
+        let true_val = EvaluationResult::boolean(true);
         let result = to_decimal_function(&true_val).unwrap();
-        assert_eq!(result, EvaluationResult::Decimal(Decimal::ONE));
+        assert_eq!(result, EvaluationResult::decimal(Decimal::ONE));
 
-        let false_val = EvaluationResult::Boolean(false);
+        let false_val = EvaluationResult::boolean(false);
         let result = to_decimal_function(&false_val).unwrap();
-        assert_eq!(result, EvaluationResult::Decimal(Decimal::ZERO));
+        assert_eq!(result, EvaluationResult::decimal(Decimal::ZERO));
     }
 
     #[test]
     fn test_to_decimal_integer() {
         // Test toDecimal on Integer
-        let int_val = EvaluationResult::Integer(42);
+        let int_val = EvaluationResult::integer(42);
         let result = to_decimal_function(&int_val).unwrap();
-        assert_eq!(result, EvaluationResult::Decimal(Decimal::from(42)));
+        assert_eq!(result, EvaluationResult::decimal(Decimal::from(42)));
     }
 
     #[test]
     fn test_to_decimal_decimal() {
         // Test toDecimal on Decimal
         let decimal = Decimal::from_str("3.14159").unwrap();
-        let decimal_val = EvaluationResult::Decimal(decimal);
+        let decimal_val = EvaluationResult::decimal(decimal);
         let result = to_decimal_function(&decimal_val).unwrap();
         assert_eq!(result, decimal_val);
     }
@@ -149,18 +149,18 @@ mod tests {
     #[test]
     fn test_to_decimal_string_valid() {
         // Test toDecimal on valid String
-        let string_val = EvaluationResult::String("3.14159".to_string());
+        let string_val = EvaluationResult::string("3.14159".to_string());
         let result = to_decimal_function(&string_val).unwrap();
         assert_eq!(
             result,
-            EvaluationResult::Decimal(Decimal::from_str("3.14159").unwrap())
+            EvaluationResult::decimal(Decimal::from_str("3.14159").unwrap())
         );
     }
 
     #[test]
     fn test_to_decimal_string_invalid() {
         // Test toDecimal on invalid String
-        let string_val = EvaluationResult::String("not a number".to_string());
+        let string_val = EvaluationResult::string("not a number".to_string());
         let result = to_decimal_function(&string_val).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -169,20 +169,18 @@ mod tests {
     fn test_to_decimal_quantity() {
         // Test toDecimal on Quantity
         let decimal = Decimal::from_str("3.14159").unwrap();
-        let quantity_val = EvaluationResult::Quantity(decimal, "m".to_string());
+        let quantity_val = EvaluationResult::quantity(decimal, "m".to_string());
         let result = to_decimal_function(&quantity_val).unwrap();
-        assert_eq!(result, EvaluationResult::Decimal(decimal));
+        assert_eq!(result, EvaluationResult::decimal(decimal));
     }
 
     #[test]
     fn test_to_decimal_collection() {
         // Test toDecimal on multi-item collection
         let collection = EvaluationResult::Collection {
-            items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-            ],
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = to_decimal_function(&collection);
         assert!(result.is_err());
@@ -199,19 +197,19 @@ mod tests {
     #[test]
     fn test_to_integer_boolean() {
         // Test toInteger on Boolean values
-        let true_val = EvaluationResult::Boolean(true);
+        let true_val = EvaluationResult::boolean(true);
         let result = to_integer_function(&true_val).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(1));
+        assert_eq!(result, EvaluationResult::integer(1));
 
-        let false_val = EvaluationResult::Boolean(false);
+        let false_val = EvaluationResult::boolean(false);
         let result = to_integer_function(&false_val).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(0));
+        assert_eq!(result, EvaluationResult::integer(0));
     }
 
     #[test]
     fn test_to_integer_integer() {
         // Test toInteger on Integer
-        let int_val = EvaluationResult::Integer(42);
+        let int_val = EvaluationResult::integer(42);
         let result = to_integer_function(&int_val).unwrap();
         assert_eq!(result, int_val);
     }
@@ -220,7 +218,7 @@ mod tests {
     fn test_to_integer_decimal() {
         // Test toInteger on Decimal - should return Empty per spec
         let decimal = Decimal::from_str("3.14159").unwrap();
-        let decimal_val = EvaluationResult::Decimal(decimal);
+        let decimal_val = EvaluationResult::decimal(decimal);
         let result = to_integer_function(&decimal_val).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -228,19 +226,19 @@ mod tests {
     #[test]
     fn test_to_integer_string_valid() {
         // Test toInteger on valid Integer String
-        let string_val = EvaluationResult::String("42".to_string());
+        let string_val = EvaluationResult::string("42".to_string());
         let result = to_integer_function(&string_val).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
+        assert_eq!(result, EvaluationResult::integer(42));
     }
 
     #[test]
     fn test_to_integer_string_invalid() {
         // Test toInteger on invalid or decimal String
-        let string_val = EvaluationResult::String("not a number".to_string());
+        let string_val = EvaluationResult::string("not a number".to_string());
         let result = to_integer_function(&string_val).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
 
-        let decimal_string = EvaluationResult::String("3.14".to_string());
+        let decimal_string = EvaluationResult::string("3.14".to_string());
         let result = to_integer_function(&decimal_string).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -249,16 +247,16 @@ mod tests {
     fn test_to_integer_quantity_integer() {
         // Test toInteger on Quantity with integer value
         let decimal = Decimal::from(42);
-        let quantity_val = EvaluationResult::Quantity(decimal, "units".to_string());
+        let quantity_val = EvaluationResult::quantity(decimal, "units".to_string());
         let result = to_integer_function(&quantity_val).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(42));
+        assert_eq!(result, EvaluationResult::integer(42));
     }
 
     #[test]
     fn test_to_integer_quantity_decimal() {
         // Test toInteger on Quantity with decimal value - should return Empty
         let decimal = Decimal::from_str("3.14159").unwrap();
-        let quantity_val = EvaluationResult::Quantity(decimal, "units".to_string());
+        let quantity_val = EvaluationResult::quantity(decimal, "units".to_string());
         let result = to_integer_function(&quantity_val).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -267,11 +265,9 @@ mod tests {
     fn test_to_integer_collection() {
         // Test toInteger on multi-item collection
         let collection = EvaluationResult::Collection {
-            items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-            ],
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = to_integer_function(&collection);
         assert!(result.is_err());

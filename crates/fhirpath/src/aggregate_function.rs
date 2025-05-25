@@ -100,8 +100,8 @@ mod tests {
 
         // Simulate computing $this + $total
         match (this, total) {
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => {
-                Ok(EvaluationResult::Integer(a + b))
+            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
+                Ok(EvaluationResult::integer(a + b))
             }
             _ => Ok(EvaluationResult::Empty),
         }
@@ -127,7 +127,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => {
+            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
                 if a < b {
                     Ok(this.clone())
                 } else {
@@ -158,7 +158,7 @@ mod tests {
 
         // Otherwise compare this and total
         match (this, total) {
-            (EvaluationResult::Integer(a), EvaluationResult::Integer(b)) => {
+            (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => {
                 if a > b {
                     Ok(this.clone())
                 } else {
@@ -173,22 +173,23 @@ mod tests {
     fn test_aggregate_sum() {
         // Create a collection of integers 1 through 9
         let collection = EvaluationResult::Collection {
-            items: (1..=9).map(|i| EvaluationResult::Integer(i)).collect(),
+            items: (1..=9).map(|i| EvaluationResult::integer(i)).collect(),
             has_undefined_order: false, // Assuming ordered for this literal collection
+            type_info: None,
         };
 
         // This expression uses $this + $total to sum values
         let expr = crate::parser::parser().parse("$this + $total").unwrap();
 
         // Initialize with 0
-        let init = EvaluationResult::Integer(0);
+        let init = EvaluationResult::integer(0);
 
         // Create empty context
         let mut context = EvaluationContext::new_empty();
 
         // Make sure variables are properly defined in the context
-        context.set_variable_result("$this", EvaluationResult::Integer(0));
-        context.set_variable_result("$total", EvaluationResult::Integer(0));
+        context.set_variable_result("$this", EvaluationResult::integer(0));
+        context.set_variable_result("$total", EvaluationResult::integer(0));
 
         // The real problem in the test is that we need to override the evaluate function
         // Instead of calling the real function, we'll create a custom aggregate function
@@ -202,7 +203,7 @@ mod tests {
 
         // Handle empty collection case
         if items_to_aggregate.is_empty() {
-            assert_eq!(EvaluationResult::Integer(0), EvaluationResult::Integer(0));
+            assert_eq!(EvaluationResult::integer(0), EvaluationResult::integer(0));
             return;
         }
 
@@ -232,7 +233,7 @@ mod tests {
         }
 
         // The sum of integers from 1 to 9 is 45
-        assert_eq!(total, EvaluationResult::Integer(45));
+        assert_eq!(total, EvaluationResult::integer(45));
     }
 
     #[test]
@@ -240,13 +241,14 @@ mod tests {
         // Create a collection of integers
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(5),
-                EvaluationResult::Integer(3),
-                EvaluationResult::Integer(9),
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(7),
+                EvaluationResult::integer(5),
+                EvaluationResult::integer(3),
+                EvaluationResult::integer(9),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(7),
             ],
             has_undefined_order: false, // Assuming ordered for this literal collection
+            type_info: None,
         };
 
         // Get the items to aggregate
@@ -282,7 +284,7 @@ mod tests {
         }
 
         // The minimum value should be 1
-        assert_eq!(total, EvaluationResult::Integer(1));
+        assert_eq!(total, EvaluationResult::integer(1));
     }
 
     #[test]
@@ -290,13 +292,14 @@ mod tests {
         // Create a collection of integers
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(5),
-                EvaluationResult::Integer(3),
-                EvaluationResult::Integer(9),
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(7),
+                EvaluationResult::integer(5),
+                EvaluationResult::integer(3),
+                EvaluationResult::integer(9),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(7),
             ],
             has_undefined_order: false, // Assuming ordered for this literal collection
+            type_info: None,
         };
 
         // Get the items to aggregate
@@ -332,7 +335,7 @@ mod tests {
         }
 
         // The maximum value should be 9
-        assert_eq!(total, EvaluationResult::Integer(9));
+        assert_eq!(total, EvaluationResult::integer(9));
     }
 
     #[test]
@@ -349,7 +352,7 @@ mod tests {
         context.set_variable_result("$total", EvaluationResult::Empty);
 
         // Call aggregate_function with init value
-        let init = EvaluationResult::Integer(42);
+        let init = EvaluationResult::integer(42);
         let result = aggregate_function(&collection, &expr, Some(&init), &context).unwrap();
 
         // Should return the init value

@@ -1,3 +1,13 @@
+
+- Finish code review
+  - There are some Special Cases in r4_tests.rs that we need to eliminate
+  - RESOURCE_TYPE_HIERARCHY is temporarily hard coded
+  - run_expression in polymorphic_r4_tests.r4 needs to be in lib.r4 
+  - Remove eprintln from implementation code
+  - Mismatch of implementation in separate files vs single evaluator.rs
+  - CHOICE_ELEMENTS are hard coded
+
+
 - Review all READMEs and decide on the outline of yours
   - https://www.emilyomier.com/blog/argillas-readme
   - https://github.com/neondatabase/neon
@@ -18,14 +28,6 @@
     -Documentation (if not above)
 
 
-- Finish code review
-  - There are some Special Cases in r4_tests.rs that we need to eliminate
-  - RESOURCE_TYPE_HIERARCHY is temporarily hard coded
-  - run_expression in polymorphic_r4_tests.r4 needs to be in lib.r4 
-  - Remove eprintln from implementation code
-  - Mismatch of implementation in separate files vs single evaluator.rs
-  - CHOICE_ELEMENTS are hard coded
-
 - Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 
 
 - Test to see if invalid attributes in the FHIR JSON model are allowed/disallowed?
@@ -35,10 +37,8 @@
 - Investigate the tests in https://github.com/FHIR/fhir-test-cases - are the fhirpath tests different for each FHIR version?
 
 - Write README.md for the root - homepage!
-- Write README.md for fhir_gen
 - Write README.md for hfs
-- Write README.md for fhir
-- Write README.md for fhirpath
+- Write README.md for fhir - Need to modify fhir_gen to add comments to r4.rs, etc...
 
 - Is there a documented fhirpath validator endpoint, and an apply?
 
@@ -47,11 +47,5 @@
 
 - Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
 
-- Document: export RUST_MIN_STACK=8388608
-- Document: ldd install and .cargo/config.toml for both mac and pc. pc requires 'sudo apt install clang lld'
-- Document: Build process:
-      cargo build --features R4,R4B,R5,R6
-      ./target/debug/fhir_gen --all
-      cargo test --features R4,R4B,R5,R6
-
+- Might be able to delete type_info from Collection and Object
 

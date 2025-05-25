@@ -1450,20 +1450,44 @@ where
 // For Element<V, E> - Returns Object with id, extension, value if present
 impl<V, E> IntoEvaluationResult for Element<V, E>
 where
-    V: IntoEvaluationResult + Clone,
+    V: IntoEvaluationResult + Clone + 'static,
     E: IntoEvaluationResult + Clone,
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
+        use std::any::TypeId;
+        
         // Prioritize returning the primitive value if it exists
         if let Some(v) = &self.value {
-            return v.into_evaluation_result();
-        }
-
-        // If value is None, but id or extension exist, return an Object with those
-        if self.id.is_some() || self.extension.is_some() {
+            let result = v.into_evaluation_result();
+            // For primitive values, we need to preserve FHIR type information
+            return match result {
+                EvaluationResult::Boolean(b, _) => {
+                    // Return FHIR boolean
+                    EvaluationResult::fhir_boolean(b)
+                }
+                EvaluationResult::Integer(i, _) => {
+                    // Return FHIR integer
+                    EvaluationResult::fhir_integer(i)
+                }
+                EvaluationResult::String(s, _) => {
+                    // Determine the FHIR type name based on V's type
+                    let fhir_type_name = if TypeId::of::<V>() == TypeId::of::<String>() {
+                        // For strings, we need more context to determine the exact FHIR type
+                        // Default to "string" but this could be date, dateTime, etc.
+                        "string"
+                    } else {
+                        // Default fallback
+                        "string"
+                    };
+                    EvaluationResult::fhir_string(s, fhir_type_name)
+                }
+                _ => result, // For other types, return as-is
+            };
+        } else if self.id.is_some() || self.extension.is_some() {
+            // If value is None, but id or extension exist, return an Object with those
             let mut map = std::collections::HashMap::new();
             if let Some(id) = &self.id {
-                map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+                map.insert("id".to_string(), EvaluationResult::string(id.clone()));
             }
             if let Some(ext) = &self.extension {
                 let ext_collection: Vec<EvaluationResult> = ext
@@ -1471,12 +1495,12 @@ where
                     .map(|e| e.into_evaluation_result())
                     .collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::Collection { items: ext_collection, has_undefined_order: false });
+                    map.insert("extension".to_string(), EvaluationResult::collection(ext_collection));
                 }
             }
             // Only return Object if map is not empty (i.e., id or extension was actually present)
             if !map.is_empty() {
-                return EvaluationResult::Object(map);
+                return EvaluationResult::typed_object(map, "FHIR", "Element");
             }
         }
 
@@ -1494,7 +1518,8 @@ where
         // Prioritize returning the primitive decimal value if it exists
         if let Some(precise_decimal) = &self.value {
             if let Some(decimal_val) = precise_decimal.value() {
-                return EvaluationResult::Decimal(decimal_val);
+                // Return FHIR decimal
+                return EvaluationResult::fhir_decimal(decimal_val);
             }
             // If PreciseDecimal holds None for value, fall through to check id/extension
         }
@@ -1503,7 +1528,7 @@ where
         if self.id.is_some() || self.extension.is_some() {
             let mut map = std::collections::HashMap::new();
             if let Some(id) = &self.id {
-                map.insert("id".to_string(), EvaluationResult::String(id.clone()));
+                map.insert("id".to_string(), EvaluationResult::string(id.clone()));
             }
             if let Some(ext) = &self.extension {
                 let ext_collection: Vec<EvaluationResult> = ext
@@ -1511,12 +1536,12 @@ where
                     .map(|e| e.into_evaluation_result())
                     .collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::Collection { items: ext_collection, has_undefined_order: false });
+                    map.insert("extension".to_string(), EvaluationResult::collection(ext_collection));
                 }
             }
              // Only return Object if map is not empty
             if !map.is_empty() {
-                return EvaluationResult::Object(map);
+                return EvaluationResult::typed_object(map, "FHIR", "decimal");
             }
         }
 

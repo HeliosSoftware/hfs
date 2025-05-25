@@ -15,22 +15,23 @@ mod tests {
         // Basic test cases
         let trace_cases = vec![
             // Basic trace with literal
-            ("1.trace('test')", EvaluationResult::Integer(1)),
+            ("1.trace('test')", EvaluationResult::integer(1)),
             // Trace with a chain
             (
                 "1.trace('first').trace('second')",
-                EvaluationResult::Integer(1),
+                EvaluationResult::integer(1),
             ),
             // Trace with a collection
             (
                 "(1 | 2 | 3).trace('collection')",
                 EvaluationResult::Collection {
                     items: vec![
-                        EvaluationResult::Integer(1),
-                        EvaluationResult::Integer(2),
-                        EvaluationResult::Integer(3),
+                        EvaluationResult::integer(1),
+                        EvaluationResult::integer(2),
+                        EvaluationResult::integer(3),
                     ],
                     has_undefined_order: true, // Union operator implies undefined order
+                    type_info: None,
                 },
             ),
             // Trace with a projection (second parameter)
@@ -38,11 +39,12 @@ mod tests {
                 "(1 | 2 | 3).trace('projection', $this + 1)",
                 EvaluationResult::Collection {
                     items: vec![
-                        EvaluationResult::Integer(1),
-                        EvaluationResult::Integer(2),
-                        EvaluationResult::Integer(3),
+                        EvaluationResult::integer(1),
+                        EvaluationResult::integer(2),
+                        EvaluationResult::integer(3),
                     ],
                     has_undefined_order: true, // Input collection from union has undefined order
+                    type_info: None,
                 },
             ),
         ];
@@ -100,20 +102,32 @@ pub fn trace_function(
     let trace_value = if let Some(projection) = projection_expr {
         // When projection is provided, evaluate it on each item and collect results
         let (items, base_was_unordered) = match invocation_base {
-            EvaluationResult::Collection { items, has_undefined_order } => (items.clone(), *has_undefined_order), // Destructure
+            EvaluationResult::Collection {
+                items,
+                has_undefined_order,
+                ..
+            } => (items.clone(), *has_undefined_order), // Destructure
             EvaluationResult::Empty => (Vec::new(), false),
             single_item => (vec![single_item.clone()], false),
         };
 
         let mut projected_items = Vec::new();
         let mut projected_is_unordered = base_was_unordered; // Start with base order status
-        for item in items { // Iterate over destructured items
+        for item in items {
+            // Iterate over destructured items
             // Evaluate the projection expression with the current item as context
             let result = evaluate(projection, context, Some(&item))?;
             match result {
-                EvaluationResult::Collection { items: inner, has_undefined_order } => { // Destructure
+                EvaluationResult::Collection {
+                    items: inner,
+                    has_undefined_order,
+                    ..
+                } => {
+                    // Destructure
                     projected_items.extend(inner);
-                    if has_undefined_order { projected_is_unordered = true; }
+                    if has_undefined_order {
+                        projected_is_unordered = true;
+                    }
                 }
                 EvaluationResult::Empty => {} // Skip empty results
                 single_result => projected_items.push(single_result),
@@ -128,7 +142,11 @@ pub fn trace_function(
             // The order of projected items depends on the input and the projection itself.
             // If the base was unordered, or if any projection resulted in an unordered collection,
             // the result is unordered.
-            EvaluationResult::Collection { items: projected_items, has_undefined_order: projected_is_unordered }
+            EvaluationResult::Collection {
+                items: projected_items,
+                has_undefined_order: projected_is_unordered,
+                type_info: None,
+            }
         }
     } else {
         // When no projection is provided, trace the input directly
@@ -141,4 +159,3 @@ pub fn trace_function(
     // Return the original input collection unchanged
     Ok(invocation_base.clone())
 }
-

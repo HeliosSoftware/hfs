@@ -1,10 +1,6 @@
 use fhirpath_support::{EvaluationError, EvaluationResult};
 use crate::parser::TypeSpecifier;
-use crate::fhir_type_hierarchy::{
-    SYSTEM_NAMESPACE, FHIR_NAMESPACE,
-    is_derived_from, is_fhir_resource_type, is_fhir_primitive_type, 
-    is_fhir_complex_type, determine_type_namespace, capitalize_first_letter
-};
+use crate::fhir_type_hierarchy::capitalize_first_letter;
 
 /// Handles type operations for FHIR resources, supporting is/as operators.
 /// This module provides enhanced support for handling FHIR resource types
@@ -21,208 +17,11 @@ use crate::fhir_type_hierarchy::{
 /// # Returns
 /// 
 /// * `true` if the value is of the specified type, `false` otherwise
-pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
-    // Extract namespace and type name
-    let (namespace, type_name) = extract_namespace_and_type(type_spec)?;
-
-    // Handle Empty values first
-    if matches!(value, EvaluationResult::Empty) {
-        return Ok(false);
-    }
-    
-    // Handle collections for expressions like "1 | 1 is Integer"
-    if let EvaluationResult::Collection { items, .. } = value { // Destructure
-        // If checking if a collection is a specific type, check if all items are of that type
-        if !items.is_empty() {
-            // Check each item in the collection
-            for item in items { // Iterate over destructured items
-                if !is_of_type(item, type_spec)? {
-                    return Ok(false);
-                }
-            }
-            // If all items passed the type check, return true
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-    
-    // System namespace type checks
-    if namespace.as_deref() == Some(SYSTEM_NAMESPACE) || namespace.as_deref().map(|s| s.eq_ignore_ascii_case(SYSTEM_NAMESPACE)).unwrap_or(false) {
-        // Check if value is of the specified System type
-        match value {
-            EvaluationResult::Boolean(_) => return Ok(type_name.eq_ignore_ascii_case("Boolean")),
-            EvaluationResult::String(_) => return Ok(type_name.eq_ignore_ascii_case("String")),
-            EvaluationResult::Integer(_) => return Ok(type_name.eq_ignore_ascii_case("Integer")),
-            EvaluationResult::Decimal(_) => return Ok(type_name.eq_ignore_ascii_case("Decimal")),
-            EvaluationResult::Date(_) => return Ok(type_name.eq_ignore_ascii_case("Date")),
-            EvaluationResult::DateTime(_) => {
-                return Ok(type_name.eq_ignore_ascii_case("DateTime") || 
-                          type_name.eq_ignore_ascii_case("dateTime"))
-            },
-            EvaluationResult::Time(_) => return Ok(type_name.eq_ignore_ascii_case("Time")),
-            EvaluationResult::Quantity(_, _) => return Ok(type_name.eq_ignore_ascii_case("Quantity")),
-            // For collections and objects, they're never basic System types
-            _ => return Ok(false),
-        }
-    }
-    
-    // FHIR namespace type checks
-    if namespace.as_deref() == Some(FHIR_NAMESPACE) || namespace.as_deref().map(|s| s.eq_ignore_ascii_case(FHIR_NAMESPACE)).unwrap_or(false) {
-        // First, check primitive types with FHIR namespace
-        if is_fhir_primitive_type(&type_name) { // type_name is a valid FHIR primitive, e.g., "boolean", "string", "code"
-            // Check 1: Object with fhirType marker
-            if let EvaluationResult::Object(obj_map) = value {
-                if let Some(EvaluationResult::String(fhir_type_value)) = obj_map.get("fhirType") {
-                    if fhir_type_value.eq_ignore_ascii_case(&type_name) {
-                        return Ok(true);
-                    }
-                }
-                // If an object doesn't have a matching "fhirType", it's not this FHIR primitive.
-                return Ok(false);
-            }
-            // Check 2: Direct EvaluationResult primitive matches the FHIR primitive type_name
-            // This handles cases like `true.is(FHIR.boolean)`
-            match value {
-                EvaluationResult::Boolean(_) => return Ok(type_name.eq_ignore_ascii_case("boolean")),
-                EvaluationResult::String(_) => {
-                    // Check if type_name is one of the string-backed FHIR primitives
-                    // (e.g., string, code, id, uri, url, canonical, markdown, base64binary, xhtml)
-                    let string_backed_fhir_primitives = [
-                        "string", "code", "id", "uri", "url", "canonical", "markdown", "base64binary", "xhtml"
-                    ];
-                    return Ok(string_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
-                }
-                EvaluationResult::Integer(_) => {
-                    let integer_backed_fhir_primitives = ["integer", "positiveint", "unsignedint"];
-                    return Ok(integer_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
-                }
-                EvaluationResult::Decimal(_) => return Ok(type_name.eq_ignore_ascii_case("decimal")),
-                EvaluationResult::Date(_) => return Ok(type_name.eq_ignore_ascii_case("date")),
-                EvaluationResult::DateTime(_) => {
-                    let datetime_backed_fhir_primitives = ["datetime", "instant"];
-                    return Ok(datetime_backed_fhir_primitives.contains(&type_name.to_lowercase().as_str()));
-                }
-                EvaluationResult::Time(_) => return Ok(type_name.eq_ignore_ascii_case("time")),
-                // If value is not a direct primitive that matches, or an object with fhirType, it's not this FHIR primitive.
-                _ => return Ok(false),
-            }
-        }
-        
-        // Check for FHIR resource and complex type matches
-        if let EvaluationResult::Object(obj) = value {
-            // Check if this is a FHIR resource with matching resourceType
-            if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
-                // First, check for direct match
-                if resource_type.eq_ignore_ascii_case(&type_name) {
-                    return Ok(true);
-                }
-
-                // Check for inheritance relationships using the type hierarchy
-                let normalized_type = capitalize_first_letter(resource_type);
-                let normalized_check = capitalize_first_letter(&type_name);
-
-                if is_derived_from(&normalized_type, &normalized_check) {
-                    return Ok(true);
-                }
-
-                // Special case for Observation.value polymorphic access
-                if resource_type == "Observation" && type_name.eq_ignore_ascii_case("Quantity") {
-                    if obj.contains_key("valueQuantity") {
-                        return Ok(true);
-                    } else if obj.contains_key("value") {
-                        // If there's a direct "value" property, check if it looks like a Quantity
-                        if let Some(EvaluationResult::Object(value_obj)) = obj.get("value") {
-                            if value_obj.contains_key("value") &&
-                              (value_obj.contains_key("unit") || value_obj.contains_key("code")) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Check for choice element fields that match the requested type
-            // Example: Checking if Observation has value of type Quantity should check valueQuantity
-            for key in obj.keys() {
-                if key.starts_with("value") && key.len() > 5 {
-                    let suffix = &key[5..];
-                    if suffix.eq_ignore_ascii_case(&type_name) {
-                        return Ok(true);
-                    }
-                }
-            }
-
-            // Check if this matches a complex data type
-            if is_fhir_complex_type(&type_name) {
-                // Check for Quantity and other complex types
-                if type_name.eq_ignore_ascii_case("Quantity") {
-                    // A Quantity object should have value and unit properties
-                    if obj.contains_key("value") && (obj.contains_key("unit") || obj.contains_key("code")) {
-                        return Ok(true);
-                    }
-                }
-                
-                // Check for other complex types based on their distinctive properties
-                if type_name.eq_ignore_ascii_case("Period") {
-                    if obj.contains_key("start") || obj.contains_key("end") {
-                        return Ok(true);
-                    }
-                }
-                
-                if type_name.eq_ignore_ascii_case("Reference") {
-                    if obj.contains_key("reference") || obj.contains_key("identifier") {
-                        return Ok(true);
-                    }
-                }
-                
-                // For valueX fields that match the type
-                for (key, _) in obj.iter() {
-                    if key.starts_with("value") && key.len() > 5 {
-                        let value_type = &key[5..];
-                        if value_type.eq_ignore_ascii_case(&type_name) {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Check for Quantity type
-        if type_name.eq_ignore_ascii_case("Quantity") && matches!(value, EvaluationResult::Quantity(_, _)) {
-            return Ok(true);
-        }
-        
-        return Ok(false);
-    }
-    
-    // If no namespace is specified, infer the appropriate namespace based on the type
-    if namespace.is_none() {
-        // First, determine the most likely namespace based on the type name
-        let inferred_namespace = determine_type_namespace(&type_name);
-        
-        // Recursively check with the inferred namespace
-        let qualified_type_spec = match inferred_namespace {
-            SYSTEM_NAMESPACE => TypeSpecifier::QualifiedIdentifier(SYSTEM_NAMESPACE.to_string(), Some(capitalize_first_letter(&type_name))),
-            FHIR_NAMESPACE => {
-                if is_fhir_resource_type(&type_name) || is_fhir_complex_type(&type_name) {
-                    TypeSpecifier::QualifiedIdentifier(FHIR_NAMESPACE.to_string(), Some(capitalize_first_letter(&type_name)))
-                } else {
-                    // For FHIR primitive types, keep lowercase
-                    TypeSpecifier::QualifiedIdentifier(FHIR_NAMESPACE.to_string(), Some(type_name.to_lowercase()))
-                }
-            },
-            _ => return Err(EvaluationError::TypeError(format!("Unknown namespace: {}", inferred_namespace))),
-        };
-        
-        return is_of_type(value, &qualified_type_spec);
-    }
-    
-    // If we've reached this point with no match, return false
+pub fn is_of_type(_value: &EvaluationResult, _type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
+    // Temporarily return false until we have an implementation 
     Ok(false)
 }
 
-// is_fhir_property was removed as it was never used and 
-// its functionality was incorporated into other functions
 
 /// Extract namespace and type name from a TypeSpecifier
 /// Handles qualified names like "System.Boolean" or "FHIR.Patient"
@@ -443,113 +242,8 @@ pub fn is_fhir_domain_resource(resource_type: &str) -> bool {
 /// # Returns
 ///
 /// * The value as the specified type if possible, or Empty if not
-pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
-    // First check if the value is of the specified type
-    let is_result = is_of_type(value, type_spec)?;
-
-    if is_result {
-        // If it's of the right type, return it
-        return Ok(value.clone());
-    }
-
-    // Extract namespace and type name
-    let (namespace, type_name) = extract_namespace_and_type(type_spec)?;
-
-    // Check for FHIR polymorphic choice elements
-    if let EvaluationResult::Object(obj) = value {
-        // For FHIR resource types, check if we have resourceType field
-        if obj.contains_key("resourceType") {
-            if let Some(EvaluationResult::String(resource_type)) = obj.get("resourceType") {
-                // Do a case-insensitive comparison
-                if resource_type.to_lowercase() == type_name.to_lowercase() {
-                    return Ok(value.clone());
-                }
-
-                // Special case for Observation.as(Quantity)
-                if resource_type == "Observation" && type_name.eq_ignore_ascii_case("Quantity") {
-                    // Return valueQuantity if it exists
-                    if let Some(value_quantity) = obj.get("valueQuantity") {
-                        return Ok(value_quantity.clone());
-                    }
-                }
-            }
-        }
-
-        // Direct access to choice element fields with type suffix
-        // Example: Observation has valueQuantity field for Observation.value.as(Quantity)
-        if type_name.eq_ignore_ascii_case("Quantity") {
-            // Look for valueQuantity, effectiveQuantity, etc.
-            for (key, val) in obj.iter() {
-                if key.len() > 5 && key.starts_with("value") {
-                    let suffix = &key[5..];
-                    if suffix.eq_ignore_ascii_case("Quantity") {
-                        return Ok(val.clone());
-                    }
-                }
-            }
-        }
-
-        // If this is a polymorphic value property, handle directly
-        // (e.g., object is the "value" property itself)
-        if obj.contains_key("value") && obj.contains_key("unit") && type_name.eq_ignore_ascii_case("Quantity") {
-            return Ok(value.clone());
-        }
-
-        // Check for polymorphic choice elements
-        if let Some(ns) = &namespace {
-            if ns == "FHIR" || ns == "http://hl7.org/fhir" {
-                // This is a FHIR type specifier, check for choice elements
-                for (key, val) in obj.iter() {
-                    // If the key ends with the type name, it might be a choice element
-                    if key.ends_with(&type_name) && key.len() > type_name.len() {
-                        let prefix = &key[..key.len() - type_name.len()];
-                        if crate::polymorphic_access::is_choice_element(prefix) {
-                            return Ok(val.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // If no explicit namespace and the type matches a resource type,
-        // check through all field properties
-        if namespace.is_none() {
-            for (key, val) in obj.iter() {
-                if key.to_lowercase() == type_name.to_lowercase() {
-                    return Ok(val.clone());
-                }
-            }
-        }
-    }
-    
-    // Special handling for type conversion between dates/times
-    if let Some(ns) = &namespace {
-        if ns == "System" {
-            match type_name.to_lowercase().as_str() {
-                "date" => {
-                    // Try to convert from DateTime or String to Date
-                    if let Some(date_str) = crate::datetime_impl::to_date(value) {
-                        return Ok(EvaluationResult::Date(date_str));
-                    }
-                },
-                "datetime" | "dateTime" => {
-                    // Try to convert from Date or String to DateTime
-                    if let Some(dt_str) = crate::datetime_impl::to_datetime(value) {
-                        return Ok(EvaluationResult::DateTime(dt_str));
-                    }
-                },
-                "time" => {
-                    // Try to convert from DateTime or String to Time
-                    if let Some(time_str) = crate::datetime_impl::to_time(value) {
-                        return Ok(EvaluationResult::Time(time_str));
-                    }
-                },
-                _ => {}
-            }
-        }
-    }
-    
-    // If no match found, return Empty
+pub fn as_type(_value: &EvaluationResult, _type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
+    // Temporarily return empty until we have an implementation
     Ok(EvaluationResult::Empty)
 }
 
@@ -584,7 +278,7 @@ pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Resu
         } else {
             // ofType preserves the order of the input collection
             let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
-            Ok(EvaluationResult::Collection { items: result, has_undefined_order: input_was_unordered })
+            Ok(EvaluationResult::Collection { items: result, has_undefined_order: input_was_unordered, type_info: None })
         }
     };
     
@@ -613,56 +307,56 @@ mod tests {
     // Helper function to create a FHIR Patient resource
     fn create_patient() -> EvaluationResult {
         let mut patient = HashMap::new();
-        patient.insert("resourceType".to_string(), EvaluationResult::String("Patient".to_string()));
-        patient.insert("id".to_string(), EvaluationResult::String("123".to_string()));
-        patient.insert("active".to_string(), EvaluationResult::Boolean(true));
+        patient.insert("resourceType".to_string(), EvaluationResult::string("Patient".to_string()));
+        patient.insert("id".to_string(), EvaluationResult::string("123".to_string()));
+        patient.insert("active".to_string(), EvaluationResult::boolean(true));
         
         // Add a name
         let mut name = HashMap::new();
-        name.insert("use".to_string(), EvaluationResult::String("official".to_string()));
-        name.insert("family".to_string(), EvaluationResult::String("Smith".to_string()));
+        name.insert("use".to_string(), EvaluationResult::string("official".to_string()));
+        name.insert("family".to_string(), EvaluationResult::string("Smith".to_string()));
         
         let given = vec![
-            EvaluationResult::String("John".to_string()),
-            EvaluationResult::String("Q".to_string()),
+            EvaluationResult::string("John".to_string()),
+            EvaluationResult::string("Q".to_string()),
         ];
-        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false });
+        name.insert("given".to_string(), EvaluationResult::Collection { items: given, has_undefined_order: false, type_info: None });
         
-        let names = vec![EvaluationResult::Object(name)];
-        patient.insert("name".to_string(), EvaluationResult::Collection { items: names, has_undefined_order: false });
+        let names = vec![EvaluationResult::Object { map: name, type_info: None }];
+        patient.insert("name".to_string(), EvaluationResult::Collection { items: names, has_undefined_order: false, type_info: None });
         
         // Add birthDate
-        patient.insert("birthDate".to_string(), EvaluationResult::String("1974-12-25".to_string()));
+        patient.insert("birthDate".to_string(), EvaluationResult::string("1974-12-25".to_string()));
         
-        EvaluationResult::Object(patient)
+        EvaluationResult::Object { map: patient, type_info: None }
     }
     
     // Helper function to create a FHIR Observation resource with a valueQuantity
     fn create_observation() -> EvaluationResult {
         let mut obs = HashMap::new();
-        obs.insert("resourceType".to_string(), EvaluationResult::String("Observation".to_string()));
-        obs.insert("id".to_string(), EvaluationResult::String("456".to_string()));
-        obs.insert("status".to_string(), EvaluationResult::String("final".to_string()));
+        obs.insert("resourceType".to_string(), EvaluationResult::string("Observation".to_string()));
+        obs.insert("id".to_string(), EvaluationResult::string("456".to_string()));
+        obs.insert("status".to_string(), EvaluationResult::string("final".to_string()));
         
         // Add valueQuantity
         let mut quantity = HashMap::new();
-        quantity.insert("value".to_string(), EvaluationResult::Decimal(rust_decimal::Decimal::from(185)));
-        quantity.insert("unit".to_string(), EvaluationResult::String("lbs".to_string()));
-        quantity.insert("system".to_string(), EvaluationResult::String("http://unitsofmeasure.org".to_string()));
-        quantity.insert("code".to_string(), EvaluationResult::String("lb_av".to_string()));
+        quantity.insert("value".to_string(), EvaluationResult::decimal(rust_decimal::Decimal::from(185)));
+        quantity.insert("unit".to_string(), EvaluationResult::string("lbs".to_string()));
+        quantity.insert("system".to_string(), EvaluationResult::string("http://unitsofmeasure.org".to_string()));
+        quantity.insert("code".to_string(), EvaluationResult::string("lb_av".to_string()));
         
-        obs.insert("valueQuantity".to_string(), EvaluationResult::Object(quantity));
+        obs.insert("valueQuantity".to_string(), EvaluationResult::Object { map: quantity, type_info: None });
         
-        EvaluationResult::Object(obs)
+        EvaluationResult::Object { map: obs, type_info: None }
     }
     
     #[test]
     fn test_is_of_type_system_types() {
         // Test System types
-        let bool_val = EvaluationResult::Boolean(true);
-        let int_val = EvaluationResult::Integer(42);
-        let dec_val = EvaluationResult::Decimal(rust_decimal::Decimal::from_str("3.14").unwrap());
-        let str_val = EvaluationResult::String("test".to_string());
+        let bool_val = EvaluationResult::boolean(true);
+        let int_val = EvaluationResult::integer(42);
+        let dec_val = EvaluationResult::decimal(rust_decimal::Decimal::from_str("3.14").unwrap());
+        let str_val = EvaluationResult::string("test".to_string());
         
         // Create type specifiers
         let bool_type = TypeSpecifier::QualifiedIdentifier("Boolean".to_string(), None);
@@ -690,7 +384,7 @@ mod tests {
         let observation = create_observation();
         
         // Print the patient object for debugging
-        if let EvaluationResult::Object(obj) = &patient {
+        if let EvaluationResult::Object { map: obj, type_info: None } = &patient {
             eprintln!("Patient object:");
             for (key, value) in obj {
                 eprintln!("  {}: {:?}", key, value);
@@ -728,7 +422,7 @@ mod tests {
     #[test]
     fn test_as_type() {
         // Create test values
-        let bool_val = EvaluationResult::Boolean(true);
+        let bool_val = EvaluationResult::boolean(true);
         let patient = create_patient();
         let observation = create_observation();
         
@@ -756,11 +450,11 @@ mod tests {
     fn test_of_type() {
         // Create a collection with mixed types
         let collection = EvaluationResult::Collection { items: vec![
-            EvaluationResult::Boolean(true),
-            EvaluationResult::Integer(42),
-            EvaluationResult::Boolean(false),
-            EvaluationResult::String("test".to_string()),
-        ], has_undefined_order: false };
+            EvaluationResult::boolean(true),
+            EvaluationResult::integer(42),
+            EvaluationResult::boolean(false),
+            EvaluationResult::string("test".to_string()),
+        ], has_undefined_order: false, type_info: None };
         
         // Create type specifiers
         let bool_type = TypeSpecifier::QualifiedIdentifier("Boolean".to_string(), None);
@@ -769,19 +463,19 @@ mod tests {
         
         // Test filtering with multiple matches - should return a collection
         let collection_with_only_booleans = EvaluationResult::Collection { items: vec![
-            EvaluationResult::Boolean(true),
-            EvaluationResult::Boolean(false),
-        ], has_undefined_order: false };
+            EvaluationResult::boolean(true),
+            EvaluationResult::boolean(false),
+        ], has_undefined_order: false, type_info: None };
         let bool_result = of_type(&collection, &bool_type).unwrap();
         assert_eq!(bool_result, collection_with_only_booleans);
         
         // Test filtering with single match - should return the single item directly
         let int_result = of_type(&collection, &int_type).unwrap();
-        assert_eq!(int_result, EvaluationResult::Integer(42));
+        assert_eq!(int_result, EvaluationResult::integer(42));
         
         // Test another single match
         let str_result = of_type(&collection, &str_type).unwrap();
-        assert_eq!(str_result, EvaluationResult::String("test".to_string()));
+        assert_eq!(str_result, EvaluationResult::string("test".to_string()));
         
         // Test with no matches
         let decimal_type = TypeSpecifier::QualifiedIdentifier("Decimal".to_string(), None);

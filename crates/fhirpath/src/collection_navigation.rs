@@ -39,11 +39,11 @@ pub fn skip_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Determine the number of items to skip
     let num_to_skip = match num_arg {
-        EvaluationResult::Integer(i) => {
+        EvaluationResult::Integer(i, _) => {
             if *i < 0 { 0 } else { *i as usize } // Treat negative skip as 0
         }
         // Add conversion from Decimal if it's an integer value
-        EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
+        EvaluationResult::Decimal(d, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
         }
         _ => {
@@ -58,6 +58,7 @@ pub fn skip_function(
         EvaluationResult::Collection {
             items,
             has_undefined_order,
+            ..
         } => {
             if *has_undefined_order && context.check_ordered_functions {
                 return Err(EvaluationError::SemanticError(
@@ -138,6 +139,7 @@ pub fn tail_function(
                 EvaluationResult::Collection {
                     items: items[1..].to_vec(), // Skip the first item
                     has_undefined_order: input_was_unordered,
+                    type_info: None,
                 }
             } else {
                 EvaluationResult::Empty // Empty if 0 or 1 item
@@ -185,11 +187,11 @@ pub fn take_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Determine the number of items to take
     let num_to_take = match num_arg {
-        EvaluationResult::Integer(i) => {
+        EvaluationResult::Integer(i, _) => {
             if *i <= 0 { 0 } else { *i as usize } // Treat non-positive take as 0
         }
         // Add conversion from Decimal if it's an integer value
-        EvaluationResult::Decimal(d) if d.is_integer() && d.is_sign_positive() => {
+        EvaluationResult::Decimal(d, _) if d.is_integer() && d.is_sign_positive() => {
             d.to_usize().unwrap_or(0) // Convert non-negative integer Decimal
         }
         _ => {
@@ -209,6 +211,7 @@ pub fn take_function(
         EvaluationResult::Collection {
             items,
             has_undefined_order,
+            ..
         } => {
             if *has_undefined_order && context.check_ordered_functions {
                 return Err(EvaluationError::SemanticError(
@@ -239,24 +242,26 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(1)
-        let num = EvaluationResult::Integer(1);
+        let num = EvaluationResult::integer(1);
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // Should return [2, 3]
         let expected = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(2), EvaluationResult::Integer(3)],
+            items: vec![EvaluationResult::integer(2), EvaluationResult::integer(3)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(result, expected);
     }
@@ -266,18 +271,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(0)
-        let num = EvaluationResult::Integer(0);
+        let num = EvaluationResult::integer(0);
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // Should return the original collection
@@ -289,18 +295,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(-1) - negative skips are treated as 0
-        let num = EvaluationResult::Integer(-1);
+        let num = EvaluationResult::integer(-1);
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // Should return the original collection
@@ -312,18 +319,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(3) - skip all elements
-        let num = EvaluationResult::Integer(3);
+        let num = EvaluationResult::integer(3);
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // Should return empty
@@ -335,18 +343,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(4) - skip more than available
-        let num = EvaluationResult::Integer(4);
+        let num = EvaluationResult::integer(4);
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // Should return empty
@@ -356,24 +365,24 @@ mod tests {
     #[test]
     fn test_skip_single_item() {
         // Create a single item (not in collection form)
-        let single = EvaluationResult::Integer(42);
+        let single = EvaluationResult::integer(42);
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip(1) on single item
-        let num = EvaluationResult::Integer(1);
+        let num = EvaluationResult::integer(1);
         let result = skip_function(&single, &num, &context).unwrap();
 
         // Should return empty
         assert_eq!(result, EvaluationResult::Empty);
 
         // Test skip(0) on single item
-        let num = EvaluationResult::Integer(0);
+        let num = EvaluationResult::integer(0);
         let result = skip_function(&single, &num, &context).unwrap();
 
         // Should return the single item
-        let expected = EvaluationResult::Integer(42);
+        let expected = EvaluationResult::integer(42);
         assert_eq!(result, expected);
     }
 
@@ -386,7 +395,7 @@ mod tests {
         let context = EvaluationContext::new_empty();
 
         // Test skip(1) on empty collection
-        let num = EvaluationResult::Integer(1);
+        let num = EvaluationResult::integer(1);
         let result = skip_function(&empty, &num, &context).unwrap();
 
         // Should return empty
@@ -398,23 +407,24 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip with a decimal value
-        let num = EvaluationResult::Decimal(Decimal::from(2));
+        let num = EvaluationResult::decimal(Decimal::from(2));
         let result = skip_function(&collection, &num, &context).unwrap();
 
         // When there's a single result, normalize_collection_result should return it directly
         // So the expected result is just the Integer(3) not in a collection
-        assert_eq!(result, EvaluationResult::Integer(3));
+        assert_eq!(result, EvaluationResult::integer(3));
     }
 
     #[test]
@@ -422,18 +432,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test skip with an invalid arg type
-        let num = EvaluationResult::String("not a number".to_string());
+        let num = EvaluationResult::string("not a number".to_string());
         let result = skip_function(&collection, &num, &context);
 
         // Should return an error
@@ -450,11 +461,12 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
@@ -465,8 +477,9 @@ mod tests {
 
         // Should return [2, 3]
         let expected = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(2), EvaluationResult::Integer(3)],
+            items: vec![EvaluationResult::integer(2), EvaluationResult::integer(3)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(result, expected);
     }
@@ -475,8 +488,9 @@ mod tests {
     fn test_tail_single_item() {
         // Create a collection with one item
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1)],
+            items: vec![EvaluationResult::integer(1)],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
@@ -507,7 +521,7 @@ mod tests {
     #[test]
     fn test_tail_single_value() {
         // Create a single value (not in collection form)
-        let single = EvaluationResult::Integer(42);
+        let single = EvaluationResult::integer(42);
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
@@ -524,24 +538,26 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(2)
-        let num = EvaluationResult::Integer(2);
+        let num = EvaluationResult::integer(2);
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return [1, 2]
         let expected = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(result, expected);
     }
@@ -551,18 +567,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(0)
-        let num = EvaluationResult::Integer(0);
+        let num = EvaluationResult::integer(0);
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return Empty
@@ -574,18 +591,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(-1) - negative takes are treated as 0
-        let num = EvaluationResult::Integer(-1);
+        let num = EvaluationResult::integer(-1);
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return Empty
@@ -597,18 +615,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(3) - take all elements
-        let num = EvaluationResult::Integer(3);
+        let num = EvaluationResult::integer(3);
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return the original collection
@@ -620,18 +639,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(4) - take more than available
-        let num = EvaluationResult::Integer(4);
+        let num = EvaluationResult::integer(4);
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return the original collection
@@ -641,20 +661,20 @@ mod tests {
     #[test]
     fn test_take_single_item() {
         // Create a single item (not in collection form)
-        let single = EvaluationResult::Integer(42);
+        let single = EvaluationResult::integer(42);
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take(1) on single item
-        let num = EvaluationResult::Integer(1);
+        let num = EvaluationResult::integer(1);
         let result = take_function(&single, &num, &context).unwrap();
 
         // Should return the single item
         assert_eq!(result, single);
 
         // Test take(0) on single item
-        let num = EvaluationResult::Integer(0);
+        let num = EvaluationResult::integer(0);
         let result = take_function(&single, &num, &context).unwrap();
 
         // Should return Empty
@@ -670,7 +690,7 @@ mod tests {
         let context = EvaluationContext::new_empty();
 
         // Test take(1) on empty collection
-        let num = EvaluationResult::Integer(1);
+        let num = EvaluationResult::integer(1);
         let result = take_function(&empty, &num, &context).unwrap();
 
         // Should return Empty
@@ -682,24 +702,26 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take with a decimal value
-        let num = EvaluationResult::Decimal(Decimal::from(2));
+        let num = EvaluationResult::decimal(Decimal::from(2));
         let result = take_function(&collection, &num, &context).unwrap();
 
         // Should return [1, 2]
         let expected = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            items: vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             has_undefined_order: false,
+            type_info: None,
         };
         assert_eq!(result, expected);
     }
@@ -709,18 +731,19 @@ mod tests {
         // Create a test collection
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
 
         // Create evaluation context
         let context = EvaluationContext::new_empty();
 
         // Test take with an invalid arg type
-        let num = EvaluationResult::String("not a number".to_string());
+        let num = EvaluationResult::string("not a number".to_string());
         let result = take_function(&collection, &num, &context);
 
         // Should return an error

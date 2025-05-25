@@ -74,8 +74,8 @@ pub fn not_function(
     // not(false) -> true
     // not({}) -> {}
     match base_as_logic_bool {
-        EvaluationResult::Boolean(true) => Ok(EvaluationResult::Boolean(false)),
-        EvaluationResult::Boolean(false) => Ok(EvaluationResult::Boolean(true)),
+        EvaluationResult::Boolean(true, _) => Ok(EvaluationResult::boolean(false)),
+        EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::boolean(true)),
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         _ => unreachable!("to_boolean_for_logic should only return Boolean or Empty on Ok"),
     }
@@ -88,13 +88,13 @@ mod tests {
     #[test]
     fn test_not_boolean() {
         // Test not() on Boolean values
-        let true_val = EvaluationResult::Boolean(true);
+        let true_val = EvaluationResult::boolean(true);
         let result = not_function(&true_val).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
 
-        let false_val = EvaluationResult::Boolean(false);
+        let false_val = EvaluationResult::boolean(false);
         let result = not_function(&false_val).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -102,11 +102,11 @@ mod tests {
         // Test not() on Integer values
         // According to FHIRPath spec and implementation in to_boolean_for_logic,
         // integers evaluate to Empty in boolean logic, not true/false
-        let integer = EvaluationResult::Integer(42);
+        let integer = EvaluationResult::integer(42);
         let result = not_function(&integer).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
 
-        let zero = EvaluationResult::Integer(0);
+        let zero = EvaluationResult::integer(0);
         let result = not_function(&zero).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -118,17 +118,17 @@ mod tests {
         // only specific string values are treated as boolean, others as Empty
 
         // "true" is considered Boolean(true)
-        let true_string = EvaluationResult::String("true".to_string());
+        let true_string = EvaluationResult::string("true".to_string());
         let result = not_function(&true_string).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
 
         // "false" is considered Boolean(false)
-        let false_string = EvaluationResult::String("false".to_string());
+        let false_string = EvaluationResult::string("false".to_string());
         let result = not_function(&false_string).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
 
         // Other strings evaluate to Empty in boolean logic
-        let other_string = EvaluationResult::String("test".to_string());
+        let other_string = EvaluationResult::string("test".to_string());
         let result = not_function(&other_string).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -145,18 +145,20 @@ mod tests {
     fn test_not_singleton_collection() {
         // Test not() on a singleton collection
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Boolean(true)],
+            items: vec![EvaluationResult::boolean(true)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = not_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
 
         let collection = EvaluationResult::Collection {
-            items: vec![EvaluationResult::Boolean(false)],
+            items: vec![EvaluationResult::boolean(false)],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = not_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -165,6 +167,7 @@ mod tests {
         let collection = EvaluationResult::Collection {
             items: vec![],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = not_function(&collection).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
@@ -176,10 +179,11 @@ mod tests {
         // Should produce an error according to the implementation
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = not_function(&collection);
         assert!(result.is_err());
@@ -190,4 +194,3 @@ mod tests {
         }
     }
 }
-

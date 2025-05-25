@@ -99,9 +99,9 @@ pub fn last_function(
 /// * Integer representing the number of items in the collection
 pub fn count_function(invocation_base: &EvaluationResult) -> EvaluationResult {
     match invocation_base {
-        EvaluationResult::Collection { items, .. } => EvaluationResult::Integer(items.len() as i64),
-        EvaluationResult::Empty => EvaluationResult::Integer(0),
-        _ => EvaluationResult::Integer(1), // Single item counts as 1
+        EvaluationResult::Collection { items, .. } => EvaluationResult::integer(items.len() as i64),
+        EvaluationResult::Empty => EvaluationResult::integer(0),
+        _ => EvaluationResult::integer(1), // Single item counts as 1
     }
 }
 
@@ -119,9 +119,9 @@ pub fn count_function(invocation_base: &EvaluationResult) -> EvaluationResult {
 /// * Boolean result: true if the collection is empty, false otherwise
 pub fn empty_function(invocation_base: &EvaluationResult) -> EvaluationResult {
     match invocation_base {
-        EvaluationResult::Empty => EvaluationResult::Boolean(true),
-        EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(items.is_empty()),
-        _ => EvaluationResult::Boolean(false), // Single non-empty item is not empty
+        EvaluationResult::Empty => EvaluationResult::boolean(true),
+        EvaluationResult::Collection { items, .. } => EvaluationResult::boolean(items.is_empty()),
+        _ => EvaluationResult::boolean(false), // Single non-empty item is not empty
     }
 }
 
@@ -139,9 +139,9 @@ pub fn empty_function(invocation_base: &EvaluationResult) -> EvaluationResult {
 /// * Boolean result: true if the collection has elements, false otherwise
 pub fn exists_function(invocation_base: &EvaluationResult) -> EvaluationResult {
     match invocation_base {
-        EvaluationResult::Empty => EvaluationResult::Boolean(false),
-        EvaluationResult::Collection { items, .. } => EvaluationResult::Boolean(!items.is_empty()),
-        _ => EvaluationResult::Boolean(true), // Single non-empty item exists
+        EvaluationResult::Empty => EvaluationResult::boolean(false),
+        EvaluationResult::Collection { items, .. } => EvaluationResult::boolean(!items.is_empty()),
+        _ => EvaluationResult::boolean(true), // Single non-empty item exists
     }
 }
 
@@ -159,12 +159,12 @@ pub fn exists_function(invocation_base: &EvaluationResult) -> EvaluationResult {
 /// * Boolean result: true if all items are true, false otherwise
 pub fn all_function(invocation_base: &EvaluationResult) -> EvaluationResult {
     match invocation_base {
-        EvaluationResult::Empty => EvaluationResult::Boolean(true), // all() is true for empty
+        EvaluationResult::Empty => EvaluationResult::boolean(true), // all() is true for empty
         EvaluationResult::Collection { items, .. } => {
             // Check if all items evaluate to true
-            EvaluationResult::Boolean(items.iter().all(|item| item.to_boolean()))
+            EvaluationResult::boolean(items.iter().all(|item| item.to_boolean()))
         }
-        single_item => EvaluationResult::Boolean(single_item.to_boolean()), // Check single item
+        single_item => EvaluationResult::boolean(single_item.to_boolean()), // Check single item
     }
 }
 
@@ -180,6 +180,7 @@ mod tests {
         EvaluationResult::Collection {
             items,
             has_undefined_order,
+            type_info: None,
         }
     }
 
@@ -197,31 +198,31 @@ mod tests {
         // Test first() on a non-empty collection
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             false,
         );
         let context = EvaluationContext::new_empty();
         let result = first_function(&collection, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(1));
+        assert_eq!(result, EvaluationResult::integer(1));
     }
 
     #[test]
     fn test_first_single_item() {
         // Test first() on a single item
-        let single = EvaluationResult::String("test".to_string());
+        let single = EvaluationResult::string("test".to_string());
         let context = EvaluationContext::new_empty();
         let result = first_function(&single, &context).unwrap();
-        assert_eq!(result, EvaluationResult::String("test".to_string()));
+        assert_eq!(result, EvaluationResult::string("test".to_string()));
     }
 
     #[test]
     fn test_first_undefined_order() {
         // Test first() on a collection with undefined order
         let collection = create_test_collection(
-            vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             true, // undefined order
         );
         let mut context = EvaluationContext::new_empty();
@@ -230,7 +231,7 @@ mod tests {
         context.check_ordered_functions = false;
         let result = first_function(&collection, &context);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), EvaluationResult::Integer(1));
+        assert_eq!(result.unwrap(), EvaluationResult::integer(1));
 
         // Then test with check_ordered_functions = true (should fail)
         context.check_ordered_functions = true;
@@ -252,31 +253,31 @@ mod tests {
         // Test last() on a non-empty collection
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             false,
         );
         let context = EvaluationContext::new_empty();
         let result = last_function(&collection, &context).unwrap();
-        assert_eq!(result, EvaluationResult::Integer(3));
+        assert_eq!(result, EvaluationResult::integer(3));
     }
 
     #[test]
     fn test_last_single_item() {
         // Test last() on a single item
-        let single = EvaluationResult::String("test".to_string());
+        let single = EvaluationResult::string("test".to_string());
         let context = EvaluationContext::new_empty();
         let result = last_function(&single, &context).unwrap();
-        assert_eq!(result, EvaluationResult::String("test".to_string()));
+        assert_eq!(result, EvaluationResult::string("test".to_string()));
     }
 
     #[test]
     fn test_last_undefined_order() {
         // Test last() on a collection with undefined order
         let collection = create_test_collection(
-            vec![EvaluationResult::Integer(1), EvaluationResult::Integer(2)],
+            vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             true, // undefined order
         );
         let mut context = EvaluationContext::new_empty();
@@ -285,7 +286,7 @@ mod tests {
         context.check_ordered_functions = false;
         let result = last_function(&collection, &context);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), EvaluationResult::Integer(2));
+        assert_eq!(result.unwrap(), EvaluationResult::integer(2));
 
         // Then test with check_ordered_functions = true (should fail)
         context.check_ordered_functions = true;
@@ -298,7 +299,7 @@ mod tests {
         // Test count() on an empty collection
         let empty = EvaluationResult::Empty;
         let result = count_function(&empty);
-        assert_eq!(result, EvaluationResult::Integer(0));
+        assert_eq!(result, EvaluationResult::integer(0));
     }
 
     #[test]
@@ -306,22 +307,22 @@ mod tests {
         // Test count() on a non-empty collection
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Integer(1),
-                EvaluationResult::Integer(2),
-                EvaluationResult::Integer(3),
+                EvaluationResult::integer(1),
+                EvaluationResult::integer(2),
+                EvaluationResult::integer(3),
             ],
             false,
         );
         let result = count_function(&collection);
-        assert_eq!(result, EvaluationResult::Integer(3));
+        assert_eq!(result, EvaluationResult::integer(3));
     }
 
     #[test]
     fn test_count_single_item() {
         // Test count() on a single item
-        let single = EvaluationResult::String("test".to_string());
+        let single = EvaluationResult::string("test".to_string());
         let result = count_function(&single);
-        assert_eq!(result, EvaluationResult::Integer(1));
+        assert_eq!(result, EvaluationResult::integer(1));
     }
 
     #[test]
@@ -329,23 +330,23 @@ mod tests {
         // Test empty() on an empty collection
         let empty = EvaluationResult::Empty;
         let result = empty_function(&empty);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
     fn test_empty_on_non_empty_collection() {
         // Test empty() on a non-empty collection
-        let collection = create_test_collection(vec![EvaluationResult::Integer(1)], false);
+        let collection = create_test_collection(vec![EvaluationResult::integer(1)], false);
         let result = empty_function(&collection);
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
     fn test_empty_on_single_item() {
         // Test empty() on a single item
-        let single = EvaluationResult::String("test".to_string());
+        let single = EvaluationResult::string("test".to_string());
         let result = empty_function(&single);
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -353,23 +354,23 @@ mod tests {
         // Test exists() on an empty collection
         let empty = EvaluationResult::Empty;
         let result = exists_function(&empty);
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
     fn test_exists_on_non_empty_collection() {
         // Test exists() on a non-empty collection
-        let collection = create_test_collection(vec![EvaluationResult::Integer(1)], false);
+        let collection = create_test_collection(vec![EvaluationResult::integer(1)], false);
         let result = exists_function(&collection);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
     fn test_exists_on_single_item() {
         // Test exists() on a single item
-        let single = EvaluationResult::String("test".to_string());
+        let single = EvaluationResult::string("test".to_string());
         let result = exists_function(&single);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -377,7 +378,7 @@ mod tests {
         // Test all() on an empty collection
         let empty = EvaluationResult::Empty;
         let result = all_function(&empty);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -385,13 +386,13 @@ mod tests {
         // Test all() on a collection with all true values
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(true),
             ],
             false,
         );
         let result = all_function(&collection);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -399,29 +400,28 @@ mod tests {
         // Test all() on a collection with mixed boolean values
         let collection = create_test_collection(
             vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
             ],
             false,
         );
         let result = all_function(&collection);
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
     fn test_all_on_single_true() {
         // Test all() on a single true value
-        let single = EvaluationResult::Boolean(true);
+        let single = EvaluationResult::boolean(true);
         let result = all_function(&single);
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
     fn test_all_on_single_false() {
         // Test all() on a single false value
-        let single = EvaluationResult::Boolean(false);
+        let single = EvaluationResult::boolean(false);
         let result = all_function(&single);
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 }
-

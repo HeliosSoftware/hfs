@@ -2,7 +2,7 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 
 /// Implements the FHIRPath allTrue() function
 ///
-/// The allTrue() function returns true if all items in the input collection 
+/// The allTrue() function returns true if all items in the input collection
 /// are true. It returns false if any item is false or empty.
 /// For an empty collection, the result is true.
 ///
@@ -28,15 +28,15 @@ pub fn all_true_function(
 
     // allTrue is true for an empty collection
     if items.is_empty() {
-        return Ok(EvaluationResult::Boolean(true));
+        return Ok(EvaluationResult::boolean(true));
     }
 
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(true) => continue,
-            EvaluationResult::Boolean(false) | EvaluationResult::Empty => {
-                return Ok(EvaluationResult::Boolean(false));
+            EvaluationResult::Boolean(true, _) => continue,
+            EvaluationResult::Boolean(false, _) | EvaluationResult::Empty => {
+                return Ok(EvaluationResult::boolean(false));
             }
             // If any item is not boolean, it's an error according to spec
             _ => {
@@ -48,12 +48,12 @@ pub fn all_true_function(
     }
 
     // All items are true
-    Ok(EvaluationResult::Boolean(true))
+    Ok(EvaluationResult::boolean(true))
 }
 
 /// Implements the FHIRPath anyTrue() function
 ///
-/// The anyTrue() function returns true if any item in the input collection 
+/// The anyTrue() function returns true if any item in the input collection
 /// is true. It returns false if all items are false or empty.
 /// For an empty collection, the result is false.
 ///
@@ -79,14 +79,14 @@ pub fn any_true_function(
 
     // anyTrue is false for an empty collection
     if items.is_empty() {
-        return Ok(EvaluationResult::Boolean(false));
+        return Ok(EvaluationResult::boolean(false));
     }
 
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(true) => return Ok(EvaluationResult::Boolean(true)),
-            EvaluationResult::Boolean(false) | EvaluationResult::Empty => continue,
+            EvaluationResult::Boolean(true, _) => return Ok(EvaluationResult::boolean(true)),
+            EvaluationResult::Boolean(false, _) | EvaluationResult::Empty => continue,
             // If any item is not boolean, it's an error according to spec
             _ => {
                 return Err(EvaluationError::TypeError(
@@ -97,12 +97,12 @@ pub fn any_true_function(
     }
 
     // No true item found
-    Ok(EvaluationResult::Boolean(false))
+    Ok(EvaluationResult::boolean(false))
 }
 
 /// Implements the FHIRPath allFalse() function
 ///
-/// The allFalse() function returns true if all items in the input collection 
+/// The allFalse() function returns true if all items in the input collection
 /// are false. It returns false if any item is true or empty.
 /// For an empty collection, the result is true.
 ///
@@ -128,15 +128,15 @@ pub fn all_false_function(
 
     // allFalse is true for an empty collection
     if items.is_empty() {
-        return Ok(EvaluationResult::Boolean(true));
+        return Ok(EvaluationResult::boolean(true));
     }
 
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(false) => continue,
-            EvaluationResult::Boolean(true) | EvaluationResult::Empty => {
-                return Ok(EvaluationResult::Boolean(false));
+            EvaluationResult::Boolean(false, _) => continue,
+            EvaluationResult::Boolean(true, _) | EvaluationResult::Empty => {
+                return Ok(EvaluationResult::boolean(false));
             }
             // If any item is not boolean, it's an error according to spec
             _ => {
@@ -148,12 +148,12 @@ pub fn all_false_function(
     }
 
     // All items are false
-    Ok(EvaluationResult::Boolean(true))
+    Ok(EvaluationResult::boolean(true))
 }
 
 /// Implements the FHIRPath anyFalse() function
 ///
-/// The anyFalse() function returns true if any item in the input collection 
+/// The anyFalse() function returns true if any item in the input collection
 /// is false. It returns false if all items are true or empty.
 /// For an empty collection, the result is false.
 ///
@@ -179,14 +179,14 @@ pub fn any_false_function(
 
     // anyFalse is false for an empty collection
     if items.is_empty() {
-        return Ok(EvaluationResult::Boolean(false));
+        return Ok(EvaluationResult::boolean(false));
     }
 
     // Check each item in the collection
     for item in items {
         match item {
-            EvaluationResult::Boolean(false) => return Ok(EvaluationResult::Boolean(true)),
-            EvaluationResult::Boolean(true) | EvaluationResult::Empty => continue,
+            EvaluationResult::Boolean(false, _) => return Ok(EvaluationResult::boolean(true)),
+            EvaluationResult::Boolean(true, _) | EvaluationResult::Empty => continue,
             // If any item is not boolean, it's an error according to spec
             _ => {
                 return Err(EvaluationError::TypeError(
@@ -197,7 +197,7 @@ pub fn any_false_function(
     }
 
     // No false item found
-    Ok(EvaluationResult::Boolean(false))
+    Ok(EvaluationResult::boolean(false))
 }
 
 #[cfg(test)]
@@ -209,7 +209,7 @@ mod tests {
         // Empty collection should return true
         let empty = EvaluationResult::Empty;
         let result = all_true_function(&empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -217,14 +217,15 @@ mod tests {
         // Collection with all true items should return true
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(true),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = all_true_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -232,14 +233,15 @@ mod tests {
         // Collection with some false items should return false
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(true),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = all_true_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -247,11 +249,12 @@ mod tests {
         // Collection with non-boolean items should error
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Integer(42),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::integer(42),
+                EvaluationResult::boolean(true),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = all_true_function(&collection);
         assert!(result.is_err());
@@ -262,7 +265,7 @@ mod tests {
         // Empty collection should return false
         let empty = EvaluationResult::Empty;
         let result = any_true_function(&empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -270,14 +273,15 @@ mod tests {
         // Collection with some true items should return true
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = any_true_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -285,14 +289,15 @@ mod tests {
         // Collection with no true items should return false
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(false),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = any_true_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -300,7 +305,7 @@ mod tests {
         // Empty collection should return true
         let empty = EvaluationResult::Empty;
         let result = all_false_function(&empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -308,14 +313,15 @@ mod tests {
         // Collection with all false items should return true
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(false),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = all_false_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -323,14 +329,15 @@ mod tests {
         // Collection with some true items should return false
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = all_false_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -338,7 +345,7 @@ mod tests {
         // Empty collection should return false
         let empty = EvaluationResult::Empty;
         let result = any_false_function(&empty).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 
     #[test]
@@ -346,14 +353,15 @@ mod tests {
         // Collection with some false items should return true
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(false),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(false),
+                EvaluationResult::boolean(true),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = any_false_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(true));
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
@@ -361,13 +369,15 @@ mod tests {
         // Collection with no false items should return false
         let collection = EvaluationResult::Collection {
             items: vec![
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(true),
-                EvaluationResult::Boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(true),
+                EvaluationResult::boolean(true),
             ],
             has_undefined_order: false,
+            type_info: None,
         };
         let result = any_false_function(&collection).unwrap();
-        assert_eq!(result, EvaluationResult::Boolean(false));
+        assert_eq!(result, EvaluationResult::boolean(false));
     }
 }
+
