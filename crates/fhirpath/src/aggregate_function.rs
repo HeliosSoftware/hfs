@@ -55,7 +55,7 @@ pub fn aggregate_function(
     for (_idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
         // Create a new context for evaluating the aggregator expression.
         // This context inherits variables and settings from the parent context.
-        let mut agg_context = EvaluationContext::new_empty();
+        let mut agg_context = EvaluationContext::new_empty(context.fhir_version);
         agg_context.variables = context.variables.clone(); // Copy variables
         agg_context.is_strict_mode = context.is_strict_mode; // Propagate strict mode
         agg_context.check_ordered_functions = context.check_ordered_functions; // Propagate ordered check
@@ -185,7 +185,7 @@ mod tests {
         let init = EvaluationResult::integer(0);
 
         // Create empty context
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // Make sure variables are properly defined in the context
         context.set_variable_result("$this", EvaluationResult::integer(0));
@@ -216,7 +216,7 @@ mod tests {
         // Iterate through the items
         for (_idx, item) in items_to_aggregate.iter().enumerate().skip(start_idx) {
             // Create a new context with special variables
-            let mut agg_context = EvaluationContext::new_empty();
+            let mut agg_context = EvaluationContext::new_empty_with_default_version();
 
             // Add special aggregate variables
             agg_context.set_variable_result("$this", item.clone());
@@ -264,7 +264,7 @@ mod tests {
         // Iterate through the remaining items
         for (_idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
             // Create a new context with special variables
-            let mut agg_context = EvaluationContext::new_empty();
+            let mut agg_context = EvaluationContext::new_empty_with_default_version();
 
             // Add special aggregate variables
             agg_context.set_variable_result("$this", item.clone());
@@ -315,7 +315,7 @@ mod tests {
         // Iterate through the remaining items
         for (_idx, item) in items_to_aggregate.iter().enumerate().skip(1) {
             // Create a new context with special variables
-            let mut agg_context = EvaluationContext::new_empty();
+            let mut agg_context = EvaluationContext::new_empty_with_default_version();
 
             // Add special aggregate variables
             agg_context.set_variable_result("$this", item.clone());
@@ -347,7 +347,7 @@ mod tests {
         let expr = crate::parser::parser().parse("$this + $total").unwrap();
 
         // Create empty context with required variables
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.set_variable_result("$this", EvaluationResult::Empty);
         context.set_variable_result("$total", EvaluationResult::Empty);
 

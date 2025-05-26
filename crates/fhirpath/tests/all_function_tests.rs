@@ -104,7 +104,7 @@ fn test_all_with_simple_criteria() {
         type_info: None,
     };
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(collection.clone());
     
     // Test: all elements are > 0
@@ -127,7 +127,7 @@ fn test_all_with_nested_collections() {
     // This test may fail due to issues with nested collections
     let nested_collection = create_nested_collection();
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(nested_collection.clone());
     
     // Test: all inner collections have at least one element
@@ -155,7 +155,7 @@ fn test_all_with_complex_object_paths() {
     // This test may fail due to issues with complex path navigation
     let patient = create_complex_object();
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(patient.clone());
     
     // Test: all observations have a status
@@ -196,7 +196,7 @@ fn test_all_with_type_operations() {
         type_info: None,
     };
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(collection.clone());
     
     // Test: check if all elements can be converted to decimal
@@ -231,7 +231,7 @@ fn test_all_with_variable_references() {
         type_info: None,
     };
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(collection.clone());
     context.set_variable_result("threshold", EvaluationResult::integer(7));
     
@@ -278,7 +278,7 @@ fn test_all_with_non_boolean_result() {
         type_info: None,
     };
     
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_this(collection.clone());
     
     // This expression doesn't return a boolean - it returns the value itself

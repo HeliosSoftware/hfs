@@ -5,7 +5,7 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 
 // Helper function to parse and evaluate
 fn eval(input: &str) -> Result<EvaluationResult, EvaluationError> {
-    let ctx = EvaluationContext::new_empty();
+    let ctx = EvaluationContext::new_empty_with_default_version();
     let expr = parser().parse(input).unwrap_or_else(|e| {
         panic!("Parser error for input '{}': {:?}", input, e);
     });

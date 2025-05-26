@@ -114,24 +114,20 @@ pub fn compare_date_time_values(
 ) -> Option<Ordering> {
     match (left, right) {
         // Direct comparisons of same types
-        (EvaluationResult::Date(d1, None), EvaluationResult::Date(d2, None)) => {
-            compare_dates(d1, d2)
-        }
-        (EvaluationResult::Time(t1, None), EvaluationResult::Time(t2, None)) => {
-            compare_times(t1, t2)
-        }
-        (EvaluationResult::DateTime(dt1, None), EvaluationResult::DateTime(dt2, None)) => {
+        (EvaluationResult::Date(d1, _), EvaluationResult::Date(d2, _)) => compare_dates(d1, d2),
+        (EvaluationResult::Time(t1, _), EvaluationResult::Time(t2, _)) => compare_times(t1, t2),
+        (EvaluationResult::DateTime(dt1, _), EvaluationResult::DateTime(dt2, _)) => {
             compare_datetimes(dt1, dt2)
         }
 
         // Date vs DateTime comparison
-        (EvaluationResult::Date(d, None), EvaluationResult::DateTime(dt, None)) => {
+        (EvaluationResult::Date(d, _), EvaluationResult::DateTime(dt, _)) => {
             // Convert date to datetime with time 00:00:00 for comparison
             let d_normalized = normalize_date(d);
             let d_as_dt = format!("{}T00:00:00", d_normalized);
             compare_datetimes(&d_as_dt, dt)
         }
-        (EvaluationResult::DateTime(dt, None), EvaluationResult::Date(d, None)) => {
+        (EvaluationResult::DateTime(dt, _), EvaluationResult::Date(d, _)) => {
             // Convert date to datetime with time 00:00:00 for comparison
             let d_normalized = normalize_date(d);
             let d_as_dt = format!("{}T00:00:00", d_normalized);
@@ -205,9 +201,9 @@ pub fn compare_date_time_values(
 /// Implements the type() function for dates, times, and datetimes
 pub fn get_type_info(value: &EvaluationResult) -> (String, String) {
     match value {
-        EvaluationResult::Date(_, None) => ("System".to_string(), "Date".to_string()),
-        EvaluationResult::DateTime(_, None) => ("System".to_string(), "DateTime".to_string()),
-        EvaluationResult::Time(_, None) => ("System".to_string(), "Time".to_string()),
+        EvaluationResult::Date(_, _) => ("System".to_string(), "Date".to_string()),
+        EvaluationResult::DateTime(_, _) => ("System".to_string(), "DateTime".to_string()),
+        EvaluationResult::Time(_, _) => ("System".to_string(), "Time".to_string()),
         _ => ("".to_string(), "".to_string()), // Not a date/time type
     }
 }

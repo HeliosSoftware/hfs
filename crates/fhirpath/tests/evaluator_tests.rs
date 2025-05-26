@@ -22,7 +22,7 @@ fn eval(input: &str, context: &EvaluationContext) -> Result<EvaluationResult, Ev
 // Spec: https://hl7.org/fhirpath/2025Jan/#literals
 #[test]
 fn test_expression_literals() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Boolean
     assert_eq!(
         eval("true", &context).unwrap(),
@@ -110,7 +110,7 @@ fn test_expression_literals() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#singleton-evaluation-of-collections
 #[test]
 fn test_expression_singleton_evaluation() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Single item collection evaluates to the item
     assert_eq!(
         eval("('hello')", &context).unwrap(), // Add unwrap
@@ -134,7 +134,7 @@ fn test_expression_singleton_evaluation() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#empty--boolean
 #[test]
 fn test_function_existence_empty() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.empty()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -152,7 +152,7 @@ fn test_function_existence_empty() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#existscriteria--expression--boolean
 #[test]
 fn test_function_existence_exists() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.exists()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(false)
@@ -183,7 +183,7 @@ fn test_function_existence_exists() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#allcriteria--expression--boolean
 #[test]
 fn test_function_existence_all() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.all($this > 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -207,7 +207,7 @@ fn test_function_existence_all() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#alltrue--boolean
 #[test]
 fn test_function_existence_all_true() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.allTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -235,7 +235,7 @@ fn test_function_existence_all_true() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#anytrue--boolean
 #[test]
 fn test_function_existence_any_true() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.anyTrue()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(false)
@@ -263,7 +263,7 @@ fn test_function_existence_any_true() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#allfalse--boolean
 #[test]
 fn test_function_existence_all_false() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.allFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -291,7 +291,7 @@ fn test_function_existence_all_false() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#anyfalse--boolean
 #[test]
 fn test_function_existence_any_false() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.anyFalse()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(false)
@@ -319,7 +319,7 @@ fn test_function_existence_any_false() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#subsetofother--collection--boolean
 #[test]
 fn test_function_existence_subset_of() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.subsetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -353,7 +353,7 @@ fn test_function_existence_subset_of() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#supersetofother--collection--boolean
 #[test]
 fn test_function_existence_superset_of() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.supersetOf({})", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -387,7 +387,7 @@ fn test_function_existence_superset_of() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#count--integer
 #[test]
 fn test_function_existence_count() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.count()", &context).unwrap(),
         EvaluationResult::integer(0)
@@ -410,7 +410,7 @@ fn test_function_existence_count() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#distinct--collection
 #[test]
 fn test_function_existence_distinct() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.distinct()", &context).unwrap(),
         EvaluationResult::Empty
@@ -439,7 +439,7 @@ fn test_function_existence_distinct() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#isdistinct--boolean
 #[test]
 fn test_function_existence_is_distinct() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.isDistinct()", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -462,7 +462,7 @@ fn test_function_existence_is_distinct() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#wherecriteria--expression--collection
 #[test]
 fn test_function_filtering_where() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.where($this > 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -499,7 +499,7 @@ fn test_function_filtering_where() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#selectprojection-expression--collection
 #[test]
 fn test_function_filtering_select() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.select($this + 1)", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -559,7 +559,7 @@ fn test_function_filtering_select() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#oftypetype--type-specifier--collection
 #[test]
 fn test_function_filtering_of_type() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Simple types - expect single item results due to normalization
     assert_eq!(
         eval("(1 | 'a' | true).ofType(Integer)", &context).unwrap(), // Add unwrap
@@ -653,7 +653,7 @@ fn test_function_filtering_of_type() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-index--integer---collection
 #[test]
 fn test_function_subsetting_indexer() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(eval("{}[0]", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
         eval("(10 | 20 | 30)[0]", &context).unwrap(), // Add unwrap
@@ -680,7 +680,7 @@ fn test_function_subsetting_indexer() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#single--collection
 #[test]
 fn test_function_subsetting_single() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.single()", &context).unwrap(),
         EvaluationResult::Empty
@@ -696,7 +696,7 @@ fn test_function_subsetting_single() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#first--collection
 #[test]
 fn test_function_subsetting_first() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.first()", &context).unwrap(),
         EvaluationResult::Empty
@@ -714,7 +714,7 @@ fn test_function_subsetting_first() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#last--collection
 #[test]
 fn test_function_subsetting_last() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.last()", &context).unwrap(),
         EvaluationResult::Empty
@@ -732,7 +732,7 @@ fn test_function_subsetting_last() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#tail--collection
 #[test]
 fn test_function_subsetting_tail() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.tail()", &context).unwrap(),
         EvaluationResult::Empty
@@ -754,7 +754,7 @@ fn test_function_subsetting_tail() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#skipnum--integer--collection
 #[test]
 fn test_function_subsetting_skip() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.skip(1)", &context).unwrap(),
         EvaluationResult::Empty
@@ -807,7 +807,7 @@ fn test_function_subsetting_skip() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#takenum--integer--collection
 #[test]
 fn test_function_subsetting_take() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.take(1)", &context).unwrap(),
         EvaluationResult::Empty
@@ -870,7 +870,7 @@ fn test_function_subsetting_take() {
 #[test]
 fn test_function_subsetting_intersect() {
     // Note: HashSet used internally, order is not guaranteed in output
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.intersect({})", &context).unwrap(),
         EvaluationResult::Empty
@@ -913,7 +913,7 @@ fn test_function_subsetting_intersect() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#excludeother-collection--collection
 #[test]
 fn test_function_subsetting_exclude() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.exclude({})", &context).unwrap(),
         EvaluationResult::Empty
@@ -967,7 +967,7 @@ fn test_function_subsetting_exclude() {
 #[test]
 fn test_function_combining_union() {
     // Note: HashSet used internally, order is not guaranteed in output
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.union({})", &context).unwrap(),
         EvaluationResult::Empty
@@ -1020,7 +1020,7 @@ fn test_function_combining_union() {
 #[test]
 fn test_function_combining_combine() {
     // Note: Order not guaranteed in output
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.combine({})", &context).unwrap(),
         EvaluationResult::Empty
@@ -1079,7 +1079,7 @@ fn test_function_combining_combine() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#iifcriterion-expression-true-result-collection--otherwise-result-collection--collection
 #[test]
 fn test_function_conversion_iif() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Requires expression passing
     assert_eq!(
         eval("iif(true, 'a', 'b')", &context).unwrap(), // Add unwrap
@@ -1129,7 +1129,7 @@ fn test_function_conversion_iif() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#toboolean--boolean
 #[test]
 fn test_function_conversion_to_boolean() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toBoolean()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1213,7 +1213,7 @@ fn test_function_conversion_to_boolean() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstoboolean--boolean
 #[test]
 fn test_function_conversion_converts_to_boolean() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToBoolean()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1261,7 +1261,7 @@ fn test_function_conversion_converts_to_boolean() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#tointeger--integer
 #[test]
 fn test_function_conversion_to_integer() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toInteger()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1314,7 +1314,7 @@ fn test_function_conversion_to_integer() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstointeger--boolean
 #[test]
 fn test_function_conversion_converts_to_integer() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToInteger()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1351,38 +1351,38 @@ fn test_function_conversion_converts_to_integer() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#todecimal--decimal
 #[test]
 fn test_function_conversion_to_decimal() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toDecimal()", &context).unwrap(),
         EvaluationResult::Empty
     ); // Add unwrap
     assert_eq!(
         eval("123.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(123.0)) // Integer to Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(123.0))      // Integer to Decimal (explicit .0)
     );
     assert_eq!(
         eval("123.45.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(123.45))  // Decimal to Decimal
+        EvaluationResult::decimal(dec!(123.45))        // Decimal to Decimal
     );
     assert_eq!(
         eval("'456.78'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(456.78))  // String to Decimal
+        EvaluationResult::decimal(dec!(456.78))          // String to Decimal
     );
     assert_eq!(
         eval("'+12.3'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(12.3))  // String with sign
+        EvaluationResult::decimal(dec!(12.3))           // String with sign
     );
     assert_eq!(
         eval("'-45.6'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(-45.6))  // String with sign
+        EvaluationResult::decimal(dec!(-45.6))          // String with sign
     );
     assert_eq!(
         eval("'789'.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(789.0)) // Integer string -> Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(789.0))        // Integer string -> Decimal (explicit .0)
     );
     assert_eq!(
         eval("true.toDecimal()", &context).unwrap(), // Add unwrap
-        EvaluationResult::decimal(dec!(1.0)) // Boolean to Decimal (explicit .0)
+        EvaluationResult::decimal(dec!(1.0))         // Boolean to Decimal (explicit .0)
     );
     assert_eq!(
         eval("false.toDecimal()", &context).unwrap(), // Add unwrap
@@ -1399,7 +1399,7 @@ fn test_function_conversion_to_decimal() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstodecimal--boolean
 #[test]
 fn test_function_conversion_converts_to_decimal() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToDecimal()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1431,7 +1431,7 @@ fn test_function_conversion_converts_to_decimal() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#tostring--string
 #[test]
 fn test_function_conversion_to_string() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toString()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1489,7 +1489,7 @@ fn test_function_conversion_to_string() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstostring--string
 #[test]
 fn test_function_conversion_converts_to_string() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToString()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1541,7 +1541,7 @@ fn test_function_conversion_converts_to_string() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#todate--date
 #[test]
 fn test_function_conversion_to_date() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toDate()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1589,7 +1589,7 @@ fn test_function_conversion_to_date() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstodate--boolean
 #[test]
 fn test_function_conversion_converts_to_date() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToDate()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1637,7 +1637,7 @@ fn test_function_conversion_converts_to_date() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#todatetime--datetime
 #[test]
 fn test_function_conversion_to_date_time() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toDateTime()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1685,7 +1685,7 @@ fn test_function_conversion_to_date_time() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstodatetime--boolean
 #[test]
 fn test_function_conversion_converts_to_date_time() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToDateTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1733,7 +1733,7 @@ fn test_function_conversion_converts_to_date_time() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#totime--time
 #[test]
 fn test_function_conversion_to_time() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toTime()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1781,7 +1781,7 @@ fn test_function_conversion_to_time() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstotime--boolean
 #[test]
 fn test_function_conversion_converts_to_time() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToTime()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1829,7 +1829,7 @@ fn test_function_conversion_converts_to_time() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#toquantity--quantity
 #[test]
 fn test_function_conversion_to_quantity() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.toQuantity()", &context).unwrap(),
         EvaluationResult::Empty
@@ -1894,7 +1894,7 @@ fn test_function_conversion_to_quantity() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#convertstoquantity--boolean
 #[test]
 fn test_function_conversion_converts_to_quantity() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("{}.convertsToQuantity()", &context).unwrap(), // Add unwrap
         EvaluationResult::Empty
@@ -1952,7 +1952,7 @@ fn test_function_conversion_converts_to_quantity() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#indexofsubstring--string--integer
 #[test]
 fn test_function_string_index_of() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.indexOf('bc')", &context).unwrap(), // Add unwrap
         EvaluationResult::integer(1)
@@ -1997,7 +1997,7 @@ fn test_function_string_index_of() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#substringstart--integer--length--integer--string
 #[test]
 fn test_function_string_substring() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.substring(0)", &context).unwrap(), // Add unwrap
         EvaluationResult::string("abcdefg".to_string())
@@ -2054,7 +2054,7 @@ fn test_function_string_substring() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#startswithprefix--string--boolean
 #[test]
 fn test_function_string_starts_with() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.startsWith('abc')", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -2103,7 +2103,7 @@ fn test_function_string_starts_with() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#endswithsuffix--string--boolean
 #[test]
 fn test_function_string_ends_with() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.endsWith('efg')", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -2152,7 +2152,7 @@ fn test_function_string_ends_with() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#containssubstring--string--boolean
 #[test]
 fn test_function_string_contains() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.contains('cde')", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -2202,7 +2202,7 @@ fn test_function_string_contains() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#upper--string
 #[test]
 fn test_function_string_upper() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.upper()", &context).unwrap(), // Add unwrap
         EvaluationResult::string("ABCDEFG".to_string())
@@ -2232,7 +2232,7 @@ fn test_function_string_upper() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#lower--string
 #[test]
 fn test_function_string_lower() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'ABCDEFG'.lower()", &context).unwrap(), // Add unwrap
         EvaluationResult::string("abcdefg".to_string())
@@ -2262,7 +2262,7 @@ fn test_function_string_lower() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#replacepattern--string-substitution--string--string
 #[test]
 fn test_function_string_replace() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.replace('cde', '123')", &context).unwrap(), // Add unwrap
         EvaluationResult::string("ab123fg".to_string())
@@ -2316,7 +2316,7 @@ fn test_function_string_replace() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#matchesregex--string--boolean
 #[test]
 fn test_function_string_matches() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Basic matching
     assert_eq!(
         eval("'abc'.matches('b')", &context).unwrap(), // Add unwrap
@@ -2389,7 +2389,7 @@ fn test_function_string_matches() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#replacematchesregex--string-substitution-string--string
 #[test]
 fn test_function_string_replace_matches() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abc123def'.replaceMatches('\\\\d+', '#')", &context).unwrap(), // Add unwrap
         EvaluationResult::string("abc#def".to_string())
@@ -2444,7 +2444,7 @@ fn test_function_string_replace_matches() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#length--integer
 #[test]
 fn test_function_string_length() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abcdefg'.length()", &context).unwrap(), // Add unwrap
         EvaluationResult::integer(7)
@@ -2466,7 +2466,7 @@ fn test_function_string_length() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#tochars--collection
 #[test]
 fn test_function_string_to_chars() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'abc'.toChars()", &context).unwrap(), // Add unwrap
         EvaluationResult::Collection {
@@ -2497,7 +2497,7 @@ fn test_function_string_to_chars() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#now--datetime
 #[test]
 fn test_function_utility_now() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("now()", &context).unwrap(); // Add unwrap
     // Check it's a DateTime, format might vary slightly
     assert!(matches!(result, EvaluationResult::DateTime(_, _)));
@@ -2511,7 +2511,7 @@ fn test_function_utility_now() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#timeofday--time
 #[test]
 fn test_function_utility_time_of_day() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("timeOfDay()", &context).unwrap(); // Add unwrap
     // Check it's a Time
     assert!(matches!(result, EvaluationResult::Time(_, _)));
@@ -2526,7 +2526,7 @@ fn test_function_utility_time_of_day() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#today--date
 #[test]
 fn test_function_utility_today() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     let result = eval("today()", &context).unwrap(); // Add unwrap
     // Check it's a Date
     assert!(matches!(result, EvaluationResult::Date(_, _)));
@@ -2544,7 +2544,7 @@ fn test_function_utility_today() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-equals
 #[test]
 fn test_operator_equality_equals() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Primitives
     assert_eq!(
         eval("1 = 1", &context).unwrap(),
@@ -2630,7 +2630,7 @@ fn test_operator_equality_equals() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-equivalent
 #[test]
 fn test_operator_equality_equivalent() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Primitives
     assert_eq!(
         eval("1 ~ 1", &context).unwrap(),
@@ -2736,7 +2736,7 @@ fn test_operator_equality_equivalent() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-not-equals
 #[test]
 fn test_operator_equality_not_equals() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("1 != 2", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -2762,7 +2762,7 @@ fn test_operator_equality_not_equals() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-not-equivalent
 #[test]
 fn test_operator_equality_not_equivalent() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("1 !~ 2", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -2802,7 +2802,7 @@ fn test_operator_equality_not_equivalent() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#comparison
 #[test]
 fn test_operator_comparison() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // >, <, >=, <=
     assert_eq!(
         eval("2 > 1", &context).unwrap(),
@@ -2917,7 +2917,7 @@ fn test_operator_comparison() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#is-type-specifier
 #[test]
 fn test_operator_types_is() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("1 is Integer", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -2960,7 +2960,7 @@ fn test_operator_types_is() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#as-type-specifier
 #[test]
 fn test_operator_types_as() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("1 as Integer", &context).unwrap(),
         EvaluationResult::integer(1)
@@ -3006,7 +3006,7 @@ fn test_operator_types_as() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-union-collections
 #[test]
 fn test_operator_collections_union() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(eval("{} | {}", &context).unwrap(), EvaluationResult::Empty); // Add unwrap
     assert_eq!(
         eval("(1 | 2) | {}", &context).unwrap(), // Add unwrap
@@ -3044,7 +3044,7 @@ fn test_operator_collections_union() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#in-membership
 #[test]
 fn test_operator_collections_in() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("1 in (1 | 2 | 3)", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -3077,7 +3077,7 @@ fn test_operator_collections_in() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#contains-containership
 #[test]
 fn test_operator_collections_contains() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("(1 | 2 | 3) contains 1", &context).unwrap(), // Add unwrap
         EvaluationResult::boolean(true)
@@ -3114,7 +3114,7 @@ fn test_operator_collections_contains() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#and
 #[test]
 fn test_operator_boolean_and() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("true and true", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -3157,7 +3157,7 @@ fn test_operator_boolean_and() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#or
 #[test]
 fn test_operator_boolean_or() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("true or true", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -3197,7 +3197,7 @@ fn test_operator_boolean_or() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#xor
 #[test]
 fn test_operator_boolean_xor() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("true xor true", &context).unwrap(),
         EvaluationResult::boolean(false)
@@ -3240,7 +3240,7 @@ fn test_operator_boolean_xor() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#implies
 #[test]
 fn test_operator_boolean_implies() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("true implies true", &context).unwrap(),
         EvaluationResult::boolean(true)
@@ -3283,7 +3283,7 @@ fn test_operator_boolean_implies() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#not--boolean (Function, but often used like operator)
 #[test]
 fn test_function_boolean_not() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("true.not()", &context).unwrap(),
         EvaluationResult::boolean(false)
@@ -3299,7 +3299,7 @@ fn test_function_boolean_not() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-multiplication
 #[test]
 fn test_operator_math_multiply() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("2 * 3", &context).unwrap(),
         EvaluationResult::integer(6) // Result is Integer
@@ -3324,7 +3324,7 @@ fn test_operator_math_multiply() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-division
 #[test]
 fn test_operator_math_divide() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("6 / 2", &context).unwrap(),
         EvaluationResult::decimal(dec!(3.0)) // Integer / Integer -> Decimal (explicit .0)
@@ -3357,7 +3357,7 @@ fn test_operator_math_divide() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-addition
 #[test]
 fn test_operator_math_add() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Numbers
     assert_eq!(
         eval("1 + 2", &context).unwrap(),
@@ -3394,7 +3394,7 @@ fn test_operator_math_add() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#--subtraction
 #[test]
 fn test_operator_math_subtract() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Integer - Integer -> Integer
     assert_eq!(
         eval("5 - 3", &context).unwrap(),
@@ -3421,7 +3421,7 @@ fn test_operator_math_subtract() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#div
 #[test]
 fn test_operator_math_div() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("5 div 2", &context).unwrap(),
         EvaluationResult::integer(2)
@@ -3460,7 +3460,7 @@ fn test_operator_math_div() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#mod
 #[test]
 fn test_operator_math_mod() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("5 mod 2", &context).unwrap(),
         EvaluationResult::integer(1)
@@ -3499,7 +3499,7 @@ fn test_operator_math_mod() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#-string-concatenation
 #[test]
 fn test_operator_math_string_concat() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     assert_eq!(
         eval("'a' & 'b'", &context).unwrap(),
         EvaluationResult::string("ab".to_string())
@@ -3530,7 +3530,7 @@ fn test_operator_math_string_concat() {
 // --- Operator Precedence ---
 #[test]
 fn test_operator_precedence() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     // Results depend on operators
     // 1 + (2 * 3) = 1 + 6 = 7 (Integer + Integer -> Integer)
     assert_eq!(
@@ -3596,7 +3596,7 @@ fn test_operator_precedence() {
 // Spec: https://hl7.org/fhirpath/2025Jan/#environment-variables
 #[test]
 fn test_environment_variables() {
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_variable("name", "John Doe".to_string()); // Pass &str for name
     context.set_variable("age", "42".to_string()); // Pass &str for name, String for value
     context.set_variable("myVar", "true".to_string()); // Pass &str for name, String for value
@@ -4024,44 +4024,23 @@ fn test_resource_oftype() {
 #[test]
 fn test_arithmetic_operations() {
     // Note: Result types vary based on operator and operands
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // --- Success Cases ---
     let success_cases = vec![
         ("1 + 2", EvaluationResult::integer(3)), // Addition -> Integer
         ("5 - 3", EvaluationResult::integer(2)), // Subtraction -> Integer
         ("2 * 3", EvaluationResult::integer(6)), // Integer Multiplication -> Integer
-        (
-            "6 / 2",
-            EvaluationResult::decimal(dec!(3.0)),
-        ), // Division -> Decimal
-        (
-            "7 / 2",
-            EvaluationResult::decimal(dec!(3.5)),
-        ), // Division -> Decimal
+        ("6 / 2", EvaluationResult::decimal(dec!(3.0))), // Division -> Decimal
+        ("7 / 2", EvaluationResult::decimal(dec!(3.5))), // Division -> Decimal
         ("7 div 2", EvaluationResult::integer(3)), // Integer div -> Integer
         ("7 mod 2", EvaluationResult::integer(1)), // Integer mod -> Integer
-        (
-            "5.5 + 2.1",
-            EvaluationResult::decimal(dec!(7.6)),
-        ), // Decimal Add -> Decimal
-        (
-            "5.5 - 2.1",
-            EvaluationResult::decimal(dec!(3.4)),
-        ), // Decimal Sub -> Decimal
-        (
-            "5.5 * 2.0",
-            EvaluationResult::decimal(dec!(11.0)),
-        ), // Decimal Mult -> Decimal
-        (
-            "5.5 / 2.0",
-            EvaluationResult::decimal(dec!(2.75)),
-        ), // Decimal Div -> Decimal
+        ("5.5 + 2.1", EvaluationResult::decimal(dec!(7.6))), // Decimal Add -> Decimal
+        ("5.5 - 2.1", EvaluationResult::decimal(dec!(3.4))), // Decimal Sub -> Decimal
+        ("5.5 * 2.0", EvaluationResult::decimal(dec!(11.0))), // Decimal Mult -> Decimal
+        ("5.5 / 2.0", EvaluationResult::decimal(dec!(2.75))), // Decimal Div -> Decimal
         ("5.5 div 2.1", EvaluationResult::integer(2)), // Decimal div -> Integer
-        (
-            "5.5 mod 2.1",
-            EvaluationResult::decimal(dec!(1.3)),
-        ), // Decimal mod -> Decimal
+        ("5.5 mod 2.1", EvaluationResult::decimal(dec!(1.3))), // Decimal mod -> Decimal
     ];
 
     for (input, expected) in success_cases {
@@ -4163,7 +4142,7 @@ fn test_boolean_operations() {
     ];
 
     // For boolean operations, we don't need any resources
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     for (input, expected) in test_cases {
         assert_eq!(
@@ -4190,7 +4169,7 @@ fn test_boolean_operations() {
 
 #[test]
 fn test_comparison_operations() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // --- Success Cases ---
     let success_cases = vec![
@@ -4288,7 +4267,7 @@ fn test_comparison_operations() {
 #[test]
 fn test_variable_access() {
     // We'll set up the context without any resources
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // For testing variable access, we'll add some variables to the context
     context.set_variable("name", "John Doe".to_string());
@@ -4323,7 +4302,7 @@ fn test_variable_access() {
 #[test]
 fn test_string_operations() {
     // We'll set up the context without any resources
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // For testing string operations, we'll add a string variable
     context.set_variable("message", "Hello, World!".to_string());
@@ -4372,7 +4351,7 @@ fn test_string_operations() {
 #[test]
 fn test_functions() {
     // We'll set up the context without any resources
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // Test collection functions
     let success_cases = vec![
@@ -4416,7 +4395,7 @@ fn test_functions() {
 #[test]
 fn test_direct_string_operations() {
     // We'll set up the context without any resources
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // Test string operations through the parser instead of direct function calls
     assert_eq!(
@@ -4476,7 +4455,7 @@ fn test_resource_access() {
 // --- Math Functions ---
 #[test]
 fn test_math_functions() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // --- Success Cases for round() ---
     let round_cases = vec![
@@ -4487,18 +4466,9 @@ fn test_math_functions() {
         ("(-1.5).round()", EvaluationResult::integer(-2)), // Traditional rounding
         ("(-1.4).round()", EvaluationResult::integer(-1)),
         // Rounding with precision
-        (
-            "3.14159.round(2)",
-            EvaluationResult::decimal(dec!(3.14)),
-        ),
-        (
-            "3.14159.round(4)",
-            EvaluationResult::decimal(dec!(3.1416)),
-        ),
-        (
-            "10.round(2)",
-            EvaluationResult::decimal(dec!(10.00)),
-        ),
+        ("3.14159.round(2)", EvaluationResult::decimal(dec!(3.14))),
+        ("3.14159.round(4)", EvaluationResult::decimal(dec!(3.1416))),
+        ("10.round(2)", EvaluationResult::decimal(dec!(10.00))),
         // Rounding quantities
         (
             "5.5 'mg'.round()",
@@ -4511,54 +4481,24 @@ fn test_math_functions() {
         // Integer inputs (should remain unchanged when rounding to whole numbers)
         ("5.round()", EvaluationResult::integer(5)),
         ("5.round(0)", EvaluationResult::integer(5)),
-        (
-            "5.round(2)",
-            EvaluationResult::decimal(dec!(5.00)),
-        ),
+        ("5.round(2)", EvaluationResult::decimal(dec!(5.00))),
     ];
 
     // --- Success Cases for sqrt() ---
     let sqrt_cases = vec![
         // Square root of perfect squares
-        (
-            "4.sqrt()",
-            EvaluationResult::decimal(dec!(2.0)),
-        ),
-        (
-            "9.sqrt()",
-            EvaluationResult::decimal(dec!(3.0)),
-        ),
-        (
-            "16.sqrt()",
-            EvaluationResult::decimal(dec!(4.0)),
-        ),
-        (
-            "25.sqrt()",
-            EvaluationResult::decimal(dec!(5.0)),
-        ),
-        (
-            "100.sqrt()",
-            EvaluationResult::decimal(dec!(10.0)),
-        ),
+        ("4.sqrt()", EvaluationResult::decimal(dec!(2.0))),
+        ("9.sqrt()", EvaluationResult::decimal(dec!(3.0))),
+        ("16.sqrt()", EvaluationResult::decimal(dec!(4.0))),
+        ("25.sqrt()", EvaluationResult::decimal(dec!(5.0))),
+        ("100.sqrt()", EvaluationResult::decimal(dec!(10.0))),
         // Square root of decimal values
-        (
-            "2.25.sqrt()",
-            EvaluationResult::decimal(dec!(1.5)),
-        ),
-        (
-            "0.25.sqrt()",
-            EvaluationResult::decimal(dec!(0.5)),
-        ),
+        ("2.25.sqrt()", EvaluationResult::decimal(dec!(1.5))),
+        ("0.25.sqrt()", EvaluationResult::decimal(dec!(0.5))),
         // Square root of 0
-        (
-            "0.sqrt()",
-            EvaluationResult::decimal(dec!(0.0)),
-        ),
+        ("0.sqrt()", EvaluationResult::decimal(dec!(0.0))),
         // Integer values converted to decimals for sqrt
-        (
-            "81.sqrt()",
-            EvaluationResult::decimal(dec!(9.0)),
-        ),
+        ("81.sqrt()", EvaluationResult::decimal(dec!(9.0))),
         // Quantities
         (
             "4.0 'mg'.sqrt()",
@@ -4573,18 +4513,9 @@ fn test_math_functions() {
         ("5.abs()", EvaluationResult::integer(5)),
         ("(-5).abs()", EvaluationResult::integer(5)),
         // Decimal values
-        (
-            "0.0.abs()",
-            EvaluationResult::decimal(dec!(0.0)),
-        ),
-        (
-            "5.5.abs()",
-            EvaluationResult::decimal(dec!(5.5)),
-        ),
-        (
-            "(-5.5).abs()",
-            EvaluationResult::decimal(dec!(5.5)),
-        ),
+        ("0.0.abs()", EvaluationResult::decimal(dec!(0.0))),
+        ("5.5.abs()", EvaluationResult::decimal(dec!(5.5))),
+        ("(-5.5).abs()", EvaluationResult::decimal(dec!(5.5))),
         // Skip i64::MIN test case due to string formatting and lifetime issues
         // We already know the implementation handles this correctly
 
@@ -4646,31 +4577,13 @@ fn test_math_functions() {
     // --- Success Cases for exp() ---
     let exp_cases = vec![
         // Integer values
-        (
-            "0.exp()",
-            EvaluationResult::decimal(dec!(1.0)),
-        ), // e^0 = 1
-        (
-            "1.exp()",
-            EvaluationResult::decimal(dec!(2.718282)),
-        ), // Approximate e
-        (
-            "(-1).exp()",
-            EvaluationResult::decimal(dec!(0.367879)),
-        ), // Approximate 1/e
+        ("0.exp()", EvaluationResult::decimal(dec!(1.0))), // e^0 = 1
+        ("1.exp()", EvaluationResult::decimal(dec!(2.718282))), // Approximate e
+        ("(-1).exp()", EvaluationResult::decimal(dec!(0.367879))), // Approximate 1/e
         // Decimal values
-        (
-            "0.0.exp()",
-            EvaluationResult::decimal(dec!(1.0)),
-        ), // e^0 = 1
-        (
-            "0.5.exp()",
-            EvaluationResult::decimal(dec!(1.648721)),
-        ), // Approximate e^0.5
-        (
-            "(-0.5).exp()",
-            EvaluationResult::decimal(dec!(0.606531)),
-        ), // Approximate e^-0.5
+        ("0.0.exp()", EvaluationResult::decimal(dec!(1.0))), // e^0 = 1
+        ("0.5.exp()", EvaluationResult::decimal(dec!(1.648721))), // Approximate e^0.5
+        ("(-0.5).exp()", EvaluationResult::decimal(dec!(0.606531))), // Approximate e^-0.5
         // Quantities
         (
             "0 'mg'.exp()",
@@ -4681,31 +4594,13 @@ fn test_math_functions() {
     // --- Success Cases for ln() ---
     let ln_cases = vec![
         // Integer values
-        (
-            "1.ln()",
-            EvaluationResult::decimal(dec!(0.0)),
-        ), // ln(1) = 0
-        (
-            "2.ln()",
-            EvaluationResult::decimal(dec!(0.693147)),
-        ), // Approximate ln(2)
-        (
-            "10.ln()",
-            EvaluationResult::decimal(dec!(2.302585)),
-        ), // Approximate ln(10)
+        ("1.ln()", EvaluationResult::decimal(dec!(0.0))), // ln(1) = 0
+        ("2.ln()", EvaluationResult::decimal(dec!(0.693147))), // Approximate ln(2)
+        ("10.ln()", EvaluationResult::decimal(dec!(2.302585))), // Approximate ln(10)
         // Decimal values
-        (
-            "1.0.ln()",
-            EvaluationResult::decimal(dec!(0.0)),
-        ), // ln(1) = 0
-        (
-            "2.718282.ln()",
-            EvaluationResult::decimal(dec!(1.0)),
-        ), // Approximate ln(e) = 1
-        (
-            "0.5.ln()",
-            EvaluationResult::decimal(dec!(-0.693147)),
-        ), // Approximate ln(0.5)
+        ("1.0.ln()", EvaluationResult::decimal(dec!(0.0))), // ln(1) = 0
+        ("2.718282.ln()", EvaluationResult::decimal(dec!(1.0))), // Approximate ln(e) = 1
+        ("0.5.ln()", EvaluationResult::decimal(dec!(-0.693147))), // Approximate ln(0.5)
         // Quantities
         (
             "1 'mg'.ln()",
@@ -4720,41 +4615,20 @@ fn test_math_functions() {
     // --- Success Cases for log() ---
     let log_cases = vec![
         // Integer values with integer base
-        (
-            "16.log(2)",
-            EvaluationResult::decimal(dec!(4.0)),
-        ), // log_2(16) = 4
-        (
-            "100.log(10)",
-            EvaluationResult::decimal(dec!(2.0)),
-        ), // log_10(100) = 2
-        (
-            "8.log(2)",
-            EvaluationResult::decimal(dec!(3.0)),
-        ), // log_2(8) = 3
+        ("16.log(2)", EvaluationResult::decimal(dec!(4.0))), // log_2(16) = 4
+        ("100.log(10)", EvaluationResult::decimal(dec!(2.0))), // log_10(100) = 2
+        ("8.log(2)", EvaluationResult::decimal(dec!(3.0))),  // log_2(8) = 3
         // Decimal values with decimal base
-        (
-            "16.0.log(2.0)",
-            EvaluationResult::decimal(dec!(4.0)),
-        ), // log_2(16) = 4
-        (
-            "100.0.log(10.0)",
-            EvaluationResult::decimal(dec!(2.0)),
-        ), // log_10(100) = 2
-        (
-            "4.0.log(2.0)",
-            EvaluationResult::decimal(dec!(2.0)),
-        ), // log_2(4) = 2
+        ("16.0.log(2.0)", EvaluationResult::decimal(dec!(4.0))), // log_2(16) = 4
+        ("100.0.log(10.0)", EvaluationResult::decimal(dec!(2.0))), // log_10(100) = 2
+        ("4.0.log(2.0)", EvaluationResult::decimal(dec!(2.0))),  // log_2(4) = 2
         // Logarithm with base 'e' (should equal natural log)
         (
             "10.log(2.718282)",
             EvaluationResult::decimal(dec!(2.302585)),
         ), // log_e(10) ≈ ln(10)
         // Fractional results
-        (
-            "10.log(3)",
-            EvaluationResult::decimal(dec!(2.095903)),
-        ), // log_3(10) ≈ 2.095903
+        ("10.log(3)", EvaluationResult::decimal(dec!(2.095903))), // log_3(10) ≈ 2.095903
         // Quantities
         (
             "16 'mg'.log(2)",
@@ -4774,25 +4648,13 @@ fn test_math_functions() {
         ("10.power(2)", EvaluationResult::integer(100)), // 10^2 = 100
         // Integer base with decimal exponent - we expect Integer when the result is integral
         ("4.power(0.5)", EvaluationResult::integer(2)), // 4^0.5 = 2 (square root)
-        (
-            "8.power(1.0/3.0)",
-            EvaluationResult::decimal(dec!(2.0)),
-        ), // 8^(1/3) = 2 (cube root) - expect Decimal due to float exponent
+        ("8.power(1.0/3.0)", EvaluationResult::decimal(dec!(2.0))), // 8^(1/3) = 2 (cube root) - expect Decimal due to float exponent
         // Decimal base with integer exponent
-        (
-            "2.5.power(2)",
-            EvaluationResult::decimal(dec!(6.25)),
-        ), // 2.5^2 = 6.25
-        (
-            "0.5.power(3)",
-            EvaluationResult::decimal(dec!(0.125)),
-        ), // 0.5^3 = 0.125
+        ("2.5.power(2)", EvaluationResult::decimal(dec!(6.25))), // 2.5^2 = 6.25
+        ("0.5.power(3)", EvaluationResult::decimal(dec!(0.125))), // 0.5^3 = 0.125
         // Decimal base with decimal exponent
         ("4.0.power(0.5)", EvaluationResult::integer(2)), // 4^0.5 = 2
-        (
-            "27.0.power(1.0/3.0)",
-            EvaluationResult::decimal(dec!(3.0)),
-        ), // 27^(1/3) = 3 - expect Decimal
+        ("27.0.power(1.0/3.0)", EvaluationResult::decimal(dec!(3.0))), // 27^(1/3) = 3 - expect Decimal
         // Special cases
         ("0.power(0)", EvaluationResult::integer(1)), // 0^0 = 1 (by convention)
         ("0.power(5)", EvaluationResult::integer(0)), // 0^5 = 0
@@ -4800,14 +4662,8 @@ fn test_math_functions() {
         ("(-1).power(2)", EvaluationResult::integer(1)), // (-1)^2 = 1
         ("(-1).power(3)", EvaluationResult::integer(-1)), // (-1)^3 = -1
         // Negative exponents
-        (
-            "2.power(-1)",
-            EvaluationResult::decimal(dec!(0.5)),
-        ), // 2^-1 = 1/2 = 0.5
-        (
-            "4.power(-0.5)",
-            EvaluationResult::decimal(dec!(0.5)),
-        ), // 4^-0.5 = 1/√4 = 0.5
+        ("2.power(-1)", EvaluationResult::decimal(dec!(0.5))), // 2^-1 = 1/2 = 0.5
+        ("4.power(-0.5)", EvaluationResult::decimal(dec!(0.5))), // 4^-0.5 = 1/√4 = 0.5
         // Quantities
         (
             "2 'mg'.power(3)",
@@ -4849,8 +4705,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, None),
-                EvaluationResult::Quantity(expected_val, expected_unit, None),
+                EvaluationResult::Quantity(actual_val, actual_unit, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4927,8 +4783,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, None),
-                EvaluationResult::Quantity(expected_val, expected_unit, None),
+                EvaluationResult::Quantity(actual_val, actual_unit, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -4978,8 +4834,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, None),
-                EvaluationResult::Quantity(expected_val, expected_unit, None),
+                EvaluationResult::Quantity(actual_val, actual_unit, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -5029,8 +4885,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, None),
-                EvaluationResult::Quantity(expected_val, expected_unit, None),
+                EvaluationResult::Quantity(actual_val, actual_unit, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -5080,8 +4936,8 @@ fn test_math_functions() {
                 );
             }
             (
-                EvaluationResult::Quantity(actual_val, actual_unit, None),
-                EvaluationResult::Quantity(expected_val, expected_unit, None),
+                EvaluationResult::Quantity(actual_val, actual_unit, _),
+                EvaluationResult::Quantity(expected_val, expected_unit, _),
             ) => {
                 // Check units are the same
                 assert_eq!(
@@ -5358,7 +5214,7 @@ fn test_math_functions() {
 // Test operator precedence and type operations
 #[test]
 fn test_type_operations_with_precedence() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // Let's start with a simpler test to confirm basic type checking
     assert_eq!(

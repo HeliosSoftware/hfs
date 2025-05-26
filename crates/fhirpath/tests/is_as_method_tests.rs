@@ -31,7 +31,7 @@ mod tests {
         );
 
         // Create a context with the resources
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // Test cases for the .is() method
         let test_cases = vec![
@@ -127,7 +127,7 @@ mod tests {
         );
 
         // Create a context with the resources
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // Test cases for the .as() method
         let test_cases = vec![
@@ -209,7 +209,7 @@ mod tests {
         ], has_undefined_order: false, type_info: None };
 
         // Create a context with the collection
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.set_this(collection);
 
         // Test cases for the .ofType() method

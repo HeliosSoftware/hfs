@@ -1,6 +1,6 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use chrono::{Local, Timelike};
-use fhir::FhirResource;
+use fhir::{FhirResource, FhirVersion};
 use fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult};
 use regex::Regex;
 use rust_decimal::Decimal;
@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 ///
 /// The `EvaluationContext` holds the state required to evaluate FHIRPath expressions, including:
 /// - Available FHIR resources for evaluation
+/// - FHIR version for type checking and resource validation
 /// - Variable values (including special variables like $this, $index, etc.)
 /// - Configuration options for evaluation behavior
 /// - Temporary values for function operations (like $total for aggregate)
@@ -24,8 +25,9 @@ use std::collections::{HashMap, HashSet};
 /// // Create a new empty context
 /// use fhirpath::evaluator::EvaluationContext;
 /// use fhirpath_support::EvaluationResult;
+/// use fhir::FhirVersion;
 ///
-/// let mut context = EvaluationContext::new_empty();
+/// let mut context = EvaluationContext::new_empty(FhirVersion::R4);
 ///
 /// // Set a variable value
 /// let patient_resource = EvaluationResult::Empty; // Simplified example
@@ -37,6 +39,9 @@ use std::collections::{HashMap, HashSet};
 pub struct EvaluationContext {
     /// The FHIR resources being evaluated (available for context access)
     pub resources: Vec<FhirResource>,
+
+    /// The FHIR version being used for type checking and resource validation
+    pub fhir_version: FhirVersion,
 
     /// Variables defined in the context with their values
     /// Stores full EvaluationResult values to support different data types
@@ -64,6 +69,8 @@ impl EvaluationContext {
     ///
     /// Initializes a context containing the specified FHIR resources with default settings.
     /// The context starts with an empty variables map and non-strict evaluation mode.
+    /// The FHIR version is automatically inferred from the first resource if available,
+    /// otherwise defaults to R4.
     ///
     /// # Arguments
     ///
@@ -73,10 +80,62 @@ impl EvaluationContext {
     ///
     /// A new `EvaluationContext` instance with the provided resources
     pub fn new(resources: Vec<FhirResource>) -> Self {
+        // Infer FHIR version from the first resource, or default to R4
+        let fhir_version = resources.first()
+            .map(|r| r.version())
+            .unwrap_or_else(|| {
+                #[cfg(feature = "R4")]
+                { FhirVersion::R4 }
+                #[cfg(not(feature = "R4"))]
+                {
+                    // If R4 is not available, use the first available version
+                    #[cfg(feature = "R4B")]
+                    { FhirVersion::R4B }
+                    #[cfg(all(not(feature = "R4B"), feature = "R5"))]
+                    { FhirVersion::R5 }
+                    #[cfg(all(not(feature = "R4B"), not(feature = "R5"), feature = "R6"))]
+                    { FhirVersion::R6 }
+                    #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
+                    { panic!("No FHIR version feature enabled") }
+                }
+            });
+
+        // Set 'this' to the first resource if available
+        let this = resources.first().map(|resource| convert_resource_to_result(resource));
+
         Self {
             resources,
+            fhir_version,
             variables: HashMap::new(),
-            this: None,
+            this,
+            is_strict_mode: false,          // Default to non-strict mode
+            check_ordered_functions: false, // Default to false
+            current_aggregate_total: None,  // Initialize aggregate total
+        }
+    }
+
+    /// Creates a new evaluation context with explicit FHIR version
+    ///
+    /// Initializes a context with the specified FHIR resources and version.
+    /// This is preferred when you know the specific FHIR version you want to use.
+    ///
+    /// # Arguments
+    ///
+    /// * `resources` - A vector of FHIR resources to be available in the context
+    /// * `fhir_version` - The FHIR version to use for type checking and validation
+    ///
+    /// # Returns
+    ///
+    /// A new `EvaluationContext` instance with the provided resources and version
+    pub fn new_with_version(resources: Vec<FhirResource>, fhir_version: FhirVersion) -> Self {
+        // Set 'this' to the first resource if available
+        let this = resources.first().map(|resource| convert_resource_to_result(resource));
+
+        Self {
+            resources,
+            fhir_version,
+            variables: HashMap::new(),
+            this,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
@@ -89,17 +148,47 @@ impl EvaluationContext {
     /// This is commonly used for testing or for evaluating expressions
     /// that don't require access to FHIR resources.
     ///
+    /// # Arguments
+    ///
+    /// * `fhir_version` - The FHIR version to use for type checking and validation
+    ///
     /// # Returns
     ///
     /// A new empty `EvaluationContext` instance
-    pub fn new_empty() -> Self {
+    pub fn new_empty(fhir_version: FhirVersion) -> Self {
         Self {
             resources: Vec::new(),
+            fhir_version,
             variables: HashMap::new(),
             this: None,
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
+        }
+    }
+
+    /// Creates a new empty evaluation context with default FHIR version
+    ///
+    /// Convenience method for testing and simple usage where the specific
+    /// FHIR version doesn't matter. Defaults to R4 if available.
+    ///
+    /// # Returns
+    ///
+    /// A new empty `EvaluationContext` instance with default version
+    pub fn new_empty_with_default_version() -> Self {
+        #[cfg(feature = "R4")]
+        { Self::new_empty(FhirVersion::R4) }
+        #[cfg(not(feature = "R4"))]
+        {
+            // If R4 is not available, use the first available version
+            #[cfg(feature = "R4B")]
+            { Self::new_empty(FhirVersion::R4B) }
+            #[cfg(all(not(feature = "R4B"), feature = "R5"))]
+            { Self::new_empty(FhirVersion::R5) }
+            #[cfg(all(not(feature = "R4B"), not(feature = "R5"), feature = "R6"))]
+            { Self::new_empty(FhirVersion::R6) }
+            #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
+            { panic!("No FHIR version feature enabled") }
         }
     }
 
@@ -335,7 +424,7 @@ fn apply_decimal_multiplicative(
 /// use chumsky::Parser;
 ///
 /// // Create a context
-/// let context = EvaluationContext::new_empty();
+/// let context = EvaluationContext::new_empty_with_default_version();
 ///
 /// // Parse and evaluate a simple literal
 /// let expr = parser().parse("5").unwrap();
@@ -971,16 +1060,17 @@ fn evaluate_term(
                 },
             };
 
-            // If the invocation is a simple member identifier (not a variable)
-            // that matches the resourceType of the base_context (focus),
-            // then this term resolves to the base_context itself.
-            // Example: If base_context is a Patient resource, and invocation is Member("Patient"),
-            // this term resolves to the Patient resource.
+            // Check if the invocation is a variable (non-% style)
             if let Invocation::Member(name) = invocation {
                 // This check ensures we don't misinterpret %variables as type names.
                 // Variables (starting with '%') are handled earlier and would have returned.
                 if !name.starts_with('%') {
-                    // Ensure it's not a variable name
+                    // First, check if this is a regular variable in the context
+                    if let Some(variable_value) = context.get_variable(name) {
+                        return Ok(variable_value.clone());
+                    }
+                    
+                    // If not a variable, check if it matches the resourceType of the base_context
                     if let EvaluationResult::Object {
                         map: obj_map,
                         type_info: None,
@@ -3884,7 +3974,7 @@ fn call_function(
                         Ok(EvaluationResult::decimal(truncated))
                     }
                 }
-                EvaluationResult::Quantity(value, unit, None) => {
+                EvaluationResult::Quantity(value, unit, _) => {
                     // For Quantity, truncate the value but preserve the unit
                     let truncated = value.trunc();
 
@@ -4409,13 +4499,13 @@ fn apply_multiplicative(
             let left_dec = match left {
                 EvaluationResult::Decimal(d, _) => Some(*d),
                 EvaluationResult::Integer(i, _) => Some(Decimal::from(*i)),
-                EvaluationResult::Quantity(val, _, None) => Some(*val), // Extract value from Quantity
+                EvaluationResult::Quantity(val, _, _) => Some(*val), // Extract value from Quantity
                 _ => None,
             };
             let right_dec = match right {
                 EvaluationResult::Decimal(d, _) => Some(*d),
                 EvaluationResult::Integer(i, _) => Some(Decimal::from(*i)),
-                EvaluationResult::Quantity(val, _, None) => Some(*val), // Extract value from Quantity
+                EvaluationResult::Quantity(val, _, _) => Some(*val), // Extract value from Quantity
                 _ => None,
             };
 
@@ -4782,6 +4872,13 @@ fn apply_type_operation(
         )));
     }
 
+    // For singleton collections, extract the item for type checking
+    let actual_value = match value {
+        EvaluationResult::Collection { items, .. } if items.len() == 1 => &items[0],
+        _ => value,
+    };
+    
+
     // Determine if the type_spec refers to a non-System FHIR type
     let (is_fhir_type_for_poly, type_name_for_poly, namespace_for_poly_opt) = match type_spec {
         TypeSpecifier::QualifiedIdentifier(namespace, Some(type_name)) => {
@@ -4791,12 +4888,16 @@ fn apply_type_operation(
                 (false, String::new(), None) // System type, handle by resource_type
             }
         }
-        TypeSpecifier::QualifiedIdentifier(type_name, None) => {
+        TypeSpecifier::QualifiedIdentifier(type_name, _) => {
             // Unqualified: could be System primitive or FHIR type
-            if !crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase()) {
-                (true, type_name.clone(), Some("FHIR")) // Assume FHIR namespace
-            } else {
+            let is_fhir_prim = crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase());
+            let is_system_prim = crate::fhir_type_hierarchy::is_system_primitive_type(type_name);
+            
+            // Prefer System primitive types when they exist (e.g., Quantity)
+            if is_system_prim || is_fhir_prim {
                 (false, String::new(), None) // System primitive, handle by resource_type
+            } else {
+                (true, type_name.clone(), Some("FHIR")) // Assume FHIR namespace
             }
         }
     };
@@ -4804,17 +4905,17 @@ fn apply_type_operation(
     if (op == "is" || op == "as") && is_fhir_type_for_poly {
         // Handle with polymorphic_access
         let poly_result = crate::polymorphic_access::apply_polymorphic_type_operation(
-            value,
+            actual_value,
             op,
             &type_name_for_poly,
             namespace_for_poly_opt,
         );
 
-        if op == "as" && context.is_strict_mode && value != &EvaluationResult::Empty {
+        if op == "as" && context.is_strict_mode && actual_value != &EvaluationResult::Empty {
             if let Ok(EvaluationResult::Empty) = poly_result {
                 return Err(EvaluationError::SemanticError(format!(
                     "Type cast of '{}' to '{:?}' (FHIR type path) failed in strict mode, resulting in empty.",
-                    value.type_name(),
+                    actual_value.type_name(),
                     type_spec
                 )));
             }
@@ -4825,19 +4926,19 @@ fn apply_type_operation(
     // Fallback to crate::resource_type for System types, 'ofType', or if not handled by polymorphic_access
     match op {
         "is" => {
-            let is_result = crate::resource_type::is_of_type(value, type_spec)?;
+            let is_result = crate::resource_type::is_of_type(actual_value, type_spec)?;
             Ok(EvaluationResult::boolean(is_result))
         }
         "as" => {
             // This path is for System types.
-            let cast_result = crate::resource_type::as_type(value, type_spec)?;
+            let cast_result = crate::resource_type::as_type(actual_value, type_spec)?;
             if context.is_strict_mode
-                && value != &EvaluationResult::Empty
+                && actual_value != &EvaluationResult::Empty
                 && cast_result == EvaluationResult::Empty
             {
                 Err(EvaluationError::SemanticError(format!(
                     "Type cast of '{}' to '{:?}' (System type path) failed in strict mode, resulting in empty.",
-                    value.type_name(),
+                    actual_value.type_name(),
                     type_spec
                 )))
             } else {
@@ -4976,7 +5077,7 @@ fn compare_inequality(
         // Object vs Quantity
         (
             EvaluationResult::Object { map: obj_l, .. },
-            EvaluationResult::Quantity(val_r_prim, unit_r_prim, None),
+            EvaluationResult::Quantity(val_r_prim, unit_r_prim, _),
         ) => {
             let val_l_obj = obj_l.get("value");
             // Prefer "code" for unit comparison if available, fallback to "unit"
@@ -5006,7 +5107,7 @@ fn compare_inequality(
         }
         // Quantity vs Object (symmetric case)
         (
-            EvaluationResult::Quantity(val_l_prim, unit_l_prim, None),
+            EvaluationResult::Quantity(val_l_prim, unit_l_prim, _),
             EvaluationResult::Object { map: obj_r, .. },
         ) => {
             let val_r_obj = obj_r.get("value");
@@ -5185,8 +5286,8 @@ fn compare_equality(
                 }
                 // Quantity equality (requires same units and equal values)
                 (
-                    EvaluationResult::Quantity(val_l, unit_l, None),
-                    EvaluationResult::Quantity(val_r, unit_r, None),
+                    EvaluationResult::Quantity(val_l, unit_l, _),
+                    EvaluationResult::Quantity(val_r, unit_r, _),
                 ) => EvaluationResult::boolean(unit_l == unit_r && val_l == val_r),
 
                 // Object vs Quantity for equality
@@ -5195,7 +5296,7 @@ fn compare_equality(
                         map: obj_l,
                         type_info: None,
                     },
-                    EvaluationResult::Quantity(val_r_prim, unit_r_prim, None),
+                    EvaluationResult::Quantity(val_r_prim, unit_r_prim, _),
                 ) => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
@@ -5214,7 +5315,7 @@ fn compare_equality(
                 }
                 // Quantity vs Object for equality (symmetric case)
                 (
-                    EvaluationResult::Quantity(val_l_prim, unit_l_prim, None),
+                    EvaluationResult::Quantity(val_l_prim, unit_l_prim, _),
                     EvaluationResult::Object {
                         map: obj_r,
                         type_info: None,
@@ -5403,15 +5504,15 @@ fn compare_equality(
                 (EvaluationResult::Collection { .. }, _)
                 | (_, EvaluationResult::Collection { .. }) => EvaluationResult::boolean(false),
                 (
-                    EvaluationResult::Quantity(val_l, unit_l, None),
-                    EvaluationResult::Quantity(val_r, unit_r, None),
+                    EvaluationResult::Quantity(val_l, unit_l, _),
+                    EvaluationResult::Quantity(val_r, unit_r, _),
                 ) => EvaluationResult::boolean(unit_l == unit_r && val_l == val_r),
                 (
                     EvaluationResult::Object {
                         map: obj_l,
                         type_info: None,
                     },
-                    EvaluationResult::Quantity(val_r_prim, unit_r_prim, None),
+                    EvaluationResult::Quantity(val_r_prim, unit_r_prim, _),
                 ) => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
@@ -5430,7 +5531,7 @@ fn compare_equality(
                 }
                 // Quantity vs Object for equivalence (symmetric case)
                 (
-                    EvaluationResult::Quantity(val_l_prim, unit_l_prim, None),
+                    EvaluationResult::Quantity(val_l_prim, unit_l_prim, _),
                     EvaluationResult::Object {
                         map: obj_r,
                         type_info: None,

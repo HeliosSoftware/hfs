@@ -101,8 +101,8 @@ fn simple_equality_check(a: &EvaluationResult, b: &EvaluationResult) -> bool {
 
         // Quantity comparison with same units
         (
-            EvaluationResult::Quantity(a_val, a_unit, None),
-            EvaluationResult::Quantity(b_val, b_unit, None),
+            EvaluationResult::Quantity(a_val, a_unit, _),
+            EvaluationResult::Quantity(b_val, b_unit, _),
         ) => a_val == b_val && a_unit == b_unit,
 
         // Object comparison by checking all keys/values are equal
@@ -162,7 +162,7 @@ mod tests {
 
     // Helper function to create a simple EvaluationContext for tests
     fn create_test_context() -> EvaluationContext {
-        EvaluationContext::new_empty()
+        EvaluationContext::new_empty_with_default_version()
     }
 
     #[test]

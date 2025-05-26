@@ -5,6 +5,7 @@ This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https
 ## Table of Contents
  - [About FHIRPath](#about-fhirpath)
  - [Features Implemented](#features-implemented)
+ - [Architecture](#architecture)
  - [Performance](#performance)
 
 ## About FHIRPath
@@ -351,8 +352,104 @@ The SQL on FHIR specification leverages FHIRPath to define flattened tabular vie
 ### [Type Safety and Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation)
     
 *   [Type Safety / Strict Evaluation](https://hl7.org/fhirpath/2025Jan/#type-safety-and-strict-evaluation): 🟡 (Runtime checks, errors signaled via Empty/panic)
-    
-    
+
+## Architecture
+
+### Overview
+
+This FHIRPath implementation is built using a modular architecture with clear separation of concerns:
+
+- **Parser** (`parser.rs`): Converts FHIRPath expressions into an Abstract Syntax Tree (AST)
+- **Evaluator** (`evaluator.rs`): Evaluates AST nodes against FHIR resources with context management
+- **Type System** (`fhir_type_hierarchy.rs`): Manages FHIR and System type hierarchies with version-aware resource type checking
+- **Function Modules**: Specialized modules for individual FHIRPath functions and operations
+
+### FHIR Version Support
+
+The implementation supports multiple FHIR versions (R4, R4B, R5, R6) through:
+
+- **Feature flags**: Each FHIR version is enabled via Cargo features
+- **Version-aware type checking**: Resource type validation uses the appropriate FHIR version's Resource enum
+- **Dynamic resource type discovery**: The `FhirResourceTypeProvider` trait automatically extracts resource types from generated Resource enums
+
+### Evaluation Context
+
+The `EvaluationContext` provides the runtime environment for FHIRPath evaluation:
+
+```rust
+use fhirpath::evaluator::EvaluationContext;
+use fhir::FhirVersion;
+
+// Create context with explicit FHIR version
+let context = EvaluationContext::new_empty(FhirVersion::R4);
+
+// Create context with resources (version auto-detected)
+let context = EvaluationContext::new(fhir_resources);
+
+// Create context with specific version and resources
+let context = EvaluationContext::new_with_version(fhir_resources, FhirVersion::R5);
+```
+
+The context includes:
+- **FHIR Version**: Used for version-specific type checking and resource validation
+- **Resources**: Available FHIR resources for evaluation
+- **Variables**: Environment variables (including `$this`, `$index`, `$total`)
+- **Configuration**: Strict mode, ordered function checking, etc.
+
+### Type System and Namespace Resolution
+
+The type system handles both FHIR and System namespaces:
+
+#### FHIR Namespace
+- **Primitive types**: `boolean`, `string`, `integer`, `decimal`, `date`, `dateTime`, `time`, etc.
+- **Complex types**: `Quantity`, `HumanName`, `CodeableConcept`, `Reference`, etc.
+- **Resource types**: Version-specific types like `Patient`, `Observation`, `Condition`, etc.
+
+#### System Namespace  
+- **Primitive types**: `Boolean`, `String`, `Integer`, `Decimal`, `Date`, `DateTime`, `Time`, `Quantity`
+
+#### Version-Aware Resource Type Checking
+
+```rust
+use fhir::FhirVersion;
+use fhirpath::fhir_type_hierarchy::{is_fhir_resource_type, determine_type_namespace_with_version};
+
+// Check if "Patient" is a resource type in R4
+let is_resource = is_fhir_resource_type("Patient", FhirVersion::R4); // true
+
+// Determine namespace for a type with version context
+let namespace = determine_type_namespace_with_version("Patient", FhirVersion::R4); // "FHIR"
+```
+
+### Code Generation Integration
+
+The implementation leverages procedural macros to automatically generate type information:
+
+- **FhirPath Macro**: Automatically generates `IntoEvaluationResult` implementations for all FHIR types
+- **Resource Type Provider**: Automatically generates `FhirResourceTypeProvider` trait implementations for Resource enums
+- **Dynamic Resource Discovery**: Resource type information is extracted at compile time from the actual FHIR specification
+
+This approach ensures that:
+- Resource type lists are never hardcoded
+- Each FHIR version gets accurate resource type information
+- Type information stays in sync with the generated FHIR models
+
+### Function Module Architecture
+
+Each FHIRPath function is implemented in its own module:
+
+- `aggregate_function.rs`: Implementation of `aggregate()` with accumulator support
+- `date_arithmetic.rs`: Date/time operations and comparisons  
+- `extension_function.rs`: Extension access functions
+- `resource_type.rs`: Type checking operations (`is`, `as`, `ofType`)
+- `trace_function.rs`: Implementation of `trace()` function
+
+This modular approach enables:
+- Clear separation of concerns
+- Independent testing of each function
+- Easy addition of new functions
+- Maintainable code organization
+
 ## Performance
 
 Performance results go here...

@@ -17,9 +17,140 @@ use crate::fhir_type_hierarchy::capitalize_first_letter;
 /// # Returns
 /// 
 /// * `true` if the value is of the specified type, `false` otherwise
-pub fn is_of_type(_value: &EvaluationResult, _type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
-    // Temporarily return false until we have an implementation 
-    Ok(false)
+pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
+    let (target_namespace, target_type) = extract_namespace_and_type(type_spec)?;
+    
+    match value {
+        EvaluationResult::Boolean(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Boolean for boolean values
+                check_type_match(&Some("System".to_string()), "Boolean", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Integer(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Integer for integer values
+                check_type_match(&Some("System".to_string()), "Integer", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Decimal(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Decimal for decimal values
+                check_type_match(&Some("System".to_string()), "Decimal", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::String(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.String for string values
+                check_type_match(&Some("System".to_string()), "String", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Date(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Date for date values
+                check_type_match(&Some("System".to_string()), "Date", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::DateTime(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.DateTime for datetime values
+                check_type_match(&Some("System".to_string()), "DateTime", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Time(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Time for time values
+                check_type_match(&Some("System".to_string()), "Time", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Quantity(_, _, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Quantity for quantity values
+                check_type_match(&Some("System".to_string()), "Quantity", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Collection { .. } => {
+            // Collections are not simple types and don't match single type checks
+            Ok(false)
+        },
+        EvaluationResult::Empty => {
+            // Empty values don't match any specific type
+            Ok(false)
+        },
+        EvaluationResult::Object { map, type_info, .. } => {
+            // First check if there's type_info available
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else if let Some(resource_type_value) = map.get("resourceType") {
+                // For FHIR resources, check the resourceType property
+                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                    // Check if the resource type matches the target type
+                    check_type_match(&Some("FHIR".to_string()), resource_type, &target_namespace, &target_type)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                // For non-FHIR objects, we can't determine the type
+                Ok(false)
+            }
+        },
+    }
+}
+
+/// Helper function to check if two types match, considering namespace and case-insensitive comparison
+fn check_type_match(
+    value_namespace: &Option<String>, 
+    value_type: &str,
+    target_namespace: &Option<String>, 
+    target_type: &str
+) -> Result<bool, EvaluationError> {
+    // Case-insensitive type name comparison
+    let type_matches = value_type.eq_ignore_ascii_case(target_type);
+    
+    // If no target namespace is specified, match any namespace
+    if target_namespace.is_none() {
+        return Ok(type_matches);
+    }
+    
+    // Special case: FHIR complex types should match their System equivalents
+    // For example, FHIR.Quantity should match System.Quantity
+    if type_matches {
+        match (value_namespace, target_namespace) {
+            (Some(value_ns), Some(target_ns)) => {
+                let namespace_matches = value_ns.eq_ignore_ascii_case(target_ns);
+                
+                // Allow FHIR/System cross-matching for certain types like Quantity
+                let cross_namespace_match = 
+                    (value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("System")) ||
+                    (value_ns.eq_ignore_ascii_case("System") && target_ns.eq_ignore_ascii_case("FHIR"));
+                
+                Ok(namespace_matches || cross_namespace_match)
+            },
+            (None, Some(_)) => {
+                // Value has no namespace but target does - no match
+                Ok(false)
+            },
+            _ => Ok(type_matches), // This case is already handled above
+        }
+    } else {
+        Ok(false)
+    }
 }
 
 
@@ -59,7 +190,7 @@ pub fn extract_namespace_and_type(type_spec: &TypeSpecifier) -> Result<(Option<S
         // Handle plain identifiers - these might be:
         // 1. Simple types like "Boolean"
         // 2. Already-qualified types like "System.Boolean" that need parsing
-        TypeSpecifier::QualifiedIdentifier(name, None) => {
+        TypeSpecifier::QualifiedIdentifier(name, _) => {
             // Clean the identifier
             let clean_name = clean_identifier(name);
             
@@ -242,9 +373,15 @@ pub fn is_fhir_domain_resource(resource_type: &str) -> bool {
 /// # Returns
 ///
 /// * The value as the specified type if possible, or Empty if not
-pub fn as_type(_value: &EvaluationResult, _type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
-    // Temporarily return empty until we have an implementation
-    Ok(EvaluationResult::Empty)
+pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<EvaluationResult, EvaluationError> {
+    // Check if the value is of the specified type
+    if is_of_type(value, type_spec)? {
+        // If it matches, return the value as-is
+        Ok(value.clone())
+    } else {
+        // If it doesn't match, return Empty
+        Ok(EvaluationResult::Empty)
+    }
 }
 
 /// Filters a collection based on a type specifier

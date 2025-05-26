@@ -251,7 +251,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(1)
         let num = EvaluationResult::integer(1);
@@ -280,7 +280,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(0)
         let num = EvaluationResult::integer(0);
@@ -304,7 +304,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(-1) - negative skips are treated as 0
         let num = EvaluationResult::integer(-1);
@@ -328,7 +328,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(3) - skip all elements
         let num = EvaluationResult::integer(3);
@@ -352,7 +352,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(4) - skip more than available
         let num = EvaluationResult::integer(4);
@@ -368,7 +368,7 @@ mod tests {
         let single = EvaluationResult::integer(42);
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(1) on single item
         let num = EvaluationResult::integer(1);
@@ -392,7 +392,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip(1) on empty collection
         let num = EvaluationResult::integer(1);
@@ -416,7 +416,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip with a decimal value
         let num = EvaluationResult::decimal(Decimal::from(2));
@@ -441,7 +441,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test skip with an invalid arg type
         let num = EvaluationResult::string("not a number".to_string());
@@ -470,7 +470,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test tail()
         let result = tail_function(&collection, &context).unwrap();
@@ -494,7 +494,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test tail()
         let result = tail_function(&collection, &context).unwrap();
@@ -509,7 +509,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test tail() on empty
         let result = tail_function(&empty, &context).unwrap();
@@ -524,7 +524,7 @@ mod tests {
         let single = EvaluationResult::integer(42);
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test tail() on single value
         let result = tail_function(&single, &context).unwrap();
@@ -547,7 +547,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(2)
         let num = EvaluationResult::integer(2);
@@ -576,7 +576,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(0)
         let num = EvaluationResult::integer(0);
@@ -600,7 +600,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(-1) - negative takes are treated as 0
         let num = EvaluationResult::integer(-1);
@@ -624,7 +624,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(3) - take all elements
         let num = EvaluationResult::integer(3);
@@ -648,7 +648,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(4) - take more than available
         let num = EvaluationResult::integer(4);
@@ -664,7 +664,7 @@ mod tests {
         let single = EvaluationResult::integer(42);
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(1) on single item
         let num = EvaluationResult::integer(1);
@@ -687,7 +687,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take(1) on empty collection
         let num = EvaluationResult::integer(1);
@@ -711,7 +711,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take with a decimal value
         let num = EvaluationResult::decimal(Decimal::from(2));
@@ -740,7 +740,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test take with an invalid arg type
         let num = EvaluationResult::string("not a number".to_string());

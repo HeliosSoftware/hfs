@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_to_long_integer() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with Integer values
         let result = to_long(&EvaluationResult::integer(42), &context).unwrap();
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn test_to_long_decimal() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with Decimal values
         let result = to_long(&EvaluationResult::decimal(dec!(42.75)), &context).unwrap();
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_to_long_boolean() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with Boolean values
         let result = to_long(&EvaluationResult::boolean(true), &context).unwrap();
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_to_long_string() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with String values
         let result = to_long(&EvaluationResult::string("42".to_string()), &context).unwrap();
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn test_to_long_collection() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with single-item Collection
         let collection = EvaluationResult::Collection {
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_to_long_other_types() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test with other types that should return Empty
         let result = to_long(&EvaluationResult::date("2022-01-01".to_string()), &context).unwrap();
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_converts_to_long() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Types that should convert
         assert_eq!(

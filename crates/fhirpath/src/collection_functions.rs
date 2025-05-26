@@ -188,7 +188,7 @@ mod tests {
     fn test_first_empty_collection() {
         // Test first() on an empty collection
         let empty = EvaluationResult::Empty;
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = first_function(&empty, &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -204,7 +204,7 @@ mod tests {
             ],
             false,
         );
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = first_function(&collection, &context).unwrap();
         assert_eq!(result, EvaluationResult::integer(1));
     }
@@ -213,7 +213,7 @@ mod tests {
     fn test_first_single_item() {
         // Test first() on a single item
         let single = EvaluationResult::string("test".to_string());
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = first_function(&single, &context).unwrap();
         assert_eq!(result, EvaluationResult::string("test".to_string()));
     }
@@ -225,7 +225,7 @@ mod tests {
             vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             true, // undefined order
         );
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // First test with check_ordered_functions = false (should succeed)
         context.check_ordered_functions = false;
@@ -243,7 +243,7 @@ mod tests {
     fn test_last_empty_collection() {
         // Test last() on an empty collection
         let empty = EvaluationResult::Empty;
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = last_function(&empty, &context).unwrap();
         assert_eq!(result, EvaluationResult::Empty);
     }
@@ -259,7 +259,7 @@ mod tests {
             ],
             false,
         );
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = last_function(&collection, &context).unwrap();
         assert_eq!(result, EvaluationResult::integer(3));
     }
@@ -268,7 +268,7 @@ mod tests {
     fn test_last_single_item() {
         // Test last() on a single item
         let single = EvaluationResult::string("test".to_string());
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
         let result = last_function(&single, &context).unwrap();
         assert_eq!(result, EvaluationResult::string("test".to_string()));
     }
@@ -280,7 +280,7 @@ mod tests {
             vec![EvaluationResult::integer(1), EvaluationResult::integer(2)],
             true, // undefined order
         );
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // First test with check_ordered_functions = false (should succeed)
         context.check_ordered_functions = false;

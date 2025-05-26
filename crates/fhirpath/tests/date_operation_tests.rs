@@ -37,7 +37,7 @@ fn test_date_parsing() {
     assert_eq!(result, EvaluationResult::date("2015-02-04".to_string()));
     
     let result = parse_date_literal("@2015T").unwrap();
-    assert!(matches!(result, EvaluationResult::DateTime(_, None)));
+    assert!(matches!(result, EvaluationResult::DateTime(_, Some(_))));
     
     let result = parse_date_literal("@T14").unwrap();
     assert_eq!(result, EvaluationResult::time("14:00:00".to_string()));

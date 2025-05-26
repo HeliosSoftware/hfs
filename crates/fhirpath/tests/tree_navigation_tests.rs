@@ -83,7 +83,7 @@ mod tests {
         let patient = create_test_object();
         
         // Set up the test context with our patient object
-        let mut test_context = EvaluationContext::new_empty();
+        let mut test_context = EvaluationContext::new_empty_with_default_version();
         test_context.set_this(patient.clone());
         
         // Test children() on an object
@@ -126,14 +126,14 @@ mod tests {
         }
         
         // Test children() on a primitive type (should return Empty)
-        let mut primitive_context = EvaluationContext::new_empty();
+        let mut primitive_context = EvaluationContext::new_empty_with_default_version();
         primitive_context.set_this(EvaluationResult::string("test".to_string()));
         
         let primitive_result = evaluate(&parser().parse("$this.children()").unwrap(), &primitive_context, None).unwrap();
         assert_eq!(primitive_result, EvaluationResult::Empty);
         
         // Test children() on a collection
-        let mut collection_context = EvaluationContext::new_empty();
+        let mut collection_context = EvaluationContext::new_empty_with_default_version();
         collection_context.set_this(create_test_collection());
         
         let collection_result = evaluate(&parser().parse("$this.children()").unwrap(), &collection_context, None).unwrap();
@@ -153,7 +153,7 @@ mod tests {
         let patient = create_test_object();
         
         // Set up the test context with our patient object
-        let mut test_context = EvaluationContext::new_empty();
+        let mut test_context = EvaluationContext::new_empty_with_default_version();
         test_context.set_this(patient.clone());
         
         // Test descendants() on an object
@@ -195,14 +195,14 @@ mod tests {
         }
         
         // Test descendants() on a primitive type (should return Empty)
-        let mut primitive_context = EvaluationContext::new_empty();
+        let mut primitive_context = EvaluationContext::new_empty_with_default_version();
         primitive_context.set_this(EvaluationResult::string("test".to_string()));
         
         let primitive_result = evaluate(&parser().parse("$this.descendants()").unwrap(), &primitive_context, None).unwrap();
         assert_eq!(primitive_result, EvaluationResult::Empty);
         
         // Test descendants() on a collection
-        let mut collection_context = EvaluationContext::new_empty();
+        let mut collection_context = EvaluationContext::new_empty_with_default_version();
         collection_context.set_this(create_test_collection());
         
         let collection_result = evaluate(&parser().parse("$this.descendants()").unwrap(), &collection_context, None).unwrap();
@@ -230,7 +230,7 @@ mod tests {
         simple_obj.insert("nested".to_string(), EvaluationResult::object(nested));
         
         // Setup context
-        let mut test_context = EvaluationContext::new_empty();
+        let mut test_context = EvaluationContext::new_empty_with_default_version();
         test_context.set_this(EvaluationResult::object(simple_obj));
         
         // Test children() function 

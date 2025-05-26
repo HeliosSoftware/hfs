@@ -2453,6 +2453,13 @@ fn generate_fhirpath_enum_impl(
 
     // Check if the enum being derived is the top-level Resource enum
     let is_resource_enum = name == "Resource";
+    
+    // If this is a Resource enum, collect all variant names for the FhirResourceTypeProvider trait
+    let resource_type_names: Vec<String> = if is_resource_enum {
+        data.variants.iter().map(|variant| variant.ident.to_string()).collect()
+    } else {
+        Vec::new()
+    };
 
     let match_arms = data.variants.iter().map(|variant| {
         let variant_name = &variant.ident;
@@ -2517,12 +2524,31 @@ fn generate_fhirpath_enum_impl(
         }
     };
 
-    quote! {
+    let into_evaluation_result_impl = quote! {
         impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
             fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
                  #body // Use the generated body (either Empty or the match statement)
             }
         }
+    };
+    
+    // Generate additional FhirResourceTypeProvider implementation for Resource enums
+    if is_resource_enum {
+        let resource_type_literals: Vec<_> = resource_type_names.iter().map(|name| {
+            quote! { #name }
+        }).collect();
+        
+        quote! {
+            #into_evaluation_result_impl
+            
+            impl #impl_generics crate::FhirResourceTypeProvider for #name #ty_generics #where_clause {
+                fn get_resource_type_names() -> Vec<&'static str> {
+                    vec![#(#resource_type_literals),*]
+                }
+            }
+        }
+    } else {
+        into_evaluation_result_impl
     }
 }
 

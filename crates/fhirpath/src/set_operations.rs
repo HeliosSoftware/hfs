@@ -377,7 +377,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test intersect
         let result = intersect_function(&collection1, &collection2, &context).unwrap();
@@ -423,7 +423,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test intersect
         let result = intersect_function(&collection1, &collection2, &context).unwrap();
@@ -458,7 +458,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test intersect
         let result = intersect_function(&collection1, &collection2, &context).unwrap();
@@ -495,7 +495,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test intersect with empty
         let result = intersect_function(&collection, &empty, &context).unwrap();
@@ -534,7 +534,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test exclude
         let result = exclude_function(&collection1, &collection2, &context).unwrap();
@@ -568,7 +568,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test exclude
         let result = exclude_function(&collection1, &collection2, &context).unwrap();
@@ -598,7 +598,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test exclude
         let result = exclude_function(&collection1, &collection2, &context).unwrap();
@@ -628,7 +628,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test exclude with empty (should return original collection)
         let result = exclude_function(&collection, &empty, &context).unwrap();
@@ -667,7 +667,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test union
         let result = union_function(&collection1, &collection2, &context).unwrap();
@@ -717,7 +717,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test union
         let result = union_function(&collection1, &collection2, &context).unwrap();
@@ -756,7 +756,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test union with empty
         let result = union_function(&collection, &empty, &context).unwrap();
@@ -821,7 +821,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test combine
         let result = combine_function(&collection1, &collection2, &context).unwrap();
@@ -868,7 +868,7 @@ mod tests {
         };
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test combine
         let result = combine_function(&collection1, &collection2, &context).unwrap();
@@ -921,7 +921,7 @@ mod tests {
         let empty = EvaluationResult::Empty;
 
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test combine with empty
         let result = combine_function(&collection, &empty, &context).unwrap();
@@ -965,7 +965,7 @@ mod tests {
     #[test]
     fn test_equal_helper() {
         // Create evaluation context
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test basic equality
         assert!(equal_helper(

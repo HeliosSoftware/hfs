@@ -153,7 +153,7 @@ mod tests {
         };
 
         // Build a context with our test object
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.this = Some(object1.clone());
 
         // Test repeat with child projection
@@ -195,7 +195,7 @@ mod tests {
     fn test_repeat_function_empty() {
         // Test with empty collection
         let empty = EvaluationResult::Empty;
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Parse a simple projection expression
         let parsed = parser().parse("name").unwrap();
@@ -265,7 +265,7 @@ mod tests {
         };
 
         // Create context
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.this = Some(root.clone());
 
         // Test repeat with next projection (should handle the circular references)

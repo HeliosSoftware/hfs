@@ -5,7 +5,7 @@ use fhirpath_support::EvaluationResult;
 
 #[test]
 fn test_trace_function() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
 
     // Basic test cases
     let trace_cases = vec![

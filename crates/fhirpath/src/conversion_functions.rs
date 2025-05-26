@@ -43,7 +43,7 @@ pub fn to_decimal_function(
                 .map(EvaluationResult::decimal)
                 .unwrap_or(EvaluationResult::Empty) // Return Empty if parsing fails
         }
-        EvaluationResult::Quantity(val, _, None) => EvaluationResult::decimal(*val),
+        EvaluationResult::Quantity(val, _, _) => EvaluationResult::decimal(*val),
         // Collections are handled by the count check above
         EvaluationResult::Collection { .. } => unreachable!(),
         // Other types are not convertible to Decimal
@@ -89,7 +89,7 @@ pub fn to_integer_function(
         // Per FHIRPath spec, Decimal cannot be converted to Integer via toInteger()
         EvaluationResult::Decimal(_, _) => EvaluationResult::Empty,
         // Quantity to Integer (returns value if integer, else empty)
-        EvaluationResult::Quantity(val, _, None) => {
+        EvaluationResult::Quantity(val, _, _) => {
             if val.is_integer() {
                 val.to_i64()
                     .map(EvaluationResult::integer)

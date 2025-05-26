@@ -13,7 +13,7 @@ fn eval(expr: &str, context: &EvaluationContext) -> EvaluationResult {
 
 // Helper to create a test Patient context with birthTime extension
 fn create_patient_context() -> EvaluationContext {
-    let mut ctx = EvaluationContext::new_empty();
+    let mut ctx = EvaluationContext::new_empty_with_default_version();
 
     // Create a patient resource with a birthDate that has an extension
     let _patient = json!({

@@ -17,7 +17,7 @@ fn eval(input: &str, context: &EvaluationContext) -> Result<EvaluationResult, Ev
 
 #[test]
 fn test_enhanced_variable_handling() {
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     
     // Set variables with different types using the new API
     context.set_variable_result("intVar", EvaluationResult::integer(42));
@@ -112,7 +112,7 @@ fn test_enhanced_variable_handling() {
 
 #[test]
 fn test_variable_coercion() {
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     
     // Set variables with different types 
     context.set_variable_result("intVar", EvaluationResult::integer(42));
@@ -156,7 +156,7 @@ fn test_variable_coercion() {
 
 #[test]
 fn test_variable_error_handling() {
-    let context = EvaluationContext::new_empty();
+    let context = EvaluationContext::new_empty_with_default_version();
     
     // Test undefined variable
     let result = eval("%undefinedVar", &context);
@@ -164,7 +164,7 @@ fn test_variable_error_handling() {
     assert!(result.unwrap_err().to_string().contains("undefined"));
     
     // Test evaluating a variable that doesn't support the operation
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
     context.set_variable_result("stringVar", EvaluationResult::string("not a number".to_string()));
     
     // Trying to do math on a non-convertible string should fail

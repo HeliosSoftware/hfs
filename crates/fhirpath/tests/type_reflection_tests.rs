@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_type_function_with_primitives() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test type() on various primitive types
         let test_cases = vec![
@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_type_function_with_collections() {
-        let context = EvaluationContext::new_empty();
+        let context = EvaluationContext::new_empty_with_default_version();
 
         // Test type() on collections
 
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn test_type_function_with_fhir_resources() {
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // Set up resource in context
         let resource = create_test_resource();
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_type_function_with_generic_objects() {
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
 
         // Set up generic object in context
         let obj = create_generic_object();
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn test_type_function_chaining() {
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.set_this(create_test_resource());
 
         // Test chaining type() with other operations

@@ -19,7 +19,7 @@ mod tests {
         observation.insert("id".to_string(), EvaluationResult::string("456".to_string()));
         
         // Create a context with the resources
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         
         // Test cases for the 'is' operator
         let test_cases = vec![
@@ -68,7 +68,7 @@ mod tests {
         observation.insert("id".to_string(), EvaluationResult::string("456".to_string()));
         
         // Create a context with the resources
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         
         // Test cases for the 'as' operator
         let test_cases = vec![
@@ -111,7 +111,7 @@ mod tests {
         invalid_resource.insert("id".to_string(), EvaluationResult::string("123".to_string()));
         
         // Create a context with the resource
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.set_this(EvaluationResult::object(invalid_resource.clone()));
         
         // Test cases
@@ -140,7 +140,7 @@ mod tests {
         invalid_resource.insert("id".to_string(), EvaluationResult::string("123".to_string()));
         
         // Create a context with the resource
-        let mut context = EvaluationContext::new_empty();
+        let mut context = EvaluationContext::new_empty_with_default_version();
         context.set_this(EvaluationResult::object(invalid_resource.clone()));
         
         // Test cases

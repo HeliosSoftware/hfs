@@ -9,7 +9,7 @@ use std::collections::HashMap;
 fn test_polymorphic_access() {
     // Create a simple context with direct Objects where we set up both 'value' and 'valueQuantity'
     // to test polymorphic access
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // Create valueQuantity object
     let mut quantity = HashMap::new();
@@ -90,7 +90,7 @@ fn test_polymorphic_access() {
 #[test]
 fn test_polymorphic_access_simple() {
     // Create a simple context with direct Objects
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // Create valueQuantity object
     let mut quantity = HashMap::new();
@@ -154,7 +154,7 @@ fn test_polymorphic_access_simple() {
 #[test]
 fn test_polymorphic_as_operator() {
     // Create a simple context with direct Objects
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // Create valueQuantity object
     let mut quantity = HashMap::new();
@@ -238,7 +238,7 @@ fn test_polymorphic_as_operator() {
 #[test]
 fn test_polymorphic_access_on_direct_object() {
     // Create a simple context with direct Objects
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // Create valueQuantity object
     let mut quantity = HashMap::new();
@@ -300,7 +300,7 @@ fn test_polymorphic_access_on_direct_object() {
 #[test]
 fn test_more_complex_polymorphic_expressions() {
     // Create a simple context with direct Objects
-    let mut context = EvaluationContext::new_empty();
+    let mut context = EvaluationContext::new_empty_with_default_version();
 
     // Create valueQuantity object
     let mut quantity = HashMap::new();

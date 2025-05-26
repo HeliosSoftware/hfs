@@ -51,8 +51,8 @@ pub use distinct_functions::{
 };
 pub use evaluator::{EvaluationContext, evaluate};
 pub use fhir_type_hierarchy::{
-    FHIR_NAMESPACE, SYSTEM_NAMESPACE, determine_type_namespace, is_derived_from,
-    is_fhir_complex_type, is_fhir_primitive_type, is_fhir_resource_type, is_system_primitive_type,
+    FHIR_NAMESPACE, SYSTEM_NAMESPACE, determine_type_namespace_with_version, is_fhir_complex_type,
+    is_fhir_primitive_type, is_fhir_resource_type, is_system_primitive_type,
 };
 pub use fhirpath_support::EvaluationResult;
 pub use long_conversion::{converts_to_long, to_long};

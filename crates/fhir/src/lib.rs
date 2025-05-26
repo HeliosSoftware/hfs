@@ -773,6 +773,22 @@ impl clap::ValueEnum for FhirVersion {
     }
 }
 
+/// Trait for providing FHIR resource type information
+/// 
+/// This trait allows querying which resource types are available in a specific
+/// FHIR version without hardcoding resource type lists in multiple places.
+pub trait FhirResourceTypeProvider {
+    /// Returns a vector of all resource type names supported in this FHIR version
+    fn get_resource_type_names() -> Vec<&'static str>;
+    
+    /// Checks if a given type name is a resource type in this FHIR version
+    fn is_resource_type(type_name: &str) -> bool {
+        Self::get_resource_type_names()
+            .iter()
+            .any(|&resource_type| resource_type.eq_ignore_ascii_case(type_name))
+    }
+}
+
 // --- Internal Visitor for Element Object Deserialization ---
 
 /// Internal visitor struct for deserializing Element objects from JSON maps.
