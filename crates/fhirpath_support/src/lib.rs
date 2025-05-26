@@ -1020,9 +1020,12 @@ impl EvaluationResult {
                     ))),
                 }
             }
+            EvaluationResult::Integer(i, _) => {
+                // Integers have boolean semantics: 0 is false, non-zero is true
+                Ok(EvaluationResult::boolean(*i != 0))
+            }
             // Per FHIRPath spec section 5.2: other types evaluate to Empty for logical operators
-            EvaluationResult::Integer(_, _)
-            | EvaluationResult::Decimal(_, _)
+            EvaluationResult::Decimal(_, _)
             | EvaluationResult::Date(_, _)
             | EvaluationResult::DateTime(_, _)
             | EvaluationResult::Time(_, _)

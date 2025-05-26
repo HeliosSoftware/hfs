@@ -100,15 +100,15 @@ mod tests {
     #[test]
     fn test_not_integer() {
         // Test not() on Integer values
-        // According to FHIRPath spec and implementation in to_boolean_for_logic,
-        // integers evaluate to Empty in boolean logic, not true/false
+        // According to FHIRPath spec, integers have boolean semantics:
+        // 0 is falsy (so 0.not() = true), non-zero is truthy (so 1.not() = false)
         let integer = EvaluationResult::integer(42);
         let result = not_function(&integer).unwrap();
-        assert_eq!(result, EvaluationResult::Empty);
+        assert_eq!(result, EvaluationResult::boolean(false));
 
         let zero = EvaluationResult::integer(0);
         let result = not_function(&zero).unwrap();
-        assert_eq!(result, EvaluationResult::Empty);
+        assert_eq!(result, EvaluationResult::boolean(true));
     }
 
     #[test]
