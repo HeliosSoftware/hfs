@@ -939,7 +939,9 @@ impl EvaluationResult {
             EvaluationResult::Time(t, _) => t.clone(), // Return stored string
             EvaluationResult::Quantity(val, unit, _) => {
                 // Format as "value 'unit'" per FHIRPath specification
-                format!("{} '{}'", val, unit)
+                // Use UCUM formatting for calendar units
+                let formatted_unit = format_unit_for_display(unit);
+                format!("{} '{}'", val, formatted_unit)
             }
             EvaluationResult::Collection { items, .. } => {
                 // FHIRPath toString rules for collections
@@ -1242,4 +1244,21 @@ where
     T: IntoEvaluationResult + ?Sized,
 {
     value.into_evaluation_result()
+}
+
+/// Formats a unit for display, converting calendar units to UCUM format with curly braces
+fn format_unit_for_display(unit: &str) -> String {
+    // Calendar units that should be displayed with UCUM curly brace format for toString()
+    match unit {
+        // Only word-based time units get converted to UCUM braces for display
+        // This matches the pattern where "week" becomes "{week}" but "wk" stays "wk"
+        "week" => "{week}".to_string(),
+        "year" => "{year}".to_string(),
+        "month" => "{month}".to_string(),
+        "day" => "{day}".to_string(),
+        
+        // Short UCUM codes and other units - display as-is
+        // Note: "wk", "a", "mo", "d" etc. should NOT get braces when displaying
+        other => other.to_string(),
+    }
 }

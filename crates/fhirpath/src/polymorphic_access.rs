@@ -489,6 +489,28 @@ pub fn apply_polymorphic_type_operation(
                         map: obj,
                         type_info: _,
                     } => {
+                        // First check for FHIR resource type matching (for objects with type_info)
+                        if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
+                            
+                            // For direct resource type checks (like Patient.is(Patient) or Patient.is(FHIR.Patient))
+                            if resource_type.to_lowercase() == type_name.to_lowercase() {
+                                return Ok(EvaluationResult::boolean(true));
+                            }
+
+                            // Handle parent types like DomainResource and Resource
+                            if type_name.to_lowercase() == "domainresource"
+                                && crate::resource_type::is_fhir_domain_resource(resource_type)
+                            {
+                                return Ok(EvaluationResult::boolean(true));
+                            }
+
+                            // All FHIR resources are Resource types
+                            if type_name.to_lowercase() == "resource" {
+                                return Ok(EvaluationResult::boolean(true));
+                            }
+                        }
+                        
+                        // Continue with other type checking logic...
                         // Check for boolean-like properties in FHIR resources without hardcoding specific fields
                         if type_name.to_lowercase() == "boolean" {
                             // Check for properties with names often used for boolean flags in FHIR

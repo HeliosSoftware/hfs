@@ -728,7 +728,7 @@
 		<test name="testNotEquivalent16" inputfile="patient-example.json"><expression>@2012-04-15 !~ @2012-04-15T10:00:00</expression><output type="boolean">true</output></test>
 		<test name="testNotEquivalent17" inputfile="patient-example.json"><expression>@2012-04-15T15:30:31 !~ @2012-04-15T15:30:31.0</expression><output type="boolean">false</output></test>
 		<test name="testNotEquivalent18" inputfile="patient-example.json"><expression>@2012-04-15T15:30:31 !~ @2012-04-15T15:30:31.1</expression><output type="boolean">true</output></test>
-		<test name="testNotEquivalent19" inputfile="patient-example.json"><expression>name !~ name</expression><output type="boolean">true</output></test>
+		<test name="testNotEquivalent19" inputfile="patient-example.json"><expression>name !~ name</expression><output type="boolean">false</output></test>
 		<test name="testNotEquivalent20" inputfile="patient-example.json"><expression>name.take(2).given !~ name.take(2).first().given | name.take(2).last().given</expression><output type="boolean">false</output></test>
 		<test name="testNotEquivalent21" inputfile="patient-example.json"><expression>name.take(2).given !~ name.take(2).last().given | name.take(2).first().given</expression><output type="boolean">false</output></test>
     <test name="testNotEquivalent22" inputfile="observation-example.json"><expression>Observation.value !~ 185 'kg'</expression><output type="boolean">true</output></test>

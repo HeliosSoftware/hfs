@@ -229,12 +229,8 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     // Create an evaluation context with the resource
     let mut context = EvaluationContext::new(vec![fhir::FhirResource::R4(Box::new(resource))]);
 
-    println!("DEBUG: Loading resource from file: {}", json_filename);
-    
     // Enhanced context setup for tests: For patient example, we'll add a direct birth date access path
     if json_filename == "patient-example.json" {
-        println!("DEBUG: Setting up Patient context");
-        println!("DEBUG: context.this = {:?}", context.this);
         // Clone relevant information before modifying the context
         let patient_data = if let Some(this) = &context.this {
             if let EvaluationResult::Object { map: obj, .. } = this {
@@ -258,7 +254,6 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
         // Now use the cloned data to update the context
         if let Some((patient_obj, birthdate_opt, birthdate_ext_opt)) = patient_data {
             // First, set the complete Patient object
-            println!("DEBUG: Setting Patient variable to: {:?}", patient_obj);
             context.set_variable_result("Patient", patient_obj.clone());
 
             // If we have both birthdate and its extension, create a special enhanced context
@@ -284,7 +279,6 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                 patient_map.insert("_birthDate".to_string(), birthdate_ext.clone());
 
                 // Set this enhanced context for the "Patient" variable
-                println!("DEBUG: Replacing Patient variable with enhanced context");
                 context.set_variable_result("Patient", EvaluationResult::object(patient_map));
             }
         }
@@ -324,18 +318,10 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                         observation_map.insert(key.clone(), value.clone());
                     }
 
-                    // Debug the Observation object
-                    println!(
-                        "  DEBUG: Observation valueQuantity found: {:?}",
-                        obj.get("valueQuantity")
-                    );
-
                     // Extract the unit from valueQuantity for easy testing
-                    if let Some(EvaluationResult::Object { map: vq, .. }) = obj.get("valueQuantity")
+                    if let Some(EvaluationResult::Object { map: _vq, .. }) = obj.get("valueQuantity")
                     {
-                        if let Some(unit) = vq.get("unit") {
-                            println!("  DEBUG: Found unit in valueQuantity: {:?}", unit);
-                        }
+                        // Note: unit information available for debugging if needed
                     }
                 }
 
@@ -354,6 +340,56 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                 context
                     .set_variable_result("Observation", EvaluationResult::object(observation_map));
             }
+        }
+    }
+    // Enhanced context setup for ValueSet tests
+    else if json_filename == "valueset-example-expansion.json" {
+        // Clone relevant information before modifying the context
+        let valueset_data = if let Some(this) = &context.this {
+            if let EvaluationResult::Object { map: obj, .. } = this {
+                if obj.get("resourceType")
+                    == Some(&EvaluationResult::String("ValueSet".to_string(), None))
+                {
+                    Some(this.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Now use the cloned data to update the context
+        if let Some(valueset_obj) = valueset_data {
+            // Set the ValueSet variable
+            context.set_variable_result("ValueSet", valueset_obj.clone());
+        }
+    }
+    // Enhanced context setup for Questionnaire tests
+    else if json_filename == "questionnaire-example.json" {
+        // Clone relevant information before modifying the context
+        let questionnaire_data = if let Some(this) = &context.this {
+            if let EvaluationResult::Object { map: obj, .. } = this {
+                if obj.get("resourceType")
+                    == Some(&EvaluationResult::String("Questionnaire".to_string(), None))
+                {
+                    Some(this.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Now use the cloned data to update the context
+        if let Some(questionnaire_obj) = questionnaire_data {
+            // Set the Questionnaire variable
+            context.set_variable_result("Questionnaire", questionnaire_obj.clone());
         }
     }
 
@@ -636,6 +672,7 @@ fn test_patient_active_type() {
         "but due to test structure limitations, we're reporting diagnostics instead of strict assertions."
     );
 }
+
 
 #[test]
 fn test_r4_test_suite() {
@@ -998,14 +1035,6 @@ fn test_r4_test_suite() {
                 continue;
             }
 
-            // Add special debug output for type tests
-            if test.name.starts_with("testType") {
-                println!(
-                    "\n*** Running type test: {} - '{}' ***",
-                    test.name, test.expression
-                );
-                println!("  Expected results: {:?}", expected_results);
-            }
 
             // Run the test
             let is_predicate_test = test.predicate == "true";

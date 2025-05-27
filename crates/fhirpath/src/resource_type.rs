@@ -19,7 +19,7 @@ use fhir::{FhirVersion, FhirResourceTypeProvider};
 /// # Returns
 /// 
 /// * `true` if the type is a resource type in the given FHIR version, `false` otherwise
-fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
+pub fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
     match fhir_version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => fhir::r4::Resource::is_resource_type(type_name),
@@ -45,7 +45,6 @@ fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> 
 /// * `true` if the value is of the specified type, `false` otherwise
 pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifier, context: &EvaluationContext) -> Result<bool, EvaluationError> {
     let (target_namespace, target_type) = extract_namespace_and_type_with_context(type_spec, context)?;
-    
     match value {
         EvaluationResult::Boolean(_, type_info) => {
             if let Some(type_info) = type_info {
@@ -111,9 +110,18 @@ pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifi
                 check_type_match(&Some("System".to_string()), "Quantity", &target_namespace, &target_type)
             }
         },
-        EvaluationResult::Object { type_info, .. } => {
+        EvaluationResult::Object { map, type_info, .. } => {
+            // First check if there's type_info available
             if let Some(type_info) = type_info {
                 check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else if let Some(resource_type_value) = map.get("resourceType") {
+                // For FHIR resources, check the resourceType property
+                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                    // Check if the resource type matches the target type
+                    check_type_match(&Some("FHIR".to_string()), resource_type, &target_namespace, &target_type)
+                } else {
+                    Ok(false)
+                }
             } else {
                 // Default to System.Object for object values
                 check_type_match(&Some("System".to_string()), "Object", &target_namespace, &target_type)
@@ -264,8 +272,8 @@ fn check_type_match(
                 
                 // Allow FHIR/System cross-matching for specific types:
                 // 1. Complex types like Quantity, Date, DateTime, Time
-                // 2. Resource types (checked dynamically)
-                // Primitive types (boolean, integer, string, etc.) should NOT cross-match
+                // 2. Resource types (checked dynamically)  
+                // Note: Primitive types (boolean, string, etc.) should NOT cross-match namespaces
                 let is_complex_type = matches!(
                     value_type.to_lowercase().as_str(), 
                     "quantity" | "date" | "datetime" | "time"
@@ -273,12 +281,12 @@ fn check_type_match(
                 
                 // Note: We can't easily access context here, so we use a simple heuristic
                 // that capitalized types starting with uppercase are likely resource types
-                let is_likely_resource_type = value_type.chars().next().map_or(false, |c| c.is_uppercase()) &&
+                let _is_likely_resource_type = value_type.chars().next().map_or(false, |c| c.is_uppercase()) &&
                     value_type.len() > 1 &&
                     !matches!(value_type.to_lowercase().as_str(), 
                              "boolean" | "string" | "integer" | "decimal" | "object" | "collection");
                 
-                let is_cross_matchable_type = is_complex_type || is_likely_resource_type;
+                let is_cross_matchable_type = is_complex_type; // Only complex types, not resource types
                 
                 let cross_namespace_match = is_cross_matchable_type && (
                     (value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("System")) ||
@@ -310,6 +318,7 @@ pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, contex
             // Clean the namespace and name
             let clean_name = clean_identifier(name);
             let clean_ns = clean_identifier(ns);
+            
             
             // Special handling for multi-part namespaces (e.g. System.Collections.List)
             if clean_ns.contains('.') {
@@ -382,7 +391,20 @@ pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, contex
                 "positiveInt", "unsignedInt", "uuid"
             ];
             
-            // Check if the clean_name is a known System primitive type
+            // Check type based on capitalization to determine intended namespace
+            if is_likely_system_type {
+                // Capitalized names likely intended for System namespace
+                if system_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
+                    return Ok((Some("System".to_string()), clean_name.clone()));
+                }
+            } else {
+                // Lowercase names likely intended for FHIR namespace  
+                if fhir_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
+                    return Ok((Some("FHIR".to_string()), clean_name.to_lowercase()));
+                }
+            }
+            
+            // Fallback: check if it matches any primitive type regardless of case preference
             if system_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
                 // When using "is(Boolean)" or "is(Integer)", normalize to System.X
                 let normalized_type = if is_likely_system_type {
@@ -396,7 +418,6 @@ pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, contex
                 return Ok((Some("System".to_string()), normalized_type));
             }
             
-            // Check if the clean_name is a known FHIR primitive type
             else if fhir_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
                 // FHIR primitive types are conventionally lowercase
                 let normalized_type = if is_likely_system_type {
@@ -412,8 +433,8 @@ pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, contex
             
             // Use context-aware resource checking instead of hard-coded lists
             else if is_resource_type_for_version(&clean_name, &context.fhir_version) {
-                // Resource types default to System namespace when unqualified
-                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
+                // Resource types default to FHIR namespace when unqualified since FHIR resources have FHIR type info
+                return Ok((Some("FHIR".to_string()), capitalize_first_letter(&clean_name)));
             }
             
             // For complex types and unknown types, make an educated guess based on capitalization
@@ -558,14 +579,14 @@ pub fn extract_namespace_and_type(type_spec: &TypeSpecifier) -> Result<(Option<S
             
             // Check if the clean_name is a known FHIR resource type
             else if fhir_resource_types.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
-                // Unqualified resource types default to System namespace but should match FHIR types
-                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
+                // Unqualified resource types default to FHIR namespace
+                return Ok((Some("FHIR".to_string()), capitalize_first_letter(&clean_name)));
             }
             
             // Check if the clean_name is a known FHIR complex type
             else if fhir_complex_types.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
-                // Unqualified complex types default to System namespace but should match FHIR types
-                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
+                // Unqualified complex types default to FHIR namespace
+                return Ok((Some("FHIR".to_string()), capitalize_first_letter(&clean_name)));
             }
             
             // For types we're not confident about, make an educated guess based on capitalization
