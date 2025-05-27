@@ -1,13 +1,140 @@
 use fhirpath_support::{EvaluationError, EvaluationResult};
 use crate::parser::TypeSpecifier;
 use crate::fhir_type_hierarchy::capitalize_first_letter;
+use crate::evaluator::EvaluationContext;
+use fhir::{FhirVersion, FhirResourceTypeProvider};
 
 /// Handles type operations for FHIR resources, supporting is/as operators.
 /// This module provides enhanced support for handling FHIR resource types
 /// in FHIRPath expressions, allowing for proper type checking and filtering
 /// based on resource types.
 
-/// Determines if a value is of a specified FHIR or System type
+/// Checks if a type name is a resource type for the given FHIR version
+/// 
+/// # Arguments
+/// 
+/// * `type_name` - The type name to check (e.g., "Patient", "Observation")
+/// * `fhir_version` - The FHIR version to check against
+/// 
+/// # Returns
+/// 
+/// * `true` if the type is a resource type in the given FHIR version, `false` otherwise
+fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
+    match fhir_version {
+        #[cfg(feature = "R4")]
+        FhirVersion::R4 => fhir::r4::Resource::is_resource_type(type_name),
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => fhir::r4b::Resource::is_resource_type(type_name),
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => fhir::r5::Resource::is_resource_type(type_name),
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => fhir::r6::Resource::is_resource_type(type_name),
+    }
+}
+
+/// Determines if a value is of a specified FHIR or System type (context-aware version)
+/// 
+/// # Arguments
+/// 
+/// * `value` - The value to check
+/// * `type_spec` - The type specifier to check against
+/// * `context` - The evaluation context containing FHIR version information
+/// 
+/// # Returns
+/// 
+/// * `true` if the value is of the specified type, `false` otherwise
+pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifier, context: &EvaluationContext) -> Result<bool, EvaluationError> {
+    let (target_namespace, target_type) = extract_namespace_and_type_with_context(type_spec, context)?;
+    
+    match value {
+        EvaluationResult::Boolean(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Boolean for boolean values
+                check_type_match(&Some("System".to_string()), "Boolean", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Integer(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Integer for integer values
+                check_type_match(&Some("System".to_string()), "Integer", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Decimal(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Decimal for decimal values
+                check_type_match(&Some("System".to_string()), "Decimal", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::String(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.String for string values
+                check_type_match(&Some("System".to_string()), "String", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Date(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Date for date values
+                check_type_match(&Some("System".to_string()), "Date", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::DateTime(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.DateTime for datetime values
+                check_type_match(&Some("System".to_string()), "DateTime", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Time(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Time for time values
+                check_type_match(&Some("System".to_string()), "Time", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Quantity(_, _, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Quantity for quantity values
+                check_type_match(&Some("System".to_string()), "Quantity", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Object { type_info, .. } => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Object for object values
+                check_type_match(&Some("System".to_string()), "Object", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Collection { type_info, .. } => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Collection for collection values
+                check_type_match(&Some("System".to_string()), "Collection", &target_namespace, &target_type)
+            }
+        },
+        EvaluationResult::Empty => {
+            // Empty values don't match any specific type
+            Ok(false)
+        },
+    }
+}
+
+/// Determines if a value is of a specified FHIR or System type (legacy version without context)
 /// 
 /// # Arguments
 /// 
@@ -135,10 +262,28 @@ fn check_type_match(
             (Some(value_ns), Some(target_ns)) => {
                 let namespace_matches = value_ns.eq_ignore_ascii_case(target_ns);
                 
-                // Allow FHIR/System cross-matching for certain types like Quantity
-                let cross_namespace_match = 
+                // Allow FHIR/System cross-matching for specific types:
+                // 1. Complex types like Quantity, Date, DateTime, Time
+                // 2. Resource types (checked dynamically)
+                // Primitive types (boolean, integer, string, etc.) should NOT cross-match
+                let is_complex_type = matches!(
+                    value_type.to_lowercase().as_str(), 
+                    "quantity" | "date" | "datetime" | "time"
+                );
+                
+                // Note: We can't easily access context here, so we use a simple heuristic
+                // that capitalized types starting with uppercase are likely resource types
+                let is_likely_resource_type = value_type.chars().next().map_or(false, |c| c.is_uppercase()) &&
+                    value_type.len() > 1 &&
+                    !matches!(value_type.to_lowercase().as_str(), 
+                             "boolean" | "string" | "integer" | "decimal" | "object" | "collection");
+                
+                let is_cross_matchable_type = is_complex_type || is_likely_resource_type;
+                
+                let cross_namespace_match = is_cross_matchable_type && (
                     (value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("System")) ||
-                    (value_ns.eq_ignore_ascii_case("System") && target_ns.eq_ignore_ascii_case("FHIR"));
+                    (value_ns.eq_ignore_ascii_case("System") && target_ns.eq_ignore_ascii_case("FHIR"))
+                );
                 
                 Ok(namespace_matches || cross_namespace_match)
             },
@@ -154,7 +299,138 @@ fn check_type_match(
 }
 
 
-/// Extract namespace and type name from a TypeSpecifier
+/// Extract namespace and type name from a TypeSpecifier with context-aware resource checking
+/// Handles qualified names like "System.Boolean" or "FHIR.Patient"
+/// including backtick-quoted variants
+pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, context: &EvaluationContext) -> Result<(Option<String>, String), EvaluationError> {
+    match type_spec {
+        // Handle explicitly qualified types like FHIR.Patient in the AST
+        // The parser should have already cleaned up backticks in both parts
+        TypeSpecifier::QualifiedIdentifier(ns, Some(name)) => {
+            // Clean the namespace and name
+            let clean_name = clean_identifier(name);
+            let clean_ns = clean_identifier(ns);
+            
+            // Special handling for multi-part namespaces (e.g. System.Collections.List)
+            if clean_ns.contains('.') {
+                // For our current qualified type checks, we only need the main namespace
+                // (System, FHIR, etc.) and don't need to further split multi-part namespaces
+                let primary_ns = clean_ns.split('.').next().unwrap_or(&clean_ns).to_string();
+                
+                // For now, we'll treat complex namespaces as just their first part
+                // This simplifies handling System.Collections.List.Item vs System.Boolean
+                return Ok((Some(primary_ns), clean_name));
+            }
+            
+            // Normalize namespace casing for standard namespaces
+            let normalized_ns = match clean_ns.to_lowercase().as_str() {
+                "system" => "System".to_string(),
+                "fhir" => "FHIR".to_string(),
+                _ => clean_ns,
+            };
+            
+            Ok((Some(normalized_ns), clean_name))
+        },
+        
+        // Handle plain identifiers - these might be:
+        // 1. Simple types like "Boolean"
+        // 2. Already-qualified types like "System.Boolean" that need parsing
+        TypeSpecifier::QualifiedIdentifier(name, _) => {
+            // Clean the identifier
+            let clean_name = clean_identifier(name);
+            
+            // Check if this is a dot-separated qualified name like "System.Boolean"
+            if clean_name.contains('.') {
+                let parts: Vec<&str> = clean_name.split('.').collect();
+                
+                if parts.len() >= 2 {
+                    // Get namespace (first part) and type name (last part)
+                    // For multi-part qualifiers like System.Collections.List,
+                    // we'll consider only the first part as the primary namespace
+                    let raw_namespace = parts[0].to_string();
+                    let type_name = parts[parts.len() - 1].to_string();
+                    
+                    // Normalize namespace casing for standard namespaces
+                    let normalized_ns = match raw_namespace.to_lowercase().as_str() {
+                        "system" => "System".to_string(),
+                        "fhir" => "FHIR".to_string(),
+                        _ => raw_namespace,
+                    };
+                    
+                    // Return namespace and clean type name
+                    return Ok((Some(normalized_ns), clean_identifier(&type_name)));
+                }
+            }
+            
+            // Improved detection of type names with context-aware resource checking
+            
+            // First check for System types (with capitalized first letter)
+            let first_char = clean_name.chars().next().unwrap_or('_');
+            let is_likely_system_type = first_char.is_uppercase();
+            
+            // Known System primitive types
+            let system_primitives = [
+                "Boolean", "String", "Integer", "Decimal", "Date", 
+                "DateTime", "Time", "Quantity"
+            ];
+            
+            // Known FHIR primitive types (lowercase)
+            let fhir_primitives = [
+                "boolean", "string", "integer", "decimal", "date", 
+                "dateTime", "time", "code", "id", "uri", "url", 
+                "canonical", "markdown", "base64Binary", "instant", 
+                "positiveInt", "unsignedInt", "uuid"
+            ];
+            
+            // Check if the clean_name is a known System primitive type
+            if system_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
+                // When using "is(Boolean)" or "is(Integer)", normalize to System.X
+                let normalized_type = if is_likely_system_type {
+                    // Keep original capitalization for System types
+                    clean_name.clone()
+                } else {
+                    // Capitalize first letter for System types
+                    capitalize_first_letter(&clean_name)
+                };
+                
+                return Ok((Some("System".to_string()), normalized_type));
+            }
+            
+            // Check if the clean_name is a known FHIR primitive type
+            else if fhir_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
+                // FHIR primitive types are conventionally lowercase
+                let normalized_type = if is_likely_system_type {
+                    // If capitalized, it might be a System type
+                    clean_name.clone()
+                } else {
+                    // Otherwise keep lowercase for FHIR primitive
+                    clean_name.to_lowercase()
+                };
+                
+                return Ok((Some("FHIR".to_string()), normalized_type));
+            }
+            
+            // Use context-aware resource checking instead of hard-coded lists
+            else if is_resource_type_for_version(&clean_name, &context.fhir_version) {
+                // Resource types default to System namespace when unqualified
+                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
+            }
+            
+            // For complex types and unknown types, make an educated guess based on capitalization
+            else {
+                if is_likely_system_type {
+                    // Capitalized types are likely System types
+                    return Ok((Some("System".to_string()), clean_name));
+                } else {
+                    // Lowercase types are likely FHIR types
+                    return Ok((Some("FHIR".to_string()), clean_name));
+                }
+            }
+        }
+    }
+}
+
+/// Extract namespace and type name from a TypeSpecifier (legacy version without context)
 /// Handles qualified names like "System.Boolean" or "FHIR.Patient"
 /// including backtick-quoted variants
 pub fn extract_namespace_and_type(type_spec: &TypeSpecifier) -> Result<(Option<String>, String), EvaluationError> {
@@ -282,14 +558,14 @@ pub fn extract_namespace_and_type(type_spec: &TypeSpecifier) -> Result<(Option<S
             
             // Check if the clean_name is a known FHIR resource type
             else if fhir_resource_types.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
-                // FHIR resource types should be capitalized
-                return Ok((Some("FHIR".to_string()), capitalize_first_letter(&clean_name)));
+                // Unqualified resource types default to System namespace but should match FHIR types
+                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
             }
             
             // Check if the clean_name is a known FHIR complex type
             else if fhir_complex_types.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
-                // FHIR complex types should be capitalized
-                return Ok((Some("FHIR".to_string()), capitalize_first_letter(&clean_name)));
+                // Unqualified complex types default to System namespace but should match FHIR types
+                return Ok((Some("System".to_string()), capitalize_first_letter(&clean_name)));
             }
             
             // For types we're not confident about, make an educated guess based on capitalization

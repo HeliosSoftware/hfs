@@ -4926,7 +4926,7 @@ fn apply_type_operation(
     // Fallback to crate::resource_type for System types, 'ofType', or if not handled by polymorphic_access
     match op {
         "is" => {
-            let is_result = crate::resource_type::is_of_type(actual_value, type_spec)?;
+            let is_result = crate::resource_type::is_of_type_with_context(actual_value, type_spec, context)?;
             Ok(EvaluationResult::boolean(is_result))
         }
         "as" => {
