@@ -4912,7 +4912,7 @@ fn apply_type_operation(
         TypeSpecifier::QualifiedIdentifier(type_name, _) => {
             // Unqualified: could be System primitive, FHIR primitive, or resource type
             let is_fhir_prim = crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase());
-            let is_system_prim = crate::fhir_type_hierarchy::is_system_primitive_type(type_name);
+            let is_system_prim = matches!(type_name.as_str(), "Boolean" | "String" | "Integer" | "Decimal" | "Date" | "DateTime" | "Time" | "Quantity");
             let is_resource_type = crate::resource_type::is_resource_type_for_version(type_name, &context.fhir_version);
             
             // Route primitives and resource types to resource_type module

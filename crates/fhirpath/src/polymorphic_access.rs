@@ -490,8 +490,9 @@ pub fn apply_polymorphic_type_operation(
                         type_info: _,
                     } => {
                         // First check for FHIR resource type matching (for objects with type_info)
-                        if let Some(EvaluationResult::String(resource_type, _)) = obj.get("resourceType") {
-                            
+                        if let Some(EvaluationResult::String(resource_type, _)) =
+                            obj.get("resourceType")
+                        {
                             // For direct resource type checks (like Patient.is(Patient) or Patient.is(FHIR.Patient))
                             if resource_type.to_lowercase() == type_name.to_lowercase() {
                                 return Ok(EvaluationResult::boolean(true));
@@ -509,7 +510,7 @@ pub fn apply_polymorphic_type_operation(
                                 return Ok(EvaluationResult::boolean(true));
                             }
                         }
-                        
+
                         // Continue with other type checking logic...
                         // Check for boolean-like properties in FHIR resources without hardcoding specific fields
                         if type_name.to_lowercase() == "boolean" {
@@ -729,63 +730,6 @@ pub fn apply_polymorphic_type_operation(
     }
 }
 
-/// Filters a choice element by type, returning the type-specific field if it exists.
-///
-/// This is a simpler version of apply_polymorphic_type_operation that directly checks
-/// for a specific type without the full 'is'/'as' operator semantics.
-///
-/// # Arguments
-///
-/// * `obj` - A reference to a HashMap representing a FHIR resource or part of a resource
-/// * `field_name` - The base name of the choice element to filter
-/// * `type_name` - The type name to filter for
-///
-/// # Returns
-///
-/// * `Some(EvaluationResult)` if the type-specific field was found
-/// * `None` if the field wasn't found
-///
-/// # Examples
-///
-/// ```no_run
-/// use fhirpath::polymorphic_access::filter_by_type;
-/// use fhirpath_support::EvaluationResult;
-/// use std::collections::HashMap;
-///
-/// // Example code not meant for execution, just for documentation
-/// let observation = HashMap::new();
-/// let result1 = filter_by_type(&observation, "value", "Quantity");
-/// let result2 = filter_by_type(&observation, "value", "String");
-/// ```
-pub fn filter_by_type(
-    obj: &HashMap<String, EvaluationResult>,
-    field_name: &str,
-    type_name: &str,
-) -> Option<EvaluationResult> {
-    // Try to find the type-specific field
-    let field_with_type = format!("{}{}", field_name, type_name);
-
-    if let Some(value) = obj.get(&field_with_type) {
-        return Some(value.clone());
-    }
-
-    // No matching field found
-    None
-}
-
-/// Checks if a FHIR resource field is of a specific type
-/// For example, Observation.value.is(Quantity) will check if the value is a Quantity
-pub fn check_field_type(
-    obj: &HashMap<String, EvaluationResult>,
-    field_name: &str,
-    type_name: &str,
-) -> Result<bool, EvaluationError> {
-    // Try to get the type-specific field
-    let field_with_type = format!("{}{}", field_name, type_name);
-
-    // Return true if the field exists
-    Ok(obj.contains_key(&field_with_type))
-}
 
 #[cfg(test)]
 mod tests {
@@ -859,44 +803,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_filter_by_type() {
-        let obs = create_observation_with_quantity();
 
-        // Test filtering by correct type
-        let value = filter_by_type(&obs, "value", "Quantity").unwrap();
-
-        // Verify that it correctly finds valueQuantity
-        if let EvaluationResult::Object {
-            map: quantity,
-            type_info: None,
-        } = &value
-        {
-            assert_eq!(
-                quantity.get("unit").unwrap(),
-                &EvaluationResult::string("lbs".to_string())
-            );
-        } else {
-            panic!("Expected Object result, got {:?}", value);
-        }
-
-        // Test filtering by incorrect type
-        let value = filter_by_type(&obs, "value", "String");
-        assert!(value.is_none());
-    }
-
-    #[test]
-    fn test_check_field_type() {
-        let obs = create_observation_with_quantity();
-
-        // Test checking for correct type
-        let is_quantity = check_field_type(&obs, "value", "Quantity").unwrap();
-        assert!(is_quantity);
-
-        // Test checking for incorrect type
-        let is_string = check_field_type(&obs, "value", "String").unwrap();
-        assert!(!is_string);
-    }
 
     #[test]
     fn test_is_type_operation() {
@@ -940,9 +847,6 @@ mod tests {
             apply_polymorphic_type_operation(&value_quantity, "as", "Quantity", None).unwrap();
         assert_eq!(result, value_quantity);
 
-        // Verify we can get the valueQuantity directly
-        let value_quantity_direct = filter_by_type(&obs, "value", "Quantity").unwrap();
-        assert_eq!(value_quantity_direct, value_quantity);
 
         // Test with an Observation object
         let obj = EvaluationResult::Object {

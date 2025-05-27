@@ -206,37 +206,6 @@ fn find_extension_by_url(
 ///
 /// * If the extension is found, returns the extension element
 /// * If no extension is found with the given URL, returns Empty
-pub fn find_extension_in_underscore_property(
-    parent_obj: &HashMap<String, EvaluationResult>,
-    element_name: &str,
-    extension_url: &str,
-) -> Result<EvaluationResult, EvaluationError> {
-    // Create the underscore-prefixed name (e.g., "_birthDate")
-    let underscore_name = format!("_{}", element_name);
-
-    // Look for the underscore-prefixed element
-    if let Some(EvaluationResult::Object {
-        map: underscore_obj,
-        ..
-    }) = parent_obj.get(&underscore_name)
-    {
-        // Check for extensions array
-        if let Some(EvaluationResult::Collection {
-            items: extensions, ..
-        }) = underscore_obj.get("extension")
-        {
-            // Destructure
-            // Use find_extension_by_url to reuse the same logic for finding extensions
-            let result = find_extension_by_url(extensions, extension_url)?;
-            if !matches!(result, EvaluationResult::Empty) {
-                return Ok(result);
-            }
-        }
-    }
-
-    // No matching extension found
-    Ok(EvaluationResult::Empty)
-}
 
 #[cfg(test)]
 mod tests {
@@ -431,53 +400,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_extension_in_underscore_property() {
-        // Create a test extension
-        let mut extension_obj = HashMap::new();
-        extension_obj.insert(
-            "url".to_string(),
-            EvaluationResult::string("http://example.org/test-extension".to_string()),
-        );
-        extension_obj.insert(
-            "valueString".to_string(),
-            EvaluationResult::string("test value".to_string()),
-        );
-        let extension = EvaluationResult::Object {
-            map: extension_obj,
-            type_info: None,
-        };
-
-        // Create a test underscore element
-        let mut underscore_obj = HashMap::new();
-        underscore_obj.insert(
-            "extension".to_string(),
-            EvaluationResult::Collection {
-                items: vec![extension.clone()],
-                has_undefined_order: false,
-                type_info: None,
-            },
-        );
-
-        // Create a test parent object with the underscore element
-        let mut parent_obj = HashMap::new();
-        parent_obj.insert(
-            "_element".to_string(),
-            EvaluationResult::Object {
-                map: underscore_obj,
-                type_info: None,
-            },
-        );
-
-        // Test finding the extension
-        let result = find_extension_in_underscore_property(
-            &parent_obj,
-            "element",
-            "http://example.org/test-extension",
-        )
-        .unwrap();
-
-        // Verify the result matches the extension
-        assert_eq!(result, extension);
-    }
 }

@@ -1,6 +1,4 @@
-use chumsky::Parser;
-use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::parser;
+use fhirpath::{EvaluationContext, evaluate_expression};
 use fhirpath_support::EvaluationResult;
 
 #[test]
@@ -31,8 +29,7 @@ fn test_trace_function() {
     for (expr, expected) in trace_cases {
         println!("Testing: {}", expr);
         
-        let parsed = parser().parse(expr).unwrap();
-        let result = evaluate(&parsed, &context, None).unwrap();
+        let result = evaluate_expression(expr, &context).unwrap();
         
         assert_eq!(result, expected, "Expression: {}", expr);
     }
@@ -48,8 +45,7 @@ fn test_trace_function() {
     for expr in error_cases {
         println!("Testing error case: {}", expr);
         
-        let parsed = parser().parse(expr).unwrap();
-        let result = evaluate(&parsed, &context, None);
+        let result = evaluate_expression(expr, &context);
         
         assert!(result.is_err(), "Expected error for expression: {}", expr);
     }

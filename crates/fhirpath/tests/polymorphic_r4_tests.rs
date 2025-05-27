@@ -1,7 +1,5 @@
-use chumsky::Parser;
 use fhir::r4;
-use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::parser;
+use fhirpath::{EvaluationContext, evaluate_expression};
 use fhirpath_support::EvaluationResult;
 use std::fs::File;
 use std::io::Read;
@@ -57,11 +55,7 @@ fn test_polymorphic_as_quantity() {
 
 /// Evaluates a FHIRPath expression and returns the result
 fn run_expression(context: &EvaluationContext, expression: &str) -> EvaluationResult {
-    // Otherwise evaluate normally
-    let parsed = parser()
-        .parse(expression)
-        .expect("Failed to parse expression");
-    evaluate(&parsed, context, None).expect("Failed to evaluate expression")
+    evaluate_expression(expression, context).expect("Failed to evaluate expression")
 }
 
 /// Loads a FHIR R4 resource from a JSON test file and creates an evaluation context

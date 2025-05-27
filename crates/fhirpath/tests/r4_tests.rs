@@ -1,8 +1,9 @@
-use chumsky::Parser;
 use fhir::r4;
-use fhirpath::evaluator::{EvaluationContext, evaluate};
+use fhirpath::{EvaluationContext, evaluate_expression};
+use fhirpath::evaluator::evaluate;
 use fhirpath::parser::parser;
 use fhirpath_support::EvaluationResult;
+use chumsky::Parser;
 use roxmltree::{Document, Node};
 use rust_decimal::Decimal;
 use serde_json;
@@ -17,14 +18,9 @@ fn run_fhir_r4_test(
     expected: &[EvaluationResult],
     is_predicate_test: bool, // New parameter
 ) -> Result<(), String> {
-    // Parse the expression
-    let parsed = parser()
-        .parse(expression)
-        .map_err(|e| format!("Parse error: {:?}", e))?;
-
     // Evaluate the expression
-    let eval_result =
-        evaluate(&parsed, context, None).map_err(|e| format!("Evaluation error: {:?}", e))?;
+    let eval_result = evaluate_expression(expression, context)
+        .map_err(|e| format!("Evaluation error: {:?}", e))?;
 
     // If this is a predicate test, coerce the result according to FHIRPath spec 5.1.1
     let final_eval_result_for_comparison = if is_predicate_test {

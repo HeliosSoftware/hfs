@@ -198,35 +198,6 @@ pub fn compare_date_time_values(
     }
 }
 
-/// Implements the type() function for dates, times, and datetimes
-pub fn get_type_info(value: &EvaluationResult) -> (String, String) {
-    match value {
-        EvaluationResult::Date(_, _) => ("System".to_string(), "Date".to_string()),
-        EvaluationResult::DateTime(_, _) => ("System".to_string(), "DateTime".to_string()),
-        EvaluationResult::Time(_, _) => ("System".to_string(), "Time".to_string()),
-        _ => ("".to_string(), "".to_string()), // Not a date/time type
-    }
-}
-
-/// Checks if a value is of the specified date/time type
-pub fn is_date_time_type(
-    value: &EvaluationResult,
-    type_name: &str,
-    namespace: Option<&str>,
-) -> bool {
-    let (actual_namespace, actual_type) = get_type_info(value);
-
-    // Check namespace if specified
-    let namespace_matches = match namespace {
-        Some(ns) => ns == actual_namespace,
-        None => true, // Any namespace is fine if not specified
-    };
-
-    // Check type name
-    let type_matches = type_name == actual_type;
-
-    namespace_matches && type_matches
-}
 
 /// Converts a value to a date representation if possible
 pub fn to_date(value: &EvaluationResult) -> Option<String> {
@@ -289,46 +260,6 @@ pub fn to_datetime(value: &EvaluationResult) -> Option<String> {
     }
 }
 
-/// Converts a value to a time representation if possible
-pub fn to_time(value: &EvaluationResult) -> Option<String> {
-    match value {
-        EvaluationResult::Time(t, _) => Some(t.clone()),
-        EvaluationResult::DateTime(dt, _) => {
-            // Extract time part from datetime
-            let parts: Vec<&str> = dt.split('T').collect();
-            if parts.len() > 1 {
-                Some(parts[1].to_string())
-            } else {
-                None
-            }
-        }
-        EvaluationResult::String(s, _) => {
-            // Try to interpret as a time
-            if s.starts_with('T') {
-                let time_part = &s[1..]; // Remove leading 'T'
-                if parse_time(time_part).is_some() {
-                    Some(time_part.to_string())
-                } else {
-                    None
-                }
-            } else if parse_time(s).is_some() {
-                // Direct time format
-                Some(s.clone())
-            } else if let Some(idx) = s.find('T') {
-                // Extract time part from a datetime string
-                let time_part = &s[idx + 1..];
-                if parse_time(time_part).is_some() {
-                    Some(time_part.to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

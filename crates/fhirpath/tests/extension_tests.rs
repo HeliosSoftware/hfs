@@ -1,14 +1,11 @@
-use chumsky::Parser;
-use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::parser;
+use fhirpath::{EvaluationContext, evaluate_expression};
 use fhirpath_support::EvaluationResult;
 use serde_json::{self, json};
 use std::collections::HashMap;
 
 // Helper function to parse and evaluate FHIRPath expressions
 fn eval(expr: &str, context: &EvaluationContext) -> EvaluationResult {
-    let parsed = parser().parse(expr).unwrap();
-    evaluate(&parsed, context, None).unwrap()
+    evaluate_expression(expr, context).unwrap()
 }
 
 // Helper to create a test Patient context with birthTime extension

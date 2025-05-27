@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use chumsky::Parser;
-    use fhirpath::evaluator::{EvaluationContext, evaluate};
-    use fhirpath::parser::parser;
+    use fhirpath::{EvaluationContext, evaluate_expression};
     use fhirpath_support::EvaluationResult;
     use std::collections::HashMap;
 
@@ -41,14 +39,11 @@ mod tests {
         ];
         
         for (expression, input, expected) in test_cases {
-            // Parse the expression
-            let parsed = parser().parse(expression).unwrap();
-            
             // Set the $this variable to the input
             context.set_this(input);
             
             // Evaluate the expression
-            let result = evaluate(&parsed, &context, None).unwrap();
+            let result = evaluate_expression(expression, &context).unwrap();
             
             // Check if the result matches the expected result
             assert_eq!(result, expected, "Failed test for: {}", expression);
@@ -90,14 +85,11 @@ mod tests {
         ];
         
         for (expression, input, expected) in test_cases {
-            // Parse the expression
-            let parsed = parser().parse(expression).unwrap();
-            
             // Set the $this variable to the input
             context.set_this(input.clone());
             
             // Evaluate the expression
-            let result = evaluate(&parsed, &context, None).unwrap();
+            let result = evaluate_expression(expression, &context).unwrap();
             
             // Check if the result matches the expected result
             assert_eq!(result, expected, "Failed test for: {}", expression);
@@ -121,11 +113,8 @@ mod tests {
         ];
         
         for (expression, expected) in test_cases {
-            // Parse the expression
-            let parsed = parser().parse(expression).unwrap();
-            
             // Evaluate the expression
-            let result = evaluate(&parsed, &context, None).unwrap();
+            let result = evaluate_expression(expression, &context).unwrap();
             
             // Check if the result matches the expected result
             assert_eq!(result, expected, "Failed test for: {}", expression);
@@ -150,11 +139,8 @@ mod tests {
         ];
         
         for (expression, expected) in test_cases {
-            // Parse the expression
-            let parsed = parser().parse(expression).unwrap();
-            
             // Evaluate the expression
-            let result = evaluate(&parsed, &context, None).unwrap();
+            let result = evaluate_expression(expression, &context).unwrap();
             
             // Check if the result matches the expected result
             assert_eq!(result, expected, "Failed test for: {}", expression);
