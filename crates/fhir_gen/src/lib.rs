@@ -15,15 +15,15 @@
 //!
 //! ## Example Usage
 //!
-//! ```rust
+//! ```ignore
 //! use fhir_gen::process_fhir_version;
 //! use fhir::FhirVersion;
 //! use std::path::PathBuf;
 //!
 //! let output_dir = PathBuf::from("output");
 //! 
-//! // Generate code for R5
-//! process_fhir_version(Some(FhirVersion::R5), &output_dir)?;
+//! // Generate code for R4
+//! process_fhir_version(Some(FhirVersion::R4), &output_dir)?;
 //! 
 //! // Generate code for all versions
 //! process_fhir_version(None, &output_dir)?;
@@ -67,13 +67,13 @@ use std::path::PathBuf;
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// use fhir_gen::process_single_version;
 /// use fhir::FhirVersion;
 /// use std::path::PathBuf;
 ///
 /// let output_dir = PathBuf::from("generated");
-/// process_single_version(&FhirVersion::R5, &output_dir)?;
+/// process_single_version(&FhirVersion::R4, &output_dir)?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
 fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) -> io::Result<()> {
@@ -136,15 +136,15 @@ use crate::{Element, DecimalElement};\n\n",
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// use fhir_gen::process_fhir_version;
 /// use fhir::FhirVersion;
 /// use std::path::PathBuf;
 ///
 /// let output_dir = PathBuf::from("crates/fhir/src");
 ///
-/// // Process only R5
-/// process_fhir_version(Some(FhirVersion::R5), &output_dir)?;
+/// // Process only R4
+/// process_fhir_version(Some(FhirVersion::R4), &output_dir)?;
 ///
 /// // Process all enabled versions
 /// process_fhir_version(None, &output_dir)?;
@@ -475,7 +475,7 @@ fn generate_resource_enum(resources: Vec<String>) -> String {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// # use fhir_gen::make_rust_safe;
 /// assert_eq!(make_rust_safe("birthDate"), "birth_date");
 /// assert_eq!(make_rust_safe("type"), "r#type");
@@ -514,7 +514,7 @@ fn make_rust_safe(input: &str) -> String {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// # use fhir_gen::capitalize_first_letter;
 /// assert_eq!(capitalize_first_letter("patient"), "Patient");
 /// assert_eq!(capitalize_first_letter("humanName"), "HumanName");

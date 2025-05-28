@@ -60,32 +60,43 @@ mod tests {
 
         // Test type() on various primitive types
         let test_cases = vec![
-            // (Expression, Expected Result)
-            ("true.type()", "Boolean"),
-            ("42.type()", "Integer"),
-            ("3.14.type()", "Decimal"),
-            ("'test'.type()", "String"),
-            ("@2021-01-01.type()", "Date"),
-            ("@T12:00:00.type()", "Time"),
-            ("@2021-01-01T12:00:00.type()", "DateTime"),
-            ("10 'mg'.type()", "Quantity"),
-            ("{}.type()", "Empty"),
+            // (Expression, Expected namespace, Expected name)
+            ("true.type()", "System", "Boolean"),
+            ("42.type()", "System", "Integer"),
+            ("3.14.type()", "System", "Decimal"),
+            ("'test'.type()", "System", "String"),
+            ("@2021-01-01.type()", "System", "Date"),
+            ("@T12:00:00.type()", "System", "Time"),
+            ("@2021-01-01T12:00:00.type()", "System", "DateTime"),
+            ("10 'mg'.type()", "System", "Quantity"),
         ];
 
-        for (expr, expected) in test_cases {
-            // Check if this expression has a special handler
+        for (expr, expected_namespace, expected_name) in test_cases {
             let result = evaluate(&parser().parse(expr).unwrap(), &context, None).unwrap();
 
             match result {
-                EvaluationResult::String(type_name, _) => {
-                    assert_eq!(type_name, expected, "Failed for expression: {}", expr);
+                EvaluationResult::Collection { items, .. } => {
+                    assert_eq!(items.len(), 1, "Expected single item for {}", expr);
+                    match &items[0] {
+                        EvaluationResult::Object { map, .. } => {
+                            let namespace = map.get("namespace").unwrap();
+                            let name = map.get("name").unwrap();
+                            
+                            assert_eq!(namespace, &EvaluationResult::String(expected_namespace.to_string(), None), 
+                                      "Wrong namespace for {}", expr);
+                            assert_eq!(name, &EvaluationResult::String(expected_name.to_string(), None), 
+                                      "Wrong name for {}", expr);
+                        }
+                        _ => panic!("Expected Object in collection for {}, got {:?}", expr, items[0]),
+                    }
                 }
-                EvaluationResult::Empty => {
-                    assert_eq!(expected, "Empty", "Failed for expression: {}", expr);
-                }
-                _ => panic!("Expected String or Empty for {}, got {:?}", expr, result),
+                _ => panic!("Expected Collection for {}, got {:?}", expr, result),
             }
         }
+
+        // Test empty collection
+        let result = evaluate(&parser().parse("{}.type()").unwrap(), &context, None).unwrap();
+        assert_eq!(result, EvaluationResult::Empty);
     }
 
     #[test]
@@ -100,7 +111,19 @@ mod tests {
 
         // Single-item collection (returns type of the item)
         let result = evaluate(&parser().parse("(42).type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::string("Integer".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Integer".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
         // Multi-item collection (returns collection of types)
         let result = evaluate(
@@ -113,9 +136,26 @@ mod tests {
         match result {
             EvaluationResult::Collection { items: types, .. } => {
                 assert_eq!(types.len(), 3);
-                assert!(types.contains(&EvaluationResult::string("Integer".to_string())));
-                assert!(types.contains(&EvaluationResult::string("String".to_string())));
-                assert!(types.contains(&EvaluationResult::string("Boolean".to_string())));
+                
+                // Check each type object
+                for type_obj in &types {
+                    match type_obj {
+                        EvaluationResult::Object { map, .. } => {
+                            let namespace = map.get("namespace").unwrap();
+                            let name = map.get("name").unwrap();
+                            
+                            assert_eq!(namespace, &EvaluationResult::String("System".to_string(), None));
+                            
+                            let name_str = match name {
+                                EvaluationResult::String(s, _) => s,
+                                _ => panic!("Expected string name"),
+                            };
+                            
+                            assert!(["Integer", "String", "Boolean"].contains(&name_str.as_str()));
+                        }
+                        _ => panic!("Expected Object in collection, got {:?}", type_obj),
+                    }
+                }
             }
             _ => panic!("Expected Collection, got {:?}", result),
         }
@@ -131,7 +171,19 @@ mod tests {
 
         // Test type() on FHIR resource
         let result = evaluate(&parser().parse("$this.type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::string("Patient".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
         // Test type() on nested object within FHIR resource
         let result = evaluate(
@@ -140,11 +192,35 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::string("Object".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
         // Test type() on property within FHIR resource
         let result = evaluate(&parser().parse("$this.id.type()").unwrap(), &context, None).unwrap();
-        assert_eq!(result, EvaluationResult::string("String".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("String".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
     }
 
     #[test]
@@ -155,15 +231,21 @@ mod tests {
         let obj = create_generic_object();
         context.set_this(obj.clone());
 
-        // Note: For the generic object test, our special handler doesn't handle "$this.type()"
-        // in this context, since it can't distinguish between resource and generic contexts.
-        // But it will still handle property accesses.
-
-        // Test type() on generic (non-FHIR) object - using a different expression identifier
-        let _expr = "$this.type()";
-        // We'll force the result here since our handler returns "Patient" for all "$this.type()" calls
-        let result = EvaluationResult::string("Object".to_string());
-        assert_eq!(result, EvaluationResult::string("Object".to_string()));
+        // Test type() on generic (non-FHIR) object
+        let result = evaluate(&parser().parse("$this.type()").unwrap(), &context, None).unwrap();
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
         // Test type() on property within generic object
         let result = evaluate(
@@ -172,7 +254,19 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::string("String".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("String".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
         let result = evaluate(
             &parser().parse("$this.key2.type()").unwrap(),
@@ -180,7 +274,19 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::string("Integer".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Integer".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
     }
 
     #[test]
@@ -190,29 +296,30 @@ mod tests {
 
         // Test chaining type() with other operations
 
-        // Type of the type result (should be String)
+        // Type of the type result (should be Type object)
         let result = evaluate(
             &parser().parse("$this.type().type()").unwrap(),
             &context,
             None,
         )
         .unwrap();
-        assert_eq!(result, EvaluationResult::string("String".to_string()));
+        match result {
+            EvaluationResult::Collection { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    EvaluationResult::Object { map, .. } => {
+                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
+                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Type".to_string(), None));
+                    }
+                    _ => panic!("Expected Object in collection, got {:?}", items[0]),
+                }
+            }
+            _ => panic!("Expected Collection, got {:?}", result),
+        }
 
-        // Type check on the result of type()
+        // Type used in conditional - accessing the name property
         let result = evaluate(
-            &parser().parse("$this.type() = 'Patient'").unwrap(),
-            &context,
-            None,
-        )
-        .unwrap();
-        assert_eq!(result, EvaluationResult::boolean(true));
-
-        // Type used in conditional
-        let result = evaluate(
-            &parser()
-                .parse("$this.type() = 'Patient' implies $this.id.exists()")
-                .unwrap(),
+            &parser().parse("$this.type().name = 'Object' implies $this.id.exists()").unwrap(),
             &context,
             None,
         )

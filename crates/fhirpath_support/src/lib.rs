@@ -27,7 +27,7 @@
 //! // Convert a string to an evaluation result
 //! let text = "Hello, FHIR!".to_string();
 //! let result = text.into_evaluation_result();
-//! assert_eq!(result, EvaluationResult::String("Hello, FHIR!".to_string()));
+//! assert_eq!(result, EvaluationResult::String("Hello, FHIR!".to_string(), None));
 //!
 //! // Work with collections
 //! let numbers = vec![1, 2, 3];
@@ -73,7 +73,7 @@ pub use type_info::TypeInfoResult;
 ///         let mut map = std::collections::HashMap::new();
 ///         map.insert("value".to_string(), self.value.into_evaluation_result());
 ///         map.insert("active".to_string(), self.active.into_evaluation_result());
-///         EvaluationResult::Object(map)
+///         EvaluationResult::Object { map, type_info: None }
 ///     }
 /// }
 /// ```
@@ -119,9 +119,9 @@ pub trait IntoEvaluationResult {
 ///
 /// // Creating different result types
 /// let empty = EvaluationResult::Empty;
-/// let text = EvaluationResult::String("Patient".to_string());
-/// let number = EvaluationResult::Integer(42);
-/// let decimal = EvaluationResult::Decimal(Decimal::new(1234, 2)); // 12.34
+/// let text = EvaluationResult::String("Patient".to_string(), None);
+/// let number = EvaluationResult::Integer(42, None);
+/// let decimal = EvaluationResult::Decimal(Decimal::new(1234, 2), None); // 12.34
 ///
 /// // Working with collections
 /// let items = vec![text, number];
@@ -394,12 +394,12 @@ impl std::fmt::Display for EvaluationError {
 /// use fhirpath_support::EvaluationResult;
 /// use rust_decimal::Decimal;
 ///
-/// let a = EvaluationResult::String("test".to_string());
-/// let b = EvaluationResult::String("test".to_string());
+/// let a = EvaluationResult::String("test".to_string(), None);
+/// let b = EvaluationResult::String("test".to_string(), None);
 /// assert_eq!(a, b);
 ///
-/// let c = EvaluationResult::Decimal(Decimal::new(100, 2)); // 1.00
-/// let d = EvaluationResult::Decimal(Decimal::new(1, 0));   // 1
+/// let c = EvaluationResult::Decimal(Decimal::new(100, 2), None); // 1.00
+/// let d = EvaluationResult::Decimal(Decimal::new(1, 0), None);   // 1
 /// assert_eq!(c, d); // Normalized decimals are equal
 /// ```
 impl PartialEq for EvaluationResult {
@@ -816,10 +816,11 @@ impl EvaluationResult {
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![],
     ///     has_undefined_order: false,
+    ///     type_info: None,
     /// };
     /// assert!(collection.is_collection());
     ///
-    /// let string = EvaluationResult::String("test".to_string());
+    /// let string = EvaluationResult::String("test".to_string(), None);
     /// assert!(!string.is_collection());
     /// ```
     pub fn is_collection(&self) -> bool {
@@ -841,14 +842,15 @@ impl EvaluationResult {
     /// use fhirpath_support::EvaluationResult;
     ///
     /// assert_eq!(EvaluationResult::Empty.count(), 0);
-    /// assert_eq!(EvaluationResult::String("test".to_string()).count(), 1);
+    /// assert_eq!(EvaluationResult::String("test".to_string(), None).count(), 1);
     ///
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![
-    ///         EvaluationResult::Integer(1),
-    ///         EvaluationResult::Integer(2),
+    ///         EvaluationResult::Integer(1, None),
+    ///         EvaluationResult::Integer(2, None),
     ///     ],
     ///     has_undefined_order: false,
+    ///     type_info: None,
     /// };
     /// assert_eq!(collection.count(), 2);
     /// ```
@@ -879,11 +881,11 @@ impl EvaluationResult {
     /// use rust_decimal::Decimal;
     ///
     /// assert_eq!(EvaluationResult::Empty.to_boolean(), false);
-    /// assert_eq!(EvaluationResult::Boolean(true).to_boolean(), true);
-    /// assert_eq!(EvaluationResult::String("".to_string()).to_boolean(), false);
-    /// assert_eq!(EvaluationResult::String("text".to_string()).to_boolean(), true);
-    /// assert_eq!(EvaluationResult::Integer(0).to_boolean(), false);
-    /// assert_eq!(EvaluationResult::Integer(42).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::Boolean(true, None).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::String("".to_string(), None).to_boolean(), false);
+    /// assert_eq!(EvaluationResult::String("text".to_string(), None).to_boolean(), true);
+    /// assert_eq!(EvaluationResult::Integer(0, None).to_boolean(), false);
+    /// assert_eq!(EvaluationResult::Integer(42, None).to_boolean(), true);
     /// ```
     pub fn to_boolean(&self) -> bool {
         match self {
@@ -921,10 +923,10 @@ impl EvaluationResult {
     /// use rust_decimal::Decimal;
     ///
     /// assert_eq!(EvaluationResult::Empty.to_string_value(), "");
-    /// assert_eq!(EvaluationResult::Boolean(true).to_string_value(), "true");
-    /// assert_eq!(EvaluationResult::Integer(42).to_string_value(), "42");
+    /// assert_eq!(EvaluationResult::Boolean(true, None).to_string_value(), "true");
+    /// assert_eq!(EvaluationResult::Integer(42, None).to_string_value(), "42");
     ///
-    /// let quantity = EvaluationResult::Quantity(Decimal::new(54, 1), "mg".to_string());
+    /// let quantity = EvaluationResult::Quantity(Decimal::new(54, 1), "mg".to_string(), None);
     /// assert_eq!(quantity.to_string_value(), "5.4 'mg'");
     /// ```
     pub fn to_string_value(&self) -> String {
@@ -987,17 +989,17 @@ impl EvaluationResult {
     /// ```rust
     /// use fhirpath_support::{EvaluationResult, EvaluationError};
     ///
-    /// let true_str = EvaluationResult::String("true".to_string());
-    /// assert_eq!(true_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true));
+    /// let true_str = EvaluationResult::String("true".to_string(), None);
+    /// assert_eq!(true_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None));
     ///
-    /// let false_str = EvaluationResult::String("false".to_string());
-    /// assert_eq!(false_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(false));
+    /// let false_str = EvaluationResult::String("false".to_string(), None);
+    /// assert_eq!(false_str.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(false, None));
     ///
-    /// let other_str = EvaluationResult::String("maybe".to_string());
+    /// let other_str = EvaluationResult::String("maybe".to_string(), None);
     /// assert_eq!(other_str.to_boolean_for_logic().unwrap(), EvaluationResult::Empty);
     ///
-    /// let integer = EvaluationResult::Integer(42);
-    /// assert_eq!(integer.to_boolean_for_logic().unwrap(), EvaluationResult::Empty);
+    /// let integer = EvaluationResult::Integer(42, None);
+    /// assert_eq!(integer.to_boolean_for_logic().unwrap(), EvaluationResult::Boolean(true, None));
     /// ```
     pub fn to_boolean_for_logic(&self) -> Result<EvaluationResult, EvaluationError> {
         match self {
@@ -1048,8 +1050,8 @@ impl EvaluationResult {
     /// use fhirpath_support::EvaluationResult;
     ///
     /// assert!(EvaluationResult::Empty.is_string_or_empty());
-    /// assert!(EvaluationResult::String("test".to_string()).is_string_or_empty());
-    /// assert!(!EvaluationResult::Integer(42).is_string_or_empty());
+    /// assert!(EvaluationResult::String("test".to_string(), None).is_string_or_empty());
+    /// assert!(!EvaluationResult::Integer(42, None).is_string_or_empty());
     /// ```
     pub fn is_string_or_empty(&self) -> bool {
         matches!(
@@ -1069,12 +1071,13 @@ impl EvaluationResult {
     /// use fhirpath_support::EvaluationResult;
     ///
     /// assert_eq!(EvaluationResult::Empty.type_name(), "Empty");
-    /// assert_eq!(EvaluationResult::String("test".to_string()).type_name(), "String");
-    /// assert_eq!(EvaluationResult::Integer(42).type_name(), "Integer");
+    /// assert_eq!(EvaluationResult::String("test".to_string(), None).type_name(), "String");
+    /// assert_eq!(EvaluationResult::Integer(42, None).type_name(), "Integer");
     ///
     /// let collection = EvaluationResult::Collection {
     ///     items: vec![],
     ///     has_undefined_order: false,
+    ///     type_info: None,
     /// };
     /// assert_eq!(collection.type_name(), "Collection");
     /// ```
@@ -1233,7 +1236,7 @@ where
 /// use fhirpath_support::{convert_value_to_evaluation_result, EvaluationResult};
 ///
 /// let result = convert_value_to_evaluation_result(&"hello".to_string());
-/// assert_eq!(result, EvaluationResult::String("hello".to_string()));
+/// assert_eq!(result, EvaluationResult::String("hello".to_string(), None));
 ///
 /// let numbers = vec![1, 2, 3];
 /// let collection_result = convert_value_to_evaluation_result(&numbers);

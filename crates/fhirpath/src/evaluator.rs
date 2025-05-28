@@ -429,7 +429,7 @@ fn apply_decimal_multiplicative(
 /// // Parse and evaluate a simple literal
 /// let expr = parser().parse("5").unwrap();
 /// let result = evaluate(&expr, &context, None);
-/// assert!(matches!(result, Ok(EvaluationResult::integer(5))));
+/// assert!(matches!(result, Ok(EvaluationResult::Integer(5, _))));
 /// ```
 pub fn evaluate(
     expr: &Expression,

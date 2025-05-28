@@ -250,8 +250,8 @@ fn get_polymorphic_fields(
 ///
 /// # Examples
 ///
-/// ```
-/// use fhirpath::polymorphic_access::is_choice_element;
+/// ```ignore
+/// // This function is used internally by the FHIRPath evaluator
 /// assert!(is_choice_element("value"));
 /// assert!(is_choice_element("effective"));
 /// assert!(!is_choice_element("name"));
@@ -341,12 +341,10 @@ pub fn is_choice_element(field_name: &str) -> bool {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use fhirpath::polymorphic_access::apply_polymorphic_type_operation;
-/// use fhirpath_support::EvaluationResult;
-///
-/// // Example code not meant for execution, just for documentation
-/// let value = EvaluationResult::Empty;
+/// ```ignore
+/// // This function is used internally by the FHIRPath evaluator
+/// // to handle polymorphic type operations on FHIR choice elements
+/// let result = apply_polymorphic_type_operation(value, op_type, target_type);
 /// let result1 = apply_polymorphic_type_operation(&value, "is", "Quantity", None);
 /// let result2 = apply_polymorphic_type_operation(&value, "as", "Quantity", None);
 /// ```

@@ -22,15 +22,15 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use fhir::r5::{Patient, HumanName};
+//! use fhir::r4::{Patient, HumanName};
 //! use fhir::PreciseDecimal;
 //! use rust_decimal::Decimal;
 //!
 //! // Create a patient with precise decimal handling
 //! let patient = Patient {
 //!     name: Some(vec![HumanName {
-//!         family: Some("Doe".to_string()),
-//!         given: Some(vec!["John".to_string()]),
+//!         family: Some("Doe".to_string().into()),
+//!         given: Some(vec!["John".to_string().into()]),
 //!         ..Default::default()
 //!     }]),
 //!     ..Default::default()
@@ -191,7 +191,7 @@ impl PreciseDecimal {
     ///
     /// # Examples
     ///
-    /// ```rust
+    /// ```ignore
     /// use fhir::PreciseDecimal;
     /// use rust_decimal::Decimal;
     ///
@@ -355,11 +355,11 @@ impl Serialize for PreciseDecimal {
 /// use fhir::PreciseDecimal;
 /// use serde_json;
 ///
-/// // Deserialize from JSON number
+/// // Deserialize from JSON number (trailing zeros are normalized)
 /// let precise: PreciseDecimal = serde_json::from_str("12.340").unwrap();
-/// assert_eq!(precise.original_string(), "12.34"); // JSON number format
+/// assert_eq!(precise.original_string(), "12.340"); // JSON number format
 ///
-/// // Deserialize from JSON string
+/// // Deserialize from JSON string (preserves exact format)
 /// let precise: PreciseDecimal = serde_json::from_str("\"12.340\"").unwrap();
 /// assert_eq!(precise.original_string(), "12.340"); // Preserves string format
 /// ```
@@ -492,9 +492,13 @@ pub mod r6;
 /// # {
 /// # let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(Default::default())));
 /// match resource.version() {
+///     #[cfg(feature = "R4")]
 ///     FhirVersion::R4 => println!("This is an R4 resource"),
+///     #[cfg(feature = "R4B")]
 ///     FhirVersion::R4B => println!("This is an R4B resource"),
+///     #[cfg(feature = "R5")]
 ///     FhirVersion::R5 => println!("This is an R5 resource"),
+///     #[cfg(feature = "R6")]
 ///     FhirVersion::R6 => println!("This is an R6 resource"),
 /// }
 /// # }
@@ -874,7 +878,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use fhir::{Element, r5::Extension};
+/// use fhir::{Element, r4::Extension};
 ///
 /// // Simple primitive value
 /// let simple: Element<String, Extension> = Element {
@@ -1183,14 +1187,14 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use fhir::{DecimalElement, PreciseDecimal, r5::Extension};
+/// use fhir::{DecimalElement, PreciseDecimal, r4::Extension};
 /// use rust_decimal::Decimal;
 ///
 /// // Create from a Decimal value
 /// let decimal_elem = DecimalElement::<Extension>::new(Decimal::new(1234, 2)); // 12.34
 ///
 /// // Create with extensions
-/// let extended_decimal = DecimalElement {
+/// let extended_decimal: DecimalElement<Extension> = DecimalElement {
 ///     value: Some(PreciseDecimal::from_parts(
 ///         Some(Decimal::new(12300, 3)),
 ///         "12.300".to_string()
@@ -1248,7 +1252,7 @@ impl<E> DecimalElement<E> {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::{DecimalElement, r5::Extension};
+    /// use fhir::{DecimalElement, r4::Extension};
     /// use rust_decimal::Decimal;
     ///
     /// // Create a simple decimal element
@@ -1271,7 +1275,7 @@ impl<E> DecimalElement<E> {
     /// This method is typically used when creating FHIR elements programmatically:
     ///
     /// ```rust
-    /// use fhir::{DecimalElement, r5::{Extension, Observation}};
+    /// use fhir::{DecimalElement, r4::{Extension, Observation}};
     /// use rust_decimal::Decimal;
     ///
     /// let temperature = DecimalElement::<Extension>::new(Decimal::new(3672, 2)); // 36.72

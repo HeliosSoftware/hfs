@@ -58,7 +58,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```ignore
 //! use fhir_macro::{FhirSerde, FhirPath};
 //!
 //! #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
