@@ -482,24 +482,24 @@ pub mod r6;
 ///
 /// ```rust
 /// use fhir::{FhirResource, FhirVersion};
-/// # #[cfg(feature = "R5")]
-/// use fhir::r5::{Patient, HumanName};
+/// # #[cfg(feature = "R4")]
+/// use fhir::r4::{Patient, HumanName};
 ///
-/// # #[cfg(feature = "R5")]
+/// # #[cfg(feature = "R4")]
 /// {
-///     // Create an R5 patient
+///     // Create an R4 patient
 ///     let patient = Patient {
 ///         name: Some(vec![HumanName {
-///             family: Some("Doe".to_string()),
-///             given: Some(vec!["John".to_string()]),
+///             family: Some("Doe".to_string().into()),
+///             given: Some(vec!["John".to_string().into()]),
 ///             ..Default::default()
 ///         }]),
 ///         ..Default::default()
 ///     };
 ///
 ///     // Wrap in version-agnostic container
-///     let resource = FhirResource::R5(Box::new(patient.into()));
-///     assert_eq!(resource.version(), FhirVersion::R5);
+///     let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+///     assert_eq!(resource.version(), FhirVersion::R4);
 /// }
 /// ```
 ///
