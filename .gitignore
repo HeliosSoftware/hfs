@@ -5,6 +5,7 @@ yarn.lock
 .aider*
 crates/fhir_gen/resources/R6
 crates/fhir/tests/data/R6
+crates/fhir/src/r6.rs
 .idea
 package-lock.json
 **/.claude/settings.local.json

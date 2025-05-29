@@ -1,4 +1,3 @@
-- Temporarily identify excluded tests - should not fail the entire build
 
 - Regenerate with fhir_gen - all code - get r6 working properly.
 
@@ -40,3 +39,6 @@
     -What do people build using the Helios FHIR Server?
     -Quick Start
     -Documentation (if not above)
+
+
+- When R6 is released, remove NullSkippingVec and fix test files directly.

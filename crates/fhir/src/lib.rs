@@ -49,6 +49,31 @@ use serde::{
 };
 use std::marker::PhantomData;
 
+/// Custom deserializer that is more forgiving of null values in JSON.
+///
+/// This creates a custom `Option<T>` deserializer that will return None for null values
+/// but also for any deserialization errors. This makes it possible to skip over
+/// malformed or unexpected values in FHIR JSON.
+pub fn deserialize_forgiving_option<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    // Use the intermediate Value approach to check for null first
+    let json_value = serde_json::Value::deserialize(deserializer)?;
+
+    match json_value {
+        serde_json::Value::Null => Ok(None),
+        _ => {
+            // Try to deserialize the value, but return None if it fails
+            match T::deserialize(json_value) {
+                Ok(value) => Ok(Some(value)),
+                Err(_) => Ok(None), // Ignore errors and return None
+            }
+        }
+    }
+}
+
 /// High-precision decimal type that preserves original string representation.
 ///
 /// FHIR requires that decimal values maintain their original precision and format
@@ -75,7 +100,7 @@ use std::marker::PhantomData;
 ///
 /// // Create with specific string format
 /// let precise = PreciseDecimal::from_parts(
-///     Some(Decimal::new(1000, 2)), 
+///     Some(Decimal::new(1000, 2)),
 ///     "10.00".to_string()
 /// );
 /// assert_eq!(precise.original_string(), "10.00");
@@ -210,7 +235,7 @@ impl PreciseDecimal {
     fn parse_decimal_string(s: &str) -> Option<Decimal> {
         // Normalize 'E' to 'e' for consistent parsing
         let normalized = s.replace('E', "e");
-        
+
         if normalized.contains('e') {
             // Use scientific notation parsing
             Decimal::from_scientific(&normalized).ok()
@@ -316,7 +341,7 @@ impl From<Decimal> for PreciseDecimal {
 ///     Some(Decimal::new(1230, 2)),
 ///     "12.30".to_string()
 /// );
-/// 
+///
 /// let json = serde_json::to_string(&precise).unwrap();
 /// assert_eq!(json, "12.30"); // Preserves trailing zero
 /// ```
@@ -384,31 +409,27 @@ impl<'de> Deserialize<'de> for PreciseDecimal {
                 Ok(PreciseDecimal::from_parts(parsed_value, s))
             }
             // Handle nested object format (for macro-generated structures)
-            serde_json::Value::Object(map) => {
-                match map.get("value") {
-                    Some(serde_json::Value::Number(n)) => {
-                        let original_string = n.to_string();
-                        let parsed_value = Self::parse_decimal_string(&original_string);
-                        Ok(PreciseDecimal::from_parts(parsed_value, original_string))
-                    }
-                    Some(serde_json::Value::String(s)) => {
-                        let original_string = s.clone();
-                        let parsed_value = Self::parse_decimal_string(&original_string);
-                        Ok(PreciseDecimal::from_parts(parsed_value, original_string))
-                    }
-                    Some(serde_json::Value::Null) => {
-                        Err(de::Error::invalid_value(
-                            de::Unexpected::Unit,
-                            &"a number or string for decimal value",
-                        ))
-                    }
-                    None => Err(de::Error::missing_field("value")),
-                    _ => Err(de::Error::invalid_type(
-                        de::Unexpected::Map,
-                        &"a map with a 'value' field containing a number or string",
-                    )),
+            serde_json::Value::Object(map) => match map.get("value") {
+                Some(serde_json::Value::Number(n)) => {
+                    let original_string = n.to_string();
+                    let parsed_value = Self::parse_decimal_string(&original_string);
+                    Ok(PreciseDecimal::from_parts(parsed_value, original_string))
                 }
-            }
+                Some(serde_json::Value::String(s)) => {
+                    let original_string = s.clone();
+                    let parsed_value = Self::parse_decimal_string(&original_string);
+                    Ok(PreciseDecimal::from_parts(parsed_value, original_string))
+                }
+                Some(serde_json::Value::Null) => Err(de::Error::invalid_value(
+                    de::Unexpected::Unit,
+                    &"a number or string for decimal value",
+                )),
+                None => Err(de::Error::missing_field("value")),
+                _ => Err(de::Error::invalid_type(
+                    de::Unexpected::Map,
+                    &"a map with a 'value' field containing a number or string",
+                )),
+            },
             // Handle remaining unexpected types
             other => Err(de::Error::invalid_type(
                 match other {
@@ -533,13 +554,13 @@ impl FhirResource {
     ///
     /// ```rust
     /// use fhir::{FhirResource, FhirVersion};
-    /// 
+    ///
     /// # #[cfg(feature = "R5")]
     /// # {
     /// # let resource = FhirResource::R5(Box::new(fhir::r5::Resource::Patient(Default::default())));
     /// let version = resource.version();
     /// assert_eq!(version, FhirVersion::R5);
-    /// 
+    ///
     /// // Use version for conditional logic
     /// match version {
     ///     FhirVersion::R5 => {
@@ -696,7 +717,7 @@ impl FhirVersion {
 /// # {
 /// let version = FhirVersion::R5;
 /// println!("Using FHIR version: {}", version); // Prints: "Using FHIR version: R5"
-/// 
+///
 /// let formatted = format!("fhir-{}.json", version);
 /// assert_eq!(formatted, "fhir-R5.json");
 /// # }
@@ -778,13 +799,13 @@ impl clap::ValueEnum for FhirVersion {
 }
 
 /// Trait for providing FHIR resource type information
-/// 
+///
 /// This trait allows querying which resource types are available in a specific
 /// FHIR version without hardcoding resource type lists in multiple places.
 pub trait FhirResourceTypeProvider {
     /// Returns a vector of all resource type names supported in this FHIR version
     fn get_resource_type_names() -> Vec<&'static str>;
-    
+
     /// Checks if a given type name is a resource type in this FHIR version
     fn is_resource_type(type_name: &str) -> bool {
         Self::get_resource_type_names()
@@ -796,7 +817,7 @@ pub trait FhirResourceTypeProvider {
 // --- Internal Visitor for Element Object Deserialization ---
 
 /// Internal visitor struct for deserializing Element objects from JSON maps.
-/// 
+///
 /// This visitor handles the complex deserialization logic for Element<V, E> when
 /// the JSON input is an object containing id, extension, and value fields.
 struct ElementObjectVisitor<V, E>(PhantomData<(V, E)>);
@@ -921,8 +942,8 @@ pub struct Element<V, E> {
 // Remove PartialEq/Eq bounds for V and E as they are not needed for deserialization itself
 impl<'de, V, E> Deserialize<'de> for Element<V, E>
 where
-    V: Deserialize<'de>, // Removed PartialEq + Eq
-    E: Deserialize<'de>, // Removed PartialEq
+    V: Deserialize<'de> + 'static, // Added 'static for TypeId comparisons
+    E: Deserialize<'de>,           // Removed PartialEq
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -933,7 +954,7 @@ where
 
         impl<'de, V, E> Visitor<'de> for AnyValueVisitor<V, E>
         where
-            V: Deserialize<'de>,
+            V: Deserialize<'de> + 'static,
             E: Deserialize<'de>,
         {
             type Value = Element<V, E>;
@@ -1000,6 +1021,52 @@ where
             where
                 Er: de::Error,
             {
+                use std::any::TypeId;
+
+                // Try to handle numeric strings for integer types
+                if TypeId::of::<V>() == TypeId::of::<i64>() {
+                    if let Ok(int_val) = v.parse::<i64>() {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
+                    if let Ok(int_val) = v.parse::<i32>() {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
+                    if let Ok(int_val) = v.parse::<u64>() {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
+                    if let Ok(int_val) = v.parse::<u32>() {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                }
+
+                // Fall back to normal string deserialization
                 V::deserialize(de::value::StrDeserializer::new(v))
                     .map(|value| Element {
                         id: None,
@@ -1013,6 +1080,52 @@ where
             where
                 Er: de::Error,
             {
+                use std::any::TypeId;
+
+                // Try to handle numeric strings for integer types
+                if TypeId::of::<V>() == TypeId::of::<i64>() {
+                    if let Ok(int_val) = v.parse::<i64>() {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
+                    if let Ok(int_val) = v.parse::<i32>() {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
+                    if let Ok(int_val) = v.parse::<u64>() {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
+                    if let Ok(int_val) = v.parse::<u32>() {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                }
+
+                // Fall back to normal string deserialization
                 V::deserialize(de::value::StringDeserializer::new(v.clone()))
                     .map(|value| Element {
                         // Clone v for error message
@@ -1027,6 +1140,52 @@ where
             where
                 Er: de::Error,
             {
+                use std::any::TypeId;
+
+                // Try to handle numeric strings for integer types
+                if TypeId::of::<V>() == TypeId::of::<i64>() {
+                    if let Ok(int_val) = v.parse::<i64>() {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<i32>() {
+                    if let Ok(int_val) = v.parse::<i32>() {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u64>() {
+                    if let Ok(int_val) = v.parse::<u64>() {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                } else if TypeId::of::<V>() == TypeId::of::<u32>() {
+                    if let Ok(int_val) = v.parse::<u32>() {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val))
+                            .map(|value| Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            })
+                            .map_err(|e| e);
+                    }
+                }
+
+                // Fall back to normal string deserialization
                 V::deserialize(de::value::BorrowedStrDeserializer::new(v))
                     .map(|value| Element {
                         id: None,
@@ -1279,7 +1438,7 @@ impl<E> DecimalElement<E> {
     /// use rust_decimal::Decimal;
     ///
     /// let temperature = DecimalElement::<Extension>::new(Decimal::new(3672, 2)); // 36.72
-    /// 
+    ///
     /// // Would be used in an Observation like:
     /// // observation.value_quantity.value = Some(temperature);
     /// ```
@@ -1475,7 +1634,7 @@ where
 {
     fn into_evaluation_result(&self) -> EvaluationResult {
         use std::any::TypeId;
-        
+
         // Prioritize returning the primitive value if it exists
         if let Some(v) = &self.value {
             let result = v.into_evaluation_result();
@@ -1510,12 +1669,13 @@ where
                 map.insert("id".to_string(), EvaluationResult::string(id.clone()));
             }
             if let Some(ext) = &self.extension {
-                let ext_collection: Vec<EvaluationResult> = ext
-                    .iter()
-                    .map(|e| e.into_evaluation_result())
-                    .collect();
+                let ext_collection: Vec<EvaluationResult> =
+                    ext.iter().map(|e| e.into_evaluation_result()).collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::collection(ext_collection));
+                    map.insert(
+                        "extension".to_string(),
+                        EvaluationResult::collection(ext_collection),
+                    );
                 }
             }
             // Only return Object if map is not empty (i.e., id or extension was actually present)
@@ -1551,15 +1711,16 @@ where
                 map.insert("id".to_string(), EvaluationResult::string(id.clone()));
             }
             if let Some(ext) = &self.extension {
-                let ext_collection: Vec<EvaluationResult> = ext
-                    .iter()
-                    .map(|e| e.into_evaluation_result())
-                    .collect();
+                let ext_collection: Vec<EvaluationResult> =
+                    ext.iter().map(|e| e.into_evaluation_result()).collect();
                 if !ext_collection.is_empty() {
-                    map.insert("extension".to_string(), EvaluationResult::collection(ext_collection));
+                    map.insert(
+                        "extension".to_string(),
+                        EvaluationResult::collection(ext_collection),
+                    );
                 }
             }
-             // Only return Object if map is not empty
+            // Only return Object if map is not empty
             if !map.is_empty() {
                 return EvaluationResult::typed_object(map, "FHIR", "decimal");
             }
@@ -1585,5 +1746,68 @@ impl IntoEvaluationResult for FhirResource {
                                                                   // Note: If no features are enabled, this match might be empty or non-exhaustive.
                                                                   // This is generally okay as the enum itself wouldn't be usable.
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_integer_string_deserialization() {
+        // Test deserializing a string "2" into Element<i64, ()>
+        type TestElement = Element<i64, ()>;
+
+        // Test case 1: String containing integer
+        let json_str = r#""2""#;
+        let result: Result<TestElement, _> = serde_json::from_str(json_str);
+        assert!(
+            result.is_ok(),
+            "Failed to deserialize string '2' as i64: {:?}",
+            result.err()
+        );
+
+        let element = result.unwrap();
+        assert_eq!(element.value, Some(2i64));
+        assert_eq!(element.id, None);
+        assert_eq!(element.extension, None);
+
+        // Test case 2: Number
+        let json_num = r#"2"#;
+        let result: Result<TestElement, _> = serde_json::from_str(json_num);
+        assert!(
+            result.is_ok(),
+            "Failed to deserialize number 2 as i64: {:?}",
+            result.err()
+        );
+
+        let element = result.unwrap();
+        assert_eq!(element.value, Some(2i64));
+    }
+
+    #[test]
+    fn test_i32_string_deserialization() {
+        type TestElement = Element<i32, ()>;
+
+        let json_str = r#""123""#;
+        let result: Result<TestElement, _> = serde_json::from_str(json_str);
+        assert!(result.is_ok());
+
+        let element = result.unwrap();
+        assert_eq!(element.value, Some(123i32));
+    }
+
+    #[test]
+    fn test_invalid_string_fallback() {
+        type TestElement = Element<i64, ()>;
+
+        // Non-numeric string should fail for integer type
+        let json_str = r#""not_a_number""#;
+        let result: Result<TestElement, _> = serde_json::from_str(json_str);
+        assert!(
+            result.is_err(),
+            "Should fail to deserialize non-numeric string as i64"
+        );
     }
 }

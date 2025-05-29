@@ -1809,6 +1809,57 @@ fn test_fhir_serde_deserialize() {
 }
 
 #[test]
+fn test_timing_roundtrip_serialization() {
+    let json_input = r#"
+    {
+      "timingTiming": {
+        "event": [
+          null
+        ],
+        "_event": [
+          {
+            "extension": [
+              {
+                "url": "http://hl7.org/fhir/StructureDefinition/cqf-expression",
+                "valueExpression": {
+                  "language": "text/cql",
+                  "expression": "Now()"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+    "#;
+
+    // Parse original to compare
+    let original_value: serde_json::Value = serde_json::from_str(json_input).unwrap();
+
+    // Deserialize the JSON input
+    let deserialized_struct: TimingTestStruct =
+        serde_json::from_str(json_input).expect("Deserialization failed");
+
+    // Serialize back to JSON
+    let reserialized_json = serde_json::to_string(&deserialized_struct)
+        .expect("Serialization failed");
+    
+    // Parse reserialized JSON to compare
+    let reserialized_value: serde_json::Value = serde_json::from_str(&reserialized_json).unwrap();
+
+    // The _event field should be preserved in roundtrip
+    let original_event = &original_value["timingTiming"]["_event"];
+    let reserialized_event = reserialized_value["timingTiming"].get("_event").unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        original_event,
+        reserialized_event,
+        "The _event field with extensions should be preserved during roundtrip serialization. Original: {}, Reserialized: {}",
+        serde_json::to_string_pretty(&original_value).unwrap(),
+        serde_json::to_string_pretty(&reserialized_value).unwrap()
+    );
+}
+
+#[test]
 fn test_fhir_serde_deserialize_extension_with_primitive_extension() {
     // This test replicates the structure found in slm-codesystem.json
     // where an Extension has a value[x] (valueString) which itself has an extension (_valueString).

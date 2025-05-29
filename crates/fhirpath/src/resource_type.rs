@@ -29,6 +29,8 @@ pub fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion)
         FhirVersion::R5 => fhir::r5::Resource::is_resource_type(type_name),
         #[cfg(feature = "R6")]
         FhirVersion::R6 => fhir::r6::Resource::is_resource_type(type_name),
+        #[allow(unreachable_patterns)]
+        _ => false, // For versions not enabled by feature flags
     }
 }
 

@@ -870,6 +870,25 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             }
+                        } else if is_vec && is_fhir_element {
+                            // Handle Vec<Element> counting - count both primitive and extension arrays if present
+                            let vec_access = if is_option {
+                                quote! { #field_access.as_ref() }
+                            } else {
+                                quote! { Some(&#field_access) }
+                            };
+                            quote! {
+                                if let Some(vec_value) = #vec_access {
+                                    if !vec_value.is_empty() {
+                                        // Count primitive array
+                                        count += 1;
+                                        // Count extension array if any elements have extensions
+                                        if vec_value.iter().any(|element| element.id.is_some() || element.extension.is_some()) {
+                                            count += 1;
+                                        }
+                                    }
+                                }
+                            }
                         } else {
                             if field_is_flattened {
                                 // For flattened fields, we don't increment the count
