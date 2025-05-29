@@ -1,6 +1,3 @@
-
-- Regenerate with fhir_gen - all code - get r6 working properly.
-
 - sof - command line and server crate
 
 - Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 
