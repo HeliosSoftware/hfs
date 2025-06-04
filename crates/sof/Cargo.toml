@@ -1,0 +1,16 @@
+[package]
+name = "sof"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sof-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "sof-cli"
+path = "src/cli.rs"
+
+[dependencies]
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
