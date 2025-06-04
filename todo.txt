@@ -38,4 +38,3 @@
     -Documentation (if not above)
 
 
-- When R6 is released, remove NullSkippingVec and fix test files directly.
