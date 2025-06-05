@@ -21,10 +21,10 @@
 //! use std::path::PathBuf;
 //!
 //! let output_dir = PathBuf::from("output");
-//! 
+//!
 //! // Generate code for R4
 //! process_fhir_version(Some(FhirVersion::R4), &output_dir)?;
-//! 
+//!
 //! // Generate code for all versions
 //! process_fhir_version(None, &output_dir)?;
 //! # Ok::<(), std::io::Error>(())
@@ -494,7 +494,9 @@ fn make_rust_safe(input: &str) -> String {
         });
 
     match snake_case.as_str() {
-        "type" | "use" | "abstract" | "for" | "ref" | "const" => format!("r#{}", snake_case),
+        "type" | "use" | "abstract" | "for" | "ref" | "const" | "where" => {
+            format!("r#{}", snake_case)
+        }
         _ => snake_case,
     }
 }
