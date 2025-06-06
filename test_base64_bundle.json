@@ -1,0 +1,34 @@
+{
+    "resourceType": "Bundle",
+    "type": "collection",
+    "entry": [
+        {
+            "resource": {
+                "resourceType": "Device",
+                "id": "d1",
+                "udiCarrier": [
+                    {
+                        "carrierAIDC": "aGVsbG8K"
+                    }
+                ]
+            }
+        },
+        {
+            "resource": {
+                "resourceType": "Device",
+                "id": "d2",
+                "udiCarrier": [
+                    {
+                        "carrierAIDC": "YnllCg=="
+                    }
+                ]
+            }
+        },
+        {
+            "resource": {
+                "resourceType": "Device",
+                "id": "d3"
+            }
+        }
+    ]
+}

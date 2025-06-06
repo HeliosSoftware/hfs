@@ -342,9 +342,35 @@ fn equal_helper(
         (
             EvaluationResult::Quantity(l_val, l_unit, _),
             EvaluationResult::Quantity(r_val, r_unit, _),
-        ) => l_val == r_val && l_unit == r_unit,
+        ) => l_val == r_val && units_are_equivalent(l_unit, r_unit),
         // Fallback: not equal for different types
         _ => false,
+    }
+}
+
+/// Helper function to check if two unit strings are equivalent
+/// This handles common UCUM unit equivalences like "lbs" vs "[lb_av]"
+fn units_are_equivalent(unit1: &str, unit2: &str) -> bool {
+    // Direct string equality
+    if unit1 == unit2 {
+        return true;
+    }
+    
+    // Handle common UCUM equivalences
+    let normalized_unit1 = normalize_ucum_unit(unit1);
+    let normalized_unit2 = normalize_ucum_unit(unit2);
+    
+    normalized_unit1 == normalized_unit2
+}
+
+/// Normalize UCUM unit strings to handle common equivalences
+fn normalize_ucum_unit(unit: &str) -> &str {
+    match unit {
+        "lbs" | "[lb_av]" => "[lb_av]", // Normalize pounds to UCUM code
+        "kg" | "[kg]" => "kg",          // Normalize kilograms
+        "g" | "[g]" => "g",             // Normalize grams
+        "mg" | "[mg]" => "mg",          // Normalize milligrams
+        _ => unit,                      // Return as-is for other units
     }
 }
 

@@ -504,6 +504,46 @@ fn test_basic_fhirpath_expressions() {
 }
 
 #[test]
+fn test_real_fhir_patient_type() {
+    println!("Testing real FHIR Patient from JSON parsing");
+    
+    // Create a real Patient from JSON
+    let patient_json = r#"{
+        "resourceType": "Patient",
+        "id": "example",
+        "active": true
+    }"#;
+    
+    let patient: r4::Patient = serde_json::from_str(patient_json).unwrap();
+    let fhir_resource = fhir::FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+    let context = EvaluationContext::new(vec![fhir_resource]);
+    
+    // First, let's see what the context contains
+    println!("Context resources: {:?}", context.resources.len());
+    if let Some(resource) = context.resources.first() {
+        println!("First resource: {:?}", resource);
+    }
+    
+    // Test accessing the Patient resource via 'this' context
+    let result = evaluate_expression("$this", &context).unwrap();
+    println!("$this (Patient resource): {:?}", result);
+    
+    // Test direct property access (Patient is already the context)
+    let result = evaluate_expression("active", &context).unwrap();
+    println!("Real active: {:?}", result);
+    
+    // Test active.type().namespace - should be FHIR
+    let result = evaluate_expression("active.type().namespace", &context).unwrap();
+    println!("Real active.type().namespace: {:?}", result);
+    assert_eq!(result, EvaluationResult::String("FHIR".to_string(), None));
+    
+    // Test active.type().name - should be boolean
+    let result = evaluate_expression("active.type().name", &context).unwrap();
+    println!("Real active.type().name: {:?}", result);
+    assert_eq!(result, EvaluationResult::String("boolean".to_string(), None));
+}
+
+#[test]
 fn test_patient_active_type() {
     println!("Testing Patient.active type operations specifically");
 
@@ -526,7 +566,7 @@ fn test_patient_active_type() {
         "resourceType".to_string(),
         EvaluationResult::String("Patient".to_string(), None),
     );
-    patient.insert("active".to_string(), EvaluationResult::Boolean(true, None));
+    patient.insert("active".to_string(), EvaluationResult::fhir_boolean(true));
 
     // Create a test context with this Patient
     let mut context = EvaluationContext::new_empty_with_default_version();

@@ -263,6 +263,7 @@
 // Internal modules - not part of the public API
 mod aggregate_function;
 mod boolean_functions;
+mod boundary_functions;
 mod collection_functions;
 mod collection_navigation;
 mod contains_function;
@@ -277,6 +278,7 @@ mod fhir_type_hierarchy;
 mod long_conversion;
 mod not_function;
 mod polymorphic_access;
+mod reference_key_functions;
 mod repeat_function;
 mod resource_type;
 mod set_operations;

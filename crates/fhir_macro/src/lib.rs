@@ -2511,9 +2511,74 @@ fn generate_fhirpath_enum_impl(
                         }
                     }
                 } else {
-                    // For other enums (like choice types), just delegate to the inner value
+                    // For other enums (like choice types), preserve type information from the variant
+                    // Extract type information from the variant name or rename attribute
+                    let variant_name_str = variant_name.to_string();
+                    
+                    // Check for fhir_serde rename attribute to get the FHIR field name
+                    let mut fhir_field_name = variant_name_str.clone();
+                    for attr in &variant.attrs {
+                        if attr.path().is_ident("fhir_serde") {
+                            if let Ok(list) = attr.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::token::Comma>::parse_terminated) {
+                                for meta in list {
+                                    if let syn::Meta::NameValue(nv) = meta {
+                                        if nv.path.is_ident("rename") {
+                                            if let syn::Expr::Lit(expr_lit) = nv.value {
+                                                if let syn::Lit::Str(lit_str) = expr_lit.lit {
+                                                    fhir_field_name = lit_str.value();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Extract FHIR type from choice element field name (e.g., "valueCode" -> "code")
+                    let fhir_type = if fhir_field_name.starts_with("value") && fhir_field_name.len() > 5 {
+                        // Convert first character to lowercase for FHIR primitive types
+                        let type_part = &fhir_field_name[5..]; // Remove "value" prefix
+                        let mut chars = type_part.chars();
+                        match chars.next() {
+                            None => variant_name_str.clone(),
+                            Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+                        }
+                    } else {
+                        // Fallback to variant name if it doesn't match value[x] pattern
+                        variant_name_str.clone()
+                    };
+                    
                     quote! {
-                        Self::#variant_name(value) => value.into_evaluation_result(),
+                        Self::#variant_name(value) => {
+                            // Get the base evaluation result from the inner value
+                            let mut result = value.into_evaluation_result();
+                            
+                            // Add FHIR type information to preserve type for .ofType() operations
+                            result = match result {
+                                fhirpath_support::EvaluationResult::String(s, _) => {
+                                    fhirpath_support::EvaluationResult::String(s, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                },
+                                fhirpath_support::EvaluationResult::Integer(i, _) => {
+                                    fhirpath_support::EvaluationResult::Integer(i, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                },
+                                fhirpath_support::EvaluationResult::Decimal(d, _) => {
+                                    fhirpath_support::EvaluationResult::Decimal(d, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                },
+                                fhirpath_support::EvaluationResult::Boolean(b, _) => {
+                                    fhirpath_support::EvaluationResult::Boolean(b, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                },
+                                fhirpath_support::EvaluationResult::Object { map, type_info: _ } => {
+                                    fhirpath_support::EvaluationResult::Object {
+                                        map,
+                                        type_info: Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)),
+                                    }
+                                },
+                                _ => result, // For other types, return as-is
+                            };
+                            
+                            result
+                        }
                     }
                 }
            }
@@ -2557,8 +2622,39 @@ fn generate_fhirpath_enum_impl(
             quote! { #name }
         }).collect();
         
+        // Generate resource_name method for Resource enum
+        let resource_name_arms = data.variants.iter().map(|variant| {
+            let variant_name = &variant.ident;
+            let variant_name_str = variant_name.to_string();
+            
+            match &variant.fields {
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                    // Newtype variant (expected for Resource enum)
+                    quote! {
+                        Self::#variant_name(_) => #variant_name_str,
+                    }
+                }
+                _ => {
+                    // For other field types, still return the variant name
+                    quote! {
+                        Self::#variant_name { .. } => #variant_name_str,
+                    }
+                }
+            }
+        });
+        
         quote! {
             #into_evaluation_result_impl
+            
+            impl #impl_generics #name #ty_generics #where_clause {
+                /// Returns the resource type name as a string.
+                /// This is equivalent to the resourceType field in FHIR JSON.
+                pub fn resource_name(&self) -> &'static str {
+                    match self {
+                        #(#resource_name_arms)*
+                    }
+                }
+            }
             
             impl #impl_generics crate::FhirResourceTypeProvider for #name #ty_generics #where_clause {
                 fn get_resource_type_names() -> Vec<&'static str> {

@@ -455,7 +455,7 @@ pub fn evaluate(
 
             if let EvaluationResult::Object {
                 map: obj_map,
-                type_info: None,
+                type_info: _,
             } = &global_context_item
             {
                 if let Some(EvaluationResult::String(ctx_type, _)) = obj_map.get("resourceType") {
@@ -526,7 +526,7 @@ pub fn evaluate(
                                 evaluate(parent_expr_of_field, context, None)?;
                             if let EvaluationResult::Object {
                                 map: actual_parent_map,
-                                type_info: None,
+                                type_info: _,
                             } = parent_obj_eval_result
                             {
                                 parent_obj = Some(actual_parent_map);
@@ -1065,12 +1065,10 @@ fn evaluate_term(
                 // This check ensures we don't misinterpret %variables as type names.
                 // Variables (starting with '%') are handled earlier and would have returned.
                 if !name.starts_with('%') {
-                    // First, check if this is a regular variable in the context
-                    if let Some(variable_value) = context.get_variable(name) {
-                        return Ok(variable_value.clone());
-                    }
+                    // Non-prefixed names should NOT check variables - only object properties and resourceType
+                    // Variables should only be accessible with the % prefix per FHIRPath specification
                     
-                    // If not a variable, check if it matches the resourceType of the base_context
+                    // Check if it matches the resourceType of the base_context
                     if let EvaluationResult::Object {
                         map: obj_map,
                         type_info: None,
@@ -1530,18 +1528,34 @@ fn evaluate_invocation(
                     let otherwise_result_expr = args_exprs.get(2); // Optional third argument
 
                     // Evaluate the condition expression, handle potential error
+                    // Use global context for resource expressions, current context for variables
+                    let condition_invocation_base = if expression_starts_with_resource_identifier(condition_expr, context) {
+                        None  // Global context for expressions like "Patient.name.exists()"
+                    } else {
+                        Some(invocation_base)  // Current context for expressions like "$total.empty()"
+                    };
                     let condition_result =
-                        evaluate(condition_expr, context, Some(invocation_base))?;
+                        evaluate(condition_expr, context, condition_invocation_base)?;
                     let condition_bool = condition_result.to_boolean_for_logic()?; // Use logic conversion
 
                     if matches!(condition_bool, EvaluationResult::Boolean(true, _)) {
-                        // Condition is true, evaluate the trueResult expression, propagate error
-                        evaluate(true_result_expr, context, Some(invocation_base))
+                        // Condition is true, evaluate the trueResult expression, propagate error  
+                        let true_invocation_base = if expression_starts_with_resource_identifier(true_result_expr, context) {
+                            None
+                        } else {
+                            Some(invocation_base)
+                        };
+                        evaluate(true_result_expr, context, true_invocation_base)
                     } else {
                         // Condition is false or empty
                         if let Some(otherwise_expr) = otherwise_result_expr {
                             // Evaluate the otherwiseResult expression if present, propagate error
-                            evaluate(otherwise_expr, context, Some(invocation_base))
+                            let otherwise_invocation_base = if expression_starts_with_resource_identifier(otherwise_expr, context) {
+                                None
+                            } else {
+                                Some(invocation_base)
+                            };
+                            evaluate(otherwise_expr, context, otherwise_invocation_base)
                         } else {
                             // Otherwise result is omitted, return empty collection
                             Ok(EvaluationResult::Empty)
@@ -1620,6 +1634,46 @@ fn evaluate_invocation(
                         projection_expr,
                         context,
                     )
+                }
+                "getReferenceKey" => {
+                    // Special handling for getReferenceKey to support bare type identifiers
+                    let type_filter = if args_exprs.is_empty() {
+                        None
+                    } else if args_exprs.len() == 1 {
+                        // Check if the argument is a bare type identifier
+                        match &args_exprs[0] {
+                            // Handle literal string like 'Patient'
+                            Expression::Term(Term::Literal(Literal::String(type_name))) => {
+                                Some(type_name.clone())
+                            }
+                            // Handle bare identifier like Patient (without quotes)
+                            Expression::Term(Term::Invocation(Invocation::Member(type_name))) => {
+                                Some(type_name.clone())
+                            }
+                            _ => {
+                                // For other expressions, evaluate normally and try to extract string
+                                let evaluated = evaluate(&args_exprs[0], context, current_item_for_args)?;
+                                match evaluated {
+                                    EvaluationResult::String(s, _) => Some(s),
+                                    _ => None,
+                                }
+                            }
+                        }
+                    } else {
+                        return Err(EvaluationError::InvalidArity(
+                            "Function 'getReferenceKey' expects 0 or 1 argument".to_string(),
+                        ));
+                    };
+                    
+                    // Convert type filter to EvaluationResult array format expected by the function
+                    let args_for_function = if let Some(type_str) = type_filter {
+                        vec![EvaluationResult::String(type_str, None)]
+                    } else {
+                        vec![]
+                    };
+                    
+                    // Call the getReferenceKey function with proper arguments
+                    crate::reference_key_functions::get_reference_key_function(invocation_base, &args_for_function)
                 }
                 // Add other functions taking lambdas here (e.g., any)
                 _ => {
@@ -3012,6 +3066,64 @@ fn call_function(
                 }
             })
         }
+        "join" => {
+            // Joins a collection of strings with a separator
+            // If no separator is provided, defaults to empty string
+            if args.len() > 1 {
+                return Err(EvaluationError::InvalidArity(
+                    "Function 'join' expects 0 or 1 argument (separator)".to_string(),
+                ));
+            }
+            
+            let separator = if args.is_empty() {
+                // Default to empty separator when no arguments provided
+                ""
+            } else {
+                // Check for singleton separator argument
+                if args[0].count() > 1 {
+                    return Err(EvaluationError::SingletonEvaluationError(
+                        "join requires a singleton separator argument".to_string(),
+                    ));
+                }
+                
+                match &args[0] {
+                    EvaluationResult::String(sep, _) => sep,
+                    EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // join({}) -> {}
+                    _ => {
+                        return Err(EvaluationError::TypeError(
+                            "join separator must be a string".to_string(),
+                        ));
+                    }
+                }
+            };
+            
+            // Handle the base collection
+            match invocation_base {
+                EvaluationResult::Collection { items, .. } => {
+                    // Convert all items to strings and join
+                    let mut string_items = Vec::new();
+                    for item in items {
+                        match item {
+                            EvaluationResult::String(s, _) => string_items.push(s.clone()),
+                            EvaluationResult::Empty => {} // Skip empty items (don't add anything)
+                            _ => {
+                                return Err(EvaluationError::TypeError(
+                                    "join requires all items to be strings".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(EvaluationResult::string(string_items.join(separator)))
+                }
+                EvaluationResult::Empty => Ok(EvaluationResult::string(String::new())), // {}.join(sep) -> ""
+                EvaluationResult::String(s, _) => Ok(EvaluationResult::string(s.clone())), // Single string -> same string
+                _ => {
+                    Err(EvaluationError::TypeError(
+                        "join requires string items or a collection of strings".to_string(),
+                    ))
+                }
+            }
+        }
         "round" => {
             // Implements round([precision : Integer]) : Decimal
             // Round a decimal to the nearest whole number or to a specified precision
@@ -4165,6 +4277,22 @@ fn call_function(
             // Delegate to the extension_function module
             crate::extension_function::extension_function(invocation_base, args)
         }
+        "lowBoundary" => {
+            // Delegate to the dedicated function in boundary_functions.rs
+            crate::boundary_functions::low_boundary_function(invocation_base)
+        }
+        "highBoundary" => {
+            // Delegate to the dedicated function in boundary_functions.rs
+            crate::boundary_functions::high_boundary_function(invocation_base)
+        }
+        "getResourceKey" => {
+            // Delegate to the reference key functions module
+            crate::reference_key_functions::get_resource_key_function(invocation_base)
+        }
+        "getReferenceKey" => {
+            // Delegate to the reference key functions module
+            crate::reference_key_functions::get_reference_key_function(invocation_base, args)
+        }
         // where, select, ofType are handled in evaluate_invocation
         // Add other standard functions here
         _ => {
@@ -4229,12 +4357,17 @@ fn call_function(
                 "replace",
                 "matches",
                 "replaceMatches",
+                "join",
                 "round",
                 "sqrt",
                 "toChars",
                 "now",
                 "today",
                 "timeOfDay",
+                "lowBoundary",
+                "highBoundary",
+                "getResourceKey",
+                "getReferenceKey",
             ];
             if !handled_functions.contains(&name) {
                 eprintln!("Warning: Unsupported function called: {}", name); // Keep this warning for truly unhandled functions
@@ -5219,6 +5352,8 @@ fn compare_equality(
             if l_cmp == EvaluationResult::Empty || r_cmp == EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
+            
+            
             Ok(match (&l_cmp, &r_cmp) {
                 // Use references to l_cmp and r_cmp
                 // Wrap result in Ok
@@ -5331,6 +5466,8 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_str);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_prim);
+                        
+                        
                         EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l == val_r_prim)
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
@@ -5344,7 +5481,7 @@ fn compare_equality(
                         type_info: Some(type_info),
                     },
                     EvaluationResult::Quantity(val_r_prim, unit_r_prim, _),
-                ) if type_info.namespace == "FHIR" && type_info.name == "Quantity" => {
+                ) if type_info.namespace == "FHIR" && (type_info.name == "Quantity" || type_info.name == "quantity") => {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
 
@@ -5381,6 +5518,8 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_prim);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_str);
+                        
+                        
                         EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l_prim == val_r)
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
@@ -5521,8 +5660,6 @@ fn compare_equality(
                     // If not a FHIR primitive wrapper or "value" is missing, they are not equal.
                     EvaluationResult::boolean(false)
                 }
-                // General case: if types are different and not handled by specific rules above, equality is false.
-                _ if l_cmp.type_name() != r_cmp.type_name() => EvaluationResult::boolean(false),
                 // If types are the same but not handled by any specific rule above
                 _ => EvaluationResult::boolean(false),
             })
@@ -5777,5 +5914,21 @@ fn check_membership(
             "Unknown membership operator: {}",
             op
         ))),
+    }
+}
+
+/// Helper function to determine if an expression starts with a resource identifier
+/// This is used to decide whether to use global or current context in iif() evaluation
+fn expression_starts_with_resource_identifier(expr: &Expression, context: &EvaluationContext) -> bool {
+    match expr {
+        Expression::Invocation(base, _) => {
+            // Check if the base expression starts with a resource identifier
+            expression_starts_with_resource_identifier(base, context)
+        }
+        Expression::Term(Term::Invocation(Invocation::Member(name))) => {
+            // Check if this is a known FHIR resource type using the existing infrastructure
+            crate::resource_type::is_resource_type_for_version(name, &context.fhir_version)
+        }
+        _ => false,
     }
 }

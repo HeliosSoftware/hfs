@@ -67,7 +67,7 @@ pub fn access_polymorphic_element(
             for (_, value) in &matches {
                 if let EvaluationResult::Object {
                     map: inner_obj,
-                    type_info: None,
+                    type_info: _,
                 } = value
                 {
                     // Recursively resolve the rest of the path
@@ -88,7 +88,7 @@ pub fn access_polymorphic_element(
                             // This is a potential choice element with type suffix
                             if let EvaluationResult::Object {
                                 map: inner_obj,
-                                type_info: None,
+                                type_info: _,
                             } = value
                             {
                                 // Try to resolve the rest of the path
@@ -105,7 +105,7 @@ pub fn access_polymorphic_element(
             if let Some(value) = obj.get(first_part) {
                 if let EvaluationResult::Object {
                     map: inner_obj,
-                    type_info: None,
+                    type_info: _,
                 } = value
                 {
                     return access_polymorphic_element(inner_obj, rest);
@@ -386,7 +386,7 @@ pub fn apply_polymorphic_type_operation(
         // First handle direct FHIR resource type checks
         if let EvaluationResult::Object {
             map: obj,
-            type_info: None,
+            type_info: _,
         } = value
         {
             // For polymorphic value checks (like value.is(Quantity))
@@ -789,7 +789,7 @@ mod tests {
         // Verify that it correctly finds valueQuantity
         if let EvaluationResult::Object {
             map: quantity,
-            type_info: None,
+            type_info: _,
         } = &value
         {
             assert_eq!(

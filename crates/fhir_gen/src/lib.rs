@@ -905,7 +905,7 @@ fn generate_element_definition(
             Some(ty) => ty,
             None => {
                 if let Some(content_ref) = &element.content_reference {
-                    let ref_id = &content_ref[1..];
+                    let ref_id = extract_content_reference_id(content_ref);
                     if let Some(referenced_element) = elements
                         .iter()
                         .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
@@ -942,8 +942,9 @@ fn generate_element_definition(
         };
 
         let base_type = if let Some(content_ref) = &element.content_reference {
-            if content_ref.starts_with('#') {
-                generate_type_name(&content_ref[1..])
+            let ref_id = extract_content_reference_id(content_ref);
+            if !ref_id.is_empty() {
+                generate_type_name(ref_id)
             } else {
                 base_type.to_string()
             }
@@ -1001,6 +1002,37 @@ fn generate_element_definition(
         };
 
         output.push_str(&format!("    pub {}: {},\n", clean_field_name, type_str));
+    }
+}
+
+/// Extracts the element ID from a contentReference value.
+///
+/// This function handles both local contentReferences (starting with #) and
+/// URL-based contentReferences that include a fragment after #.
+///
+/// # Arguments
+///
+/// * `content_ref` - The contentReference value from a FHIR ElementDefinition
+///
+/// # Returns
+///
+/// Returns the element ID portion of the contentReference.
+///
+/// # Examples
+///
+/// - "#Patient.name" → "Patient.name"
+/// - "https://sql-on-fhir.org/ig/StructureDefinition/ViewDefinition#ViewDefinition.select" → "ViewDefinition.select"
+/// - "invalid-ref" → ""
+fn extract_content_reference_id(content_ref: &str) -> &str {
+    if let Some(fragment_start) = content_ref.find('#') {
+        let fragment = &content_ref[fragment_start + 1..];
+        if !fragment.is_empty() {
+            fragment
+        } else {
+            ""
+        }
+    } else {
+        ""
     }
 }
 

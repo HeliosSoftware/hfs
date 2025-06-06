@@ -274,21 +274,17 @@ fn check_type_match(
                 
                 // Allow FHIR/System cross-matching for specific types:
                 // 1. Complex types like Quantity, Date, DateTime, Time
-                // 2. Resource types (checked dynamically)  
-                // Note: Primitive types (boolean, string, etc.) should NOT cross-match namespaces
+                // 2. Primitive types like boolean, string, integer, decimal (for ofType operations)
+                // 3. Resource types (checked dynamically)  
                 let is_complex_type = matches!(
                     value_type.to_lowercase().as_str(), 
                     "quantity" | "date" | "datetime" | "time"
                 );
                 
-                // Note: We can't easily access context here, so we use a simple heuristic
-                // that capitalized types starting with uppercase are likely resource types
-                let _is_likely_resource_type = value_type.chars().next().map_or(false, |c| c.is_uppercase()) &&
-                    value_type.len() > 1 &&
-                    !matches!(value_type.to_lowercase().as_str(), 
-                             "boolean" | "string" | "integer" | "decimal" | "object" | "collection");
-                
-                let is_cross_matchable_type = is_complex_type; // Only complex types, not resource types
+                // Don't allow cross-namespace matching for primitive types
+                // FHIR.boolean should NOT match System.Boolean
+                // Only allow cross-matching for complex types like Quantity, Date, DateTime, Time
+                let is_cross_matchable_type = is_complex_type;
                 
                 let cross_namespace_match = is_cross_matchable_type && (
                     (value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("System")) ||

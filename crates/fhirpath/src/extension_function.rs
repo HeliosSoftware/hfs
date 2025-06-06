@@ -57,7 +57,7 @@ pub fn extension_function(
     match invocation_base {
         EvaluationResult::Object {
             map: obj,
-            type_info: None,
+            type_info: _,
         } => {
             println!(
                 "  DEBUG: extension function base is Object with {} properties",
@@ -65,9 +65,14 @@ pub fn extension_function(
             );
             if obj.contains_key("extension") {
                 println!("  DEBUG: Object has direct extension property");
+                if let Some(ext_val) = obj.get("extension") {
+                    println!("  DEBUG: Extension property value: {:?}", ext_val);
+                }
+            } else {
+                println!("  DEBUG: Object does NOT have extension property");
             }
-            for (key, _) in obj {
-                println!("  DEBUG: Object has property: {}", key);
+            for (key, value) in obj {
+                println!("  DEBUG: Object has property '{}': {:?}", key, value);
             }
         }
         EvaluationResult::String(s, _) => {
@@ -121,7 +126,7 @@ pub fn extension_function(
 
     if let EvaluationResult::Object {
         map: obj,
-        type_info: None,
+        type_info: _,
     } = invocation_base
     {
         // Case 1: Check for direct extension array on this element
@@ -164,7 +169,7 @@ fn find_extension_by_url(
     for ext in extensions {
         if let EvaluationResult::Object {
             map: ext_obj,
-            type_info: None,
+            type_info: _,
         } = ext
         {
             // Check if this extension has the requested URL

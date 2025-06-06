@@ -1,0 +1,16 @@
+{
+    "resourceType": "ViewDefinition",
+    "status": "active",
+    "resource": "Patient",
+    "select": [
+        {
+            "column": [
+                {
+                    "name": "id",
+                    "path": "id",
+                    "type": "id"
+                }
+            ]
+        }
+    ]
+}

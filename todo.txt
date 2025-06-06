@@ -38,3 +38,5 @@
     -Documentation (if not above)
 
 - Manually added ViewDefinition Structure Definition to profiles-resources.json (deleting integer64) for generating r4.rs.  Need to also add it to the others except for r6 (anticipating a ViewDefinition resource to be added to r6) (and adding back in integer64)
+
+- Added fhirVersion to constant_types.json

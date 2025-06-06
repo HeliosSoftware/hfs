@@ -1,0 +1,27 @@
+{
+    "resourceType": "ViewDefinition",
+    "status": "active",
+    "resource": "Patient",
+    "constant": [
+        {
+            "name": "gender",
+            "valueCode": "female"
+        }
+    ],
+    "select": [
+        {
+            "column": [
+                {
+                    "name": "id",
+                    "path": "id",
+                    "type": "id"
+                },
+                {
+                    "name": "bool",
+                    "path": "gender = %gender",
+                    "type": "boolean"
+                }
+            ]
+        }
+    ]
+}

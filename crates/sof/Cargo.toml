@@ -11,6 +11,21 @@ path = "src/server.rs"
 name = "sof-cli"
 path = "src/cli.rs"
 
+[features]
+default = ["R4"]
+R4 = ["fhir/R4", "fhirpath/R4"]
+R4B = ["fhir/R4B", "fhirpath/R4B"]
+R5 = ["fhir/R5", "fhirpath/R5"]
+R6 = ["fhir/R6", "fhirpath/R6"]
+
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
 tokio = { version = "1.0", features = ["full"] }
+fhir = { path = "../fhir" }
+fhirpath = { path = "../fhirpath" }
+fhirpath_support = { path = "../fhirpath_support" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.3"
+thiserror = "1.0"
+anyhow = "1.0"

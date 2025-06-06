@@ -1,0 +1,27 @@
+{
+    "resourceType": "ViewDefinition",
+    "status": "active",
+    "resource": "Device",
+    "constant": [
+        {
+            "name": "aidc",
+            "valueBase64Binary": "aGVsbG8K"
+        }
+    ],
+    "select": [
+        {
+            "column": [
+                {
+                    "name": "id",
+                    "path": "id",
+                    "type": "id"
+                },
+                {
+                    "name": "aidc",
+                    "path": "udiCarrier.first().carrierAIDC = %aidc",
+                    "type": "boolean"
+                }
+            ]
+        }
+    ]
+}
