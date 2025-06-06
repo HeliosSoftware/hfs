@@ -2,7 +2,7 @@ use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -321,7 +321,8 @@ fn test_basic_boolean_attribute() {
 #[test]
 fn test_run_basic_test_file() {
     // Load and run a simple test case from the test suite
-    let test_suite_path = Path::new("../../tests/sql-on-fhir/sql-on-fhir-v2/tests/basic.json");
+    let mut test_suite_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_suite_path.push("tests/sql-on-fhir-v2/tests/basic.json");
     
     if !test_suite_path.exists() {
         // Skip test if test suite is not available

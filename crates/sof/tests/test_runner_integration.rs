@@ -2,7 +2,7 @@ use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -226,7 +226,8 @@ fn run_test_file(test_file: &Path) -> Result<TestSuiteReport, Box<dyn std::error
 
 #[test]
 fn run_comprehensive_test_suite() {
-    let test_dir = Path::new("../../tests/sql-on-fhir/sql-on-fhir-v2/tests");
+    let mut test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_dir.push("tests/sql-on-fhir-v2/tests");
     
     if !test_dir.exists() {
         println!("Test suite directory not found at: {:?}", test_dir);

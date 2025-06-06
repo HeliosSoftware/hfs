@@ -1,6 +1,7 @@
 use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -57,8 +58,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing base64Binary constant type support...");
 
     // Load test file
-    let test_file_path = "/home/slm/git/hfs/tests/sql-on-fhir/sql-on-fhir-v2/tests/constant_types.json";
-    let content = fs::read_to_string(test_file_path)?;
+    let mut test_file_path = PathBuf::from("crates/sof/tests/sql-on-fhir-v2/tests/constant_types.json");
+    let content = fs::read_to_string(&test_file_path)?;
     let test_case: TestCase = serde_json::from_str(&content)?;
     
     // Create bundle from resources

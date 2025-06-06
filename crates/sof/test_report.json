@@ -1,100 +1,22 @@
 {
-  "collection.json": {
+  "logic.json": {
     "tests": [
       {
-        "name": "fail when 'collection' is not true",
+        "name": "filtering with 'and'",
         "result": {
-          "passed": true,
-          "reason": null
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"m0\"\n  }\n], Got: []"
         }
       },
       {
-        "name": "collection = true",
+        "name": "filtering with 'or'",
         "result": {
-          "passed": true,
-          "reason": null
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"m0\"\n  },\n  {\n    \"id\": \"f0\"\n  },\n  {\n    \"id\": \"m1\"\n  }\n], Got: [\n  {\n    \"id\": \"m0\"\n  },\n  {\n    \"id\": \"m1\"\n  }\n]"
         }
       },
       {
-        "name": "collection = false relative to forEach parent",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "collection = false relative to forEachOrNull parent",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_boundary.json": {
-    "tests": [
-      {
-        "name": "decimal lowBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "decimal highBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "datetime lowBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "datetime highBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "date lowBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "date highBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "time lowBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "time highBoundary",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fhirpath_numbers.json": {
-    "tests": [
-      {
-        "name": "add observation",
+        "name": "filtering with 'not'",
         "result": {
           "passed": true,
           "reason": null
@@ -183,176 +105,6 @@
       }
     ]
   },
-  "fn_empty.json": {
-    "tests": [
-      {
-        "name": "empty names",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_join.json": {
-    "tests": [
-      {
-        "name": "join with comma",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "join with empty value",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "join with no value - default to no separator",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "where.json": {
-    "tests": [
-      {
-        "name": "simple where path with result",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with no results",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with greater than inequality",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\"\n  }\n], Got: []"
-        }
-      },
-      {
-        "name": "where path with less than inequality",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o2\"\n  }\n], Got: []"
-        }
-      },
-      {
-        "name": "multiple where paths",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with an 'and' connector",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with an 'or' connector",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path that evaluates to true when empty",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "union.json": {
-    "tests": [
-      {
-        "name": "basic",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "unionAll + column",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "duplicates",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "empty results",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "empty with forEachOrNull",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "forEachOrNull and forEach",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "nested",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "one empty operand",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column mismatch",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column order mismatch",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
   "fn_reference_keys.json": {
     "tests": [
       {
@@ -371,77 +123,6 @@
       },
       {
         "name": "getReferenceKey result matches getResourceKey with wrong type specifier",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "logic.json": {
-    "tests": [
-      {
-        "name": "filtering with 'and'",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"m0\"\n  }\n], Got: []"
-        }
-      },
-      {
-        "name": "filtering with 'or'",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"m0\"\n  },\n  {\n    \"id\": \"f0\"\n  },\n  {\n    \"id\": \"m1\"\n  }\n], Got: [\n  {\n    \"id\": \"m0\"\n  },\n  {\n    \"id\": \"m1\"\n  }\n]"
-        }
-      },
-      {
-        "name": "filtering with 'not'",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "combinations.json": {
-    "tests": [
-      {
-        "name": "select",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column + select",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "sibling select",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "sibling select inside a select",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column + select, with where",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "unionAll + forEach + column + select",
         "result": {
           "passed": true,
           "reason": null
@@ -544,102 +225,80 @@
       }
     ]
   },
-  "fn_oftype.json": {
+  "fhirpath.json": {
     "tests": [
       {
-        "name": "select string values",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\",\n    \"string_value\": \"foo\"\n  },\n  {\n    \"id\": \"o2\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"string_value\": null\n  }\n], Got: [\n  {\n    \"id\": \"o1\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"string_value\": null\n  }\n]"
-        }
-      },
-      {
-        "name": "select integer values",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"integer_value\": 42\n  },\n  {\n    \"id\": \"o3\",\n    \"integer_value\": null\n  }\n], Got: [\n  {\n    \"id\": \"o1\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"integer_value\": null\n  }\n]"
-        }
-      }
-    ]
-  },
-  "view_resource.json": {
-    "tests": [
-      {
-        "name": "only pts",
+        "name": "one element",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "only obs",
+        "name": "two elements + first",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "resource not specified",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "constant.json": {
-    "tests": [
-      {
-        "name": "constant in path",
+        "name": "collection",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "constant in forEach",
+        "name": "index[0]",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "constant in where element",
+        "name": "index[1]",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "constant in unionAll",
+        "name": "out of index",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "integer constant",
+        "name": "where",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "boolean constant",
-        "result": {
-          "passed": false,
-          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"pt2\"\n  }\n], Got: []"
-        }
-      },
-      {
-        "name": "accessing an undefined constant",
+        "name": "exists",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "incorrect constant definition",
+        "name": "nested exists",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "string join",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "string join: default separator",
         "result": {
           "passed": true,
           "reason": null
@@ -767,6 +426,169 @@
       }
     ]
   },
+  "fn_empty.json": {
+    "tests": [
+      {
+        "name": "empty names",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "union.json": {
+    "tests": [
+      {
+        "name": "basic",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "unionAll + column",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "duplicates",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "empty results",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "empty with forEachOrNull",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "forEachOrNull and forEach",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "nested",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "one empty operand",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column mismatch",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column order mismatch",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_extension.json": {
+    "tests": [
+      {
+        "name": "simple extension",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "nested extension",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "constant.json": {
+    "tests": [
+      {
+        "name": "constant in path",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "constant in forEach",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "constant in where element",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "constant in unionAll",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "integer constant",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "boolean constant",
+        "result": {
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"pt2\"\n  }\n], Got: []"
+        }
+      },
+      {
+        "name": "accessing an undefined constant",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "incorrect constant definition",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
   "validate.json": {
     "tests": [
       {
@@ -806,17 +628,63 @@
       }
     ]
   },
-  "fn_extension.json": {
+  "fn_oftype.json": {
     "tests": [
       {
-        "name": "simple extension",
+        "name": "select string values",
+        "result": {
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\",\n    \"string_value\": \"foo\"\n  },\n  {\n    \"id\": \"o2\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"string_value\": null\n  }\n], Got: [\n  {\n    \"id\": \"o1\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"string_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"string_value\": null\n  }\n]"
+        }
+      },
+      {
+        "name": "select integer values",
+        "result": {
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"integer_value\": 42\n  },\n  {\n    \"id\": \"o3\",\n    \"integer_value\": null\n  }\n], Got: [\n  {\n    \"id\": \"o1\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o2\",\n    \"integer_value\": null\n  },\n  {\n    \"id\": \"o3\",\n    \"integer_value\": null\n  }\n]"
+        }
+      }
+    ]
+  },
+  "combinations.json": {
+    "tests": [
+      {
+        "name": "select",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "nested extension",
+        "name": "column + select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "sibling select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "sibling select inside a select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column + select, with where",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "unionAll + forEach + column + select",
         "result": {
           "passed": true,
           "reason": null
@@ -824,80 +692,212 @@
       }
     ]
   },
-  "fhirpath.json": {
+  "fn_join.json": {
     "tests": [
       {
-        "name": "one element",
+        "name": "join with comma",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "two elements + first",
+        "name": "join with empty value",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "collection",
+        "name": "join with no value - default to no separator",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "view_resource.json": {
+    "tests": [
+      {
+        "name": "only pts",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "index[0]",
+        "name": "only obs",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "index[1]",
+        "name": "resource not specified",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "where.json": {
+    "tests": [
+      {
+        "name": "simple where path with result",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "out of index",
+        "name": "where path with no results",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "where",
+        "name": "where path with greater than inequality",
+        "result": {
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o1\"\n  }\n], Got: []"
+        }
+      },
+      {
+        "name": "where path with less than inequality",
+        "result": {
+          "passed": false,
+          "reason": "Results don't match. Expected: [\n  {\n    \"id\": \"o2\"\n  }\n], Got: []"
+        }
+      },
+      {
+        "name": "multiple where paths",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "exists",
+        "name": "where path with an 'and' connector",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "nested exists",
+        "name": "where path with an 'or' connector",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "string join",
+        "name": "where path that evaluates to true when empty",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_boundary.json": {
+    "tests": [
+      {
+        "name": "decimal lowBoundary",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "string join: default separator",
+        "name": "decimal highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "datetime lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "datetime highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "date lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "date highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "time lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "time highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "collection.json": {
+    "tests": [
+      {
+        "name": "fail when 'collection' is not true",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "collection = true",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "collection = false relative to forEach parent",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "collection = false relative to forEachOrNull parent",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fhirpath_numbers.json": {
+    "tests": [
+      {
+        "name": "add observation",
         "result": {
           "passed": true,
           "reason": null

@@ -1,7 +1,7 @@
 use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
@@ -145,7 +145,8 @@ fn compare_json_values(actual: &serde_json::Value, expected: &serde_json::Value)
 
 #[test]
 fn test_foreach_file() {
-    let test_file = Path::new("/home/slm/git/hfs/tests/sql-on-fhir/sql-on-fhir-v2/tests/foreach.json");
+    let mut test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    test_file.push("tests/sql-on-fhir-v2/tests/foreach.json");
     
     if !test_file.exists() {
         println!("Test file not found: {:?}", test_file);
