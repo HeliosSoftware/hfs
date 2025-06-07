@@ -144,6 +144,112 @@ pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifi
     }
 }
 
+/// Determines if a value is of a specified FHIR or System type with cross-namespace matching (for ofType operations)
+/// 
+/// # Arguments
+/// 
+/// * `value` - The value to check
+/// * `type_spec` - The type specifier to check against
+/// 
+/// # Returns
+/// 
+/// * `true` if the value is of the specified type, `false` otherwise
+pub fn is_of_type_for_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<bool, EvaluationError> {
+    let (target_namespace, target_type) = extract_namespace_and_type(type_spec)?;
+    
+    match value {
+        EvaluationResult::Boolean(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Boolean for boolean values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Boolean", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Integer(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Integer for integer values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Integer", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Decimal(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Decimal for decimal values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Decimal", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::String(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.String for string values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "String", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Date(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Date for date values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Date", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::DateTime(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.DateTime for datetime values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "DateTime", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Time(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Time for time values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Time", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Quantity(_, _, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Quantity for quantity values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Quantity", &target_namespace, &target_type, true)
+            }
+        },
+        EvaluationResult::Collection { .. } => {
+            // Collections are not simple types and don't match single type checks
+            Ok(false)
+        },
+        EvaluationResult::Empty => {
+            // Empty values don't match any specific type
+            Ok(false)
+        },
+        EvaluationResult::Object { map, type_info, .. } => {
+            // First check if there's type_info available
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else if let Some(resource_type_value) = map.get("resourceType") {
+                // For FHIR resources, check the resourceType property
+                if let EvaluationResult::String(resource_type, _) = resource_type_value {
+                    // Check if the resource type matches the target type
+                    check_type_match_with_cross_namespace(&Some("FHIR".to_string()), resource_type, &target_namespace, &target_type, true)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                // For non-FHIR objects, we can't determine the type
+                Ok(false)
+            }
+        },
+    }
+}
+
 /// Determines if a value is of a specified FHIR or System type (legacy version without context)
 /// 
 /// # Arguments
@@ -257,6 +363,17 @@ fn check_type_match(
     target_namespace: &Option<String>, 
     target_type: &str
 ) -> Result<bool, EvaluationError> {
+    check_type_match_with_cross_namespace(value_namespace, value_type, target_namespace, target_type, false)
+}
+
+/// Helper function to check if two types match with configurable cross-namespace matching
+fn check_type_match_with_cross_namespace(
+    value_namespace: &Option<String>, 
+    value_type: &str,
+    target_namespace: &Option<String>, 
+    target_type: &str,
+    allow_cross_namespace: bool
+) -> Result<bool, EvaluationError> {
     // Case-insensitive type name comparison
     let type_matches = value_type.eq_ignore_ascii_case(target_type);
     
@@ -273,18 +390,24 @@ fn check_type_match(
                 let namespace_matches = value_ns.eq_ignore_ascii_case(target_ns);
                 
                 // Allow FHIR/System cross-matching for specific types:
-                // 1. Complex types like Quantity, Date, DateTime, Time
-                // 2. Primitive types like boolean, string, integer, decimal (for ofType operations)
+                // 1. Complex types like Quantity, Date, DateTime, Time (always allowed)
+                // 2. Primitive types like boolean, string, integer, decimal (only for ofType operations when allow_cross_namespace is true)
                 // 3. Resource types (checked dynamically)  
                 let is_complex_type = matches!(
                     value_type.to_lowercase().as_str(), 
                     "quantity" | "date" | "datetime" | "time"
                 );
                 
-                // Don't allow cross-namespace matching for primitive types
-                // FHIR.boolean should NOT match System.Boolean
-                // Only allow cross-matching for complex types like Quantity, Date, DateTime, Time
-                let is_cross_matchable_type = is_complex_type;
+                // Only allow cross-namespace matching for primitive types when explicitly enabled (for ofType operations)
+                // FHIR.boolean should match the type specifier "boolean" only in ofType, not in is operations
+                let is_primitive_type = allow_cross_namespace && matches!(
+                    value_type.to_lowercase().as_str(), 
+                    "boolean" | "string" | "integer" | "decimal" | "date" | "datetime" | "time" | 
+                    "instant" | "id" | "oid" | "url" | "uuid" | "uri" | "canonical" | "code" | 
+                    "markdown" | "base64binary" | "positiveint" | "unsignedint"
+                );
+                
+                let is_cross_matchable_type = is_complex_type || is_primitive_type;
                 
                 let cross_namespace_match = is_cross_matchable_type && (
                     (value_ns.eq_ignore_ascii_case("FHIR") && target_ns.eq_ignore_ascii_case("System")) ||
@@ -679,6 +802,129 @@ pub fn as_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<Ev
     }
 }
 
+/// Helper function to try converting a value to a target type for ofType operations
+fn try_convert_for_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result<Option<EvaluationResult>, EvaluationError> {
+    let (_target_namespace, target_type) = extract_namespace_and_type(type_spec)?;
+    
+    match value {
+        EvaluationResult::String(s, type_info) => {
+            // Check if this is a FHIR string that might represent a different type
+            if let Some(type_info) = type_info {
+                if type_info.namespace == "FHIR" && type_info.name == "string" {
+                    // Try to convert FHIR strings to target types
+                    match target_type.to_lowercase().as_str() {
+                        "datetime" => {
+                            // Only convert to datetime if it looks like a date or datetime, not a time
+                            if s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-') {
+                                // This is a date string like "2010-10-10", convert to DateTime
+                                Ok(Some(EvaluationResult::datetime(s.clone())))
+                            } else if s.contains('T') || s.len() > 10 {
+                                // This looks like a full datetime string
+                                Ok(Some(EvaluationResult::datetime(s.clone())))
+                            } else {
+                                // Don't convert time-only strings to datetime
+                                Ok(None)
+                            }
+                        }
+                        "time" => {
+                            // Try to parse as time
+                            if s.contains(':') {
+                                Ok(Some(EvaluationResult::time(s.clone())))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "date" => {
+                            // Try to parse as date
+                            if s.len() >= 7 && s.chars().nth(4) == Some('-') {
+                                Ok(Some(EvaluationResult::date(s.clone())))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "instant" => {
+                            // Try to parse as instant (must have timezone)
+                            if s.contains('T') && (s.contains('+') || s.contains('-') || s.ends_with('Z')) {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "instant")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "id" => {
+                            // Only convert simple strings to ID, not URLs or other special formats
+                            if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("urn:") {
+                                // These look like URLs, URIs, OIDs, UUIDs - not simple IDs
+                                Ok(None)
+                            } else {
+                                // Simple string values can be IDs
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "id")))
+                            }
+                        }
+                        "oid" => {
+                            // OID strings start with "urn:oid:"
+                            if s.starts_with("urn:oid:") {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "oid")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "url" => {
+                            // URL strings typically start with "http://" or "https://"
+                            if s.starts_with("http://") || s.starts_with("https://") {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "url")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "uuid" => {
+                            // UUID strings start with "urn:uuid:"
+                            if s.starts_with("urn:uuid:") {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "uuid")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "uri" => {
+                            // URI strings can be various formats
+                            if s.starts_with("urn:") || s.starts_with("http://") || s.starts_with("https://") {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "uri")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "canonical" => {
+                            // Canonical URIs are similar to URIs
+                            if s.starts_with("http://") || s.starts_with("https://") {
+                                Ok(Some(EvaluationResult::fhir_string(s.clone(), "canonical")))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        "code" => {
+                            // Simple string values can be codes
+                            Ok(Some(EvaluationResult::fhir_string(s.clone(), "code")))
+                        }
+                        "markdown" => {
+                            // Any string can be markdown
+                            Ok(Some(EvaluationResult::fhir_string(s.clone(), "markdown")))
+                        }
+                        "base64binary" => {
+                            // Base64 encoded strings 
+                            Ok(Some(EvaluationResult::fhir_string(s.clone(), "base64Binary")))
+                        }
+                        _ => Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None)
+    }
+}
+
 /// Filters a collection based on a type specifier
 /// 
 /// # Arguments
@@ -698,8 +944,10 @@ pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Resu
         let mut result = Vec::new();
         
         for item in items {
-            if is_of_type(item, type_spec)? {
+            if is_of_type_for_of_type(item, type_spec)? {
                 result.push(item.clone());
+            } else if let Some(converted) = try_convert_for_of_type(item, type_spec)? {
+                result.push(converted);
             }
         }
         
@@ -720,9 +968,11 @@ pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Resu
         
         // For a singleton value, treat it like a collection of one
         _ => {
-            if is_of_type(collection, type_spec)? {
+            if is_of_type_for_of_type(collection, type_spec)? {
                 // Return the value directly for a singleton that matches
                 Ok(collection.clone())
+            } else if let Some(converted) = try_convert_for_of_type(collection, type_spec)? {
+                Ok(converted)
             } else {
                 Ok(EvaluationResult::Empty)
             }

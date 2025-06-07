@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
+    #[allow(dead_code)]
     title: String,
+    #[allow(dead_code)]
     description: String,
     #[serde(rename = "fhirVersion")]
     fhir_version: Vec<String>,
@@ -17,9 +19,11 @@ struct TestCase {
 #[derive(Debug, Deserialize)]
 struct Test {
     title: String,
+    #[allow(dead_code)]
     tags: Option<Vec<String>>,
     view: serde_json::Value,
     expect: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
     #[serde(rename = "expectColumns")]
     expect_columns: Option<Vec<String>>,
     #[serde(rename = "expectError")]
@@ -293,4 +297,11 @@ fn run_comprehensive_test_suite() {
     let report_json = serde_json::to_string_pretty(&all_reports).expect("Failed to serialize test report");
     fs::write("test_report.json", report_json).expect("Failed to write test report");
     println!("\nTest report saved to test_report.json");
+    
+    // Fail the test if any individual tests failed
+    assert_eq!(
+        passed_tests, total_tests,
+        "Test suite failed: {} out of {} tests failed",
+        total_tests - passed_tests, total_tests
+    );
 }

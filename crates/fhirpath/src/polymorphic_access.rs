@@ -225,12 +225,94 @@ fn get_polymorphic_fields(
         if let Some(value) = obj.get(&field_with_type) {
             // Don't add duplicates
             if !matches.iter().any(|(name, _)| name == &field_with_type) {
-                matches.push((field_with_type, value.clone()));
+                // Convert the value to the appropriate FHIRPath type based on the suffix
+                let converted_value = convert_fhir_field_to_fhirpath_type(value, suffix);
+                matches.push((field_with_type, converted_value));
             }
         }
     }
 
     matches
+}
+
+/// Converts a FHIR field value to the appropriate FHIRPath type based on the field suffix.
+///
+/// This function handles the conversion of FHIR string values to their appropriate
+/// FHIRPath types when accessed through polymorphic paths. For example, a `valueDateTime`
+/// field that contains a string like "2010-10-10" should be treated as a `DateTime`
+/// type in FHIRPath expressions.
+///
+/// # Arguments
+///
+/// * `value` - The original FHIR field value
+/// * `suffix` - The FHIR type suffix (e.g., "DateTime", "Date", "Time")
+///
+/// # Returns
+///
+/// An `EvaluationResult` with the appropriate FHIRPath type
+fn convert_fhir_field_to_fhirpath_type(value: &EvaluationResult, suffix: &str) -> EvaluationResult {
+    match value {
+        EvaluationResult::String(s, _) => {
+            match suffix {
+                "DateTime" => {
+                    // Convert string to DateTime if it's a valid date/datetime format
+                    EvaluationResult::datetime(s.clone())
+                }
+                "Date" => {
+                    // Convert string to Date if it's a valid date format
+                    EvaluationResult::date(s.clone())
+                }
+                "Time" => {
+                    // Convert string to Time if it's a valid time format
+                    EvaluationResult::time(s.clone())
+                }
+                "Instant" => {
+                    // Convert string to DateTime for instant (which is a datetime with required timezone)
+                    EvaluationResult::datetime(s.clone())
+                }
+                "Code" => {
+                    // Convert string to code type
+                    EvaluationResult::fhir_string(s.clone(), "code")
+                }
+                "Id" => {
+                    // Convert string to id type
+                    EvaluationResult::fhir_string(s.clone(), "id")
+                }
+                "Uri" => {
+                    // Convert string to uri type
+                    EvaluationResult::fhir_string(s.clone(), "uri")
+                }
+                "Url" => {
+                    // Convert string to url type
+                    EvaluationResult::fhir_string(s.clone(), "url")
+                }
+                "Canonical" => {
+                    // Convert string to canonical type
+                    EvaluationResult::fhir_string(s.clone(), "canonical")
+                }
+                "Oid" => {
+                    // Convert string to oid type
+                    EvaluationResult::fhir_string(s.clone(), "oid")
+                }
+                "Markdown" => {
+                    // Convert string to markdown type
+                    EvaluationResult::fhir_string(s.clone(), "markdown")
+                }
+                "Base64Binary" => {
+                    // Convert string to base64Binary type
+                    EvaluationResult::fhir_string(s.clone(), "base64Binary")
+                }
+                _ => {
+                    // For other types or when the conversion doesn't apply, return as-is
+                    value.clone()
+                }
+            }
+        }
+        _ => {
+            // For non-string values, return as-is
+            value.clone()
+        }
+    }
 }
 
 /// Determines if a field name represents a FHIR choice element.

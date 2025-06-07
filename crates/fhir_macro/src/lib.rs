@@ -2544,9 +2544,26 @@ fn generate_fhirpath_enum_impl(
                             None => variant_name_str.clone(),
                             Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
                         }
+                    } else if fhir_field_name.ends_with("Boolean") {
+                        // Special case for FHIR boolean primitives - use lowercase
+                        "boolean".to_string()
+                    } else if fhir_field_name.ends_with("Integer") {
+                        // Special case for FHIR integer primitives - use lowercase  
+                        "integer".to_string()
+                    } else if fhir_field_name.ends_with("Decimal") {
+                        // Special case for FHIR decimal primitives - use lowercase
+                        "decimal".to_string()
+                    } else if fhir_field_name.ends_with("String") {
+                        // Special case for FHIR string primitives - use lowercase
+                        "string".to_string()
                     } else {
-                        // Fallback to variant name if it doesn't match value[x] pattern
-                        variant_name_str.clone()
+                        // Fallback to variant name if it doesn't match known patterns
+                        // Convert first character to lowercase for consistency with FHIR primitive naming
+                        let mut chars = variant_name_str.chars();
+                        match chars.next() {
+                            None => variant_name_str.clone(),
+                            Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+                        }
                     };
                     
                     quote! {
@@ -2555,23 +2572,29 @@ fn generate_fhirpath_enum_impl(
                             let mut result = value.into_evaluation_result();
                             
                             // Add FHIR type information to preserve type for .ofType() operations
+                            // Only override type info if it's not already set correctly
                             result = match result {
-                                fhirpath_support::EvaluationResult::String(s, _) => {
-                                    fhirpath_support::EvaluationResult::String(s, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                fhirpath_support::EvaluationResult::String(s, existing_type_info) => {
+                                    let type_info = existing_type_info.unwrap_or_else(|| fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
+                                    fhirpath_support::EvaluationResult::String(s, Some(type_info))
                                 },
-                                fhirpath_support::EvaluationResult::Integer(i, _) => {
-                                    fhirpath_support::EvaluationResult::Integer(i, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                fhirpath_support::EvaluationResult::Integer(i, existing_type_info) => {
+                                    let type_info = existing_type_info.unwrap_or_else(|| fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
+                                    fhirpath_support::EvaluationResult::Integer(i, Some(type_info))
                                 },
-                                fhirpath_support::EvaluationResult::Decimal(d, _) => {
-                                    fhirpath_support::EvaluationResult::Decimal(d, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                fhirpath_support::EvaluationResult::Decimal(d, existing_type_info) => {
+                                    let type_info = existing_type_info.unwrap_or_else(|| fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
+                                    fhirpath_support::EvaluationResult::Decimal(d, Some(type_info))
                                 },
-                                fhirpath_support::EvaluationResult::Boolean(b, _) => {
-                                    fhirpath_support::EvaluationResult::Boolean(b, Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)))
+                                fhirpath_support::EvaluationResult::Boolean(b, existing_type_info) => {
+                                    let type_info = existing_type_info.unwrap_or_else(|| fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
+                                    fhirpath_support::EvaluationResult::Boolean(b, Some(type_info))
                                 },
-                                fhirpath_support::EvaluationResult::Object { map, type_info: _ } => {
+                                fhirpath_support::EvaluationResult::Object { map, type_info: existing_type_info } => {
+                                    let type_info = existing_type_info.unwrap_or_else(|| fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type));
                                     fhirpath_support::EvaluationResult::Object {
                                         map,
-                                        type_info: Some(fhirpath_support::TypeInfoResult::new("FHIR", &#fhir_type)),
+                                        type_info: Some(type_info),
                                     }
                                 },
                                 _ => result, // For other types, return as-is
