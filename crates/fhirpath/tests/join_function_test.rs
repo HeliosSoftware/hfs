@@ -1,5 +1,5 @@
 use fhirpath::{evaluate_expression, EvaluationContext, EvaluationResult};
-use fhir::{FhirResource, FhirVersion};
+use fhir::FhirResource;
 
 #[test]
 fn test_join_function_basic() {

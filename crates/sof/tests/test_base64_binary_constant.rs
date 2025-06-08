@@ -1,12 +1,15 @@
 use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
+    #[allow(dead_code)]
     title: String,
+    #[allow(dead_code)]
     description: String,
+    #[allow(dead_code)]
     #[serde(rename = "fhirVersion")]
     fhir_version: Vec<String>,
     resources: Vec<serde_json::Value>,
@@ -16,9 +19,11 @@ struct TestCase {
 #[derive(Debug, Deserialize)]
 struct Test {
     title: String,
+    #[allow(dead_code)]
     tags: Option<Vec<String>>,
     view: serde_json::Value,
     expect: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
     #[serde(rename = "expectError")]
     expect_error: Option<bool>,
 }

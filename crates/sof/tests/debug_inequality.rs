@@ -1,4 +1,4 @@
-use fhirpath::{evaluate_expression, EvaluationContext, EvaluationResult};
+use fhirpath::{evaluate_expression, EvaluationContext};
 use serde_json;
 
 #[test]

@@ -1,5 +1,4 @@
 use fhirpath::{evaluate_expression, EvaluationContext};
-use fhirpath_support::EvaluationResult;
 
 #[test]
 fn test_debug_boundary_inputs() {

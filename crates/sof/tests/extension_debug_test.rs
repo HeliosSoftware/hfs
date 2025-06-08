@@ -1,6 +1,5 @@
 use sof::{run_view_definition, SofBundle, SofViewDefinition, ContentType};
 use fhir::r4::{Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn};
-use fhir::Element;
 use serde_json;
 
 #[test]

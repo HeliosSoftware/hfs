@@ -1,12 +1,13 @@
 use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 struct TestCase {
+    #[allow(dead_code)]
     title: String,
+    #[allow(dead_code)]
     description: String,
     #[serde(rename = "fhirVersion")]
     fhir_version: Vec<String>,
@@ -17,30 +18,22 @@ struct TestCase {
 #[derive(Debug, Deserialize)]
 struct Test {
     title: String,
+    #[allow(dead_code)]
     tags: Option<Vec<String>>,
     view: serde_json::Value,
     expect: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
     #[serde(rename = "expectColumns")]
     expect_columns: Option<Vec<String>>,
     #[serde(rename = "expectError")]
     expect_error: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
+#[allow(dead_code)]
 struct TestResult {
     passed: bool,
     reason: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TestReport {
-    name: String,
-    result: TestResult,
-}
-
-#[derive(Debug, Serialize)]
-struct TestSuiteReport {
-    tests: Vec<TestReport>,
 }
 
 fn create_test_bundle(resources: &[serde_json::Value]) -> Result<SofBundle, Box<dyn std::error::Error>> {

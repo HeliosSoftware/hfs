@@ -31,10 +31,20 @@ fn test_fhir_resource_structure_debug() {
     let fhir_resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient.clone())));
     
     // Serialize the FhirResource back to JSON to see if extensions are preserved
-    if let FhirResource::R4(boxed_resource) = &fhir_resource {
-        if let fhir::r4::Resource::Patient(p) = boxed_resource.as_ref() {
-            println!("\nAfter FhirResource conversion:");
-            println!("{}", serde_json::to_string_pretty(p).unwrap());
+    match &fhir_resource {
+        FhirResource::R4(boxed_resource) => {
+            if let fhir::r4::Resource::Patient(p) = boxed_resource.as_ref() {
+                println!("\nAfter FhirResource conversion:");
+                println!("{}", serde_json::to_string_pretty(p).unwrap());
+            }
+        }
+        #[cfg(feature = "R4B")]
+        FhirResource::R4B(_) => {
+            println!("R4B resource - not handled in this test");
+        }
+        #[cfg(feature = "R5")]
+        FhirResource::R5(_) => {
+            println!("R5 resource - not handled in this test");
         }
     }
     

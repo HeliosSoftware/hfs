@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use fhir::{r4::{Patient, ViewDefinition}, FhirResource};
+    use fhir::{r4::Patient, FhirResource};
     use fhirpath::{EvaluationContext, evaluate_expression};
     use serde_json;
 

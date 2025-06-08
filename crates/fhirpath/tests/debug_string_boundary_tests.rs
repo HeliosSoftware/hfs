@@ -1,5 +1,4 @@
 use fhirpath::{evaluate_expression, EvaluationContext};
-use fhirpath_support::EvaluationResult;
 use fhir::FhirResource;
 
 #[test]
