@@ -1,4 +1,12 @@
-- sof - command line and server crate
+- sof - review all code for anything hard coded
+  - is_likely_non_boolean_path
+  - add parameter for fhir version in sof-cli - default to R4
+- sof - _r4 - can these be refactored? - we want the logic to be version agnostic
+  - Why is evaluate_path_on_item and create_iteration_content a R4 only feature??
+- sof - add Json, Ndjson, and Parquet formats
+- sof - add documentation
+- sof - implement sof-server - implement $run
+- sof - I betcha the R6 build won't work because we don't have a R4 ViewDefinition (yet)
 
 - Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 
 

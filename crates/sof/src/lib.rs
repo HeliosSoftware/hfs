@@ -1,5 +1,3 @@
-// Removed module declarations - binaries are standalone
-
 use fhir::{FhirResource, FhirVersion};
 use fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
 use serde::{Deserialize, Serialize};
@@ -868,8 +866,13 @@ fn generate_row_combinations_r4(
     }];
 
     for select in selects {
-        row_combinations =
-            expand_select_combinations_r4(context, select, &row_combinations, all_columns, variables)?;
+        row_combinations = expand_select_combinations_r4(
+            context,
+            select,
+            &row_combinations,
+            all_columns,
+            variables,
+        )?;
     }
 
     // Convert to ProcessedRow format
@@ -1357,16 +1360,19 @@ fn evaluate_path_on_item(
 }
 
 #[cfg(feature = "R4")]
-fn create_iteration_context(item: &EvaluationResult, variables: &HashMap<String, EvaluationResult>) -> EvaluationContext {
+fn create_iteration_context(
+    item: &EvaluationResult,
+    variables: &HashMap<String, EvaluationResult>,
+) -> EvaluationContext {
     // Create a new context with the iteration item as the root
     let mut context = EvaluationContext::new(vec![]);
     context.this = Some(item.clone());
-    
+
     // Preserve variables from the parent context
     for (name, value) in variables {
         context.set_variable_result(name, value.clone());
     }
-    
+
     context
 }
 
