@@ -463,48 +463,35 @@ fn validate_view_definition_r6(view_def: &fhir::r6::ViewDefinition) -> Result<()
 fn validate_where_clauses_r4(
     where_clauses: &[fhir::r4::ViewDefinitionWhere],
 ) -> Result<(), SofError> {
+    // Basic validation - just ensure paths are provided
+    // Type checking will be done during actual evaluation
     for where_clause in where_clauses {
-        if let Some(path) = &where_clause.path.value {
-            // Basic validation: where clause paths should not resolve to simple property access
-            // that would return strings/other non-boolean values
-            if is_likely_non_boolean_path(path) {
-                return Err(SofError::InvalidViewDefinition(format!(
-                    "Where clause path '{}' likely resolves to non-boolean value",
-                    path
-                )));
-            }
+        if where_clause.path.value.is_none() {
+            return Err(SofError::InvalidViewDefinition(
+                "Where clause must have a path specified".to_string()
+            ));
         }
     }
     Ok(())
 }
 
 #[cfg(feature = "R4")]
-fn is_likely_non_boolean_path(path: &str) -> bool {
-    // Simple heuristic: paths that end with common property names that return strings
-    // This is a basic check without full FHIRPath evaluation
-    let non_boolean_patterns = [
-        "family",  // name.family returns string
-        "given",   // name.given returns string
-        "id",      // id returns string
-        "value",   // many .value properties return non-boolean
-        "text",    // text fields return string
-        "display", // display fields return string
-        "system",  // system fields return string
-        "code",    // code fields return string
-    ];
-
-    for pattern in &non_boolean_patterns {
-        if path.ends_with(pattern)
-            && !path.contains("=")
-            && !path.contains(">")
-            && !path.contains("<")
-            && !path.contains("exists")
-        {
-            return true;
-        }
+fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
+    // Check if the result can be meaningfully used as a boolean in a where clause
+    match result {
+        // Boolean values are obviously OK
+        EvaluationResult::Boolean(_, _) => true,
+        
+        // Empty is OK (evaluates to false)
+        EvaluationResult::Empty => true,
+        
+        // Collections are OK - they evaluate based on whether they're empty or not
+        EvaluationResult::Collection { .. } => true,
+        
+        // Other types cannot be meaningfully coerced to boolean for where clauses
+        // This includes: String, Integer, Decimal, Date, DateTime, Time, Quantity, Object
+        _ => false,
     }
-
-    false
 }
 
 #[cfg(feature = "R4")]
@@ -670,6 +657,15 @@ fn apply_where_clauses_r4<'a>(
 
                 match evaluate_expression(path, &context) {
                     Ok(result) => {
+                        // Check if the result can be meaningfully used as a boolean
+                        if !can_be_coerced_to_boolean(&result) {
+                            return Err(SofError::InvalidViewDefinition(format!(
+                                "Where clause path '{}' returns type '{}' which cannot be used as a boolean condition. \
+                                 Where clauses must return boolean values, collections, or empty results.",
+                                path, result.type_name()
+                            )));
+                        }
+                        
                         // Check if result is truthy (non-empty and not false)
                         if !is_truthy(&result) {
                             include_resource = false;
