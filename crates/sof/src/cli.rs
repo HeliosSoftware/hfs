@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+use fhir::FhirVersion;
 
 #[derive(Parser, Debug)]
 #[command(name = "sof-cli")]
@@ -27,6 +28,10 @@ struct Args {
     /// Output file path (defaults to stdout)
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
+
+    /// FHIR version to use for parsing resources
+    #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
+    fhir_version: FhirVersion,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,29 +62,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Parse ViewDefinition (assume R4 for now, could be enhanced to auto-detect)
-    let view_definition: SofViewDefinition = {
+    // Parse ViewDefinition based on specified FHIR version
+    let view_definition: SofViewDefinition = match args.fhir_version {
         #[cfg(feature = "R4")]
-        {
+        FhirVersion::R4 => {
             let vd: fhir::r4::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R4(vd)
         }
-        #[cfg(not(feature = "R4"))]
-        {
-            return Err("R4 feature not enabled".into());
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            let vd: fhir::r4b::ViewDefinition = serde_json::from_str(&view_content)?;
+            SofViewDefinition::R4B(vd)
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            let vd: fhir::r5::ViewDefinition = serde_json::from_str(&view_content)?;
+            SofViewDefinition::R5(vd)
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            let vd: fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
+            SofViewDefinition::R6(vd)
         }
     };
 
-    // Parse Bundle (assume R4 for now, could be enhanced to auto-detect)
-    let bundle: SofBundle = {
+    // Parse Bundle based on specified FHIR version
+    let bundle: SofBundle = match args.fhir_version {
         #[cfg(feature = "R4")]
-        {
+        FhirVersion::R4 => {
             let b: fhir::r4::Bundle = serde_json::from_str(&bundle_content)?;
             SofBundle::R4(b)
         }
-        #[cfg(not(feature = "R4"))]
-        {
-            return Err("R4 feature not enabled".into());
+        #[cfg(feature = "R4B")]
+        FhirVersion::R4B => {
+            let b: fhir::r4b::Bundle = serde_json::from_str(&bundle_content)?;
+            SofBundle::R4B(b)
+        }
+        #[cfg(feature = "R5")]
+        FhirVersion::R5 => {
+            let b: fhir::r5::Bundle = serde_json::from_str(&bundle_content)?;
+            SofBundle::R5(b)
+        }
+        #[cfg(feature = "R6")]
+        FhirVersion::R6 => {
+            let b: fhir::r6::Bundle = serde_json::from_str(&bundle_content)?;
+            SofBundle::R6(b)
         }
     };
 
