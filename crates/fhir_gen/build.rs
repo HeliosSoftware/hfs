@@ -1,3 +1,4 @@
+use serde_json::Value;
 use std::fs;
 use std::fs::File;
 use std::io::copy;
@@ -94,5 +95,42 @@ fn main() {
     // Delete the zip file after extraction
     fs::remove_file(output_path).expect("Failed to delete zip file");
 
+    // Insert ViewDefinition into profiles-resources.json
+    insert_view_definition(&resources_dir).expect("Failed to insert ViewDefinition");
+
     println!("FHIR definitions downloaded successfully");
+}
+
+/// Inserts the ViewDefinition resource into profiles-resources.json for R6 builds.
+/// 
+/// This is a temporary workaround because the ViewDefinition FHIR Resource is not yet
+/// included in the latest R6 build from HL7's build server. This function should be
+/// removed once ViewDefinition is officially added to the R6 specification.
+fn insert_view_definition(resources_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let profiles_resources_path = resources_dir.join("profiles-resources.json");
+    let view_definition_path = resources_dir.join("view-definition-to-be-inserted.json");
+
+    // Read the existing profiles-resources.json
+    let profiles_content = fs::read_to_string(&profiles_resources_path)?;
+    let mut profiles_json: Value = serde_json::from_str(&profiles_content)?;
+
+    // Read the ViewDefinition to be inserted
+    let view_definition_content = fs::read_to_string(&view_definition_path)?;
+    let view_definition: Value = serde_json::from_str(&view_definition_content)?;
+
+    // Insert the ViewDefinition at the end of the entry array
+    if let Some(entry_array) = profiles_json["entry"].as_array_mut() {
+        entry_array.push(view_definition);
+        println!("Inserted ViewDefinition into profiles-resources.json");
+    } else {
+        return Err(
+            "profiles-resources.json does not have expected 'entry' array structure".into(),
+        );
+    }
+
+    // Write the modified JSON back to the file
+    let updated_content = serde_json::to_string_pretty(&profiles_json)?;
+    fs::write(&profiles_resources_path, updated_content)?;
+
+    Ok(())
 }

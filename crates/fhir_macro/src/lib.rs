@@ -2470,6 +2470,34 @@ fn generate_fhirpath_enum_impl(
     where_clause: Option<&syn::WhereClause>,
 ) -> proc_macro2::TokenStream {
 
+    // Handle empty enums (like initial R6 Resource enum)
+    if data.variants.is_empty() {
+        let is_resource_enum = name == "Resource";
+        
+        let additional_impl = if is_resource_enum {
+            quote! {
+                impl #impl_generics crate::FhirResourceTypeProvider for #name #ty_generics #where_clause {
+                    fn get_resource_type_names() -> Vec<&'static str> {
+                        vec![] // Empty enum has no resource types
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+        
+        return quote! {
+            impl #impl_generics fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
+                fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
+                    // This should never be called for an empty enum
+                    unreachable!("Empty enum should not be instantiated")
+                }
+            }
+            
+            #additional_impl
+        };
+    }
+
     // Check if the enum being derived is the top-level Resource enum
     let is_resource_enum = name == "Resource";
     

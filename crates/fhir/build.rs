@@ -10,6 +10,20 @@ fn main() {
         return;
     }
 
+    // Check if r6.rs exists, if not, copy from template
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let r6_file = src_dir.join("r6.rs");
+    let r6_template = src_dir.join("r6.rs.template");
+
+    if !r6_file.exists() {
+        if r6_template.exists() {
+            fs::copy(&r6_template, &r6_file).expect("Failed to copy r6.rs.template to r6.rs");
+            println!("Created r6.rs from template");
+        } else {
+            panic!("r6.rs.template not found at {:?}", r6_template);
+        }
+    }
+
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/R6");
 
     // Create the resources directory if it doesn't exist

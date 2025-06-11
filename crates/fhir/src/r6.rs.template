@@ -1,0 +1,7 @@
+// This is an empty r6.rs file - only sufficient for the initial R6 feature build before
+// downloading the spec.  It will be overwritten by fhir_gen
+use fhir_macro::FhirPath;
+use serde::{Deserialize, Serialize};
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FhirPath)]
+#[serde(tag = "resourceType")]
+pub enum Resource {}

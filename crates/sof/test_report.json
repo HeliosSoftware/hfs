@@ -101,6 +101,70 @@
       }
     ]
   },
+  "fn_join.json": {
+    "tests": [
+      {
+        "name": "join with comma",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "join with empty value",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "join with no value - default to no separator",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "validate.json": {
+    "tests": [
+      {
+        "name": "empty",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "missing resource",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "wrong fhirpath",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "wrong type in forEach",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "where with path resolving to not boolean",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
   "collection.json": {
     "tests": [
       {
@@ -133,17 +197,287 @@
       }
     ]
   },
-  "fn_first.json": {
+  "fn_empty.json": {
     "tests": [
       {
-        "name": "table level first()",
+        "name": "empty names",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_reference_keys.json": {
+    "tests": [
+      {
+        "name": "getReferenceKey result matches getResourceKey without type specifier",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "table and field level first()",
+        "name": "getReferenceKey result matches getResourceKey with right type specifier",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "getReferenceKey result matches getResourceKey with wrong type specifier",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_oftype.json": {
+    "tests": [
+      {
+        "name": "select string values",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "select integer values",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fhirpath_numbers.json": {
+    "tests": [
+      {
+        "name": "add observation",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "union.json": {
+    "tests": [
+      {
+        "name": "basic",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "unionAll + column",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "duplicates",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "empty results",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "empty with forEachOrNull",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "forEachOrNull and forEach",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "nested",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "one empty operand",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column mismatch",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column order mismatch",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_boundary.json": {
+    "tests": [
+      {
+        "name": "decimal lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "decimal highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "datetime lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "datetime highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "date lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "date highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "time lowBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "time highBoundary",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "fn_extension.json": {
+    "tests": [
+      {
+        "name": "simple extension",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "nested extension",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "logic.json": {
+    "tests": [
+      {
+        "name": "filtering with 'and'",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "filtering with 'or'",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "filtering with 'not'",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "combinations.json": {
+    "tests": [
+      {
+        "name": "select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column + select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "sibling select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "sibling select inside a select",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "column + select, with where",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "unionAll + forEach + column + select",
         "result": {
           "passed": true,
           "reason": null
@@ -246,212 +580,6 @@
       }
     ]
   },
-  "fn_empty.json": {
-    "tests": [
-      {
-        "name": "empty names",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_join.json": {
-    "tests": [
-      {
-        "name": "join with comma",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "join with empty value",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "join with no value - default to no separator",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "constant.json": {
-    "tests": [
-      {
-        "name": "constant in path",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "constant in forEach",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "constant in where element",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "constant in unionAll",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "integer constant",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "boolean constant",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "accessing an undefined constant",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "incorrect constant definition",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "where.json": {
-    "tests": [
-      {
-        "name": "simple where path with result",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with no results",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with greater than inequality",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with less than inequality",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "multiple where paths",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with an 'and' connector",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path with an 'or' connector",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where path that evaluates to true when empty",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "view_resource.json": {
-    "tests": [
-      {
-        "name": "only pts",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "only obs",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "resource not specified",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_reference_keys.json": {
-    "tests": [
-      {
-        "name": "getReferenceKey result matches getResourceKey without type specifier",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "getReferenceKey result matches getResourceKey with right type specifier",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "getReferenceKey result matches getResourceKey with wrong type specifier",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
   "basic.json": {
     "tests": [
       {
@@ -533,59 +661,59 @@
       }
     ]
   },
-  "fn_boundary.json": {
+  "where.json": {
     "tests": [
       {
-        "name": "decimal lowBoundary",
+        "name": "simple where path with result",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "decimal highBoundary",
+        "name": "where path with no results",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "datetime lowBoundary",
+        "name": "where path with greater than inequality",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "datetime highBoundary",
+        "name": "where path with less than inequality",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "date lowBoundary",
+        "name": "multiple where paths",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "date highBoundary",
+        "name": "where path with an 'and' connector",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "time lowBoundary",
+        "name": "where path with an 'or' connector",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "time highBoundary",
+        "name": "where path that evaluates to true when empty",
         "result": {
           "passed": true,
           "reason": null
@@ -593,24 +721,17 @@
       }
     ]
   },
-  "logic.json": {
+  "fn_first.json": {
     "tests": [
       {
-        "name": "filtering with 'and'",
+        "name": "table level first()",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "filtering with 'or'",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "filtering with 'not'",
+        "name": "table and field level first()",
         "result": {
           "passed": true,
           "reason": null
@@ -618,205 +739,59 @@
       }
     ]
   },
-  "combinations.json": {
+  "constant.json": {
     "tests": [
       {
-        "name": "select",
+        "name": "constant in path",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "column + select",
+        "name": "constant in forEach",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "sibling select",
+        "name": "constant in where element",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "sibling select inside a select",
+        "name": "constant in unionAll",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "column + select, with where",
+        "name": "integer constant",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "unionAll + forEach + column + select",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_extension.json": {
-    "tests": [
-      {
-        "name": "simple extension",
+        "name": "boolean constant",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "nested extension",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fhirpath_numbers.json": {
-    "tests": [
-      {
-        "name": "add observation",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "validate.json": {
-    "tests": [
-      {
-        "name": "empty",
+        "name": "accessing an undefined constant",
         "result": {
           "passed": true,
           "reason": null
         }
       },
       {
-        "name": "missing resource",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "wrong fhirpath",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "wrong type in forEach",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "where with path resolving to not boolean",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "union.json": {
-    "tests": [
-      {
-        "name": "basic",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "unionAll + column",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "duplicates",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "empty results",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "empty with forEachOrNull",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "forEachOrNull and forEach",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "nested",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "one empty operand",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column mismatch",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "column order mismatch",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      }
-    ]
-  },
-  "fn_oftype.json": {
-    "tests": [
-      {
-        "name": "select string values",
-        "result": {
-          "passed": true,
-          "reason": null
-        }
-      },
-      {
-        "name": "select integer values",
+        "name": "incorrect constant definition",
         "result": {
           "passed": true,
           "reason": null
@@ -898,6 +873,31 @@
       },
       {
         "name": "string join: default separator",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "view_resource.json": {
+    "tests": [
+      {
+        "name": "only pts",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "only obs",
+        "result": {
+          "passed": true,
+          "reason": null
+        }
+      },
+      {
+        "name": "resource not specified",
         "result": {
           "passed": true,
           "reason": null
