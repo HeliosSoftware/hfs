@@ -1,6 +1,4 @@
 {
-    "fullUrl" : "http://hl7.org/fhir/StructureDefinition/ViewDefinition",
-    "resource" : {
   "resourceType" : "StructureDefinition",
   "id" : "ViewDefinition",
   "text" : {
@@ -2380,6 +2378,6 @@
       }]
     }]
   }
-}}
+}
 
 

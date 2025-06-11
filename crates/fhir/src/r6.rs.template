@@ -1,5 +1,4 @@
-// This is a template r6.rs file - it gets copied to r6.rs by build.rs and is only sufficient for the
-// initial R6 feature build before downloading the spec.  It will be overwritten by fhir_gen if the R6 feature is specified (or --all)
+// This is a template r6.rs file.
 use fhir_macro::{FhirPath, FhirSerde};
 use serde::{Deserialize, Serialize};
 use crate::Element;

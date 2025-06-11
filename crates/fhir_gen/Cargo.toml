@@ -5,10 +5,10 @@ edition = "2024"
 
 [features]
 default = ["R4"]
-R4 = []
-R4B = []
-R5 = []
-R6 = []
+R4 = ["fhir/R4"]
+R4B = ["fhir/R4B"]
+R5 = ["fhir/R5"]
+R6 = ["fhir/R6"]
 
 [dependencies]
 serde = { workspace = true }

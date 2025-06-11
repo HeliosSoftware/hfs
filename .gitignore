@@ -6,7 +6,6 @@ yarn.lock
 crates/fhir_gen/resources/R6/*
 !crates/fhir_gen/resources/R6/view-definition-to-be-inserted.json
 crates/fhir/tests/data/R6
-crates/fhir/src/r6.rs
 .idea
 package-lock.json
 **/.claude/settings.local.json
