@@ -59,10 +59,11 @@ FHIR Rest API
 SQL On FHIR
 
 - Document: Build process:
-      cargo build --features R4,R4B,R5,R6
-      ./target/debug/fhir_gen --all
-      cargo test --features R4,R4B,R5,R6
-
+```
+cargo build -p fhir_gen --features R6
+./target/debug/fhir_gen --all
+cargo test --features R4,R4B,R5,R6
+```
 # Documentation
 
 ## Product Documentation

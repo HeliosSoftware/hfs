@@ -46,6 +46,10 @@ fn test_fhir_resource_structure_debug() {
         FhirResource::R5(_) => {
             println!("R5 resource - not handled in this test");
         }
+        #[cfg(feature = "R6")]
+        FhirResource::R6(_) => {
+            println!("R6 resource - not handled in this test");
+        }
     }
     
     // Test 2: Create evaluation context and test direct paths

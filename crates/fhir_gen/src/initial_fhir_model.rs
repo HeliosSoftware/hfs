@@ -939,7 +939,6 @@ pub struct ElementDefinitionConstraint {
 /// 3. Understand inheritance relationships
 /// 4. Apply constraints and cardinality rules
 #[derive(Debug, Serialize, Deserialize, Default)] // Added Default
-#[serde(tag = "resourceType")]
 pub struct StructureDefinition {
     pub id: Option<String>,
     pub meta: Option<Meta>,

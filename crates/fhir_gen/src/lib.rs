@@ -213,7 +213,9 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
                 if ext == "json" {
                     if let Some(filename) = path.file_name() {
                         let filename = filename.to_string_lossy();
-                        if !filename.contains("conceptmap") && !filename.contains("valueset") {
+                        if !filename.contains("conceptmap") 
+                            && !filename.contains("valueset") 
+                            && !filename.contains("bundle-entry") {
                             json_files.push(path);
                         }
                     }
