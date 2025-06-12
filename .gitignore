@@ -4,7 +4,7 @@
 yarn.lock
 .aider*
 crates/fhir_gen/resources/R6/*
-!crates/fhir_gen/resources/R6/view-definition-bundle.json
+!crates/fhir_gen/resources/R6/view-definition-bundle-entry.json
 crates/fhir/tests/data/R6
 .idea
 package-lock.json
