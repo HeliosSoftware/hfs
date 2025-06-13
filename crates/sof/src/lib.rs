@@ -1,8 +1,11 @@
-use fhir::{FhirResource, FhirVersion};
+mod traits;
+
+use fhir::FhirVersion;
 use fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+use traits::*;
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
 #[derive(Debug, Clone)]
@@ -137,172 +140,84 @@ fn process_view_definition(
         ));
     }
 
-    match view_definition {
+    match (view_definition, bundle) {
         #[cfg(feature = "R4")]
-        SofViewDefinition::R4(vd) =>
-        {
-            #[allow(irrefutable_let_patterns)]
-            if let SofBundle::R4(bundle) = bundle {
-                process_view_definition_r4(vd, bundle)
-            } else {
-                unreachable!("Version mismatch should have been caught above")
-            }
+        (SofViewDefinition::R4(vd), SofBundle::R4(bundle)) => {
+            process_view_definition_generic(vd, bundle)
         }
         #[cfg(feature = "R4B")]
-        SofViewDefinition::R4B(vd) => {
-            if let SofBundle::R4B(bundle) = bundle {
-                process_view_definition_r4b(vd, bundle)
-            } else {
-                unreachable!("Version mismatch should have been caught above")
-            }
+        (SofViewDefinition::R4B(vd), SofBundle::R4B(bundle)) => {
+            process_view_definition_generic(vd, bundle)
         }
         #[cfg(feature = "R5")]
-        SofViewDefinition::R5(vd) => {
-            if let SofBundle::R5(bundle) = bundle {
-                process_view_definition_r5(vd, bundle)
-            } else {
-                unreachable!("Version mismatch should have been caught above")
-            }
+        (SofViewDefinition::R5(vd), SofBundle::R5(bundle)) => {
+            process_view_definition_generic(vd, bundle)
         }
         #[cfg(feature = "R6")]
-        SofViewDefinition::R6(vd) => {
-            if let SofBundle::R6(bundle) = bundle {
-                process_view_definition_r6(vd, bundle)
-            } else {
-                unreachable!("Version mismatch should have been caught above")
-            }
+        (SofViewDefinition::R6(vd), SofBundle::R6(bundle)) => {
+            process_view_definition_generic(vd, bundle)
         }
+        _ => unreachable!("Version mismatch should have been caught above"),
     }
 }
 
-#[cfg(feature = "R4")]
-fn extract_view_definition_constants_r4(
-    view_definition: &fhir::r4::ViewDefinition,
+// Generic version-agnostic constant extraction
+fn extract_view_definition_constants<VD: ViewDefinitionTrait>(
+    view_definition: &VD,
 ) -> Result<HashMap<String, EvaluationResult>, SofError> {
     let mut variables = HashMap::new();
 
-    if let Some(constants) = &view_definition.constant {
+    if let Some(constants) = view_definition.constants() {
         for constant in constants {
-            // Extract the string value from the Element wrapper
             let name = constant
-                .name
-                .value
-                .as_ref()
+                .name()
                 .ok_or_else(|| {
                     SofError::InvalidViewDefinition("Constant name is required".to_string())
                 })?
-                .clone();
+                .to_string();
 
-            if let Some(value) = &constant.value {
-                let eval_result = match value {
-                    fhir::r4::ViewDefinitionConstantValue::String(s) => {
-                        EvaluationResult::String(s.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Boolean(b) => {
-                        EvaluationResult::Boolean(b.value.unwrap_or(false), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Integer(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0) as i64, None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Decimal(d) => {
-                        // Extract decimal value from DecimalElement
-                        if let Some(precise_decimal) = &d.value {
-                            // Parse the original string to get a rust_decimal::Decimal
-                            match precise_decimal.original_string().parse() {
-                                Ok(decimal_value) => EvaluationResult::Decimal(decimal_value, None),
-                                Err(_) => {
-                                    return Err(SofError::InvalidViewDefinition(format!(
-                                        "Invalid decimal value for constant '{}'",
-                                        name
-                                    )));
-                                }
-                            }
-                        } else {
-                            EvaluationResult::Decimal("0".parse().unwrap(), None)
-                        }
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Date(d) => {
-                        EvaluationResult::Date(d.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::DateTime(dt) => {
-                        EvaluationResult::DateTime(dt.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Time(t) => {
-                        EvaluationResult::Time(t.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Code(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Base64Binary(b) => {
-                        EvaluationResult::String(b.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Id(i) => {
-                        EvaluationResult::String(i.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Instant(i) => {
-                        EvaluationResult::DateTime(i.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Oid(o) => {
-                        EvaluationResult::String(o.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::PositiveInt(p) => {
-                        EvaluationResult::Integer(p.value.unwrap_or(1) as i64, None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::UnsignedInt(u) => {
-                        EvaluationResult::Integer(u.value.unwrap_or(0) as i64, None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Uri(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Url(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Uuid(u) => {
-                        EvaluationResult::String(u.value.clone().unwrap_or_default(), None)
-                    }
-                    fhir::r4::ViewDefinitionConstantValue::Canonical(c) => {
-                        EvaluationResult::String(c.value.clone().unwrap_or_default(), None)
-                    }
-                };
-
-                variables.insert(name, eval_result);
-            }
+            let eval_result = constant.to_evaluation_result()?;
+            variables.insert(name, eval_result);
         }
     }
 
     Ok(variables)
 }
 
-#[cfg(feature = "R4")]
-fn process_view_definition_r4(
-    view_definition: fhir::r4::ViewDefinition,
-    bundle: fhir::r4::Bundle,
-) -> Result<ProcessedResult, SofError> {
-    validate_view_definition_r4(&view_definition)?;
+// Generic version-agnostic ViewDefinition processing
+fn process_view_definition_generic<VD, B>(
+    view_definition: VD,
+    bundle: B,
+) -> Result<ProcessedResult, SofError>
+where
+    VD: ViewDefinitionTrait,
+    B: BundleTrait,
+    B::Resource: ResourceTrait,
+{
+    validate_view_definition(&view_definition)?;
 
     // Step 1: Extract constants/variables from ViewDefinition
-    let variables = extract_view_definition_constants_r4(&view_definition)?;
+    let variables = extract_view_definition_constants(&view_definition)?;
 
     // Step 2: Filter resources by type and profile
-    let target_resource_type =
-        view_definition.resource.value.as_ref().ok_or_else(|| {
-            SofError::InvalidViewDefinition("Resource type is required".to_string())
-        })?;
+    let target_resource_type = view_definition.resource().ok_or_else(|| {
+        SofError::InvalidViewDefinition("Resource type is required".to_string())
+    })?;
 
-    let filtered_resources = filter_resources_r4(&bundle, target_resource_type)?;
+    let filtered_resources = filter_resources(&bundle, target_resource_type)?;
 
     // Step 3: Apply where clauses to filter resources
     let filtered_resources =
-        apply_where_clauses_r4(filtered_resources, &view_definition.r#where, &variables)?;
+        apply_where_clauses(filtered_resources, view_definition.where_clauses(), &variables)?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
-    let select_clauses = view_definition.select.as_ref().ok_or_else(|| {
+    let select_clauses = view_definition.select().ok_or_else(|| {
         SofError::InvalidViewDefinition("At least one select clause is required".to_string())
     })?;
 
-    // Generate rows for each resource using the new forEach-aware approach
+    // Generate rows for each resource using the forEach-aware approach
     let (all_columns, rows) =
-        generate_rows_from_selects_r4(&filtered_resources, select_clauses, &variables)?;
+        generate_rows_from_selects(&filtered_resources, select_clauses, &variables)?;
 
     Ok(ProcessedResult {
         columns: all_columns,
@@ -310,163 +225,44 @@ fn process_view_definition_r4(
     })
 }
 
-#[cfg(feature = "R4B")]
-fn process_view_definition_r4b(
-    view_definition: fhir::r4b::ViewDefinition,
-    _bundle: fhir::r4b::Bundle,
-) -> Result<ProcessedResult, SofError> {
-    validate_view_definition_r4b(&view_definition)?;
-
-    let columns = Vec::new();
-    let rows = Vec::new();
-
-    // TODO: Implement the actual R4B processing logic
-    // For now, return empty result
-    Ok(ProcessedResult { columns, rows })
-}
-
-#[cfg(feature = "R5")]
-fn process_view_definition_r5(
-    view_definition: fhir::r5::ViewDefinition,
-    _bundle: fhir::r5::Bundle,
-) -> Result<ProcessedResult, SofError> {
-    validate_view_definition_r5(&view_definition)?;
-
-    let columns = Vec::new();
-    let rows = Vec::new();
-
-    // TODO: Implement the actual R5 processing logic
-    // For now, return empty result
-    Ok(ProcessedResult { columns, rows })
-}
-
-#[cfg(feature = "R6")]
-fn process_view_definition_r6(
-    view_definition: fhir::r6::ViewDefinition,
-    _bundle: fhir::r6::Bundle,
-) -> Result<ProcessedResult, SofError> {
-    validate_view_definition_r6(&view_definition)?;
-
-    let columns = Vec::new();
-    let rows = Vec::new();
-
-    // TODO: Implement the actual R6 processing logic
-    // For now, return empty result
-    Ok(ProcessedResult { columns, rows })
-}
-
-#[cfg(feature = "R4")]
-fn validate_view_definition_r4(view_def: &fhir::r4::ViewDefinition) -> Result<(), SofError> {
+// Generic version-agnostic validation
+fn validate_view_definition<VD: ViewDefinitionTrait>(view_def: &VD) -> Result<(), SofError> {
     // Basic validation
-    if view_def
-        .resource
-        .value
-        .as_ref()
-        .map_or(true, |s| s.is_empty())
-    {
+    if view_def.resource().map_or(true, |s| s.is_empty()) {
         return Err(SofError::InvalidViewDefinition(
             "ViewDefinition must specify a resource type".to_string(),
         ));
     }
 
-    if view_def.select.is_none() || view_def.select.as_ref().unwrap().is_empty() {
+    if view_def.select().map_or(true, |s| s.is_empty()) {
         return Err(SofError::InvalidViewDefinition(
             "ViewDefinition must have at least one select".to_string(),
         ));
     }
 
     // Validate where clauses
-    if let Some(where_clauses) = &view_def.r#where {
-        validate_where_clauses_r4(where_clauses)?;
+    if let Some(where_clauses) = view_def.where_clauses() {
+        validate_where_clauses(where_clauses)?;
     }
 
     // Validate selects
-    if let Some(selects) = &view_def.select {
+    if let Some(selects) = view_def.select() {
         for select in selects {
-            validate_select_r4(select)?;
+            validate_select(select)?;
         }
     }
 
     Ok(())
 }
 
-#[cfg(feature = "R4B")]
-fn validate_view_definition_r4b(view_def: &fhir::r4b::ViewDefinition) -> Result<(), SofError> {
-    // Basic validation (same logic as R4 for now)
-    if view_def
-        .resource
-        .value
-        .as_ref()
-        .map_or(true, |s| s.is_empty())
-    {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must specify a resource type".to_string(),
-        ));
-    }
-
-    if view_def.select.is_none() || view_def.select.as_ref().unwrap().is_empty() {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must have at least one select".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "R5")]
-fn validate_view_definition_r5(view_def: &fhir::r5::ViewDefinition) -> Result<(), SofError> {
-    // Basic validation (same logic as R4 for now)
-    if view_def
-        .resource
-        .value
-        .as_ref()
-        .map_or(true, |s| s.is_empty())
-    {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must specify a resource type".to_string(),
-        ));
-    }
-
-    if view_def.select.is_none() || view_def.select.as_ref().unwrap().is_empty() {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must have at least one select".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "R6")]
-fn validate_view_definition_r6(view_def: &fhir::r6::ViewDefinition) -> Result<(), SofError> {
-    // Basic validation (same logic as R4 for now)
-    if view_def
-        .resource
-        .value
-        .as_ref()
-        .map_or(true, |s| s.is_empty())
-    {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must specify a resource type".to_string(),
-        ));
-    }
-
-    if view_def.select.is_none() || view_def.select.as_ref().unwrap().is_empty() {
-        return Err(SofError::InvalidViewDefinition(
-            "ViewDefinition must have at least one select".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "R4")]
-fn validate_where_clauses_r4(
-    where_clauses: &[fhir::r4::ViewDefinitionWhere],
+// Generic where clause validation
+fn validate_where_clauses<W: ViewDefinitionWhereTrait>(
+    where_clauses: &[W],
 ) -> Result<(), SofError> {
     // Basic validation - just ensure paths are provided
     // Type checking will be done during actual evaluation
     for where_clause in where_clauses {
-        if where_clause.path.value.is_none() {
+        if where_clause.path().is_none() {
             return Err(SofError::InvalidViewDefinition(
                 "Where clause must have a path specified".to_string()
             ));
@@ -475,7 +271,7 @@ fn validate_where_clauses_r4(
     Ok(())
 }
 
-#[cfg(feature = "R4")]
+// Generic helper - no longer needs to be version-specific
 fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
     // Check if the result can be meaningfully used as a boolean in a where clause
     match result {
@@ -494,60 +290,60 @@ fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
     }
 }
 
-#[cfg(feature = "R4")]
-fn validate_select_r4(select: &fhir::r4::ViewDefinitionSelect) -> Result<(), SofError> {
-    validate_select_with_context_r4(select, false)
+// Generic select validation
+fn validate_select<S: ViewDefinitionSelectTrait>(select: &S) -> Result<(), SofError> {
+    validate_select_with_context(select, false)
 }
 
-#[cfg(feature = "R4")]
-fn validate_select_with_context_r4(
-    select: &fhir::r4::ViewDefinitionSelect,
+fn validate_select_with_context<S: ViewDefinitionSelectTrait>(
+    select: &S,
     in_foreach_context: bool,
-) -> Result<(), SofError> {
+) -> Result<(), SofError>
+where
+    S::Select: ViewDefinitionSelectTrait,
+{
     // Determine if we're entering a forEach context at this level
-    let entering_foreach = select.for_each.is_some() || select.for_each_or_null.is_some();
+    let entering_foreach = select.for_each().is_some() || select.for_each_or_null().is_some();
     let current_foreach_context = in_foreach_context || entering_foreach;
 
     // Validate collection attribute with the current forEach context
-    if let Some(columns) = &select.column {
+    if let Some(columns) = select.column() {
         for column in columns {
-            if let Some(collection_element) = &column.collection {
-                if let Some(collection_value) = collection_element.value {
-                    if !collection_value && !current_foreach_context {
-                        return Err(SofError::InvalidViewDefinition(
-                            "Column 'collection' attribute must be true when specified".to_string(),
-                        ));
-                    }
+            if let Some(collection_value) = column.collection() {
+                if !collection_value && !current_foreach_context {
+                    return Err(SofError::InvalidViewDefinition(
+                        "Column 'collection' attribute must be true when specified".to_string(),
+                    ));
                 }
             }
         }
     }
 
     // Validate unionAll column consistency
-    if let Some(union_selects) = &select.union_all {
-        validate_union_all_columns_r4(union_selects)?;
+    if let Some(union_selects) = select.union_all() {
+        validate_union_all_columns(union_selects)?;
     }
 
     // Recursively validate nested selects
-    if let Some(nested_selects) = &select.select {
+    if let Some(nested_selects) = select.select() {
         for nested_select in nested_selects {
-            validate_select_with_context_r4(nested_select, current_foreach_context)?;
+            validate_select_with_context(nested_select, current_foreach_context)?;
         }
     }
 
     // Validate unionAll selects with forEach context
-    if let Some(union_selects) = &select.union_all {
+    if let Some(union_selects) = select.union_all() {
         for union_select in union_selects {
-            validate_select_with_context_r4(union_select, current_foreach_context)?;
+            validate_select_with_context(union_select, current_foreach_context)?;
         }
     }
 
     Ok(())
 }
 
-#[cfg(feature = "R4")]
-fn validate_union_all_columns_r4(
-    union_selects: &[fhir::r4::ViewDefinitionSelect],
+// Generic union validation
+fn validate_union_all_columns<S: ViewDefinitionSelectTrait>(
+    union_selects: &[S],
 ) -> Result<(), SofError> {
     if union_selects.len() < 2 {
         return Ok(());
@@ -555,11 +351,11 @@ fn validate_union_all_columns_r4(
 
     // Get column names and order from first select
     let first_select = &union_selects[0];
-    let first_columns = get_column_names_r4(first_select)?;
+    let first_columns = get_column_names(first_select)?;
 
     // Validate all other selects have the same column names in the same order
     for (index, union_select) in union_selects.iter().enumerate().skip(1) {
-        let current_columns = get_column_names_r4(union_select)?;
+        let current_columns = get_column_names(union_select)?;
 
         if current_columns != first_columns {
             if current_columns.len() != first_columns.len()
@@ -583,24 +379,24 @@ fn validate_union_all_columns_r4(
     Ok(())
 }
 
-#[cfg(feature = "R4")]
-fn get_column_names_r4(select: &fhir::r4::ViewDefinitionSelect) -> Result<Vec<String>, SofError> {
+// Generic column name extraction
+fn get_column_names<S: ViewDefinitionSelectTrait>(select: &S) -> Result<Vec<String>, SofError> {
     let mut column_names = Vec::new();
 
     // Collect direct column names
-    if let Some(columns) = &select.column {
+    if let Some(columns) = select.column() {
         for column in columns {
-            if let Some(name) = &column.name.value {
-                column_names.push(name.clone());
+            if let Some(name) = column.name() {
+                column_names.push(name.to_string());
             }
         }
     }
 
     // If this select has unionAll but no direct columns, get columns from first unionAll branch
     if column_names.is_empty() {
-        if let Some(union_selects) = &select.union_all {
+        if let Some(union_selects) = select.union_all() {
             if !union_selects.is_empty() {
-                return get_column_names_r4(&union_selects[0]);
+                return get_column_names(&union_selects[0]);
             }
         }
     }
@@ -608,33 +404,28 @@ fn get_column_names_r4(select: &fhir::r4::ViewDefinitionSelect) -> Result<Vec<St
     Ok(column_names)
 }
 
-#[cfg(feature = "R4")]
-fn filter_resources_r4<'a>(
-    bundle: &'a fhir::r4::Bundle,
+// Generic resource filtering
+fn filter_resources<'a, B: BundleTrait>(
+    bundle: &'a B,
     resource_type: &str,
-) -> Result<Vec<&'a fhir::r4::Resource>, SofError> {
-    let mut filtered = Vec::new();
-
-    if let Some(entries) = &bundle.entry {
-        for entry in entries {
-            if let Some(resource) = &entry.resource {
-                // Use the generated resource_name() method
-                if resource.resource_name() == resource_type {
-                    filtered.push(resource);
-                }
-            }
-        }
-    }
-
-    Ok(filtered)
+) -> Result<Vec<&'a B::Resource>, SofError> {
+    Ok(bundle
+        .entries()
+        .into_iter()
+        .filter(|resource| resource.resource_name() == resource_type)
+        .collect())
 }
 
-#[cfg(feature = "R4")]
-fn apply_where_clauses_r4<'a>(
-    resources: Vec<&'a fhir::r4::Resource>,
-    where_clauses: &Option<Vec<fhir::r4::ViewDefinitionWhere>>,
+// Generic where clause application
+fn apply_where_clauses<'a, R, W>(
+    resources: Vec<&'a R>,
+    where_clauses: Option<&[W]>,
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<Vec<&'a fhir::r4::Resource>, SofError> {
+) -> Result<Vec<&'a R>, SofError>
+where
+    R: ResourceTrait,
+    W: ViewDefinitionWhereTrait,
+{
     if let Some(wheres) = where_clauses {
         let mut filtered = Vec::new();
 
@@ -643,7 +434,7 @@ fn apply_where_clauses_r4<'a>(
 
             // All where clauses must evaluate to true for the resource to be included
             for where_clause in wheres {
-                let fhir_resource = FhirResource::R4(Box::new(resource.clone()));
+                let fhir_resource = resource.to_fhir_resource();
                 let mut context = EvaluationContext::new(vec![fhir_resource]);
 
                 // Add variables to the context
@@ -651,7 +442,7 @@ fn apply_where_clauses_r4<'a>(
                     context.set_variable_result(name, value.clone());
                 }
 
-                let path = where_clause.path.value.as_ref().ok_or_else(|| {
+                let path = where_clause.path().ok_or_else(|| {
                     SofError::InvalidViewDefinition("Where clause path is required".to_string())
                 })?;
 
@@ -799,35 +590,43 @@ fn extract_iteration_items(result: EvaluationResult) -> Vec<EvaluationResult> {
     }
 }
 
-// Remove the old collect_columns_from_select_r4 function since it's replaced by the new approach
+// Generic row generation functions
 
-#[cfg(feature = "R4")]
-fn generate_rows_from_selects_r4(
-    resources: &[&fhir::r4::Resource],
-    selects: &[fhir::r4::ViewDefinitionSelect],
+fn generate_rows_from_selects<R, S>(
+    resources: &[&R],
+    selects: &[S],
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError> {
+) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
+where
+    R: ResourceTrait,
+    S: ViewDefinitionSelectTrait,
+    S::Select: ViewDefinitionSelectTrait,
+{
     let mut all_columns = Vec::new();
     let mut all_rows = Vec::new();
 
     // For each resource, generate all possible row combinations
     for resource in resources {
         let resource_rows =
-            generate_rows_for_resource_r4(resource, selects, &mut all_columns, variables)?;
+            generate_rows_for_resource(*resource, selects, &mut all_columns, variables)?;
         all_rows.extend(resource_rows);
     }
 
     Ok((all_columns, all_rows))
 }
 
-#[cfg(feature = "R4")]
-fn generate_rows_for_resource_r4(
-    resource: &fhir::r4::Resource,
-    selects: &[fhir::r4::ViewDefinitionSelect],
+fn generate_rows_for_resource<R, S>(
+    resource: &R,
+    selects: &[S],
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<Vec<ProcessedRow>, SofError> {
-    let fhir_resource = FhirResource::R4(Box::new(resource.clone()));
+) -> Result<Vec<ProcessedRow>, SofError>
+where
+    R: ResourceTrait,
+    S: ViewDefinitionSelectTrait,
+    S::Select: ViewDefinitionSelectTrait,
+{
+    let fhir_resource = resource.to_fhir_resource();
     let mut context = EvaluationContext::new(vec![fhir_resource]);
 
     // Add variables to the context
@@ -836,7 +635,7 @@ fn generate_rows_for_resource_r4(
     }
 
     // Generate all possible row combinations for this resource
-    let row_combinations = generate_row_combinations_r4(&context, selects, all_columns, variables)?;
+    let row_combinations = generate_row_combinations(&context, selects, all_columns, variables)?;
 
     Ok(row_combinations)
 }
@@ -846,15 +645,18 @@ struct RowCombination {
     values: Vec<Option<serde_json::Value>>,
 }
 
-#[cfg(feature = "R4")]
-fn generate_row_combinations_r4(
+fn generate_row_combinations<S>(
     context: &EvaluationContext,
-    selects: &[fhir::r4::ViewDefinitionSelect],
+    selects: &[S],
     all_columns: &mut Vec<String>,
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<Vec<ProcessedRow>, SofError> {
+) -> Result<Vec<ProcessedRow>, SofError>
+where
+    S: ViewDefinitionSelectTrait,
+    S::Select: ViewDefinitionSelectTrait,
+{
     // First pass: collect all column names to ensure consistent ordering
-    collect_all_columns_r4(selects, all_columns)?;
+    collect_all_columns(selects, all_columns)?;
 
     // Second pass: generate all row combinations
     let mut row_combinations = vec![RowCombination {
@@ -862,7 +664,7 @@ fn generate_row_combinations_r4(
     }];
 
     for select in selects {
-        row_combinations = expand_select_combinations_r4(
+        row_combinations = expand_select_combinations(
             context,
             select,
             &row_combinations,
@@ -880,71 +682,72 @@ fn generate_row_combinations_r4(
         .collect())
 }
 
-#[cfg(feature = "R4")]
-fn collect_all_columns_r4(
-    selects: &[fhir::r4::ViewDefinitionSelect],
+fn collect_all_columns<S>(
+    selects: &[S],
     all_columns: &mut Vec<String>,
-) -> Result<(), SofError> {
+) -> Result<(), SofError>
+where
+    S: ViewDefinitionSelectTrait,
+{
     for select in selects {
         // Add columns from this select
-        if let Some(columns) = &select.column {
+        if let Some(columns) = select.column() {
             for col in columns {
-                if let Some(name) = &col.name.value {
-                    if !all_columns.contains(name) {
-                        all_columns.push(name.clone());
+                if let Some(name) = col.name() {
+                    if !all_columns.contains(&name.to_string()) {
+                        all_columns.push(name.to_string());
                     }
                 }
             }
         }
 
         // Recursively collect from nested selects
-        if let Some(nested_selects) = &select.select {
-            collect_all_columns_r4(nested_selects, all_columns)?;
+        if let Some(nested_selects) = select.select() {
+            collect_all_columns(nested_selects, all_columns)?;
         }
 
         // Collect from unionAll
-        if let Some(union_selects) = &select.union_all {
-            collect_all_columns_r4(union_selects, all_columns)?;
+        if let Some(union_selects) = select.union_all() {
+            collect_all_columns(union_selects, all_columns)?;
         }
     }
     Ok(())
 }
 
-#[cfg(feature = "R4")]
-fn expand_select_combinations_r4(
+fn expand_select_combinations<S>(
     context: &EvaluationContext,
-    select: &fhir::r4::ViewDefinitionSelect,
+    select: &S,
     existing_combinations: &[RowCombination],
     all_columns: &[String],
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<Vec<RowCombination>, SofError> {
+) -> Result<Vec<RowCombination>, SofError>
+where
+    S: ViewDefinitionSelectTrait,
+    S::Select: ViewDefinitionSelectTrait,
+{
     // Handle forEach and forEachOrNull
-    if let Some(for_each_element) = &select.for_each {
-        if let Some(for_each_path) = &for_each_element.value {
-            return expand_for_each_combinations_r4(
-                context,
-                select,
-                existing_combinations,
-                all_columns,
-                for_each_path,
-                false,
-                variables,
-            );
-        }
+    if let Some(for_each_path) = select.for_each() {
+        return expand_for_each_combinations(
+            context,
+            select,
+            existing_combinations,
+            all_columns,
+            for_each_path,
+            false,
+            variables,
+        );
     }
 
-    if let Some(for_each_or_null_element) = &select.for_each_or_null {
-        if let Some(for_each_or_null_path) = &for_each_or_null_element.value {
-            return expand_for_each_combinations_r4(
-                context,
-                select,
-                existing_combinations,
-                all_columns,
-                for_each_or_null_path,
-                true,
-                variables,
-            );
-        }
+    if let Some(for_each_or_null_path) = select.for_each_or_null() {
+        return expand_for_each_combinations(
+            context,
+            select,
+            existing_combinations,
+            all_columns,
+            for_each_or_null_path,
+            true,
+            variables,
+        );
     }
 
     // Handle regular columns (no forEach)
@@ -954,22 +757,18 @@ fn expand_select_combinations_r4(
         let mut new_combo = existing_combo.clone();
 
         // Add values from this select's columns
-        if let Some(columns) = &select.column {
+        if let Some(columns) = select.column() {
             for col in columns {
-                if let Some(col_name) = &col.name.value {
+                if let Some(col_name) = col.name() {
                     if let Some(col_index) = all_columns.iter().position(|name| name == col_name) {
-                        let path = col.path.value.as_ref().ok_or_else(|| {
+                        let path = col.path().ok_or_else(|| {
                             SofError::InvalidViewDefinition("Column path is required".to_string())
                         })?;
 
                         match evaluate_expression(path, context) {
                             Ok(result) => {
                                 // Check if this column is marked as a collection
-                                let is_collection = col
-                                    .collection
-                                    .as_ref()
-                                    .and_then(|b| b.value)
-                                    .unwrap_or(false);
+                                let is_collection = col.collection().unwrap_or(false);
 
                                 new_combo.values[col_index] = if is_collection {
                                     fhirpath_result_to_json_value_collection(result)
@@ -993,9 +792,9 @@ fn expand_select_combinations_r4(
     }
 
     // Handle nested selects
-    if let Some(nested_selects) = &select.select {
+    if let Some(nested_selects) = select.select() {
         for nested_select in nested_selects {
-            new_combinations = expand_select_combinations_r4(
+            new_combinations = expand_select_combinations(
                 context,
                 nested_select,
                 &new_combinations,
@@ -1006,13 +805,13 @@ fn expand_select_combinations_r4(
     }
 
     // Handle unionAll
-    if let Some(union_selects) = &select.union_all {
+    if let Some(union_selects) = select.union_all() {
         let mut union_combinations = Vec::new();
 
         // Process each unionAll select independently, using the combinations that already have
         // values from this select's columns and nested selects
         for union_select in union_selects {
-            let select_combinations = expand_select_combinations_r4(
+            let select_combinations = expand_select_combinations(
                 context,
                 union_select,
                 &new_combinations,
@@ -1030,16 +829,19 @@ fn expand_select_combinations_r4(
     Ok(new_combinations)
 }
 
-#[cfg(feature = "R4")]
-fn expand_for_each_combinations_r4(
+fn expand_for_each_combinations<S>(
     context: &EvaluationContext,
-    select: &fhir::r4::ViewDefinitionSelect,
+    select: &S,
     existing_combinations: &[RowCombination],
     all_columns: &[String],
     for_each_path: &str,
     allow_null: bool,
     variables: &HashMap<String, EvaluationResult>,
-) -> Result<Vec<RowCombination>, SofError> {
+) -> Result<Vec<RowCombination>, SofError>
+where
+    S: ViewDefinitionSelectTrait,
+    S::Select: ViewDefinitionSelectTrait,
+{
     // Evaluate the forEach expression to get iteration items
     let for_each_result = evaluate_expression(for_each_path, context).map_err(|e| {
         SofError::FhirPathError(format!(
@@ -1058,9 +860,9 @@ fn expand_for_each_combinations_r4(
                 let mut new_combo = existing_combo.clone();
 
                 // Set column values to null for this forEach scope
-                if let Some(columns) = &select.column {
+                if let Some(columns) = select.column() {
                     for col in columns {
-                        if let Some(col_name) = &col.name.value {
+                        if let Some(col_name) = col.name() {
                             if let Some(col_index) =
                                 all_columns.iter().position(|name| name == col_name)
                             {
@@ -1090,13 +892,13 @@ fn expand_for_each_combinations_r4(
             let mut new_combo = existing_combo.clone();
 
             // Evaluate columns in the context of the iteration item
-            if let Some(columns) = &select.column {
+            if let Some(columns) = select.column() {
                 for col in columns {
-                    if let Some(col_name) = &col.name.value {
+                    if let Some(col_name) = col.name() {
                         if let Some(col_index) =
                             all_columns.iter().position(|name| name == col_name)
                         {
-                            let path = col.path.value.as_ref().ok_or_else(|| {
+                            let path = col.path().ok_or_else(|| {
                                 SofError::InvalidViewDefinition(
                                     "Column path is required".to_string(),
                                 )
@@ -1112,11 +914,7 @@ fn expand_for_each_combinations_r4(
                             };
 
                             // Check if this column is marked as a collection
-                            let is_collection = col
-                                .collection
-                                .as_ref()
-                                .and_then(|b| b.value)
-                                .unwrap_or(false);
+                            let is_collection = col.collection().unwrap_or(false);
 
                             new_combo.values[col_index] = if is_collection {
                                 fhirpath_result_to_json_value_collection(result)
@@ -1133,7 +931,7 @@ fn expand_for_each_combinations_r4(
     }
 
     // Handle nested selects with the forEach context
-    if let Some(nested_selects) = &select.select {
+    if let Some(nested_selects) = select.select() {
         let mut final_combinations = Vec::new();
 
         for item in &iteration_items {
@@ -1147,13 +945,13 @@ fn expand_for_each_combinations_r4(
                 let mut base_combo = existing_combo.clone();
 
                 // Update the base combination with column values for this iteration item
-                if let Some(columns) = &select.column {
+                if let Some(columns) = select.column() {
                     for col in columns {
-                        if let Some(col_name) = &col.name.value {
+                        if let Some(col_name) = col.name() {
                             if let Some(col_index) =
                                 all_columns.iter().position(|name| name == col_name)
                             {
-                                let path = col.path.value.as_ref().ok_or_else(|| {
+                                let path = col.path().ok_or_else(|| {
                                     SofError::InvalidViewDefinition(
                                         "Column path is required".to_string(),
                                     )
@@ -1166,11 +964,7 @@ fn expand_for_each_combinations_r4(
                                 };
 
                                 // Check if this column is marked as a collection
-                                let is_collection = col
-                                    .collection
-                                    .as_ref()
-                                    .and_then(|b| b.value)
-                                    .unwrap_or(false);
+                                let is_collection = col.collection().unwrap_or(false);
 
                                 base_combo.values[col_index] = if is_collection {
                                     fhirpath_result_to_json_value_collection(result)
@@ -1187,7 +981,7 @@ fn expand_for_each_combinations_r4(
 
                 // Process nested selects
                 for nested_select in nested_selects {
-                    item_combinations = expand_select_combinations_r4(
+                    item_combinations = expand_select_combinations(
                         &item_context,
                         nested_select,
                         &item_combinations,
@@ -1204,7 +998,7 @@ fn expand_for_each_combinations_r4(
     }
 
     // Handle unionAll within forEach context
-    if let Some(union_selects) = &select.union_all {
+    if let Some(union_selects) = select.union_all() {
         let mut union_combinations = Vec::new();
 
         for item in &iteration_items {
@@ -1215,13 +1009,13 @@ fn expand_for_each_combinations_r4(
                 let mut base_combo = existing_combo.clone();
 
                 // Update the base combination with column values for this iteration item
-                if let Some(columns) = &select.column {
+                if let Some(columns) = select.column() {
                     for col in columns {
-                        if let Some(col_name) = &col.name.value {
+                        if let Some(col_name) = col.name() {
                             if let Some(col_index) =
                                 all_columns.iter().position(|name| name == col_name)
                             {
-                                let path = col.path.value.as_ref().ok_or_else(|| {
+                                let path = col.path().ok_or_else(|| {
                                     SofError::InvalidViewDefinition(
                                         "Column path is required".to_string(),
                                     )
@@ -1234,11 +1028,7 @@ fn expand_for_each_combinations_r4(
                                 };
 
                                 // Check if this column is marked as a collection
-                                let is_collection = col
-                                    .collection
-                                    .as_ref()
-                                    .and_then(|b| b.value)
-                                    .unwrap_or(false);
+                                let is_collection = col.collection().unwrap_or(false);
 
                                 base_combo.values[col_index] = if is_collection {
                                     fhirpath_result_to_json_value_collection(result)
@@ -1251,15 +1041,15 @@ fn expand_for_each_combinations_r4(
                 }
 
                 // Also evaluate columns from nested selects and add them to base_combo
-                if let Some(nested_selects) = &select.select {
+                if let Some(nested_selects) = select.select() {
                     for nested_select in nested_selects {
-                        if let Some(nested_columns) = &nested_select.column {
+                        if let Some(nested_columns) = nested_select.column() {
                             for col in nested_columns {
-                                if let Some(col_name) = &col.name.value {
+                                if let Some(col_name) = col.name() {
                                     if let Some(col_index) =
                                         all_columns.iter().position(|name| name == col_name)
                                     {
-                                        let path = col.path.value.as_ref().ok_or_else(|| {
+                                        let path = col.path().ok_or_else(|| {
                                             SofError::InvalidViewDefinition(
                                                 "Column path is required".to_string(),
                                             )
@@ -1272,11 +1062,7 @@ fn expand_for_each_combinations_r4(
                                         };
 
                                         // Check if this column is marked as a collection
-                                        let is_collection = col
-                                            .collection
-                                            .as_ref()
-                                            .and_then(|b| b.value)
-                                            .unwrap_or(false);
+                                        let is_collection = col.collection().unwrap_or(false);
 
                                         base_combo.values[col_index] = if is_collection {
                                             fhirpath_result_to_json_value_collection(result)
@@ -1293,7 +1079,7 @@ fn expand_for_each_combinations_r4(
                 // Process each unionAll select independently for this iteration item
                 for union_select in union_selects {
                     let mut select_combinations = vec![base_combo.clone()];
-                    select_combinations = expand_select_combinations_r4(
+                    select_combinations = expand_select_combinations(
                         &item_context,
                         union_select,
                         &select_combinations,
@@ -1313,7 +1099,7 @@ fn expand_for_each_combinations_r4(
     Ok(new_combinations)
 }
 
-#[cfg(feature = "R4")]
+// Generic helper functions
 fn evaluate_path_on_item(
     path: &str,
     item: &EvaluationResult,
@@ -1355,7 +1141,6 @@ fn evaluate_path_on_item(
     }
 }
 
-#[cfg(feature = "R4")]
 fn create_iteration_context(
     item: &EvaluationResult,
     variables: &HashMap<String, EvaluationResult>,

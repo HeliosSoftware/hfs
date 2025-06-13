@@ -1,6 +1,3 @@
-- sof - I betcha the R6 build won't work because we don't have a R6 ViewDefinition (yet)
-- sof - _r4 - can these be refactored? - we want the logic to be version agnostic
-  - Why is evaluate_path_on_item and create_iteration_content a R4 only feature??
 - sof - add Json, Ndjson, and Parquet formats
 - sof - add documentation
 - sof - implement sof-server - implement $run
