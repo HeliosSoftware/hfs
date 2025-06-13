@@ -1,6 +1,6 @@
-- sof - add Json, Ndjson, and Parquet formats
 - sof - add documentation
 - sof - implement sof-server - implement $run
+- Help with documentation for $run
 
 - Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 
 
