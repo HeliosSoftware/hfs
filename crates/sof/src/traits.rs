@@ -584,7 +584,7 @@ mod r5_impl {
                         EvaluationResult::String(c.value.clone().unwrap_or_default(), None)
                     }
                     ViewDefinitionConstantValue::Integer64(i) => {
-                        EvaluationResult::Integer(i.value.unwrap_or(0), None)
+                        EvaluationResult::Integer64(i.value.unwrap_or(0), None)
                     }
                 };
                 

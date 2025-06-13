@@ -141,6 +141,14 @@ pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifi
             // Empty values don't match any specific type
             Ok(false)
         },
+        EvaluationResult::Integer64(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Integer64 for integer64 values
+                check_type_match(&Some("System".to_string()), "Integer64", &target_namespace, &target_type)
+            }
+        },
     }
 }
 
@@ -229,6 +237,14 @@ pub fn is_of_type_for_of_type(value: &EvaluationResult, type_spec: &TypeSpecifie
         EvaluationResult::Empty => {
             // Empty values don't match any specific type
             Ok(false)
+        },
+        EvaluationResult::Integer64(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
+            } else {
+                // Default to System.Integer64 for integer64 values
+                check_type_match_with_cross_namespace(&Some("System".to_string()), "Integer64", &target_namespace, &target_type, true)
+            }
         },
         EvaluationResult::Object { map, type_info, .. } => {
             // First check if there's type_info available
@@ -335,6 +351,14 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
         EvaluationResult::Empty => {
             // Empty values don't match any specific type
             Ok(false)
+        },
+        EvaluationResult::Integer64(_, type_info) => {
+            if let Some(type_info) = type_info {
+                check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
+            } else {
+                // Default to System.Integer64 for integer64 values
+                check_type_match(&Some("System".to_string()), "Integer64", &target_namespace, &target_type)
+            }
         },
         EvaluationResult::Object { map, type_info, .. } => {
             // First check if there's type_info available

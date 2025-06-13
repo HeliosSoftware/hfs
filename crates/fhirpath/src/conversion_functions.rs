@@ -36,6 +36,7 @@ pub fn to_decimal_function(
             EvaluationResult::decimal(if *b { Decimal::ONE } else { Decimal::ZERO })
         }
         EvaluationResult::Integer(i, _) => EvaluationResult::decimal(Decimal::from(*i)),
+        EvaluationResult::Integer64(i, _) => EvaluationResult::decimal(Decimal::from(*i)),
         EvaluationResult::Decimal(d, _) => EvaluationResult::decimal(*d),
         EvaluationResult::String(s, _) => {
             // Try parsing as Decimal
@@ -80,6 +81,7 @@ pub fn to_integer_function(
         EvaluationResult::Empty => EvaluationResult::Empty,
         EvaluationResult::Boolean(b, _) => EvaluationResult::integer(if *b { 1 } else { 0 }),
         EvaluationResult::Integer(i, _) => EvaluationResult::integer(*i),
+        EvaluationResult::Integer64(i, _) => EvaluationResult::integer(*i),
         EvaluationResult::String(s, _) => {
             // Try parsing as i64
             s.parse::<i64>()

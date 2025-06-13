@@ -98,6 +98,7 @@ pub trait IntoEvaluationResult {
 /// - **`String`**: Text values from FHIR strings, codes, URIs, etc.
 /// - **`Decimal`**: High-precision decimal numbers for accurate numeric computation
 /// - **`Integer`**: Whole numbers for counting and indexing operations
+/// - **`Integer64`**: Explicit 64-bit integers for special cases
 /// - **`Date`**: Date values in ISO format (YYYY-MM-DD)
 /// - **`DateTime`**: DateTime values in ISO format with optional timezone
 /// - **`Time`**: Time values in ISO format (HH:MM:SS)
@@ -121,6 +122,7 @@ pub trait IntoEvaluationResult {
 /// let empty = EvaluationResult::Empty;
 /// let text = EvaluationResult::String("Patient".to_string(), None);
 /// let number = EvaluationResult::Integer(42, None);
+/// let number64 = EvaluationResult::Integer64(9223372036854775807, None); // max i64
 /// let decimal = EvaluationResult::Decimal(Decimal::new(1234, 2), None); // 12.34
 ///
 /// // Working with collections
@@ -162,6 +164,11 @@ pub enum EvaluationResult {
     /// Used for FHIR integer, positiveInt, unsignedInt types and counting operations.
     /// Also results from indexing and length functions.
     Integer(i64, Option<TypeInfoResult>),
+    /// 64-bit integer value.
+    ///
+    /// Explicit 64-bit integer type for cases where the distinction from regular
+    /// integers is important.
+    Integer64(i64, Option<TypeInfoResult>),
     /// Date value in ISO format.
     ///
     /// Stores date as string in YYYY-MM-DD format. Handles FHIR date fields
@@ -413,6 +420,7 @@ impl PartialEq for EvaluationResult {
                 a.normalize() == b.normalize()
             }
             (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a == b,
+            (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => a == b,
             (EvaluationResult::Date(a, _), EvaluationResult::Date(b, _)) => a == b,
             (EvaluationResult::DateTime(a, _), EvaluationResult::DateTime(b, _)) => a == b,
             (EvaluationResult::Time(a, _), EvaluationResult::Time(b, _)) => a == b,
@@ -492,6 +500,10 @@ impl Ord for EvaluationResult {
             (EvaluationResult::Integer(a, _), EvaluationResult::Integer(b, _)) => a.cmp(b),
             (EvaluationResult::Integer(_, _), _) => Ordering::Less,
             (_, EvaluationResult::Integer(_, _)) => Ordering::Greater,
+
+            (EvaluationResult::Integer64(a, _), EvaluationResult::Integer64(b, _)) => a.cmp(b),
+            (EvaluationResult::Integer64(_, _), _) => Ordering::Less,
+            (_, EvaluationResult::Integer64(_, _)) => Ordering::Greater,
 
             (EvaluationResult::Decimal(a, _), EvaluationResult::Decimal(b, _)) => a.cmp(b),
             (EvaluationResult::Decimal(_, _), _) => Ordering::Less,
@@ -609,6 +621,7 @@ impl Hash for EvaluationResult {
             // Hash normalized decimal for consistency with equality
             EvaluationResult::Decimal(d, _) => d.normalize().hash(state),
             EvaluationResult::Integer(i, _) => i.hash(state),
+            EvaluationResult::Integer64(i, _) => i.hash(state),
             EvaluationResult::Date(d, _) => d.hash(state),
             EvaluationResult::DateTime(dt, _) => dt.hash(state),
             EvaluationResult::Time(t, _) => t.hash(state),
@@ -677,6 +690,16 @@ impl EvaluationResult {
     /// Creates an Integer result with FHIR type.
     pub fn fhir_integer(value: i64) -> Self {
         EvaluationResult::Integer(value, Some(TypeInfoResult::new("FHIR", "integer")))
+    }
+
+    /// Creates an Integer64 result with System type.
+    pub fn integer64(value: i64) -> Self {
+        EvaluationResult::Integer64(value, Some(TypeInfoResult::new("System", "Integer64")))
+    }
+
+    /// Creates an Integer64 result with FHIR type.
+    pub fn fhir_integer64(value: i64) -> Self {
+        EvaluationResult::Integer64(value, Some(TypeInfoResult::new("FHIR", "integer64")))
     }
 
     /// Creates a Decimal result with System type.
@@ -760,6 +783,14 @@ impl EvaluationResult {
     pub fn as_integer(&self) -> Option<i64> {
         match self {
             EvaluationResult::Integer(val, _) => Some(*val),
+            _ => None,
+        }
+    }
+
+    /// Extracts the integer value if this is an Integer64 variant.
+    pub fn as_integer64(&self) -> Option<i64> {
+        match self {
+            EvaluationResult::Integer64(val, _) => Some(*val),
             _ => None,
         }
     }
@@ -894,6 +925,7 @@ impl EvaluationResult {
             EvaluationResult::String(s, _) => !s.is_empty(),
             EvaluationResult::Decimal(d, _) => !d.is_zero(),
             EvaluationResult::Integer(i, _) => *i != 0,
+            EvaluationResult::Integer64(i, _) => *i != 0,
             EvaluationResult::Quantity(q, _, _) => !q.is_zero(), // Truthy if value is non-zero
             EvaluationResult::Collection { items, .. } => !items.is_empty(),
             _ => true, // Date, DateTime, Time, Object are always truthy
@@ -936,6 +968,7 @@ impl EvaluationResult {
             EvaluationResult::String(s, _) => s.clone(),
             EvaluationResult::Decimal(d, _) => d.to_string(),
             EvaluationResult::Integer(i, _) => i.to_string(),
+            EvaluationResult::Integer64(i, _) => i.to_string(),
             EvaluationResult::Date(d, _) => d.clone(), // Return stored string
             EvaluationResult::DateTime(dt, _) => dt.clone(), // Return stored string
             EvaluationResult::Time(t, _) => t.clone(), // Return stored string
@@ -1028,6 +1061,10 @@ impl EvaluationResult {
                 // Integers have boolean semantics: 0 is false, non-zero is true
                 Ok(EvaluationResult::boolean(*i != 0))
             }
+            EvaluationResult::Integer64(i, _) => {
+                // Integer64s have boolean semantics: 0 is false, non-zero is true
+                Ok(EvaluationResult::boolean(*i != 0))
+            }
             // Per FHIRPath spec section 5.2: other types evaluate to Empty for logical operators
             EvaluationResult::Decimal(_, _)
             | EvaluationResult::Date(_, _)
@@ -1088,6 +1125,7 @@ impl EvaluationResult {
             EvaluationResult::String(_, _) => "String",
             EvaluationResult::Decimal(_, _) => "Decimal",
             EvaluationResult::Integer(_, _) => "Integer",
+            EvaluationResult::Integer64(_, _) => "Integer64",
             EvaluationResult::Date(_, _) => "Date",
             EvaluationResult::DateTime(_, _) => "DateTime",
             EvaluationResult::Time(_, _) => "Time",
@@ -1136,7 +1174,7 @@ impl IntoEvaluationResult for i32 {
 /// This is the primary integer type used in FHIRPath evaluation.
 impl IntoEvaluationResult for i64 {
     fn into_evaluation_result(&self) -> EvaluationResult {
-        EvaluationResult::integer(*self)
+        EvaluationResult::integer64(*self)
     }
 }
 

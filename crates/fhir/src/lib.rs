@@ -1648,6 +1648,10 @@ where
                     // Return FHIR integer
                     EvaluationResult::fhir_integer(i)
                 }
+                EvaluationResult::Integer64(i, _) => {
+                    // Return FHIR integer64
+                    EvaluationResult::fhir_integer64(i)
+                }
                 EvaluationResult::String(s, _) => {
                     // Determine the FHIR type name based on V's type
                     let fhir_type_name = if TypeId::of::<V>() == TypeId::of::<String>() {

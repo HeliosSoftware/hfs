@@ -129,5 +129,12 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
             }
         }
         EvaluationResult::Empty => ("System".to_string(), "Empty".to_string()),
+        EvaluationResult::Integer64(_, type_info) => {
+            if let Some(type_info) = type_info {
+                (type_info.namespace.clone(), type_info.name.clone())
+            } else {
+                ("System".to_string(), "Integer64".to_string())
+            }
+        }
     }
 }
