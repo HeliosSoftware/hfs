@@ -141,6 +141,7 @@ pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifi
             // Empty values don't match any specific type
             Ok(false)
         },
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(_, type_info) => {
             if let Some(type_info) = type_info {
                 check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)
@@ -238,6 +239,7 @@ pub fn is_of_type_for_of_type(value: &EvaluationResult, type_spec: &TypeSpecifie
             // Empty values don't match any specific type
             Ok(false)
         },
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(_, type_info) => {
             if let Some(type_info) = type_info {
                 check_type_match_with_cross_namespace(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type, true)
@@ -352,6 +354,7 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
             // Empty values don't match any specific type
             Ok(false)
         },
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(_, type_info) => {
             if let Some(type_info) = type_info {
                 check_type_match(&Some(type_info.namespace.clone()), &type_info.name, &target_namespace, &target_type)

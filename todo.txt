@@ -1,4 +1,3 @@
-- sof - add documentation
 - sof - implement sof-server - implement $run
 - Help with documentation for $run
 

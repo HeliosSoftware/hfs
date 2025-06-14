@@ -1,4 +1,176 @@
-mod traits;
+//! # SQL-on-FHIR Implementation
+//!
+//! This crate provides a complete implementation of the SQL-on-FHIR specification,
+//! enabling the transformation of FHIR resources into tabular data using declarative
+//! ViewDefinitions. It supports all major FHIR versions (R4, R4B, R5, R6) through
+//! a version-agnostic abstraction layer.
+//!
+//! ## Architecture
+//!
+//! The SOF crate is organized around these key components:
+//! - **Version-agnostic enums** ([`SofViewDefinition`], [`SofBundle`]): Multi-version containers
+//! - **Processing engine** ([`run_view_definition`]): Core transformation logic
+//! - **Output formats** ([`ContentType`]): Support for CSV, JSON, NDJSON, and Parquet
+//! - **Trait abstractions** ([`ViewDefinitionTrait`], [`BundleTrait`]): Version independence
+//!
+//! ## Key Features
+//!
+//! - **Multi-version FHIR support**: Works with R4, R4B, R5, and R6 resources
+//! - **FHIRPath evaluation**: Complex path expressions for data extraction
+//! - **forEach iteration**: Supports flattening of nested FHIR structures
+//! - **unionAll operations**: Combines multiple select statements
+//! - **Collection handling**: Proper array serialization for multi-valued fields
+//! - **Output formats**: CSV (with/without headers), JSON, NDJSON, Parquet support
+//!
+//! ## Usage Example
+//!
+//! ```rust
+//! use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+//! use fhir::FhirVersion;
+//!
+//! # #[cfg(feature = "R4")]
+//! # {
+//! // Parse a ViewDefinition and Bundle from JSON
+//! let view_definition_json = r#"{
+//!     "resourceType": "ViewDefinition",
+//!     "resource": "Patient",
+//!     "select": [{
+//!         "column": [{
+//!             "name": "id",
+//!             "path": "id"
+//!         }, {
+//!             "name": "name",
+//!             "path": "name.family"
+//!         }]
+//!     }]
+//! }"#;
+//!
+//! let bundle_json = r#"{
+//!     "resourceType": "Bundle",
+//!     "entry": [{
+//!         "resource": {
+//!             "resourceType": "Patient",
+//!             "id": "example",
+//!             "name": [{
+//!                 "family": "Doe",
+//!                 "given": ["John"]
+//!             }]
+//!         }
+//!     }]
+//! }"#;
+//!
+//! let view_definition: fhir::r4::ViewDefinition = serde_json::from_str(view_definition_json)?;
+//! let bundle: fhir::r4::Bundle = serde_json::from_str(bundle_json)?;
+//!
+//! // Wrap in version-agnostic containers
+//! let sof_view = SofViewDefinition::R4(view_definition);
+//! let sof_bundle = SofBundle::R4(bundle);
+//!
+//! // Transform to CSV with headers
+//! let csv_output = run_view_definition(
+//!     sof_view,
+//!     sof_bundle,
+//!     ContentType::CsvWithHeader
+//! )?;
+//!
+//! // Output: "id,name\nexample,Doe\n"
+//! let csv_string = String::from_utf8(csv_output)?;
+//! assert!(csv_string.contains("id,name"));
+//! assert!(csv_string.contains("example,Doe"));
+//! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Advanced Features
+//!
+//! ### forEach Iteration
+//!
+//! ViewDefinitions can iterate over collections using `forEach` and `forEachOrNull`:
+//!
+//! ```json
+//! {
+//!   "select": [{
+//!     "forEach": "name",
+//!     "column": [{
+//!       "name": "family_name",
+//!       "path": "family"
+//!     }]
+//!   }]
+//! }
+//! ```
+//!
+//! ### Constants and Variables
+//!
+//! Define reusable values in ViewDefinitions:
+//!
+//! ```json
+//! {
+//!   "constant": [{
+//!     "name": "system",
+//!     "valueString": "http://loinc.org"
+//!   }],
+//!   "select": [{
+//!     "where": [{
+//!       "path": "code.coding.system = %system"
+//!     }]
+//!   }]
+//! }
+//! ```
+//!
+//! ### Where Clauses
+//!
+//! Filter resources using FHIRPath expressions:
+//!
+//! ```json
+//! {
+//!   "where": [{
+//!     "path": "active = true"
+//!   }, {
+//!     "path": "birthDate.exists()"
+//!   }]
+//! }
+//! ```
+//!
+//! ## Error Handling
+//!
+//! The crate provides comprehensive error handling through [`SofError`]:
+//!
+//! ```rust
+//! use sof::SofError;
+//!
+//! match run_view_definition(view, bundle, content_type) {
+//!     Ok(output) => {
+//!         // Process successful transformation
+//!     },
+//!     Err(SofError::InvalidViewDefinition(msg)) => {
+//!         eprintln!("ViewDefinition validation failed: {}", msg);
+//!     },
+//!     Err(SofError::FhirPathError(msg)) => {
+//!         eprintln!("FHIRPath evaluation failed: {}", msg);
+//!     },
+//!     Err(e) => {
+//!         eprintln!("Other error: {}", e);
+//!     }
+//! }
+//! ```
+//!
+//! ## CLI Usage
+//!
+//! The crate includes a command-line interface in `cli.rs`:
+//!
+//! ```bash
+//! sof-cli --view viewdef.json --bundle data.json --format csv --headers
+//! ```
+//!
+//! ## Feature Flags
+//!
+//! Enable support for specific FHIR versions:
+//! - `R4`: FHIR 4.0.1 support
+//! - `R4B`: FHIR 4.3.0 support
+//! - `R5`: FHIR 5.0.0 support
+//! - `R6`: FHIR 6.0.0 support
+
+pub mod traits;
 
 use fhir::FhirVersion;
 use fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
@@ -7,7 +179,51 @@ use std::collections::HashMap;
 use thiserror::Error;
 use traits::*;
 
+// Re-export commonly used traits for easier access
+pub use traits::{ViewDefinitionTrait, BundleTrait, ResourceTrait};
+
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
+///
+/// This enum provides a unified interface for working with ViewDefinition resources
+/// across different FHIR specification versions. It enables applications to handle
+/// multiple FHIR versions simultaneously while maintaining type safety.
+///
+/// # Supported Versions
+///
+/// - **R4**: FHIR 4.0.1 ViewDefinition (normative)
+/// - **R4B**: FHIR 4.3.0 ViewDefinition (ballot)
+/// - **R5**: FHIR 5.0.0 ViewDefinition (ballot)
+/// - **R6**: FHIR 6.0.0 ViewDefinition (draft)
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::{SofViewDefinition, ContentType};
+/// # #[cfg(feature = "R4")]
+/// use fhir::r4::ViewDefinition;
+///
+/// # #[cfg(feature = "R4")]
+/// # {
+/// // Parse from JSON
+/// let json = r#"{
+///     "resourceType": "ViewDefinition",
+///     "resource": "Patient",
+///     "select": [{
+///         "column": [{
+///             "name": "id",
+///             "path": "id"
+///         }]
+///     }]
+/// }"#;
+///
+/// let view_def: ViewDefinition = serde_json::from_str(json)?;
+/// let sof_view = SofViewDefinition::R4(view_def);
+///
+/// // Check version
+/// assert_eq!(sof_view.version(), fhir::FhirVersion::R4);
+/// # }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone)]
 pub enum SofViewDefinition {
     #[cfg(feature = "R4")]
@@ -21,6 +237,28 @@ pub enum SofViewDefinition {
 }
 
 impl SofViewDefinition {
+    /// Returns the FHIR specification version of this ViewDefinition.
+    ///
+    /// This method provides version detection for multi-version applications,
+    /// enabling version-specific processing logic and compatibility checks.
+    ///
+    /// # Returns
+    ///
+    /// The `FhirVersion` enum variant corresponding to this ViewDefinition's specification.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::SofViewDefinition;
+    /// use fhir::FhirVersion;
+    ///
+    /// # #[cfg(feature = "R5")]
+    /// # {
+    /// # let view_def = fhir::r5::ViewDefinition::default();
+    /// let sof_view = SofViewDefinition::R5(view_def);
+    /// assert_eq!(sof_view.version(), FhirVersion::R5);
+    /// # }
+    /// ```
     pub fn version(&self) -> FhirVersion {
         match self {
             #[cfg(feature = "R4")]
@@ -36,6 +274,47 @@ impl SofViewDefinition {
 }
 
 /// Multi-version Bundle container supporting version-agnostic operations.
+///
+/// This enum provides a unified interface for working with FHIR Bundle resources
+/// across different FHIR specification versions. Bundles contain the actual FHIR
+/// resources that will be processed by ViewDefinitions.
+///
+/// # Supported Versions
+///
+/// - **R4**: FHIR 4.0.1 Bundle (normative)
+/// - **R4B**: FHIR 4.3.0 Bundle (ballot)
+/// - **R5**: FHIR 5.0.0 Bundle (ballot)
+/// - **R6**: FHIR 6.0.0 Bundle (draft)
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::SofBundle;
+/// # #[cfg(feature = "R4")]
+/// use fhir::r4::Bundle;
+///
+/// # #[cfg(feature = "R4")]
+/// # {
+/// // Parse from JSON
+/// let json = r#"{
+///     "resourceType": "Bundle",
+///     "type": "collection",
+///     "entry": [{
+///         "resource": {
+///             "resourceType": "Patient",
+///             "id": "example"
+///         }
+///     }]
+/// }"#;
+///
+/// let bundle: Bundle = serde_json::from_str(json)?;
+/// let sof_bundle = SofBundle::R4(bundle);
+///
+/// // Check version compatibility
+/// assert_eq!(sof_bundle.version(), fhir::FhirVersion::R4);
+/// # }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone)]
 pub enum SofBundle {
     #[cfg(feature = "R4")]
@@ -49,6 +328,28 @@ pub enum SofBundle {
 }
 
 impl SofBundle {
+    /// Returns the FHIR specification version of this Bundle.
+    ///
+    /// This method provides version detection for multi-version applications,
+    /// ensuring that ViewDefinitions and Bundles use compatible FHIR versions.
+    ///
+    /// # Returns
+    ///
+    /// The `FhirVersion` enum variant corresponding to this Bundle's specification.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::SofBundle;
+    /// use fhir::FhirVersion;
+    ///
+    /// # #[cfg(feature = "R4")]
+    /// # {
+    /// # let bundle = fhir::r4::Bundle::default();
+    /// let sof_bundle = SofBundle::R4(bundle);
+    /// assert_eq!(sof_bundle.version(), FhirVersion::R4);
+    /// # }
+    /// ```
     pub fn version(&self) -> FhirVersion {
         match self {
             #[cfg(feature = "R4")]
@@ -63,40 +364,185 @@ impl SofBundle {
     }
 }
 
+/// Comprehensive error type for SQL-on-FHIR operations.
+///
+/// This enum covers all possible error conditions that can occur during
+/// ViewDefinition processing, from validation failures to output formatting issues.
+/// Each variant provides specific context about the error to aid in debugging.
+///
+/// # Error Categories
+///
+/// - **Validation**: ViewDefinition structure and logic validation
+/// - **Evaluation**: FHIRPath expression evaluation failures
+/// - **I/O**: File and serialization operations
+/// - **Format**: Output format conversion issues
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::{SofError, run_view_definition};
+///
+/// match run_view_definition(view, bundle, content_type) {
+///     Ok(output) => {
+///         println!("Transformation successful");
+///     },
+///     Err(SofError::InvalidViewDefinition(msg)) => {
+///         eprintln!("ViewDefinition validation failed: {}", msg);
+///     },
+///     Err(SofError::FhirPathError(msg)) => {
+///         eprintln!("FHIRPath evaluation error: {}", msg);
+///     },
+///     Err(SofError::UnsupportedContentType(format)) => {
+///         eprintln!("Unsupported output format: {}", format);
+///     },
+///     Err(e) => {
+///         eprintln!("Other error: {}", e);
+///     }
+/// }
+/// ```
 #[derive(Debug, Error)]
 pub enum SofError {
+    /// ViewDefinition structure or logic validation failed.
+    ///
+    /// This error occurs when a ViewDefinition contains invalid or inconsistent
+    /// configuration, such as missing required fields, invalid FHIRPath expressions,
+    /// or incompatible select/unionAll structures.
     #[error("Invalid ViewDefinition: {0}")]
     InvalidViewDefinition(String),
 
+    /// FHIRPath expression evaluation failed.
+    ///
+    /// This error occurs when a FHIRPath expression in a ViewDefinition cannot
+    /// be evaluated, either due to syntax errors or runtime evaluation issues.
     #[error("FHIRPath evaluation error: {0}")]
     FhirPathError(String),
 
+    /// JSON serialization/deserialization failed.
+    ///
+    /// This error occurs when parsing input JSON or serializing output data fails,
+    /// typically due to malformed JSON or incompatible data structures.
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 
+    /// CSV processing failed.
+    ///
+    /// This error occurs during CSV output generation, such as when writing
+    /// headers or data rows to the CSV format.
     #[error("CSV error: {0}")]
     CsvError(#[from] csv::Error),
 
+    /// File I/O operation failed.
+    ///
+    /// This error occurs when reading input files or writing output files fails,
+    /// typically due to permission issues or missing files.
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 
+    /// Unsupported output content type requested.
+    ///
+    /// This error occurs when an invalid or unimplemented content type is
+    /// specified for output formatting.
     #[error("Unsupported content type: {0}")]
     UnsupportedContentType(String),
 
+    /// CSV writer internal error.
+    ///
+    /// This error occurs when the CSV writer encounters an internal issue
+    /// that prevents successful output generation.
     #[error("CSV writer error: {0}")]
     CsvWriterError(String),
 }
 
+/// Supported output content types for ViewDefinition transformations.
+///
+/// This enum defines the available output formats for transformed FHIR data.
+/// Each format has specific characteristics and use cases for different
+/// integration scenarios.
+///
+/// # Format Descriptions
+///
+/// - **CSV**: Comma-separated values without headers
+/// - **CSV with Headers**: Comma-separated values with column headers
+/// - **JSON**: Pretty-printed JSON array of objects
+/// - **NDJSON**: Newline-delimited JSON (one object per line)
+/// - **Parquet**: Apache Parquet columnar format (planned)
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::ContentType;
+///
+/// // Parse from string
+/// let csv_type = ContentType::from_string("text/csv")?;
+/// assert_eq!(csv_type, ContentType::Csv);
+///
+/// let json_type = ContentType::from_string("application/json")?;
+/// assert_eq!(json_type, ContentType::Json);
+///
+/// // CSV with headers
+/// let csv_headers = ContentType::from_string("text/csv;header=present")?;
+/// assert_eq!(csv_headers, ContentType::CsvWithHeader);
+/// # Ok::<(), sof::SofError>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
+    /// Comma-separated values format without headers
     Csv,
+    /// Comma-separated values format with column headers
     CsvWithHeader,
+    /// Pretty-printed JSON array format
     Json,
+    /// Newline-delimited JSON format (NDJSON)
     NdJson,
+    /// Apache Parquet columnar format (not yet implemented)
     Parquet,
 }
 
 impl ContentType {
+    /// Parse a content type from its MIME type string representation.
+    ///
+    /// This method converts standard MIME type strings to the corresponding
+    /// ContentType enum variants. It supports the SQL-on-FHIR specification's
+    /// recommended content types.
+    ///
+    /// # Supported MIME Types
+    ///
+    /// - `"text/csv"` → [`ContentType::Csv`]
+    /// - `"text/csv;header=present"` → [`ContentType::CsvWithHeader`]
+    /// - `"application/json"` → [`ContentType::Json`]
+    /// - `"application/ndjson"` → [`ContentType::NdJson`]
+    /// - `"application/parquet"` → [`ContentType::Parquet`]
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The MIME type string to parse
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(ContentType)` - Successfully parsed content type
+    /// * `Err(SofError::UnsupportedContentType)` - Unknown or unsupported MIME type
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::ContentType;
+    ///
+    /// // Standard CSV
+    /// let csv = ContentType::from_string("text/csv")?;
+    /// assert_eq!(csv, ContentType::Csv);
+    ///
+    /// // CSV with headers
+    /// let csv_headers = ContentType::from_string("text/csv;header=present")?;
+    /// assert_eq!(csv_headers, ContentType::CsvWithHeader);
+    ///
+    /// // JSON format
+    /// let json = ContentType::from_string("application/json")?;
+    /// assert_eq!(json, ContentType::Json);
+    ///
+    /// // Error for unsupported type
+    /// assert!(ContentType::from_string("text/plain").is_err());
+    /// # Ok::<(), sof::SofError>(())
+    /// ```
     pub fn from_string(s: &str) -> Result<Self, SofError> {
         match s {
             "text/csv" => Ok(ContentType::Csv),
@@ -109,23 +555,174 @@ impl ContentType {
     }
 }
 
+/// A single row of processed tabular data from ViewDefinition transformation.
+///
+/// This struct represents one row in the output table, containing values for
+/// each column defined in the ViewDefinition. Values are stored as optional
+/// JSON values to handle nullable fields and diverse FHIR data types.
+///
+/// # Structure
+///
+/// Each `ProcessedRow` contains a vector of optional JSON values, where:
+/// - `Some(value)` represents a non-null column value
+/// - `None` represents a null/missing column value
+/// - The order matches the column order in [`ProcessedResult::columns`]
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::ProcessedRow;
+/// use serde_json::Value;
+///
+/// let row = ProcessedRow {
+///     values: vec![
+///         Some(Value::String("patient-123".to_string())),
+///         Some(Value::String("Doe".to_string())),
+///         None, // Missing birth date
+///         Some(Value::Bool(true)),
+///     ]
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedRow {
+    /// Column values for this row, ordered according to ProcessedResult::columns
     pub values: Vec<Option<serde_json::Value>>,
 }
 
+/// Complete result of ViewDefinition transformation containing columns and data rows.
+///
+/// This struct represents the tabular output from processing a ViewDefinition
+/// against a Bundle of FHIR resources. It contains both the column definitions
+/// and the actual data rows in a format ready for serialization to various
+/// output formats.
+///
+/// # Structure
+///
+/// - [`columns`](Self::columns): Ordered list of column names from the ViewDefinition
+/// - [`rows`](Self::rows): Data rows where each row contains values in column order
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::{ProcessedResult, ProcessedRow};
+/// use serde_json::Value;
+///
+/// let result = ProcessedResult {
+///     columns: vec![
+///         "patient_id".to_string(),
+///         "family_name".to_string(),
+///         "given_name".to_string(),
+///     ],
+///     rows: vec![
+///         ProcessedRow {
+///             values: vec![
+///                 Some(Value::String("patient-1".to_string())),
+///                 Some(Value::String("Smith".to_string())),
+///                 Some(Value::String("John".to_string())),
+///             ]
+///         },
+///         ProcessedRow {
+///             values: vec![
+///                 Some(Value::String("patient-2".to_string())),
+///                 Some(Value::String("Doe".to_string())),
+///                 None, // Missing given name
+///             ]
+///         },
+///     ]
+/// };
+///
+/// assert_eq!(result.columns.len(), 3);
+/// assert_eq!(result.rows.len(), 2);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessedResult {
+    /// Ordered list of column names as defined in the ViewDefinition
     pub columns: Vec<String>,
+    /// Data rows containing values for each column
     pub rows: Vec<ProcessedRow>,
 }
 
+/// Execute a SQL-on-FHIR ViewDefinition transformation on a FHIR Bundle.
+///
+/// This is the main entry point for SQL-on-FHIR transformations. It processes
+/// a ViewDefinition against a Bundle of FHIR resources and produces output in
+/// the specified format. The function handles version compatibility, validation,
+/// FHIRPath evaluation, and output formatting.
+///
+/// # Arguments
+///
+/// * `view_definition` - The ViewDefinition containing transformation logic
+/// * `bundle` - The Bundle containing FHIR resources to process
+/// * `content_type` - The desired output format
+///
+/// # Returns
+///
+/// * `Ok(Vec<u8>)` - Formatted output bytes ready for writing to file or stdout
+/// * `Err(SofError)` - Detailed error information about what went wrong
+///
+/// # Validation
+///
+/// The function performs comprehensive validation:
+/// - FHIR version compatibility between ViewDefinition and Bundle
+/// - ViewDefinition structure and logic validation
+/// - FHIRPath expression syntax and evaluation
+/// - Output format compatibility
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+///
+/// # #[cfg(feature = "R4")]
+/// # {
+/// # let view_def = fhir::r4::ViewDefinition::default();
+/// # let bundle = fhir::r4::Bundle::default();
+/// let sof_view = SofViewDefinition::R4(view_def);
+/// let sof_bundle = SofBundle::R4(bundle);
+///
+/// // Generate CSV with headers
+/// let csv_output = run_view_definition(
+///     sof_view,
+///     sof_bundle,
+///     ContentType::CsvWithHeader
+/// )?;
+///
+/// // Write to file or stdout
+/// std::fs::write("output.csv", csv_output)?;
+/// # }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Error Handling
+///
+/// Common error scenarios:
+///
+/// ```rust
+/// use sof::{SofError, run_view_definition};
+///
+/// match run_view_definition(view, bundle, content_type) {
+///     Ok(output) => {
+///         println!("Success: {} bytes generated", output.len());
+///     },
+///     Err(SofError::InvalidViewDefinition(msg)) => {
+///         eprintln!("ViewDefinition error: {}", msg);
+///     },
+///     Err(SofError::FhirPathError(msg)) => {
+///         eprintln!("FHIRPath error: {}", msg);
+///     },
+///     Err(e) => {
+///         eprintln!("Other error: {}", e);
+///     }
+/// }
+/// ```
 pub fn run_view_definition(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
     content_type: ContentType,
 ) -> Result<Vec<u8>, SofError> {
+    // Process the ViewDefinition to generate tabular data
     let processed_result = process_view_definition(view_definition, bundle)?;
+    // Format the result according to the requested content type
     format_output(processed_result, content_type)
 }
 
@@ -157,7 +754,6 @@ fn process_view_definition(
         (SofViewDefinition::R6(vd), SofBundle::R6(bundle)) => {
             process_view_definition_generic(vd, bundle)
         }
-        _ => unreachable!("Version mismatch should have been caught above"),
     }
 }
 

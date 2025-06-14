@@ -1356,12 +1356,26 @@ fn evaluate_invocation(
                 EvaluationResult::Boolean(_, _)
                 | EvaluationResult::String(_, _)
                 | EvaluationResult::Integer(_, _)
-                | EvaluationResult::Integer64(_, _)
                 | EvaluationResult::Decimal(_, _)
                 | EvaluationResult::Date(_, _)
                 | EvaluationResult::DateTime(_, _)
                 | EvaluationResult::Time(_, _)
                 | EvaluationResult::Quantity(_, _, _) => {
+                    // For now, we return Empty for id and extension on primitives
+                    // This is where we would add proper support for accessing these fields
+                    // if the primitive value was from a FHIR Element type with id/extension
+                    if name == "id" || name == "extension" {
+                        // TODO: Proper implementation would check if this is a FHIR Element
+                        // and return its id or extension if available
+                        Ok(EvaluationResult::Empty)
+                    } else {
+                        // For other properties on primitives, return Empty
+                        Ok(EvaluationResult::Empty)
+                    }
+                }
+                // R5+ only: Integer64 primitive type handling
+                #[cfg(not(any(feature = "R4", feature = "R4B")))]
+                EvaluationResult::Integer64(_, _) => {
                     // For now, we return Empty for id and extension on primitives
                     // This is where we would add proper support for accessing these fields
                     // if the primitive value was from a FHIR Element type with id/extension
@@ -2292,12 +2306,14 @@ fn call_function(
                 EvaluationResult::Boolean(_, _)
                 | EvaluationResult::String(_, _)
                 | EvaluationResult::Integer(_, _)
-                | EvaluationResult::Integer64(_, _)
                 | EvaluationResult::Decimal(_, _)
                 | EvaluationResult::Date(_, _)
                 | EvaluationResult::DateTime(_, _)
                 | EvaluationResult::Time(_, _)
                 | EvaluationResult::Quantity(_, _, _) => EvaluationResult::boolean(true), // Add Quantity case
+                // R5+ only: Integer64 type convertibility
+                #[cfg(not(any(feature = "R4", feature = "R4B")))]
+                EvaluationResult::Integer64(_, _) => EvaluationResult::boolean(true),
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object { .. } => EvaluationResult::boolean(false),
                 EvaluationResult::Empty => EvaluationResult::Empty,

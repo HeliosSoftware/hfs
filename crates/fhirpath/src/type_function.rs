@@ -129,6 +129,7 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
             }
         }
         EvaluationResult::Empty => ("System".to_string(), "Empty".to_string()),
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
         EvaluationResult::Integer64(_, type_info) => {
             if let Some(type_info) = type_info {
                 (type_info.namespace.clone(), type_info.name.clone())

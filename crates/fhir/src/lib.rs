@@ -1648,8 +1648,9 @@ where
                     // Return FHIR integer
                     EvaluationResult::fhir_integer(i)
                 }
+                #[cfg(not(any(feature = "R4", feature = "R4B")))]
                 EvaluationResult::Integer64(i, _) => {
-                    // Return FHIR integer64
+                    // Return FHIR integer64 (R5 and above)
                     EvaluationResult::fhir_integer64(i)
                 }
                 EvaluationResult::String(s, _) => {
