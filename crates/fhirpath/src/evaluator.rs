@@ -1388,6 +1388,21 @@ fn evaluate_invocation(
                         Ok(EvaluationResult::Empty)
                     }
                 }
+                // R4/R4B: Integer64 should be treated as Integer primitive
+                #[cfg(any(feature = "R4", feature = "R4B"))]
+                EvaluationResult::Integer64(_, _) => {
+                    // For now, we return Empty for id and extension on primitives
+                    // This is where we would add proper support for accessing these fields
+                    // if the primitive value was from a FHIR Element type with id/extension
+                    if name == "id" || name == "extension" {
+                        // TODO: Proper implementation would check if this is a FHIR Element
+                        // and return its id or extension if available
+                        Ok(EvaluationResult::Empty)
+                    } else {
+                        // For other properties on primitives, return Empty
+                        Ok(EvaluationResult::Empty)
+                    }
+                }
                 // Accessing member on Empty returns Empty
                 EvaluationResult::Empty => Ok(EvaluationResult::Empty), // Wrap in Ok
             }
@@ -2313,6 +2328,9 @@ fn call_function(
                 | EvaluationResult::Quantity(_, _, _) => EvaluationResult::boolean(true), // Add Quantity case
                 // R5+ only: Integer64 type convertibility
                 #[cfg(not(any(feature = "R4", feature = "R4B")))]
+                EvaluationResult::Integer64(_, _) => EvaluationResult::boolean(true),
+                // R4/R4B: Integer64 should be treated as Integer (convertible to String)
+                #[cfg(any(feature = "R4", feature = "R4B"))]
                 EvaluationResult::Integer64(_, _) => EvaluationResult::boolean(true),
                 // Objects are not convertible to String via this function
                 EvaluationResult::Object { .. } => EvaluationResult::boolean(false),

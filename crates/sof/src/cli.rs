@@ -1,3 +1,57 @@
+//! # SQL-on-FHIR CLI Tool
+//!
+//! This module provides a command-line interface for the SQL-on-FHIR implementation,
+//! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
+//! and output the results in various formats.
+//!
+//! ## Overview
+//!
+//! The CLI tool accepts FHIR ViewDefinition and Bundle resources as input (either from
+//! files or stdin) and applies the SQL-on-FHIR transformation to produce structured
+//! output in formats like CSV, JSON, or other supported content types.
+//!
+//! ## Usage Examples
+//!
+//! ### Basic usage with files
+//! ```bash
+//! sof-cli --view view_definition.json --bundle patient_bundle.json --format csv
+//! ```
+//!
+//! ### Using stdin for ViewDefinition
+//! ```bash
+//! cat view_definition.json | sof-cli --bundle patient_bundle.json --format csv
+//! ```
+//!
+//! ### Output to file with headers
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json -f csv --headers -o output.csv
+//! ```
+//!
+//! ### Using different FHIR versions
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json --fhir-version R5
+//! ```
+//!
+//! ## Input Requirements
+//!
+//! - **ViewDefinition**: A FHIR ViewDefinition resource that defines the SQL transformation
+//! - **Bundle**: A FHIR Bundle resource containing the resources to be transformed
+//! - At least one of ViewDefinition or Bundle must be provided as a file path (not both from stdin)
+//!
+//! ## Supported Output Formats
+//!
+//! - `csv` - Comma-separated values (with optional headers)
+//! - `json` - JSON format
+//! - Other formats supported by the ContentType enum
+//!
+//! ## FHIR Version Support
+//!
+//! The CLI supports multiple FHIR versions through feature flags:
+//! - R4 (default)
+//! - R4B  
+//! - R5
+//! - R6
+
 use clap::Parser;
 use std::fs;
 use std::io::{self, Read};
@@ -5,6 +59,19 @@ use std::path::PathBuf;
 use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
 use fhir::FhirVersion;
 
+/// Command-line arguments for the SQL-on-FHIR CLI tool.
+///
+/// This struct defines all the command-line options and arguments that can be passed
+/// to the CLI tool. It uses the `clap` crate for argument parsing and validation.
+///
+/// # Examples
+///
+/// ```rust
+/// use clap::Parser;
+/// 
+/// // Parse arguments from command line
+/// let args = Args::parse();
+/// ```
 #[derive(Parser, Debug)]
 #[command(name = "sof-cli")]
 #[command(about = "SQL-on-FHIR CLI tool for running ViewDefinition transformations")]
@@ -34,6 +101,34 @@ struct Args {
     fhir_version: FhirVersion,
 }
 
+/// Main entry point for the SQL-on-FHIR CLI application.
+///
+/// This function orchestrates the entire CLI workflow:
+/// 1. Parses command-line arguments
+/// 2. Validates input constraints (stdin usage)
+/// 3. Reads ViewDefinition and Bundle data from files or stdin
+/// 4. Parses the JSON data into appropriate FHIR version-specific types
+/// 5. Executes the SQL-on-FHIR transformation
+/// 6. Outputs the results to stdout or a specified file
+///
+/// # Returns
+///
+/// Returns `Ok(())` on successful execution, or an error if any step fails.
+/// Common error scenarios include:
+/// - Invalid command-line arguments
+/// - File I/O errors (missing files, permission issues)
+/// - JSON parsing errors (malformed FHIR resources)
+/// - SQL-on-FHIR transformation errors
+/// - Output writing errors
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - Both ViewDefinition and Bundle are attempted to be read from stdin
+/// - Input files cannot be read or parsed
+/// - The FHIR version feature is not enabled for the specified version
+/// - The transformation fails due to invalid ViewDefinition or Bundle content
+/// - Output cannot be written to the specified location
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 

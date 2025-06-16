@@ -1,6 +1,7 @@
 //! # SQL-on-FHIR Implementation
 //!
-//! This crate provides a complete implementation of the SQL-on-FHIR specification,
+//! This crate provides a complete implementation of the [SQL-on-FHIR
+//! specification](https://sql-on-fhir.org/ig/latest),
 //! enabling the transformation of FHIR resources into tabular data using declarative
 //! ViewDefinitions. It supports all major FHIR versions (R4, R4B, R5, R6) through
 //! a version-agnostic abstraction layer.
@@ -180,7 +181,7 @@ use thiserror::Error;
 use traits::*;
 
 // Re-export commonly used traits for easier access
-pub use traits::{ViewDefinitionTrait, BundleTrait, ResourceTrait};
+pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
 ///
@@ -796,15 +797,18 @@ where
     let variables = extract_view_definition_constants(&view_definition)?;
 
     // Step 2: Filter resources by type and profile
-    let target_resource_type = view_definition.resource().ok_or_else(|| {
-        SofError::InvalidViewDefinition("Resource type is required".to_string())
-    })?;
+    let target_resource_type = view_definition
+        .resource()
+        .ok_or_else(|| SofError::InvalidViewDefinition("Resource type is required".to_string()))?;
 
     let filtered_resources = filter_resources(&bundle, target_resource_type)?;
 
     // Step 3: Apply where clauses to filter resources
-    let filtered_resources =
-        apply_where_clauses(filtered_resources, view_definition.where_clauses(), &variables)?;
+    let filtered_resources = apply_where_clauses(
+        filtered_resources,
+        view_definition.where_clauses(),
+        &variables,
+    )?;
 
     // Step 4: Process all select clauses to generate rows with forEach support
     let select_clauses = view_definition.select().ok_or_else(|| {
@@ -860,7 +864,7 @@ fn validate_where_clauses<W: ViewDefinitionWhereTrait>(
     for where_clause in where_clauses {
         if where_clause.path().is_none() {
             return Err(SofError::InvalidViewDefinition(
-                "Where clause must have a path specified".to_string()
+                "Where clause must have a path specified".to_string(),
             ));
         }
     }
@@ -873,13 +877,13 @@ fn can_be_coerced_to_boolean(result: &EvaluationResult) -> bool {
     match result {
         // Boolean values are obviously OK
         EvaluationResult::Boolean(_, _) => true,
-        
+
         // Empty is OK (evaluates to false)
         EvaluationResult::Empty => true,
-        
+
         // Collections are OK - they evaluate based on whether they're empty or not
         EvaluationResult::Collection { .. } => true,
-        
+
         // Other types cannot be meaningfully coerced to boolean for where clauses
         // This includes: String, Integer, Decimal, Date, DateTime, Time, Quantity, Object
         _ => false,
@@ -1049,10 +1053,11 @@ where
                             return Err(SofError::InvalidViewDefinition(format!(
                                 "Where clause path '{}' returns type '{}' which cannot be used as a boolean condition. \
                                  Where clauses must return boolean values, collections, or empty results.",
-                                path, result.type_name()
+                                path,
+                                result.type_name()
                             )));
                         }
-                        
+
                         // Check if result is truthy (non-empty and not false)
                         if !is_truthy(&result) {
                             include_resource = false;
@@ -1260,13 +1265,8 @@ where
     }];
 
     for select in selects {
-        row_combinations = expand_select_combinations(
-            context,
-            select,
-            &row_combinations,
-            all_columns,
-            variables,
-        )?;
+        row_combinations =
+            expand_select_combinations(context, select, &row_combinations, all_columns, variables)?;
     }
 
     // Convert to ProcessedRow format
@@ -1278,10 +1278,7 @@ where
         .collect())
 }
 
-fn collect_all_columns<S>(
-    selects: &[S],
-    all_columns: &mut Vec<String>,
-) -> Result<(), SofError>
+fn collect_all_columns<S>(selects: &[S], all_columns: &mut Vec<String>) -> Result<(), SofError>
 where
     S: ViewDefinitionSelectTrait,
 {

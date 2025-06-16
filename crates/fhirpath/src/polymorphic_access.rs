@@ -788,6 +788,15 @@ pub fn apply_polymorphic_type_operation(
                             || type_name.ends_with(".integer64");
                         Ok(EvaluationResult::boolean(is_integer64_type))
                     }
+                    #[cfg(any(feature = "R4", feature = "R4B"))]
+                    EvaluationResult::Integer64(_, _) => {
+                        // In R4 and R4B, Integer64 should be treated as Integer
+                        let is_integer_type = type_name == "Integer"
+                            || type_name == "integer"
+                            || type_name.ends_with(".Integer")
+                            || type_name.ends_with(".integer");
+                        Ok(EvaluationResult::boolean(is_integer_type))
+                    }
                 }
             }
             "as" => {

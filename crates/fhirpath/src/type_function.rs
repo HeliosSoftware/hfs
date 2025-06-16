@@ -137,5 +137,10 @@ fn get_type_info(value: &EvaluationResult) -> (String, String) {
                 ("System".to_string(), "Integer64".to_string())
             }
         }
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(_, _) => {
+            // In R4 and R4B, Integer64 should be treated as Integer
+            ("System".to_string(), "Integer".to_string())
+        }
     }
 }

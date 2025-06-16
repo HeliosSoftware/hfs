@@ -150,6 +150,11 @@ pub fn is_of_type_with_context(value: &EvaluationResult, type_spec: &TypeSpecifi
                 check_type_match(&Some("System".to_string()), "Integer64", &target_namespace, &target_type)
             }
         },
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(_, _) => {
+            // In R4 and R4B, Integer64 should be treated as Integer
+            check_type_match(&Some("System".to_string()), "Integer", &target_namespace, &target_type)
+        },
     }
 }
 
@@ -247,6 +252,11 @@ pub fn is_of_type_for_of_type(value: &EvaluationResult, type_spec: &TypeSpecifie
                 // Default to System.Integer64 for integer64 values
                 check_type_match_with_cross_namespace(&Some("System".to_string()), "Integer64", &target_namespace, &target_type, true)
             }
+        },
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(_, _) => {
+            // In R4 and R4B, Integer64 should be treated as Integer
+            check_type_match_with_cross_namespace(&Some("System".to_string()), "Integer", &target_namespace, &target_type, true)
         },
         EvaluationResult::Object { map, type_info, .. } => {
             // First check if there's type_info available
@@ -362,6 +372,11 @@ pub fn is_of_type(value: &EvaluationResult, type_spec: &TypeSpecifier) -> Result
                 // Default to System.Integer64 for integer64 values
                 check_type_match(&Some("System".to_string()), "Integer64", &target_namespace, &target_type)
             }
+        },
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(_, _) => {
+            // In R4 and R4B, Integer64 should be treated as Integer
+            check_type_match(&Some("System".to_string()), "Integer", &target_namespace, &target_type)
         },
         EvaluationResult::Object { map, type_info, .. } => {
             // First check if there's type_info available
