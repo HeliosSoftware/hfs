@@ -48,6 +48,11 @@ cargo build
 TODO
 ```
 
+NOTE:  If you find you are running out of memory on a Linux machine during complilation, limit the number of build jobs using:
+```
+export CARGO_BUILD_JOBS=4
+```
+
 # Architecture Overview
 
 

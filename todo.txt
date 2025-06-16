@@ -5,8 +5,6 @@
 
 - Test to see if invalid attributes in the FHIR JSON model are allowed/disallowed?
 
-- R6 tests need help - Should we report the ab
-
 - Investigate the tests in https://github.com/FHIR/fhir-test-cases - are the fhirpath tests different for each FHIR version?
 
 - Write README.md for the root - homepage!

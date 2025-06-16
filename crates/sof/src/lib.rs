@@ -34,6 +34,7 @@
 //! // Parse a ViewDefinition and Bundle from JSON
 //! let view_definition_json = r#"{
 //!     "resourceType": "ViewDefinition",
+//!     "status": "active",
 //!     "resource": "Patient",
 //!     "select": [{
 //!         "column": [{
@@ -48,6 +49,7 @@
 //!
 //! let bundle_json = r#"{
 //!     "resourceType": "Bundle",
+//!     "type": "collection",
 //!     "entry": [{
 //!         "resource": {
 //!             "resourceType": "Patient",
@@ -74,10 +76,11 @@
 //!     ContentType::CsvWithHeader
 //! )?;
 //!
-//! // Output: "id,name\nexample,Doe\n"
+//! // Check the CSV output
 //! let csv_string = String::from_utf8(csv_output)?;
 //! assert!(csv_string.contains("id,name"));
-//! assert!(csv_string.contains("example,Doe"));
+//! // CSV values are quoted
+//! assert!(csv_string.contains("example") && csv_string.contains("Doe"));
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -136,9 +139,12 @@
 //!
 //! The crate provides comprehensive error handling through [`SofError`]:
 //!
-//! ```rust
-//! use sof::SofError;
+//! ```rust,no_run
+//! use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 //!
+//! # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
+//! # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+//! # let content_type = ContentType::Json;
 //! match run_view_definition(view, bundle, content_type) {
 //!     Ok(output) => {
 //!         // Process successful transformation
@@ -380,9 +386,12 @@ impl SofBundle {
 ///
 /// # Examples
 ///
-/// ```rust
-/// use sof::{SofError, run_view_definition};
+/// ```rust,no_run
+/// use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 ///
+/// # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
+/// # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+/// # let content_type = ContentType::Json;
 /// match run_view_definition(view, bundle, content_type) {
 ///     Ok(output) => {
 ///         println!("Transformation successful");
@@ -676,8 +685,28 @@ pub struct ProcessedResult {
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
-/// # let view_def = fhir::r4::ViewDefinition::default();
-/// # let bundle = fhir::r4::Bundle::default();
+/// // Create a simple ViewDefinition
+/// let view_json = serde_json::json!({
+///     "resourceType": "ViewDefinition",
+///     "status": "active",
+///     "resource": "Patient",
+///     "select": [{
+///         "column": [{
+///             "name": "id",
+///             "path": "id"
+///         }]
+///     }]
+/// });
+/// let view_def: fhir::r4::ViewDefinition = serde_json::from_value(view_json)?;
+/// 
+/// // Create a simple Bundle
+/// let bundle_json = serde_json::json!({
+///     "resourceType": "Bundle",
+///     "type": "collection",
+///     "entry": []
+/// });
+/// let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+/// 
 /// let sof_view = SofViewDefinition::R4(view_def);
 /// let sof_bundle = SofBundle::R4(bundle);
 ///
@@ -698,9 +727,12 @@ pub struct ProcessedResult {
 ///
 /// Common error scenarios:
 ///
-/// ```rust
-/// use sof::{SofError, run_view_definition};
+/// ```rust,no_run
+/// use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 ///
+/// # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
+/// # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+/// # let content_type = ContentType::Json;
 /// match run_view_definition(view, bundle, content_type) {
 ///     Ok(output) => {
 ///         println!("Success: {} bytes generated", output.len());
