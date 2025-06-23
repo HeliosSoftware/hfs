@@ -1,0 +1,295 @@
+//! Integration tests for the SQL-on-FHIR server
+
+use axum::http::StatusCode;
+use serde_json::json;
+
+mod common;
+
+#[tokio::test]
+async fn test_health_endpoint() {
+    let server = common::test_server().await;
+    
+    let response = server.get("/health").await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["service"], "sof-server");
+}
+
+#[tokio::test]
+async fn test_capability_statement() {
+    let server = common::test_server().await;
+    
+    let response = server.get("/metadata").await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/fhir+json");
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "CapabilityStatement");
+    assert_eq!(json["kind"], "instance");
+    assert_eq!(json["fhirVersion"], "4.0.1");
+    
+    // Verify ViewDefinition resource is supported
+    let resources = json["rest"][0]["resource"].as_array().unwrap();
+    let view_def_resource = resources
+        .iter()
+        .find(|r| r["type"] == "ViewDefinition")
+        .expect("ViewDefinition resource should be listed");
+    
+    // Verify $run operation is supported
+    let operations = view_def_resource["operation"].as_array().unwrap();
+    assert!(operations.iter().any(|op| op["name"] == "run"));
+}
+
+#[tokio::test]
+async fn test_run_view_definition_basic() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [{
+                            "name": "id",
+                            "path": "id"
+                        }, {
+                            "name": "gender",
+                            "path": "gender"
+                        }]
+                    }]
+                }
+            },
+            {
+                "name": "patient",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "example",
+                    "gender": "male"
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Accept", "application/json")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/json");
+    
+    let json: serde_json::Value = response.json();
+    assert!(json.is_array());
+    
+    let rows = json.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "example");
+    assert_eq!(rows[0]["gender"], "male");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_csv_output() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [{
+                            "name": "id",
+                            "path": "id"
+                        }, {
+                            "name": "name",
+                            "path": "name.family"
+                        }]
+                    }]
+                }
+            },
+            {
+                "name": "patient",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "123",
+                    "name": [{
+                        "family": "Doe",
+                        "given": ["John"]
+                    }]
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_query_param("_format", "text/csv")
+        .add_query_param("_header", "present")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "text/csv");
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    assert_eq!(lines.len(), 2); // Header + 1 data row
+    assert_eq!(lines[0], "id,name");
+    assert!(lines[1].contains("123"));
+    assert!(lines[1].contains("Doe"));
+}
+
+#[tokio::test]
+async fn test_run_view_definition_ndjson_output() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Observation",
+                    "select": [{
+                        "column": [{
+                            "name": "id",
+                            "path": "id"
+                        }, {
+                            "name": "status",
+                            "path": "status"
+                        }]
+                    }]
+                }
+            },
+            {
+                "name": "patient",
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs1",
+                    "status": "final"
+                }
+            },
+            {
+                "name": "patient",
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "obs2",
+                    "status": "preliminary"
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Accept", "application/ndjson")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let content_type = response.header("content-type");
+    assert_eq!(content_type.to_str().unwrap(), "application/ndjson");
+    
+    let ndjson_text = response.text();
+    let lines: Vec<&str> = ndjson_text.trim().lines().collect();
+    
+    assert_eq!(lines.len(), 2);
+    
+    let row1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let row2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    
+    assert_eq!(row1["id"], "obs1");
+    assert_eq!(row1["status"], "final");
+    assert_eq!(row2["id"], "obs2");
+    assert_eq!(row2["status"], "preliminary");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_error_invalid_parameters() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Bundle",  // Wrong resource type
+        "type": "collection"
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert_eq!(json["issue"][0]["severity"], "error");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_error_no_view() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": []  // No ViewDefinition provided
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_unsupported_format() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "viewResource",
+            "resource": {
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                "resource": "Patient",
+                "select": [{"column": [{"name": "id", "path": "id"}]}]
+            }
+        }]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_query_param("_format", "text/plain")  // Unsupported format
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+}

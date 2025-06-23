@@ -44,31 +44,194 @@ cat complex-view.json | sof-cli --bundle large-dataset.json --format csv
 
 ### `sof-server` - HTTP Server
 
-A high-performance HTTP server for on-demand ViewDefinition execution (planned):
+A high-performance HTTP server providing SQL-on-FHIR ViewDefinition transformation capabilities:
 
 ```bash
-# Start server on default port 8080
+# Start server with defaults
 sof-server
 
-# Custom configuration
-sof-server --port 3000 --host 0.0.0.0
+# Custom configuration via command line
+sof-server --port 3000 --host 0.0.0.0 --log-level debug
 
-# Make API request
-curl -X POST http://localhost:8080/fhir/$sql-on-fhir \
-  -H "Content-Type: application/json" \
-  -d '{
-    "viewDefinition": {...},
-    "bundle": {...},
-    "format": "csv"
-  }'
+# Custom configuration via environment variables
+SOF_SERVER_PORT=3000 SOF_SERVER_HOST=0.0.0.0 sof-server
+
+# Check server health
+curl http://localhost:8080/health
+
+# Get CapabilityStatement
+curl http://localhost:8080/metadata
 ```
 
-#### Planned Server Features
+#### Configuration
 
-- **RESTful API**: Standard HTTP endpoints for ViewDefinition execution
-- **Streaming Responses**: Efficient handling of large result sets
-- **Content Negotiation**: Automatic format selection based on Accept headers
-- **Async Processing**: High-performance concurrent request handling
+The server can be configured using either command-line arguments or environment variables. Command-line arguments take precedence when both are provided.
+
+##### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SOF_SERVER_PORT` | Server port | `8080` |
+| `SOF_SERVER_HOST` | Server host address | `127.0.0.1` |
+| `SOF_LOG_LEVEL` | Log level (error, warn, info, debug, trace) | `info` |
+| `SOF_MAX_BODY_SIZE` | Maximum request body size in bytes | `10485760` (10MB) |
+| `SOF_REQUEST_TIMEOUT` | Request timeout in seconds | `30` |
+| `SOF_ENABLE_CORS` | Enable CORS (true/false) | `true` |
+| `SOF_CORS_ORIGINS` | Allowed CORS origins (comma-separated, * for any) | `*` |
+| `SOF_CORS_METHODS` | Allowed CORS methods (comma-separated, * for any) | `GET,POST,PUT,DELETE,OPTIONS` |
+| `SOF_CORS_HEADERS` | Allowed CORS headers (comma-separated, * for any) | Common headers¹ |
+
+##### Command-Line Arguments
+
+| Argument | Short | Description | Default |
+|----------|-------|-------------|---------|
+| `--port` | `-p` | Server port | `8080` |
+| `--host` | `-H` | Server host address | `127.0.0.1` |
+| `--log-level` | `-l` | Log level | `info` |
+| `--max-body-size` | `-m` | Max request body (bytes) | `10485760` |
+| `--request-timeout` | `-t` | Request timeout (seconds) | `30` |
+| `--enable-cors` | `-c` | Enable CORS | `true` |
+| `--cors-origins` | | Allowed origins (comma-separated) | `*` |
+| `--cors-methods` | | Allowed methods (comma-separated) | `GET,POST,PUT,DELETE,OPTIONS` |
+| `--cors-headers` | | Allowed headers (comma-separated) | Common headers¹ |
+
+##### Examples
+
+```bash
+# Production configuration with environment variables
+export SOF_SERVER_HOST=0.0.0.0
+export SOF_SERVER_PORT=8080
+export SOF_LOG_LEVEL=warn
+export SOF_MAX_BODY_SIZE=52428800  # 50MB
+export SOF_REQUEST_TIMEOUT=60
+export SOF_ENABLE_CORS=false
+sof-server
+
+# Development configuration
+sof-server --log-level debug --enable-cors true
+
+# CORS configuration for specific frontend
+sof-server --cors-origins "http://localhost:3000,http://localhost:3001" \
+           --cors-methods "GET,POST,OPTIONS" \
+           --cors-headers "Content-Type,Authorization"
+
+# Disable CORS for internal services
+sof-server --enable-cors false
+
+# Show all configuration options
+sof-server --help
+```
+
+##### CORS Configuration
+
+The server provides flexible CORS (Cross-Origin Resource Sharing) configuration to control which web applications can access the API:
+
+- **Origins**: Specify which domains can access the server
+  - Use `*` to allow any origin (default)
+  - Provide comma-separated list for specific origins: `https://app1.com,https://app2.com`
+  
+- **Methods**: Control which HTTP methods are allowed
+  - Default: `GET,POST,PUT,DELETE,OPTIONS`
+  - Use `*` to allow any method
+  - Provide comma-separated list: `GET,POST,OPTIONS`
+  
+- **Headers**: Specify which headers clients can send
+  - Default: Common headers¹
+  - Use `*` to allow any header
+  - Provide comma-separated list: `Content-Type,Authorization,X-Custom-Header`
+
+**Important Security Notes**:
+1. When using wildcard (`*`) for origins, credentials (cookies, auth headers) are automatically disabled for security
+2. To enable credentials, you must specify exact origins, not wildcards
+3. In production, always specify exact origins rather than using `*` to prevent unauthorized access
+
+```bash
+# Development (permissive, no credentials)
+sof-server  # Uses default wildcard origin
+
+# Production CORS configuration (with credentials)
+export SOF_CORS_ORIGINS="https://app.example.com"
+export SOF_CORS_METHODS="GET,POST,OPTIONS"
+export SOF_CORS_HEADERS="Content-Type,Authorization"
+sof-server
+```
+
+¹ Default headers: `Accept,Accept-Language,Content-Type,Content-Language,Authorization,X-Requested-With`
+
+#### Server Features
+
+- **HTTP API**: RESTful endpoints for ViewDefinition execution
+- **CapabilityStatement**: Discovery endpoint for server capabilities  
+- **ViewDefinition Runner**: Synchronous execution of ViewDefinitions
+- **Multi-format Output**: Support for CSV, JSON, and NDJSON responses
+- **FHIR Compliance**: Proper OperationOutcome error responses
+- **Configurable CORS**: Fine-grained control over cross-origin requests with support for specific origins, methods, and headers
+
+#### API Endpoints
+
+##### GET /metadata
+Returns the server's CapabilityStatement describing supported operations:
+
+```bash
+curl http://localhost:8080/metadata
+```
+
+##### POST /ViewDefinition/$run
+Execute a ViewDefinition transformation:
+
+```bash
+# JSON output (default)
+curl -X POST http://localhost:8080/ViewDefinition/$run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [{
+      "name": "viewResource",
+      "resource": {
+        "resourceType": "ViewDefinition",
+        "status": "active",
+        "resource": "Patient",
+        "select": [{
+          "column": [{
+            "name": "id",
+            "path": "id"
+          }, {
+            "name": "gender", 
+            "path": "gender"
+          }]
+        }]
+      }
+    }, {
+      "name": "patient",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "example",
+        "gender": "male"
+      }
+    }]
+  }'
+
+# CSV output with headers
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=present" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# NDJSON output
+curl -X POST http://localhost:8080/ViewDefinition/$run \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/ndjson" \
+  -d '{...}'
+```
+
+#### Parameters
+
+The `$run` operation accepts a FHIR Parameters resource with:
+
+- **viewResource**: The ViewDefinition to execute (inline)
+- **viewReference**: Reference to a ViewDefinition (not yet supported)
+- **patient**: Patient resources to transform
+- **_format**: Override output format (query parameter)
+- **_header**: Include CSV headers - "present" or "absent" (query parameter)
 
 ## Core Features
 
