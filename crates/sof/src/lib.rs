@@ -179,14 +179,14 @@
 
 pub mod traits;
 
-use fhir::FhirVersion;
 use fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use traits::*;
 
-// Re-export commonly used traits for easier access
+// Re-export commonly used types and traits for easier access
+pub use fhir::FhirVersion;
 pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
@@ -263,19 +263,19 @@ impl SofViewDefinition {
     /// # {
     /// # let view_def = fhir::r5::ViewDefinition::default();
     /// let sof_view = SofViewDefinition::R5(view_def);
-    /// assert_eq!(sof_view.version(), FhirVersion::R5);
+    /// assert_eq!(sof_view.version(), fhir::FhirVersion::R5);
     /// # }
     /// ```
-    pub fn version(&self) -> FhirVersion {
+    pub fn version(&self) -> fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofViewDefinition::R4(_) => FhirVersion::R4,
+            SofViewDefinition::R4(_) => fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofViewDefinition::R4B(_) => FhirVersion::R4B,
+            SofViewDefinition::R4B(_) => fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofViewDefinition::R5(_) => FhirVersion::R5,
+            SofViewDefinition::R5(_) => fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofViewDefinition::R6(_) => FhirVersion::R6,
+            SofViewDefinition::R6(_) => fhir::FhirVersion::R6,
         }
     }
 }
@@ -354,19 +354,101 @@ impl SofBundle {
     /// # {
     /// # let bundle = fhir::r4::Bundle::default();
     /// let sof_bundle = SofBundle::R4(bundle);
-    /// assert_eq!(sof_bundle.version(), FhirVersion::R4);
+    /// assert_eq!(sof_bundle.version(), fhir::FhirVersion::R4);
     /// # }
     /// ```
-    pub fn version(&self) -> FhirVersion {
+    pub fn version(&self) -> fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofBundle::R4(_) => FhirVersion::R4,
+            SofBundle::R4(_) => fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofBundle::R4B(_) => FhirVersion::R4B,
+            SofBundle::R4B(_) => fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofBundle::R5(_) => FhirVersion::R5,
+            SofBundle::R5(_) => fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofBundle::R6(_) => FhirVersion::R6,
+            SofBundle::R6(_) => fhir::FhirVersion::R6,
+        }
+    }
+}
+
+/// Multi-version CapabilityStatement container supporting version-agnostic operations.
+///
+/// This enum provides a unified interface for working with CapabilityStatement resources
+/// across different FHIR specification versions. It enables applications to handle
+/// multiple FHIR versions simultaneously while maintaining type safety.
+///
+/// # Supported Versions
+///
+/// - **R4**: FHIR 4.0.1 CapabilityStatement (normative)
+/// - **R4B**: FHIR 4.3.0 CapabilityStatement (ballot)
+/// - **R5**: FHIR 5.0.0 CapabilityStatement (ballot)
+/// - **R6**: FHIR 6.0.0 CapabilityStatement (draft)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SofCapabilityStatement {
+    #[cfg(feature = "R4")]
+    R4(fhir::r4::CapabilityStatement),
+    #[cfg(feature = "R4B")]
+    R4B(fhir::r4b::CapabilityStatement),
+    #[cfg(feature = "R5")]
+    R5(fhir::r5::CapabilityStatement),
+    #[cfg(feature = "R6")]
+    R6(fhir::r6::CapabilityStatement),
+}
+
+impl SofCapabilityStatement {
+    /// Returns the FHIR specification version of this CapabilityStatement.
+    pub fn version(&self) -> fhir::FhirVersion {
+        match self {
+            #[cfg(feature = "R4")]
+            SofCapabilityStatement::R4(_) => fhir::FhirVersion::R4,
+            #[cfg(feature = "R4B")]
+            SofCapabilityStatement::R4B(_) => fhir::FhirVersion::R4B,
+            #[cfg(feature = "R5")]
+            SofCapabilityStatement::R5(_) => fhir::FhirVersion::R5,
+            #[cfg(feature = "R6")]
+            SofCapabilityStatement::R6(_) => fhir::FhirVersion::R6,
+        }
+    }
+}
+
+/// Multi-version Parameters container supporting version-agnostic operations.
+///
+/// This enum provides a unified interface for working with Parameters resources
+/// across different FHIR specification versions. Parameters are commonly used
+/// for operation inputs and outputs in FHIR.
+///
+/// # Supported Versions
+///
+/// - **R4**: FHIR 4.0.1 Parameters (normative)
+/// - **R4B**: FHIR 4.3.0 Parameters (ballot)
+/// - **R5**: FHIR 5.0.0 Parameters (ballot)
+/// - **R6**: FHIR 6.0.0 Parameters (draft)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SofParameters {
+    #[cfg(feature = "R4")]
+    R4(fhir::r4::Parameters),
+    #[cfg(feature = "R4B")]
+    R4B(fhir::r4b::Parameters),
+    #[cfg(feature = "R5")]
+    R5(fhir::r5::Parameters),
+    #[cfg(feature = "R6")]
+    R6(fhir::r6::Parameters),
+}
+
+impl SofParameters {
+    /// Returns the FHIR specification version of this Parameters.
+    pub fn version(&self) -> fhir::FhirVersion {
+        match self {
+            #[cfg(feature = "R4")]
+            SofParameters::R4(_) => fhir::FhirVersion::R4,
+            #[cfg(feature = "R4B")]
+            SofParameters::R4B(_) => fhir::FhirVersion::R4B,
+            #[cfg(feature = "R5")]
+            SofParameters::R5(_) => fhir::FhirVersion::R5,
+            #[cfg(feature = "R6")]
+            SofParameters::R6(_) => fhir::FhirVersion::R6,
         }
     }
 }
@@ -490,7 +572,7 @@ pub enum SofError {
 /// assert_eq!(json_type, ContentType::Json);
 ///
 /// // CSV with headers
-/// let csv_headers = ContentType::from_string("text/csv;header=present")?;
+/// let csv_headers = ContentType::from_string("text/csv;header=true")?;
 /// assert_eq!(csv_headers, ContentType::CsvWithHeader);
 /// # Ok::<(), sof::SofError>(())
 /// ```
@@ -518,7 +600,9 @@ impl ContentType {
     /// # Supported MIME Types
     ///
     /// - `"text/csv"` → [`ContentType::Csv`]
-    /// - `"text/csv;header=present"` → [`ContentType::CsvWithHeader`]
+    /// - `"text/csv"` → [`ContentType::CsvWithHeader`] (default: headers included)
+    /// - `"text/csv;header=true"` → [`ContentType::CsvWithHeader`]
+    /// - `"text/csv;header=false"` → [`ContentType::Csv`]
     /// - `"application/json"` → [`ContentType::Json`]
     /// - `"application/ndjson"` → [`ContentType::NdJson`]
     /// - `"application/parquet"` → [`ContentType::Parquet`]
@@ -541,9 +625,13 @@ impl ContentType {
     /// let csv = ContentType::from_string("text/csv")?;
     /// assert_eq!(csv, ContentType::Csv);
     ///
-    /// // CSV with headers
-    /// let csv_headers = ContentType::from_string("text/csv;header=present")?;
+    /// // CSV with headers (default)
+    /// let csv_headers = ContentType::from_string("text/csv")?;
     /// assert_eq!(csv_headers, ContentType::CsvWithHeader);
+    /// 
+    /// // CSV without headers
+    /// let csv_no_headers = ContentType::from_string("text/csv;header=false")?;
+    /// assert_eq!(csv_no_headers, ContentType::Csv);
     ///
     /// // JSON format
     /// let json = ContentType::from_string("application/json")?;
@@ -555,14 +643,71 @@ impl ContentType {
     /// ```
     pub fn from_string(s: &str) -> Result<Self, SofError> {
         match s {
-            "text/csv" => Ok(ContentType::Csv),
-            "text/csv;header=present" => Ok(ContentType::CsvWithHeader),
+            "text/csv;header=false" => Ok(ContentType::Csv),
+            "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
             "application/json" => Ok(ContentType::Json),
             "application/ndjson" => Ok(ContentType::NdJson),
             "application/parquet" => Ok(ContentType::Parquet),
             _ => Err(SofError::UnsupportedContentType(s.to_string())),
         }
     }
+}
+
+/// Returns the FHIR version string for the newest enabled version.
+///
+/// This function provides the version string that should be used in CapabilityStatements
+/// and other FHIR resources that need to specify their version.
+pub fn get_fhir_version_string() -> &'static str {
+    let newest_version = get_newest_enabled_fhir_version();
+    
+    match newest_version {
+        #[cfg(feature = "R4")]
+        fhir::FhirVersion::R4 => "4.0.1",
+        #[cfg(feature = "R4B")]
+        fhir::FhirVersion::R4B => "4.3.0",
+        #[cfg(feature = "R5")]
+        fhir::FhirVersion::R5 => "5.0.0",
+        #[cfg(feature = "R6")]
+        fhir::FhirVersion::R6 => "6.0.0",
+    }
+}
+
+/// Returns the newest FHIR version that is enabled at compile time.
+///
+/// This function uses compile-time feature detection to determine which FHIR
+/// version should be used when multiple versions are enabled. The priority order
+/// is: R6 > R5 > R4B > R4, where newer versions take precedence.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::{get_newest_enabled_fhir_version, FhirVersion};
+///
+/// # #[cfg(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6"))]
+/// # {
+/// let version = get_newest_enabled_fhir_version();
+/// // If R5 and R4 are both enabled, this returns R5
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// This function will panic at compile time if no FHIR version features are enabled.
+pub fn get_newest_enabled_fhir_version() -> fhir::FhirVersion {
+    #[cfg(feature = "R6")]
+    return fhir::FhirVersion::R6;
+    
+    #[cfg(all(feature = "R5", not(feature = "R6")))]
+    return fhir::FhirVersion::R5;
+    
+    #[cfg(all(feature = "R4B", not(feature = "R5"), not(feature = "R6")))]
+    return fhir::FhirVersion::R4B;
+    
+    #[cfg(all(feature = "R4", not(feature = "R4B"), not(feature = "R5"), not(feature = "R6")))]
+    return fhir::FhirVersion::R4;
+    
+    #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
+    panic!("At least one FHIR version feature must be enabled");
 }
 
 /// A single row of processed tabular data from ViewDefinition transformation.
@@ -786,6 +931,16 @@ fn process_view_definition(
         #[cfg(feature = "R6")]
         (SofViewDefinition::R6(vd), SofBundle::R6(bundle)) => {
             process_view_definition_generic(vd, bundle)
+        }
+        // This case should never happen due to the version check above,
+        // but is needed for exhaustive pattern matching when multiple features are enabled
+        #[cfg(any(
+            all(feature = "R4", any(feature = "R4B", feature = "R5", feature = "R6")),
+            all(feature = "R4B", any(feature = "R5", feature = "R6")),
+            all(feature = "R5", feature = "R6")
+        ))]
+        _ => {
+            unreachable!("Version mismatch should have been caught by the version check above")
         }
     }
 }
@@ -1807,7 +1962,15 @@ fn format_csv(result: ProcessedResult, include_header: bool) -> Result<Vec<u8>, 
             .values
             .iter()
             .map(|v| match v {
-                Some(val) => serde_json::to_string(val).unwrap_or_default(),
+                Some(val) => {
+                    // For string values, extract the raw string instead of JSON serializing
+                    if let serde_json::Value::String(s) = val {
+                        s.clone()
+                    } else {
+                        // For non-string values, use JSON serialization
+                        serde_json::to_string(val).unwrap_or_default()
+                    }
+                }
                 None => String::new(),
             })
             .collect();
@@ -1859,3 +2022,4 @@ fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
 
     Ok(output)
 }
+

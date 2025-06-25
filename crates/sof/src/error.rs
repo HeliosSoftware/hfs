@@ -14,6 +14,7 @@ use std::fmt;
 
 /// Server-specific error type that can be converted to HTTP responses
 #[derive(Debug)]
+#[allow(dead_code)] // Some variants are reserved for future use
 pub enum ServerError {
     /// Invalid request parameters or body
     BadRequest(String),
@@ -32,6 +33,9 @@ pub enum ServerError {
     
     /// Generic internal server error
     InternalError(String),
+    
+    /// Feature not implemented
+    NotImplemented(String),
 }
 
 impl fmt::Display for ServerError {
@@ -43,6 +47,7 @@ impl fmt::Display for ServerError {
             ServerError::ProcessingError(err) => write!(f, "Processing error: {}", err),
             ServerError::JsonError(err) => write!(f, "JSON error: {}", err),
             ServerError::InternalError(msg) => write!(f, "Internal server error: {}", msg),
+            ServerError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
         }
     }
 }
@@ -51,7 +56,12 @@ impl std::error::Error for ServerError {}
 
 impl From<SofError> for ServerError {
     fn from(err: SofError) -> Self {
-        ServerError::ProcessingError(err)
+        match &err {
+            SofError::UnsupportedContentType(_) => {
+                ServerError::UnsupportedMediaType(err.to_string())
+            }
+            _ => ServerError::ProcessingError(err)
+        }
     }
 }
 
@@ -92,6 +102,11 @@ impl IntoResponse for ServerError {
             ServerError::InternalError(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "exception",
+                msg.clone(),
+            ),
+            ServerError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "not-supported",
                 msg.clone(),
             ),
         };

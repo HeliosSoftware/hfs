@@ -70,7 +70,7 @@ async fn test_run_view_definition_basic() {
                 }
             },
             {
-                "name": "patient",
+                "name": "resource",
                 "resource": {
                     "resourceType": "Patient",
                     "id": "example",
@@ -124,7 +124,7 @@ async fn test_run_view_definition_csv_output() {
                 }
             },
             {
-                "name": "patient",
+                "name": "resource",
                 "resource": {
                     "resourceType": "Patient",
                     "id": "123",
@@ -182,7 +182,7 @@ async fn test_run_view_definition_ndjson_output() {
                 }
             },
             {
-                "name": "patient",
+                "name": "resource",
                 "resource": {
                     "resourceType": "Observation",
                     "id": "obs1",
@@ -190,7 +190,7 @@ async fn test_run_view_definition_ndjson_output() {
                 }
             },
             {
-                "name": "patient",
+                "name": "resource",
                 "resource": {
                     "resourceType": "Observation",
                     "id": "obs2",
@@ -292,4 +292,86 @@ async fn test_run_view_definition_unsupported_format() {
     
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
+}
+
+#[tokio::test]
+async fn test_run_view_definition_get_without_reference() {
+    let server = common::test_server().await;
+    
+    // GET request without viewReference should fail
+    let response = server
+        .get("/ViewDefinition/$run")
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("viewReference parameter is required"));
+}
+
+#[tokio::test]
+async fn test_run_view_definition_get_with_reference() {
+    let server = common::test_server().await;
+    
+    // GET request with viewReference (currently not implemented)
+    let response = server
+        .get("/ViewDefinition/$run")
+        .add_query_param("viewReference", "ViewDefinition/123")
+        .add_query_param("_format", "application/json")
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("viewReference parameter is not yet supported"));
+}
+
+#[tokio::test]
+async fn test_run_view_definition_get_with_query_params() {
+    let server = common::test_server().await;
+    
+    // GET request with all query parameters
+    let response = server
+        .get("/ViewDefinition/$run")
+        .add_query_param("viewReference", "ViewDefinition/my-view")
+        .add_query_param("_format", "text/csv")
+        .add_query_param("_header", "present")
+        .add_query_param("_count", "100")
+        .add_query_param("_page", "2")
+        .add_query_param("_since", "2024-01-01T00:00:00Z")
+        .add_query_param("patient", "Patient/123")
+        .add_query_param("group", "Group/456")
+        .add_query_param("source", "my-data-source")
+        .await;
+    
+    // Should fail with not implemented for now
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn test_run_view_definition_get_instance_level() {
+    let server = common::test_server().await;
+    
+    // Instance-level GET request
+    let response = server
+        .get("/ViewDefinition/my-view-def/$run")
+        .add_query_param("_format", "application/json")
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("ViewDefinition lookup by ID"));
 }

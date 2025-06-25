@@ -20,7 +20,8 @@ fn create_test_app() -> Router {
     
     Router::new()
         .route("/metadata", get(capability_statement_handler))
-        .route("/ViewDefinition/$run", post(run_view_definition_handler))
+        .route("/ViewDefinition/$run", post(run_view_definition_handler).get(run_view_definition_get_handler))
+        .route("/ViewDefinition/:id/$run", get(run_view_definition_by_id_handler))
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive())
 }
@@ -84,6 +85,14 @@ async fn run_view_definition_handler(
     
     use sof::{run_view_definition, ContentType, SofBundle, SofViewDefinition};
     
+    // Validate query parameters first
+    if let Err(e) = validate_query_params(&params) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            &e,
+        );
+    }
+    
     // Basic parameter parsing
     if body["resourceType"] != "Parameters" {
         return error_response(
@@ -95,6 +104,8 @@ async fn run_view_definition_handler(
     // Extract ViewDefinition and resources
     let mut view_def_json = None;
     let mut resources = Vec::new();
+    let mut format_from_body = None;
+    let mut header_from_body = None;
     
     if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
@@ -102,9 +113,23 @@ async fn run_view_definition_handler(
                 Some("viewResource") => {
                     view_def_json = param["resource"].as_object().cloned();
                 }
-                Some("patient") => {
+                Some("resource") => {
                     if let Some(resource) = param["resource"].as_object() {
                         resources.push(serde_json::Value::Object(resource.clone()));
+                    }
+                }
+                Some("_format") | Some("format") => {
+                    // Extract format from valueCode or valueString
+                    if let Some(value_code) = param["valueCode"].as_str() {
+                        format_from_body = Some(value_code.to_string());
+                    } else if let Some(value_string) = param["valueString"].as_str() {
+                        format_from_body = Some(value_string.to_string());
+                    }
+                }
+                Some("_header") | Some("header") => {
+                    // Extract header from valueBoolean
+                    if let Some(value_bool) = param["valueBoolean"].as_bool() {
+                        header_from_body = Some(value_bool);
                     }
                 }
                 _ => {}
@@ -120,17 +145,51 @@ async fn run_view_definition_handler(
         ),
     };
     
-    // Parse content type
-    let format = params.get("_format");
-    let accept = headers.get(axum::http::header::ACCEPT).and_then(|h| h.to_str().ok());
-    let header_param = params.get("_header");
+    // Parse content type - body format takes precedence
+    let format = format_from_body.as_ref()
+        .map(|s| s.as_str())
+        .or_else(|| params.get("_format").map(|s| s.as_str()));
+    let accept = if format_from_body.is_some() {
+        None // Ignore Accept header when body param is present
+    } else {
+        headers.get(axum::http::header::ACCEPT).and_then(|h| h.to_str().ok())
+    };
     
-    let content_type = match parse_content_type(accept, format.map(|s| s.as_str()), header_param.map(|s| s.as_str())) {
+    // Convert header parameter - body takes precedence over query
+    let header_param = if let Some(header_bool) = header_from_body {
+        Some(header_bool)
+    } else {
+        match params.get("_header").map(|s| s.as_str()) {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        }
+    };
+    
+    // Check if header parameter is being used with non-CSV format
+    if header_param.is_some() && format_from_body.is_none() {
+        // We have a header parameter but need to check if format is CSV
+        let test_format = format.or(accept).unwrap_or("application/json");
+        if test_format != "text/csv" {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "Header parameter only applies to CSV format",
+            );
+        }
+    }
+    
+    let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,
-        Err(e) => return error_response(
-            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            &e,
-        ),
+        Err(e) => match e {
+            sof::SofError::UnsupportedContentType(_) => return error_response(
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                &e.to_string(),
+            ),
+            _ => return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                &e.to_string(),
+            ),
+        }
     };
     
     // Create ViewDefinition and Bundle
@@ -161,6 +220,16 @@ async fn run_view_definition_handler(
     // Execute ViewDefinition
     match run_view_definition(view_definition, bundle, content_type) {
         Ok(output) => {
+            // Apply pagination if requested
+            let output = if let Some(paginated) = apply_pagination(output, &params, &content_type) {
+                paginated
+            } else {
+                return error_response(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Invalid pagination parameters",
+                );
+            };
+            
             let mime_type = match content_type {
                 ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
                 ContentType::Json => "application/json",
@@ -184,23 +253,22 @@ async fn run_view_definition_handler(
 fn parse_content_type(
     accept: Option<&str>,
     format: Option<&str>,
-    header: Option<&str>,
-) -> Result<sof::ContentType, String> {
+    header: Option<bool>,
+) -> Result<sof::ContentType, sof::SofError> {
     use sof::ContentType;
     
     let content_type_str = format.or(accept).unwrap_or("application/json");
     
     let content_type_str = if content_type_str == "text/csv" {
         match header {
-            Some("absent") => "text/csv",
-            Some("present") | None => "text/csv;header=present",
-            _ => return Err(format!("Invalid _header parameter: {}", header.unwrap())),
+            Some(false) => "text/csv;header=false",
+            Some(true) | None => "text/csv;header=true", // Default to true if not specified
         }
     } else {
         content_type_str
     };
     
-    ContentType::from_string(content_type_str).map_err(|e| e.to_string())
+    ContentType::from_string(content_type_str)
 }
 
 fn error_response(status: axum::http::StatusCode, message: &str) -> axum::response::Response {
@@ -226,4 +294,172 @@ async fn health_check() -> impl axum::response::IntoResponse {
         "service": "sof-server",
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+async fn run_view_definition_get_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    _headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // Check for required viewReference parameter
+    if !params.contains_key("viewReference") {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "viewReference parameter is required for GET requests",
+        );
+    }
+
+    // For now, return not implemented
+    error_response(
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        "viewReference parameter is not yet supported. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.",
+    )
+}
+
+async fn run_view_definition_by_id_handler(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    _query: axum::extract::Query<std::collections::HashMap<String, String>>,
+    _headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    error_response(
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        &format!("ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.", id),
+    )
+}
+
+fn validate_query_params(params: &std::collections::HashMap<String, String>) -> Result<(), String> {
+    // Validate _count parameter
+    if let Some(count_str) = params.get("_count") {
+        match count_str.parse::<usize>() {
+            Ok(count) => {
+                if count == 0 {
+                    return Err("_count parameter must be greater than 0".to_string());
+                }
+                if count > 10000 {
+                    return Err("_count parameter cannot exceed 10000".to_string());
+                }
+            }
+            Err(_) => return Err("_count parameter must be a valid number".to_string()),
+        }
+    }
+    
+    // Validate _page parameter
+    if let Some(page_str) = params.get("_page") {
+        match page_str.parse::<usize>() {
+            Ok(page) => {
+                if page == 0 {
+                    return Err("_page parameter must be greater than 0 (1-based)".to_string());
+                }
+            }
+            Err(_) => return Err("_page parameter must be a valid number".to_string()),
+        }
+    }
+    
+    // Validate _since parameter
+    if let Some(since_str) = params.get("_since") {
+        if chrono::DateTime::parse_from_rfc3339(since_str).is_err() {
+            return Err(format!("_since parameter must be a valid RFC3339 timestamp: {}", since_str));
+        }
+    }
+    
+    Ok(())
+}
+
+fn apply_pagination(
+    output: Vec<u8>,
+    params: &std::collections::HashMap<String, String>,
+    content_type: &sof::ContentType,
+) -> Option<Vec<u8>> {
+    let count = params.get("_count").and_then(|s| s.parse::<usize>().ok());
+    let page = params.get("_page").and_then(|s| s.parse::<usize>().ok());
+    
+    if count.is_none() && page.is_none() {
+        return Some(output);
+    }
+    
+    match content_type {
+        sof::ContentType::Json => {
+            let output_str = String::from_utf8(output).ok()?;
+            let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str).ok()?;
+            
+            // Apply pagination
+            if let Some(count) = count {
+                let page = page.unwrap_or(1);
+                let offset = (page - 1) * count;
+                if offset < records.len() {
+                    let end = std::cmp::min(offset + count, records.len());
+                    records = records[offset..end].to_vec();
+                } else {
+                    records.clear();
+                }
+            }
+            
+            serde_json::to_string(&records).ok().map(|s| s.into_bytes())
+        }
+        sof::ContentType::NdJson => {
+            let output_str = String::from_utf8(output).ok()?;
+            let mut lines: Vec<&str> = output_str.lines().collect();
+            
+            // Apply pagination
+            if let Some(count) = count {
+                let page = page.unwrap_or(1);
+                let offset = (page - 1) * count;
+                if offset < lines.len() {
+                    let end = std::cmp::min(offset + count, lines.len());
+                    lines = lines[offset..end].to_vec();
+                } else {
+                    lines.clear();
+                }
+            }
+            
+            Some(lines.join("\n").into_bytes())
+        }
+        sof::ContentType::Csv | sof::ContentType::CsvWithHeader => {
+            let output_str = match String::from_utf8(output) {
+                Ok(s) => s,
+                Err(e) => return Some(e.into_bytes()),
+            };
+            let lines: Vec<&str> = output_str.lines().collect();
+            
+            if lines.is_empty() {
+                return Some(output_str.into_bytes());
+            }
+            
+            let has_header = matches!(content_type, sof::ContentType::CsvWithHeader);
+            let header_offset = if has_header { 1 } else { 0 };
+            
+            if lines.len() <= header_offset {
+                return Some(output_str.into_bytes());
+            }
+            
+            let (header_lines, mut data_lines) = if has_header {
+                (vec![lines[0]], lines[1..].to_vec())
+            } else {
+                (vec![], lines.to_vec())
+            };
+            
+            // Apply pagination to data lines
+            if let Some(count) = count {
+                let page = page.unwrap_or(1);
+                let offset = (page - 1) * count;
+                if offset < data_lines.len() {
+                    let end = std::cmp::min(offset + count, data_lines.len());
+                    data_lines = data_lines[offset..end].to_vec();
+                } else {
+                    data_lines.clear();
+                }
+            }
+            
+            let mut result_lines = header_lines;
+            result_lines.extend(data_lines);
+            let result = result_lines.join("\n");
+            
+            // Add final newline if original had one
+            if output_str.ends_with('\n') && !result.ends_with('\n') {
+                Some(format!("{}\n", result).into_bytes())
+            } else {
+                Some(result.into_bytes())
+            }
+        }
+        _ => Some(output),
+    }
 }

@@ -1,0 +1,391 @@
+//! Tests for _header/header parameter in the request body
+
+use axum::http::StatusCode;
+use serde_json::json;
+
+mod common;
+
+#[tokio::test]
+async fn test_header_parameter_boolean_true() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_header",
+                "valueBoolean": true
+            },
+            {
+                "name": "_format",
+                "valueCode": "text/csv"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "gender", "path": "gender"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-1",
+                    "gender": "male"
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.header("content-type").to_str().unwrap(), "text/csv");
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    // Should have header when valueBoolean is true
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("id") && lines[0].contains("gender"));
+    assert!(lines[1].contains("test-1") && lines[1].contains("male"));
+}
+
+#[tokio::test]
+async fn test_header_parameter_boolean_false() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "header",  // Test without underscore
+                "valueBoolean": false
+            },
+            {
+                "name": "_format",
+                "valueCode": "text/csv"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "birthDate", "path": "birthDate"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-2",
+                    "birthDate": "1990-01-01"
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.header("content-type").to_str().unwrap(), "text/csv");
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    // Should NOT have header when valueBoolean is false
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].contains("id,birthDate")); // No header row
+    assert!(lines[0].contains("test-2") && lines[0].contains("1990-01-01"));
+}
+
+#[tokio::test]
+async fn test_header_parameter_overrides_query() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_header",
+                "valueBoolean": false  // Body says no header
+            },
+            {
+                "name": "_format",
+                "valueCode": "text/csv"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-3"
+                }
+            }
+        ]
+    });
+    
+    // Query parameter says true, but body should override
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_query_param("_header", "true")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    // Body parameter (false) should override query parameter (true)
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].contains("id")); // No header
+    assert!(lines[0].contains("test-3"));
+}
+
+#[tokio::test]
+async fn test_header_parameter_without_format() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_header",
+                "valueBoolean": true
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-4"
+                }
+            }
+        ]
+    });
+    
+    // No format specified, should default to JSON
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    // Header parameter only applies to CSV, should get error with JSON format
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Header parameter only applies to CSV format"));
+}
+
+#[tokio::test]
+async fn test_header_parameter_with_csv_accept() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_header",
+                "valueBoolean": false
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-5"
+                }
+            }
+        ]
+    });
+    
+    // Accept header requests CSV
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Accept", "text/csv")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.header("content-type").to_str().unwrap(), "text/csv");
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    // Header parameter false should remove headers even with CSV accept
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].contains("id"));
+    assert!(lines[0].contains("test-5"));
+}
+
+#[tokio::test]
+async fn test_invalid_header_parameter_type() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_header",
+                "valueString": "yes"  // Should be boolean, not string
+            },
+            {
+                "name": "_format",
+                "valueCode": "text/csv"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-6"
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    // Should get bad request for non-boolean header value
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Header parameter must be a boolean value"));
+}
+
+#[tokio::test]
+async fn test_both_format_and_header_in_body() {
+    let server = common::test_server().await;
+    
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_format",
+                "valueCode": "text/csv"
+            },
+            {
+                "name": "_header",
+                "valueBoolean": true
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "active", "path": "active"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "test-7",
+                    "active": true
+                }
+            }
+        ]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.header("content-type").to_str().unwrap(), "text/csv");
+    
+    let csv_text = response.text();
+    let lines: Vec<&str> = csv_text.lines().collect();
+    
+    // Both format and header specified in body
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("id") && lines[0].contains("active"));
+    assert!(lines[1].contains("test-7") && lines[1].contains("true"));
+}

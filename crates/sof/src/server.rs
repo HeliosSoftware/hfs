@@ -22,7 +22,18 @@
 //!
 //! POST /ViewDefinition/$run
 //!   Body: Parameters resource containing ViewDefinition and data
+//!   Query Parameters:
+//!     _format: Output format (json/csv/ndjson)
+//!     _header: CSV header control (present/absent)
+//!     _count: Result limit (1-10000)
+//!     _page: Page number (1-based)
+//!     _since: Filter by modification time (RFC3339)
 //!   Returns: Transformed data in requested format
+//!
+//! GET /ViewDefinition/{id}/$run
+//!   Path: ViewDefinition ID
+//!   Query Parameters: Same as POST endpoint
+//!   Returns: HTTP 501 Not Implemented (storage not yet supported)
 //! ```
 //!
 //! ## Configuration
@@ -63,8 +74,7 @@
 //! ```
 
 use axum::{
-    Json, Router,
-    response::IntoResponse,
+    Router,
     routing::{get, post},
 };
 use http::{HeaderValue, Method};
@@ -252,7 +262,12 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
         .route("/metadata", get(handlers::capability_statement))
         .route(
             "/ViewDefinition/$run",
-            post(handlers::run_view_definition_handler),
+            post(handlers::run_view_definition_handler)
+                .get(handlers::run_view_definition_get_handler),
+        )
+        .route(
+            "/ViewDefinition/:id/$run",
+            get(handlers::run_view_definition_by_id_handler),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))

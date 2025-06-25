@@ -22,8 +22,11 @@ This crate provides two executable targets:
 A full-featured command-line tool for running ViewDefinition transformations:
 
 ```bash
-# Basic CSV output with headers
-sof-cli --view patient-view.json --bundle patient-data.json --format csv --headers
+# Basic CSV output (includes headers by default)
+sof-cli --view patient-view.json --bundle patient-data.json --format csv
+
+# CSV output without headers
+sof-cli --view patient-view.json --bundle patient-data.json --format csv --no-headers
 
 # JSON output to file
 sof-cli -v observation-view.json -b lab-results.json -f json -o output.json
@@ -211,8 +214,13 @@ curl -X POST http://localhost:8080/ViewDefinition/$run \
     }]
   }'
 
-# CSV output with headers
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=present" \
+# CSV output (includes headers by default)
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# CSV output without headers
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=false" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
@@ -229,9 +237,86 @@ The `$run` operation accepts a FHIR Parameters resource with:
 
 - **viewResource**: The ViewDefinition to execute (inline)
 - **viewReference**: Reference to a ViewDefinition (not yet supported)
-- **patient**: Patient resources to transform
-- **_format**: Override output format (query parameter)
-- **_header**: Include CSV headers - "present" or "absent" (query parameter)
+- **resource**: FHIR resources to transform (can be repeated)
+- **_format** or **format**: Output format as valueCode or valueString (overrides query params and Accept header)
+- **_header** or **header**: CSV header control as valueBoolean (overrides query params)
+  - `true` - Include headers (default)
+  - `false` - Exclude headers
+
+##### Query Parameters
+
+The `$run` operation supports the following query parameters:
+
+- **_format**: Override output format (takes precedence over Accept header)
+  - `application/json` - JSON array output (default)
+  - `text/csv` - CSV output (includes headers by default)
+  - `application/ndjson` - Newline-delimited JSON
+- **_header**: Control CSV headers (only applies to CSV format)
+  - `true` - Include headers (default for CSV)
+  - `false` - Exclude headers
+- **_count**: Limit the number of results (1-10000)
+  - Example: `_count=100`
+- **_page**: Page number for pagination (1-based)
+  - Example: `_page=2` (with `_count=100` returns results 101-200)
+- **_since**: Filter resources modified after this timestamp (RFC3339 format)
+  - Example: `_since=2023-01-01T00:00:00Z`
+  - Note: Currently validates format only; filtering by modification time requires resource metadata
+
+##### Parameter Precedence
+
+When the same parameter is specified in multiple places, the precedence order is:
+1. Parameters in request body (highest priority)
+2. Query parameters
+3. Accept header (for format only, lowest priority)
+
+##### Examples
+
+```bash
+# Paginated results - first 50 records as CSV
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=50&_page=1&_format=text/csv" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# Get page 3 of results (records 201-300)
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=100&_page=3" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# CSV without headers, limited to 20 results
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=false&_count=20" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+
+# Using header parameter in request body (overrides query params)
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [{
+      "name": "_header",
+      "valueBoolean": false
+    }, {
+      "name": "viewResource",
+      "resource": {...}
+    }]
+  }'
+
+# Filter by modification time (requires resources with lastUpdated metadata)
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_since=2024-01-01T00:00:00Z" \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+##### GET Endpoint
+
+The server also provides a GET endpoint for executing ViewDefinitions by ID:
+
+```bash
+# GET /ViewDefinition/{id}/$run
+curl "http://localhost:8080/ViewDefinition/my-view-def/$run?_count=50&_format=json"
+```
+
+Note: This endpoint currently returns HTTP 501 Not Implemented as ViewDefinition storage/retrieval is not yet supported.
 
 ## Core Features
 
@@ -514,6 +599,8 @@ The crate includes comprehensive tests covering:
 - **Multi-Version Compatibility** - Cross-version processing
 - **Output Format Validation** - Correct CSV, JSON, and NDJSON generation
 - **Edge Cases** - Empty results, null values, complex nested structures
+- **Query Parameter Validation** - Pagination, filtering, and format parameters
+- **Error Handling** - Proper FHIR OperationOutcome responses for invalid parameters
 
 Run tests with:
 

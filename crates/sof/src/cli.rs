@@ -22,9 +22,14 @@
 //! cat view_definition.json | sof-cli --bundle patient_bundle.json --format csv
 //! ```
 //!
-//! ### Output to file with headers
+//! ### Output to file (CSV includes headers by default)
 //! ```bash
-//! sof-cli -v view_definition.json -b patient_bundle.json -f csv --headers -o output.csv
+//! sof-cli -v view_definition.json -b patient_bundle.json -f csv -o output.csv
+//! ```
+//! 
+//! ### CSV output without headers
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json -f csv --no-headers -o output.csv
 //! ```
 //!
 //! ### Using different FHIR versions
@@ -40,7 +45,7 @@
 //!
 //! ## Supported Output Formats
 //!
-//! - `csv` - Comma-separated values (with optional headers)
+//! - `csv` - Comma-separated values (includes headers by default, use --no-headers to exclude)
 //! - `json` - JSON format
 //! - Other formats supported by the ContentType enum
 //!
@@ -88,9 +93,9 @@ struct Args {
     #[arg(long, short = 'f', default_value = "csv")]
     format: String,
 
-    /// Include CSV headers (only for CSV format)
+    /// Exclude CSV headers (only for CSV format, headers are included by default)
     #[arg(long)]
-    headers: bool,
+    no_headers: bool,
 
     /// Output file path (defaults to stdout)
     #[arg(long, short = 'o')]
@@ -207,10 +212,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine content type
     let content_type = if args.format == "csv" {
-        if args.headers {
-            ContentType::CsvWithHeader
-        } else {
+        if args.no_headers {
             ContentType::Csv
+        } else {
+            ContentType::CsvWithHeader
         }
     } else {
         ContentType::from_string(&args.format)?
