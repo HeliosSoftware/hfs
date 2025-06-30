@@ -259,7 +259,7 @@ Parameter table:
 
 | Name | Type | Use | Scope | Min | Max | Documentation |
 |------|------|-----|-------|-----|-----|---------------|
-| _format | code | in | type, instance | 1 | 1 | Output format - json, ndjson, csv, parquet |
+| _format | code | in | type, instance | 1 | 1 | Output format - application/json, application/ndjson, text/csv, application/parquet |
 | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
 | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
