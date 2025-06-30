@@ -6,6 +6,14 @@
 //! ViewDefinitions. It supports all major FHIR versions (R4, R4B, R5, R6) through
 //! a version-agnostic abstraction layer.
 //!
+//! There are three consumers of this crate:
+//! - [sof_cli](../sof_cli/index.html) - A command-line interface for the SQL-on-FHIR implementation,
+//! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
+//! and output the results in various formats.
+//! - [sof_server](../sof_server/index.html) - A stateless HTTP server implementation for the SQL-on-FHIR specification,
+//! enabling HTTP-based access to ViewDefinition transformation capabilities.
+//! - [hfs](../hfs/index.html) - The full featured Helios FHIR Server.
+//!
 //! ## Architecture
 //!
 //! The SOF crate is organized around these key components:
@@ -160,15 +168,6 @@
 //!     }
 //! }
 //! ```
-//!
-//! ## CLI Usage
-//!
-//! The crate includes a command-line interface in `cli.rs`:
-//!
-//! ```bash
-//! sof-cli --view viewdef.json --bundle data.json --format csv --headers
-//! ```
-//!
 //! ## Feature Flags
 //!
 //! Enable support for specific FHIR versions:
@@ -566,14 +565,14 @@ pub enum SofError {
 ///
 /// // Parse from string
 /// let csv_type = ContentType::from_string("text/csv")?;
-/// assert_eq!(csv_type, ContentType::Csv);
+/// assert_eq!(csv_type, ContentType::CsvWithHeader);  // Default includes headers
 ///
 /// let json_type = ContentType::from_string("application/json")?;
 /// assert_eq!(json_type, ContentType::Json);
 ///
-/// // CSV with headers
-/// let csv_headers = ContentType::from_string("text/csv;header=true")?;
-/// assert_eq!(csv_headers, ContentType::CsvWithHeader);
+/// // CSV without headers
+/// let csv_no_headers = ContentType::from_string("text/csv;header=false")?;
+/// assert_eq!(csv_no_headers, ContentType::Csv);
 /// # Ok::<(), sof::SofError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,14 +620,14 @@ impl ContentType {
     /// ```rust
     /// use sof::ContentType;
     ///
-    /// // Standard CSV
+    /// // Standard CSV (includes headers by default)
     /// let csv = ContentType::from_string("text/csv")?;
-    /// assert_eq!(csv, ContentType::Csv);
+    /// assert_eq!(csv, ContentType::CsvWithHeader);
     ///
-    /// // CSV with headers (default)
-    /// let csv_headers = ContentType::from_string("text/csv")?;
+    /// // CSV with headers explicitly
+    /// let csv_headers = ContentType::from_string("text/csv;header=true")?;
     /// assert_eq!(csv_headers, ContentType::CsvWithHeader);
-    /// 
+    ///
     /// // CSV without headers
     /// let csv_no_headers = ContentType::from_string("text/csv;header=false")?;
     /// assert_eq!(csv_no_headers, ContentType::Csv);
@@ -659,7 +658,7 @@ impl ContentType {
 /// and other FHIR resources that need to specify their version.
 pub fn get_fhir_version_string() -> &'static str {
     let newest_version = get_newest_enabled_fhir_version();
-    
+
     match newest_version {
         #[cfg(feature = "R4")]
         fhir::FhirVersion::R4 => "4.0.1",
@@ -696,16 +695,21 @@ pub fn get_fhir_version_string() -> &'static str {
 pub fn get_newest_enabled_fhir_version() -> fhir::FhirVersion {
     #[cfg(feature = "R6")]
     return fhir::FhirVersion::R6;
-    
+
     #[cfg(all(feature = "R5", not(feature = "R6")))]
     return fhir::FhirVersion::R5;
-    
+
     #[cfg(all(feature = "R4B", not(feature = "R5"), not(feature = "R6")))]
     return fhir::FhirVersion::R4B;
-    
-    #[cfg(all(feature = "R4", not(feature = "R4B"), not(feature = "R5"), not(feature = "R6")))]
+
+    #[cfg(all(
+        feature = "R4",
+        not(feature = "R4B"),
+        not(feature = "R5"),
+        not(feature = "R6")
+    ))]
     return fhir::FhirVersion::R4;
-    
+
     #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
     panic!("At least one FHIR version feature must be enabled");
 }
@@ -843,7 +847,7 @@ pub struct ProcessedResult {
 ///     }]
 /// });
 /// let view_def: fhir::r4::ViewDefinition = serde_json::from_value(view_json)?;
-/// 
+///
 /// // Create a simple Bundle
 /// let bundle_json = serde_json::json!({
 ///     "resourceType": "Bundle",
@@ -851,7 +855,7 @@ pub struct ProcessedResult {
 ///     "entry": []
 /// });
 /// let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
-/// 
+///
 /// let sof_view = SofViewDefinition::R4(view_def);
 /// let sof_bundle = SofBundle::R4(bundle);
 ///
@@ -2022,4 +2026,3 @@ fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
 
     Ok(output)
 }
-

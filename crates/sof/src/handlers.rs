@@ -5,16 +5,22 @@
 
 use axum::{
     Json,
-    extract::{Query, Path},
+    extract::Query,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition, get_newest_enabled_fhir_version, get_fhir_version_string};
+use sof::{
+    ContentType, SofBundle, SofViewDefinition, get_fhir_version_string,
+    get_newest_enabled_fhir_version, run_view_definition,
+};
 use tracing::{debug, info};
 
 use super::{
     error::{ServerError, ServerResult},
-    models::{RunParameters, RunQueryParams, extract_run_parameters, validate_query_params, apply_result_filtering, parse_content_type},
+    models::{
+        RunParameters, RunQueryParams, apply_result_filtering, extract_all_parameters,
+        parse_content_type, validate_query_params,
+    },
 };
 
 /// Handler for GET /metadata - returns the server's CapabilityStatement
@@ -32,30 +38,35 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 
 /// Handler for POST /ViewDefinition/$run - executes a ViewDefinition
 ///
-/// This is the main endpoint for executing ViewDefinition transformations.
+/// The `$run` operation on a ViewDefinition resource applies the view definition to
+/// transform FHIR resources into a tabular format and returns the results synchronously.
 ///
 /// # Arguments
 /// * `params` - Query parameters for filtering, pagination, and output format
 /// * `headers` - HTTP headers including Accept for content negotiation
 /// * `body` - FHIR Parameters resource containing ViewDefinition and resources
 ///
-/// # Parameters Resource
-/// The body should contain a FHIR Parameters resource with:
-/// * `viewResource` - The ViewDefinition to execute (inline)
-/// * `viewReference` - Reference to a ViewDefinition (not yet supported)
-/// * `resource` - FHIR resources to transform (can be repeated)
-/// * `_format` or `format` - Output format as valueCode or valueString (overrides query params and Accept header)
-/// * `_header` or `header` - CSV header control as valueBoolean (true/false, overrides query params)
+/// # Parameters (in specification order)
 ///
-/// # Query Parameters
-/// * `_format` - Output format (json/csv/ndjson), overrides Accept header
-/// * `_header` - CSV header control (true/false, defaults to true for CSV)
-/// * `_count` - Limit results (1-10000)
-/// * `_page` - Page number for pagination (1-based)
-/// * `_since` - Filter by modification time (RFC3339 format)
+/// All parameters can be provided in query string or request body (except viewResource which is body-only).
+/// Parameters in request body take precedence over query parameters.
+///
+/// | Name | Type | Scope | Min | Max | Documentation |
+/// |------|------|-------|-----|-----|---------------|
+/// | _format | code | type, instance | 1 | 1 | Output format - json, ndjson, csv, parquet |
+/// | header | boolean | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
+/// | viewReference | Reference | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. |
+/// | viewResource | ViewDefinition | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
+/// | patient | Reference | type, instance | 0 | * | Filter resources by patient. |
+/// | group | Reference | type, instance | 0 | * | Filter resources by group. |
+/// | source | string | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. |
+/// | _count | integer | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. |
+/// | _page | integer | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. |
+/// | _since | instant | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. |
+/// | resource | Resource | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 ///
 /// # Returns
-/// * `Ok(Response)` - Transformed and filtered data in requested format
+/// * `Ok(Response)` - The output of the operation is in the requested format, defined by the format parameter or accept header
 /// * `Err(ServerError)` - Various errors for invalid input or processing failures
 pub async fn run_view_definition_handler(
     Query(params): Query<RunQueryParams>,
@@ -67,15 +78,25 @@ pub async fn run_view_definition_handler(
 
     // Validate and parse query parameters
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let validated_params = validate_query_params(&params, accept_header)
-        .map_err(|e| ServerError::BadRequest(e))?;
+    let validated_params =
+        validate_query_params(&params, accept_header).map_err(|e| ServerError::BadRequest(e))?;
 
     // Parse the Parameters resource using version detection
     let parameters = parse_parameters(body)?;
 
-    // Extract ViewDefinition and resources
-    let (view_def_json, resources_json, format_from_body, header_from_body) =
-        extract_run_parameters(parameters).map_err(|e| ServerError::BadRequest(e))?;
+    // Extract all parameters including filters
+    let extracted_params =
+        extract_all_parameters(parameters).map_err(|e| ServerError::BadRequest(e))?;
+
+    // For backward compatibility, extract the legacy tuple format
+    let view_def_json = extracted_params.view_definition;
+    let resources_json = if extracted_params.resources.is_empty() {
+        None
+    } else {
+        Some(extracted_params.resources)
+    };
+    let format_from_body = extracted_params.format;
+    let header_from_body = extracted_params.header;
 
     let view_def_json = view_def_json
         .ok_or_else(|| ServerError::BadRequest("No ViewDefinition provided".to_string()))?;
@@ -105,21 +126,47 @@ pub async fn run_view_definition_handler(
         // If only header is provided in body, update the format accordingly
         let format_str = match validated_params.format {
             ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-            _ => return Err(ServerError::BadRequest("Header parameter only applies to CSV format".to_string())),
+            _ => {
+                return Err(ServerError::BadRequest(
+                    "Header parameter only applies to CSV format".to_string(),
+                ));
+            }
         };
-        let content_type = parse_content_type(
-            None,
-            Some(format_str),
-            Some(header_bool),
-        )?;
+        let content_type = parse_content_type(None, Some(format_str), Some(header_bool))?;
         validated_params.format = content_type;
     }
 
     // Create ViewDefinition
     let view_definition = parse_view_definition(view_def_json)?;
 
+    // Apply patient and group filters from body parameters to resources if provided
+    let mut filtered_resources = resources_json.unwrap_or_default();
+
+    // Merge filter parameters from body and query
+    let patient_filter = extracted_params
+        .patient
+        .or(validated_params.patient.clone());
+    let group_filter = extracted_params.group.or(validated_params.group.clone());
+    let source_param = extracted_params.source.or(validated_params.source.clone());
+
+    // Handle source parameter - in a stateless server, we can't load from external sources
+    if let Some(source) = source_param {
+        debug!("Source parameter provided: {}", source);
+        return Err(ServerError::NotImplemented(
+            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.".to_string()
+        ));
+    }
+
+    if patient_filter.is_some() || group_filter.is_some() {
+        filtered_resources = filter_resources_by_patient_and_group(
+            filtered_resources,
+            patient_filter.as_deref(),
+            group_filter.as_deref(),
+        )?;
+    }
+
     // Create Bundle from resources
-    let bundle = create_bundle_from_resources(resources_json.unwrap_or_default())?;
+    let bundle = create_bundle_from_resources(filtered_resources)?;
 
     // Execute the ViewDefinition
     info!(
@@ -140,31 +187,54 @@ pub async fn run_view_definition_handler(
         ContentType::Parquet => "application/parquet",
     };
 
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], filtered_output).into_response())
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, mime_type)],
+        filtered_output,
+    )
+        .into_response())
 }
 
-/// Handler for GET /ViewDefinition/$run - executes a ViewDefinition via query parameters
+/// Handler for GET /ViewDefinition/$run - limited parameter support per FHIR specification
 ///
-/// This endpoint allows executing a ViewDefinition by providing a viewReference query parameter.
+/// The `$run` operation on a ViewDefinition resource applies the view definition to
+/// transform FHIR resources into a tabular format and returns the results synchronously.
+///
+/// # FHIR GET Operation Constraints
 /// 
+/// Per the FHIR specification, GET operations can only use simple input parameters.
+/// Complex datatypes like Reference, Identifier, and Resource cannot be passed as
+/// URL parameters. Therefore, this GET endpoint only supports:
+/// - Simple parameters: _format, header, _count, _page, _since
+/// - NO complex parameters: viewReference, patient, group, source, viewResource, resource
+///
+/// For operations requiring complex parameters, use the POST endpoint instead.
+///
 /// # Arguments
-/// * `params` - Query parameters including viewReference and other options
+/// * `params` - Query parameters (simple types only)
 /// * `headers` - HTTP headers including Accept for content negotiation
 ///
-/// # Query Parameters
-/// * `viewReference` - Reference to the ViewDefinition to execute (required)
-/// * `_format` - Output format (json/csv/ndjson), overrides Accept header
-/// * `_header` - CSV header control (true/false, defaults to true for CSV)
-/// * `_count` - Limit results (1-10000)
-/// * `_page` - Page number for pagination (1-based)
-/// * `_since` - Filter by modification time (RFC3339 format)
-/// * `patient` - Filter resources by patient reference
-/// * `group` - Filter resources by group reference
-/// * `source` - Data source for transformation
+/// # Supported Query Parameters
+///
+/// | Name | Type | Documentation |
+/// |------|------|---------------|
+/// | _format | code | Output format - json, ndjson, csv, parquet |
+/// | header | boolean | CSV header control - true (default), false |
+/// | _count | integer | Limits the number of results (1-10000) |
+/// | _page | integer | Page number for pagination (1-based) |
+/// | _since | instant | Filter by modification time (RFC3339 format) |
+///
+/// # Unsupported Parameters for GET
+/// - viewReference (Reference type - use POST instead)
+/// - patient (Reference type - use POST instead)
+/// - group (Reference type - use POST instead)
+/// - source (string type - use POST instead)
+/// - viewResource (ViewDefinition type - use POST instead)
+/// - resource (Resource type - use POST instead)
 ///
 /// # Returns
-/// * `Ok(Response)` - Transformed data in requested format
-/// * `Err(ServerError)` - Various errors for invalid input or processing failures
+/// * `Ok(Response)` - The output in the requested format
+/// * `Err(ServerError)` - Various errors including attempts to use complex parameters
 pub async fn run_view_definition_get_handler(
     Query(params): Query<RunQueryParams>,
     headers: HeaderMap,
@@ -172,62 +242,37 @@ pub async fn run_view_definition_get_handler(
     info!("Handling GET ViewDefinition/$run request");
     debug!("Query params: {:?}", params);
 
-    // Validate and parse query parameters
-    let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let validated_params = validate_query_params(&params, accept_header)
-        .map_err(|e| ServerError::BadRequest(e))?;
-
-    // Check for required viewReference parameter
-    if validated_params.view_reference.is_none() {
+    // Per FHIR spec, GET operations cannot use complex parameters
+    // Validate that no complex parameters are provided
+    if params.view_reference.is_some() {
         return Err(ServerError::BadRequest(
-            "viewReference parameter is required for GET requests".to_string(),
+            "GET operations cannot use complex parameters like viewReference. Use POST instead.".to_string()
+        ));
+    }
+    if params.patient.is_some() {
+        return Err(ServerError::BadRequest(
+            "GET operations cannot use complex parameters like patient. Use POST instead.".to_string()
+        ));
+    }
+    if params.group.is_some() {
+        return Err(ServerError::BadRequest(
+            "GET operations cannot use complex parameters like group. Use POST instead.".to_string()
+        ));
+    }
+    if params.source.is_some() {
+        return Err(ServerError::BadRequest(
+            "GET operations cannot use the source parameter. Use POST instead.".to_string()
         ));
     }
 
-    // For now, return an error as viewReference is not yet implemented
-    // In a real implementation, this would load the ViewDefinition using the reference
-    Err(ServerError::NotImplemented(
-        "viewReference parameter is not yet supported. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.".to_string(),
-    ))
-}
-
-/// Handler for GET /ViewDefinition/{id}/$run - executes a ViewDefinition by ID
-///
-/// This endpoint allows executing a stored ViewDefinition by its identifier.
-/// 
-/// # Arguments
-/// * `view_definition_id` - The ID of the ViewDefinition to execute
-/// * `params` - Query parameters for filtering and formatting
-/// * `headers` - HTTP headers including Accept for content negotiation
-///
-/// # Returns
-/// * `Ok(Response)` - Transformed data in requested format (when implemented)
-/// * `Err(ServerError::NotImplemented)` - Currently not implemented
-///
-/// # Future Implementation
-/// When ViewDefinition storage is implemented, this handler will:
-/// 1. Retrieve the ViewDefinition from storage by ID
-/// 2. Validate query parameters
-/// 3. Execute the transformation with provided resources
-/// 4. Apply filtering and pagination
-/// 5. Return results in the requested format
-pub async fn run_view_definition_by_id_handler(
-    Path(view_definition_id): Path<String>,
-    Query(params): Query<RunQueryParams>,
-    headers: HeaderMap,
-) -> ServerResult<Response> {
-    info!("Handling ViewDefinition/{}/$run request", view_definition_id);
-    debug!("Query params: {:?}", params);
-
-    // Validate and parse query parameters
+    // Validate and parse query parameters (only simple types)
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let _validated_params = validate_query_params(&params, accept_header)
-        .map_err(|e| ServerError::BadRequest(e))?;
+    let _validated_params =
+        validate_query_params(&params, accept_header).map_err(|e| ServerError::BadRequest(e))?;
 
-    // For now, return an error as we don't have a ViewDefinition repository
-    // In a real implementation, this would load the ViewDefinition from storage
-    Err(ServerError::NotImplemented(
-        format!("ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.", view_definition_id)
+    // For GET requests without a ViewDefinition, we cannot proceed
+    Err(ServerError::BadRequest(
+        "GET /ViewDefinition/$run requires a ViewDefinition to be provided. Since complex parameters cannot be used in GET requests, please use POST with viewResource or viewReference parameter.".to_string()
     ))
 }
 
@@ -235,7 +280,7 @@ pub async fn run_view_definition_by_id_handler(
 fn create_capability_statement() -> serde_json::Value {
     // Get the FHIR version string dynamically based on enabled features
     let fhir_version = get_fhir_version_string();
-    
+
     // Create a CapabilityStatement JSON that uses the correct FHIR version
     serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -258,50 +303,93 @@ fn create_capability_statement() -> serde_json::Value {
         "format": ["json", "xml"],
         "rest": [{
             "mode": "server",
-            "resource": [{
-                "type": "ViewDefinition",
-                "operation": [{
-                    "name": "run",
-                    "definition": "http://sql-on-fhir.org/OperationDefinition/ViewDefinition-run",
-                    "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format"
-                }]
-            }],
             "operation": [{
                 "name": "run",
                 "definition": "http://sql-on-fhir.org/OperationDefinition/ViewDefinition-run",
-                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats."
+                "documentation": "Execute a ViewDefinition to transform FHIR resources into tabular format. Supports CSV, JSON, and NDJSON output formats. This is a type-level operation invoked at /ViewDefinition/$run"
             }]
         }]
     })
 }
 
+/// Resolve a ViewDefinition from a reference
+///
+/// This function implements the reference resolution algorithm described in the
+/// SQL-on-FHIR specification for the viewReference parameter:
+///
+/// 1. If the reference is a relative URL, resolve it on the server side
+/// 2. If the reference is an absolute URL with a canonical URL, look up in artifact registry
+/// 3. Otherwise, try to load the ViewDefinition from the provided absolute URL
+///
+/// # Arguments
+/// * `reference` - The reference string (e.g., "ViewDefinition/123", canonical URL, or absolute URL)
+///
+/// # Returns
+/// * `Ok(SofViewDefinition)` - Successfully resolved ViewDefinition
+/// * `Err(ServerError)` - Resolution failed
+#[allow(dead_code)]
+fn resolve_view_reference(reference: &str) -> ServerResult<SofViewDefinition> {
+    info!("Resolving ViewDefinition reference: {}", reference);
+
+    // Check if it's a relative reference (e.g., "ViewDefinition/123")
+    if !reference.starts_with("http://") && !reference.starts_with("https://") {
+        // This would be a server-relative reference
+        // Since we're stateless, we can't resolve this
+        return Err(ServerError::NotImplemented(format!(
+            "Relative ViewDefinition references are not supported in this stateless implementation: {}",
+            reference
+        )));
+    }
+
+    // Check if it's a canonical URL (contains |version)
+    if reference.contains('|') {
+        // This would require an artifact registry lookup
+        return Err(ServerError::NotImplemented(format!(
+            "Canonical URL references with versions are not yet supported: {}",
+            reference
+        )));
+    }
+
+    // Try to load from absolute URL
+    // For now, we don't support loading from external URLs
+    Err(ServerError::NotImplemented(format!(
+        "Loading ViewDefinitions from external URLs is not yet implemented: {}",
+        reference
+    )))
+}
+
 /// Parse a ViewDefinition from JSON
 fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinition> {
     let newest_version = get_newest_enabled_fhir_version();
-    
+
     match newest_version {
         #[cfg(feature = "R4")]
         fhir::FhirVersion::R4 => {
-            let view_def: fhir::r4::ViewDefinition = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e)))?;
+            let view_def: fhir::r4::ViewDefinition = serde_json::from_value(json).map_err(|e| {
+                ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
+            })?;
             Ok(SofViewDefinition::R4(view_def))
         }
         #[cfg(feature = "R4B")]
         fhir::FhirVersion::R4B => {
-            let view_def: fhir::r4b::ViewDefinition = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R4B ViewDefinition: {}", e)))?;
+            let view_def: fhir::r4b::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid R4B ViewDefinition: {}", e))
+                })?;
             Ok(SofViewDefinition::R4B(view_def))
         }
         #[cfg(feature = "R5")]
         fhir::FhirVersion::R5 => {
-            let view_def: fhir::r5::ViewDefinition = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e)))?;
+            let view_def: fhir::r5::ViewDefinition = serde_json::from_value(json).map_err(|e| {
+                ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
+            })?;
             Ok(SofViewDefinition::R5(view_def))
         }
         #[cfg(feature = "R6")]
         fhir::FhirVersion::R6 => {
-            let view_def: fhir::r6::ViewDefinition = serde_json::from_value(json)
-                .map_err(|e| ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e)))?;
+            let view_def: fhir::r6::ViewDefinition = serde_json::from_value(json).map_err(|e| {
+                ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
+            })?;
             Ok(SofViewDefinition::R6(view_def))
         }
     }
@@ -321,9 +409,9 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
             "Missing resourceType field".to_string(),
         ));
     }
-    
+
     let newest_version = get_newest_enabled_fhir_version();
-    
+
     match newest_version {
         #[cfg(feature = "R4")]
         fhir::FhirVersion::R4 => {
@@ -355,7 +443,7 @@ fn parse_parameters(json: serde_json::Value) -> ServerResult<RunParameters> {
 /// Create a Bundle from a list of resources
 fn create_bundle_from_resources(resources: Vec<serde_json::Value>) -> ServerResult<SofBundle> {
     let newest_version = get_newest_enabled_fhir_version();
-    
+
     let bundle_json = serde_json::json!({
         "resourceType": "Bundle",
         "type": "collection",
@@ -365,33 +453,126 @@ fn create_bundle_from_resources(resources: Vec<serde_json::Value>) -> ServerResu
             })
         }).collect::<Vec<_>>()
     });
-    
+
     match newest_version {
         #[cfg(feature = "R4")]
         fhir::FhirVersion::R4 => {
-            let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)
-                .map_err(|e| ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e)))?;
+            let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R4(bundle))
         }
         #[cfg(feature = "R4B")]
         fhir::FhirVersion::R4B => {
-            let bundle: fhir::r4b::Bundle = serde_json::from_value(bundle_json)
-                .map_err(|e| ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e)))?;
+            let bundle: fhir::r4b::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
+            })?;
             Ok(SofBundle::R4B(bundle))
         }
         #[cfg(feature = "R5")]
         fhir::FhirVersion::R5 => {
-            let bundle: fhir::r5::Bundle = serde_json::from_value(bundle_json)
-                .map_err(|e| ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e)))?;
+            let bundle: fhir::r5::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R5(bundle))
         }
         #[cfg(feature = "R6")]
         fhir::FhirVersion::R6 => {
-            let bundle: fhir::r6::Bundle = serde_json::from_value(bundle_json)
-                .map_err(|e| ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e)))?;
+            let bundle: fhir::r6::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
+                ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
+            })?;
             Ok(SofBundle::R6(bundle))
         }
     }
+}
+
+/// Filter resources by patient and/or group reference
+///
+/// This function implements the patient and group filtering as specified in the
+/// SQL-on-FHIR $run operation:
+///
+/// - **Patient filter**: Returns only resources in the patient compartment of specified patients
+/// - **Group filter**: Returns only resources that are members of the specified group
+///
+/// # Arguments
+/// * `resources` - List of FHIR resources to filter
+/// * `patient_ref` - Optional patient reference (e.g., "Patient/123")
+/// * `group_ref` - Optional group reference (e.g., "Group/456")
+///
+/// # Returns
+/// * `Ok(Vec<serde_json::Value>)` - Filtered list of resources
+/// * `Err(ServerError)` - If filtering fails
+fn filter_resources_by_patient_and_group(
+    resources: Vec<serde_json::Value>,
+    patient_ref: Option<&str>,
+    group_ref: Option<&str>,
+) -> ServerResult<Vec<serde_json::Value>> {
+    let mut filtered = resources;
+
+    // Apply patient filter if provided
+    if let Some(patient_ref) = patient_ref {
+        debug!("Filtering resources by patient: {}", patient_ref);
+        filtered = filtered
+            .into_iter()
+            .filter(|resource| {
+                // Check if resource belongs to patient compartment
+                // This is a simplified implementation - in production, this would
+                // need to check all patient compartment definitions
+                if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                    match resource_type {
+                        "Patient" => {
+                            // Check if this is the patient themselves
+                            if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                                return format!("Patient/{}", id) == patient_ref;
+                            }
+                        }
+                        "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
+                            // Check subject reference
+                            if let Some(subject) = resource.get("subject") {
+                                if let Some(reference) =
+                                    subject.get("reference").and_then(|r| r.as_str())
+                                {
+                                    return reference == patient_ref;
+                                }
+                            }
+                        }
+                        "Encounter" => {
+                            // Check subject reference
+                            if let Some(subject) = resource.get("subject") {
+                                if let Some(reference) =
+                                    subject.get("reference").and_then(|r| r.as_str())
+                                {
+                                    return reference == patient_ref;
+                                }
+                            }
+                        }
+                        _ => {
+                            // For other resource types, check if they have a patient reference
+                            if let Some(patient) = resource.get("patient") {
+                                if let Some(reference) =
+                                    patient.get("reference").and_then(|r| r.as_str())
+                                {
+                                    return reference == patient_ref;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            })
+            .collect();
+    }
+
+    // Apply group filter if provided
+    if let Some(_group_ref) = group_ref {
+        // Group filtering would require loading the Group resource and checking membership
+        // This is not implemented in this stateless server
+        return Err(ServerError::NotImplemented(
+            "Group filtering is not yet implemented".to_string(),
+        ));
+    }
+
+    Ok(filtered)
 }
 
 /// Simple health check endpoint
@@ -416,15 +597,99 @@ mod tests {
         assert_eq!(cap_stmt["kind"], "instance");
         assert_eq!(cap_stmt["fhirVersion"], get_fhir_version_string());
 
-        // Check that ViewDefinition resource is listed
-        let resources = &cap_stmt["rest"][0]["resource"];
-        assert!(
-            resources
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| { r["type"] == "ViewDefinition" })
-        );
+        // Check that operation is listed at rest level (type-level operation)
+        let operations = &cap_stmt["rest"][0]["operation"];
+        assert!(operations.as_array().is_some());
+        assert_eq!(operations[0]["name"], "run");
+    }
+
+    #[test]
+    fn test_filter_resources_by_patient() {
+        let resources = vec![
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "123"
+            }),
+            serde_json::json!({
+                "resourceType": "Patient",
+                "id": "456"
+            }),
+            serde_json::json!({
+                "resourceType": "Observation",
+                "id": "obs1",
+                "subject": {
+                    "reference": "Patient/123"
+                }
+            }),
+            serde_json::json!({
+                "resourceType": "Observation",
+                "id": "obs2",
+                "subject": {
+                    "reference": "Patient/456"
+                }
+            }),
+        ];
+
+        let filtered =
+            filter_resources_by_patient_and_group(resources, Some("Patient/123"), None).unwrap();
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["id"], "123");
+        assert_eq!(filtered[1]["id"], "obs1");
+    }
+
+    #[test]
+    fn test_filter_resources_with_group_returns_error() {
+        let resources = vec![serde_json::json!({
+            "resourceType": "Patient",
+            "id": "123"
+        })];
+
+        let result = filter_resources_by_patient_and_group(resources, None, Some("Group/test"));
+
+        assert!(result.is_err());
+        if let Err(ServerError::NotImplemented(msg)) = result {
+            assert!(msg.contains("Group filtering is not yet implemented"));
+        } else {
+            panic!("Expected NotImplemented error");
+        }
+    }
+
+    #[test]
+    fn test_resolve_view_reference_relative() {
+        let result = resolve_view_reference("ViewDefinition/123");
+
+        assert!(result.is_err());
+        if let Err(ServerError::NotImplemented(msg)) = result {
+            assert!(msg.contains("Relative ViewDefinition references are not supported"));
+        } else {
+            panic!("Expected NotImplemented error");
+        }
+    }
+
+    #[test]
+    fn test_resolve_view_reference_canonical() {
+        let result = resolve_view_reference("http://example.org/ViewDefinition/test|1.0.0");
+
+        assert!(result.is_err());
+        if let Err(ServerError::NotImplemented(msg)) = result {
+            assert!(msg.contains("Canonical URL references with versions are not yet supported"));
+        } else {
+            panic!("Expected NotImplemented error");
+        }
+    }
+
+    #[test]
+    fn test_resolve_view_reference_absolute() {
+        let result = resolve_view_reference("http://example.org/ViewDefinition/123");
+
+        assert!(result.is_err());
+        if let Err(ServerError::NotImplemented(msg)) = result {
+            assert!(
+                msg.contains("Loading ViewDefinitions from external URLs is not yet implemented")
+            );
+        } else {
+            panic!("Expected NotImplemented error");
+        }
     }
 }
-

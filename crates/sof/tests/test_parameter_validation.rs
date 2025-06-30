@@ -98,9 +98,9 @@ fn parse_content_type(
     // Handle CSV header parameter
     let content_type_str = if content_type_str == "text/csv" {
         match header_param {
-            Some("absent") => "text/csv",
-            Some("present") | None => "text/csv;header=present",
-            _ => return Err(format!("Invalid _header parameter: {}", header_param.unwrap())),
+            Some("false") => "text/csv;header=false",
+            Some("true") | None => "text/csv;header=true",
+            _ => return Err(format!("Invalid header parameter: {}", header_param.unwrap())),
         }
     } else {
         content_type_str
@@ -111,6 +111,7 @@ fn parse_content_type(
 }
 
 /// Mock function to test result filtering
+#[allow(dead_code)]
 fn apply_result_filtering(
     output_data: Vec<u8>,
     params: &ValidatedRunParams,
@@ -355,12 +356,12 @@ fn test_parse_content_type_format_override() {
 #[test]
 fn test_parse_content_type_csv_header_control() {
     assert_eq!(
-        parse_content_type(None, Some("text/csv"), Some("absent")).unwrap(),
+        parse_content_type(None, Some("text/csv"), Some("false")).unwrap(),
         ContentType::Csv
     );
     
     assert_eq!(
-        parse_content_type(None, Some("text/csv"), Some("present")).unwrap(),
+        parse_content_type(None, Some("text/csv"), Some("true")).unwrap(),
         ContentType::CsvWithHeader
     );
 }

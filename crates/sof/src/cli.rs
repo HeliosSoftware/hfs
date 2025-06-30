@@ -1,6 +1,7 @@
 //! # SQL-on-FHIR CLI Tool
 //!
-//! This module provides a command-line interface for the SQL-on-FHIR implementation,
+//! This module provides a command-line interface for the [SQL-on-FHIR
+//! specification](https://sql-on-fhir.org/ig/latest),
 //! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
 //! and output the results in various formats.
 //!
@@ -9,6 +10,20 @@
 //! The CLI tool accepts FHIR ViewDefinition and Bundle resources as input (either from
 //! files or stdin) and applies the SQL-on-FHIR transformation to produce structured
 //! output in formats like CSV, JSON, or other supported content types.
+//!
+//! ## Command Line Options
+//!
+//! ```text
+//! -v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
+//! -b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
+//! -f, --format <FORMAT>          Output format [default: csv]
+//!     --no-headers               Exclude CSV headers (only for CSV format)
+//! -o, --output <OUTPUT>          Output file path (defaults to stdout)
+//!     --fhir-version <VERSION>   FHIR version to use [default: R4] [possible values: R4*]
+//! -h, --help                     Print help
+//!
+//! * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
+//! ```
 //!
 //! ## Usage Examples
 //!
@@ -26,15 +41,20 @@
 //! ```bash
 //! sof-cli -v view_definition.json -b patient_bundle.json -f csv -o output.csv
 //! ```
-//! 
+//!
 //! ### CSV output without headers
 //! ```bash
 //! sof-cli -v view_definition.json -b patient_bundle.json -f csv --no-headers -o output.csv
 //! ```
 //!
-//! ### Using different FHIR versions
+//! ### Using stdin (ViewDefinition from stdin, Bundle from file)
 //! ```bash
-//! sof-cli -v view_definition.json -b patient_bundle.json --fhir-version R5
+//! cat view_definition.json | sof-cli --bundle patient_bundle.json
+//! ```
+//!
+//! ### JSON output format
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json -f json
 //! ```
 //!
 //! ## Input Requirements
@@ -51,18 +71,21 @@
 //!
 //! ## FHIR Version Support
 //!
-//! The CLI supports multiple FHIR versions through feature flags:
-//! - R4 (default)
-//! - R4B  
-//! - R5
-//! - R6
+//! The CLI defaults to FHIR R4. To use other FHIR versions, the crate must be 
+//! compiled with the corresponding feature flags:
+//! - R4 (default, always available)
+//! - R4B (requires `--features R4B` at compile time)
+//! - R5 (requires `--features R5` at compile time)
+//! - R6 (requires `--features R6` at compile time)
+//!
+//! When compiled with additional features, use `--fhir-version` to specify the version.
 
 use clap::Parser;
+use fhir::FhirVersion;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
-use fhir::FhirVersion;
 
 /// Command-line arguments for the SQL-on-FHIR CLI tool.
 ///
@@ -73,7 +96,7 @@ use fhir::FhirVersion;
 ///
 /// ```rust
 /// use clap::Parser;
-/// 
+///
 /// // Parse arguments from command line
 /// let args = Args::parse();
 /// ```

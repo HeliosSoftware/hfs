@@ -31,19 +31,34 @@ sof-cli --view patient-view.json --bundle patient-data.json --format csv --no-he
 # JSON output to file
 sof-cli -v observation-view.json -b lab-results.json -f json -o output.json
 
-# Use FHIR R5 and output NDJSON
-sof-cli --view viewdef.json --bundle data.json --fhir-version R5 --format ndjson
-
 # Read ViewDefinition from stdin, Bundle from file
-cat complex-view.json | sof-cli --bundle large-dataset.json --format csv
+cat view-definition.json | sof-cli --bundle patient-data.json --format csv
+
+# Read Bundle from stdin, ViewDefinition from file
+cat patient-bundle.json | sof-cli --view view-definition.json --format json
 ```
 
 #### CLI Features
 
-- **Flexible Input**: Read ViewDefinitions and Bundles from files or stdin
-- **FHIR Version Control**: Specify R4, R4B, R5, or R6 for proper parsing
-- **Output Options**: Multiple formats with configurable CSV headers
+- **Flexible Input**: Read ViewDefinitions and Bundles from files or stdin (but not both from stdin)
+- **Output Formats**: CSV (with/without headers), JSON, and other supported formats
+- **Output Options**: Write to stdout (default) or specified file with `-o`
+- **FHIR Version Support**: R4 by default; other versions (R4B, R5, R6) require compilation with feature flags
 - **Error Handling**: Clear, actionable error messages for debugging
+
+#### Command Line Options
+
+```
+-v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
+-b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
+-f, --format <FORMAT>          Output format [default: csv]
+    --no-headers               Exclude CSV headers (only for CSV format)
+-o, --output <OUTPUT>          Output file path (defaults to stdout)
+    --fhir-version <VERSION>   FHIR version to use [default: R4] [possible values: R4*]
+-h, --help                     Print help
+
+* Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
+```
 
 ### `sof-server` - HTTP Server
 
@@ -220,7 +235,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv" \
   -d '{...}'
 
 # CSV output without headers
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=false" \
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&header=false" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
@@ -233,34 +248,59 @@ curl -X POST http://localhost:8080/ViewDefinition/$run \
 
 #### Parameters
 
-The `$run` operation accepts a FHIR Parameters resource with:
+The `$run` operation accepts parameters either as query parameters or in a FHIR Parameters resource.
+All parameters follow the SQL-on-FHIR specification order.
 
-- **viewResource**: The ViewDefinition to execute (inline)
-- **viewReference**: Reference to a ViewDefinition (not yet supported)
-- **resource**: FHIR resources to transform (can be repeated)
-- **_format** or **format**: Output format as valueCode or valueString (overrides query params and Accept header)
-- **_header** or **header**: CSV header control as valueBoolean (overrides query params)
-  - `true` - Include headers (default)
-  - `false` - Exclude headers
+**Note on GET vs POST**: Per FHIR specification, GET operations cannot use complex datatypes. Therefore:
+- **GET requests**: Can only use simple parameters (_format, header, _count, _page, _since)
+- **POST requests**: Can use all parameters including complex types (viewReference, viewResource, patient, group, source, resource)
+
+Parameter table:
+
+| Name | Type | Use | Scope | Min | Max | Documentation |
+|------|------|-----|-------|-----|-----|---------------|
+| _format | code | in | type, instance | 1 | 1 | Output format - json, ndjson, csv, parquet |
+| header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
+| viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
+| viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
+| patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
+| group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
+| source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
+| _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
+| _page | integer | in | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. (1-based) |
+| _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
+| resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
 ##### Query Parameters
 
-The `$run` operation supports the following query parameters:
+All parameters except `viewReference`, `viewResource`, `patient`, `group`, `source` and `resource` can be provided as query parameters:
 
-- **_format**: Override output format (takes precedence over Accept header)
-  - `application/json` - JSON array output (default)
-  - `text/csv` - CSV output (includes headers by default)
-  - `application/ndjson` - Newline-delimited JSON
-- **_header**: Control CSV headers (only applies to CSV format)
+- **_format**: Output format (required if not in Accept header)
+  - `application/json` or `json` - JSON array output (default)
+  - `text/csv` or `csv` - CSV output
+  - `application/ndjson` or `ndjson` - Newline-delimited JSON
+- **header**: Control CSV headers (only applies to CSV format)
   - `true` - Include headers (default for CSV)
   - `false` - Exclude headers
-- **_count**: Limit the number of results (1-10000)
-  - Example: `_count=100`
-- **_page**: Page number for pagination (1-based)
-  - Example: `_page=2` (with `_count=100` returns results 101-200)
-- **_since**: Filter resources modified after this timestamp (RFC3339 format)
-  - Example: `_since=2023-01-01T00:00:00Z`
-  - Note: Currently validates format only; filtering by modification time requires resource metadata
+- **_count**: Limit results (1-10000)
+- **_page**: Page number (1-based)
+- **_since**: Filter by modification time (RFC3339 format)
+
+##### Body Parameters
+
+For POST requests, parameters can be provided in a FHIR Parameters resource:
+
+- **_format**: As valueCode or valueString (overrides query params and Accept header)
+- **header**: As valueBoolean (overrides query params)
+- **viewReference**: As valueReference (not yet supported)
+- **viewResource**: As resource (inline ViewDefinition)
+- **patient**: As valueReference
+- **group**: As valueReference (not yet supported)
+- **source**: As valueString (not yet supported)
+- **_count**: As valueInteger
+- **_page**: As valueInteger
+- **_since**: As valueInstant
+- **resource**: As resource (can be repeated)
 
 ##### Parameter Precedence
 
@@ -283,7 +323,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=100&_page=3" \
   -d '{...}'
 
 # CSV without headers, limited to 20 results
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&_header=false&_count=20" \
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&header=false&_count=20" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
@@ -293,7 +333,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv" \
   -d '{
     "resourceType": "Parameters",
     "parameter": [{
-      "name": "_header",
+      "name": "header",
       "valueBoolean": false
     }, {
       "name": "viewResource",
@@ -307,16 +347,34 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_since=2024-01-01T00:00:
   -d '{...}'
 ```
 
-##### GET Endpoint
+##### GET Endpoint - Limited by FHIR Specification
 
-The server also provides a GET endpoint for executing ViewDefinitions by ID:
+**Important**: Per the FHIR specification, GET operations can only use simple input parameters. Complex datatypes like Reference, Identifier, and Resource cannot be passed as URL parameters.
+
+The GET endpoint exists but has severe limitations:
 
 ```bash
-# GET /ViewDefinition/{id}/$run
-curl "http://localhost:8080/ViewDefinition/my-view-def/$run?_count=50&_format=json"
+# GET /ViewDefinition/$run - WILL FAIL due to FHIR constraints
+# Cannot use viewReference, patient, group parameters in GET
+curl "http://localhost:8080/ViewDefinition/$run?_format=json&_count=50"
 ```
 
-Note: This endpoint currently returns HTTP 501 Not Implemented as ViewDefinition storage/retrieval is not yet supported.
+**Supported GET parameters** (simple types only):
+- `_format` - Output format
+- `header` - CSV header control
+- `source` - Data source (not implemented)
+- `_count` - Result limit
+- `_page` - Page number
+- `_since` - Modification time filter
+
+**Unsupported GET parameters** (complex types - use POST instead):
+- `viewReference` - Reference type (not allowed in GET)
+- `patient` - Reference type (not allowed in GET)
+- `group` - Reference type (not allowed in GET)
+- `viewResource` - Resource type (only in POST body)
+- `resource` - Resource type (only in POST body)
+
+**Recommendation**: Always use POST for the $run operation as it supports all parameters.
 
 ## Core Features
 

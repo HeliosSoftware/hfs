@@ -308,11 +308,11 @@ async fn test_csv_header_parameter_with_non_csv_format() {
         }]
     });
     
-    // _header parameter should be ignored for non-CSV formats
+    // header parameter should be ignored for non-CSV formats
     let response = server
         .post("/ViewDefinition/$run")
         .add_query_param("_format", "application/json")
-        .add_query_param("_header", "absent")
+        .add_query_param("header", "absent")
         .json(&request_body)
         .await;
     

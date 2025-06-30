@@ -272,12 +272,14 @@ fn test_content_type_parsing() {
     // Test valid content types
     assert!(ContentType::from_string("application/json").is_ok());
     assert!(ContentType::from_string("text/csv").is_ok());
-    assert!(ContentType::from_string("text/csv;header=present").is_ok());
+    assert!(ContentType::from_string("text/csv;header=true").is_ok());
+    assert!(ContentType::from_string("text/csv;header=false").is_ok());
     assert!(ContentType::from_string("application/ndjson").is_ok());
     
     // Test that the parsed types match expected values
     assert_eq!(ContentType::from_string("application/json").unwrap(), ContentType::Json);
-    assert_eq!(ContentType::from_string("text/csv").unwrap(), ContentType::Csv);
-    assert_eq!(ContentType::from_string("text/csv;header=present").unwrap(), ContentType::CsvWithHeader);
+    assert_eq!(ContentType::from_string("text/csv").unwrap(), ContentType::CsvWithHeader);
+    assert_eq!(ContentType::from_string("text/csv;header=true").unwrap(), ContentType::CsvWithHeader);
+    assert_eq!(ContentType::from_string("text/csv;header=false").unwrap(), ContentType::Csv);
     assert_eq!(ContentType::from_string("application/ndjson").unwrap(), ContentType::NdJson);
 }

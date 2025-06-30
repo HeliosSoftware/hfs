@@ -140,7 +140,7 @@ async fn test_run_view_definition_csv_output() {
     let response = server
         .post("/ViewDefinition/$run")
         .add_query_param("_format", "text/csv")
-        .add_query_param("_header", "present")
+        .add_query_param("header", "present")
         .json(&request_body)
         .await;
     
@@ -151,7 +151,7 @@ async fn test_run_view_definition_csv_output() {
     let csv_text = response.text();
     let lines: Vec<&str> = csv_text.lines().collect();
     
-    assert_eq!(lines.len(), 2); // Header + 1 data row
+    assert_eq!(lines.len(), 2); // Column headers + 1 data row
     assert_eq!(lines[0], "id,name");
     assert!(lines[1].contains("123"));
     assert!(lines[1].contains("Doe"));
@@ -310,40 +310,40 @@ async fn test_run_view_definition_get_without_reference() {
     assert!(json["issue"][0]["details"]["text"]
         .as_str()
         .unwrap()
-        .contains("viewReference parameter is required"));
+        .contains("GET /ViewDefinition/$run requires a ViewDefinition"));
 }
 
 #[tokio::test]
 async fn test_run_view_definition_get_with_reference() {
     let server = common::test_server().await;
     
-    // GET request with viewReference (currently not implemented)
+    // GET request with viewReference (not allowed per FHIR spec)
     let response = server
         .get("/ViewDefinition/$run")
         .add_query_param("viewReference", "ViewDefinition/123")
         .add_query_param("_format", "application/json")
         .await;
     
-    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");
     assert!(json["issue"][0]["details"]["text"]
         .as_str()
         .unwrap()
-        .contains("viewReference parameter is not yet supported"));
+        .contains("GET operations cannot use complex parameters like viewReference"));
 }
 
 #[tokio::test]
 async fn test_run_view_definition_get_with_query_params() {
     let server = common::test_server().await;
     
-    // GET request with all query parameters
+    // GET request with complex parameters should fail
     let response = server
         .get("/ViewDefinition/$run")
         .add_query_param("viewReference", "ViewDefinition/my-view")
         .add_query_param("_format", "text/csv")
-        .add_query_param("_header", "present")
+        .add_query_param("header", "present")
         .add_query_param("_count", "100")
         .add_query_param("_page", "2")
         .add_query_param("_since", "2024-01-01T00:00:00Z")
@@ -352,8 +352,16 @@ async fn test_run_view_definition_get_with_query_params() {
         .add_query_param("source", "my-data-source")
         .await;
     
-    // Should fail with not implemented for now
-    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    // Should fail because GET cannot use complex parameters like viewReference
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    // The error should mention the first complex parameter encountered
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("viewReference"));
 }
 
 #[tokio::test]

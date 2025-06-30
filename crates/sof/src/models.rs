@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sof::{ContentType, SofParameters};
 use chrono::{DateTime, Utc};
+use tracing::debug;
 
 /// Query parameters for ViewDefinition/$run endpoint
 #[derive(Debug, Deserialize)]
@@ -15,7 +16,7 @@ pub struct RunQueryParams {
     pub format: Option<String>,
     
     /// Whether to include headers in CSV output
-    #[serde(rename = "_header")]
+    #[serde(rename = "header")]
     pub header: Option<String>,
     
     /// Limit number of results
@@ -114,7 +115,7 @@ pub fn validate_query_params(
         Some("true") => Some(true),
         Some("false") => Some(false),
         None => None,
-        Some(other) => return Err(format!("Invalid _header parameter value: {}. Must be 'true' or 'false'", other)),
+        Some(other) => return Err(format!("Invalid header parameter value: {}. Must be 'true' or 'false'", other)),
     };
     let format = parse_content_type(
         accept_header,
@@ -196,320 +197,167 @@ pub fn parse_content_type(
     ContentType::from_string(content_type_str)
 }
 
-/// Extract ViewDefinition and Bundle from Parameters
-pub fn extract_run_parameters(
-    params: RunParameters,
-) -> Result<(Option<serde_json::Value>, Option<Vec<serde_json::Value>>, Option<String>, Option<bool>), String> {
-    let mut view_definition = None;
-    let mut resources = Vec::new();
-    let mut format_param = None;
-    let mut header_param = None;
+/// Result type for parameter extraction
+#[derive(Debug, Default)]
+pub struct ExtractedParameters {
+    pub view_definition: Option<serde_json::Value>,
+    pub resources: Vec<serde_json::Value>,
+    pub format: Option<String>,
+    pub header: Option<bool>,
+    pub view_reference: Option<String>,
+    pub patient: Option<String>,
+    pub group: Option<String>,
+    pub source: Option<String>,
+}
+
+
+/// Helper function to process a single parameter in a version-independent way
+fn process_parameter(
+    name: &str,
+    param_json: serde_json::Value,
+    result: &mut ExtractedParameters,
+) -> Result<(), String> {
+    match name {
+        "viewResource" => {
+            if let Some(resource) = param_json.get("resource") {
+                result.view_definition = Some(resource.clone());
+            }
+        }
+        "viewReference" => {
+            // Check for valueReference first
+            if let Some(value_ref) = param_json.get("valueReference") {
+                if let Some(reference) = value_ref.get("reference") {
+                    if let Some(ref_str) = reference.as_str() {
+                        result.view_reference = Some(ref_str.to_string());
+                    }
+                }
+            } else if let Some(value_str) = param_json.get("valueString") {
+                if let Some(ref_str) = value_str.as_str() {
+                    result.view_reference = Some(ref_str.to_string());
+                }
+            }
+        }
+        "resource" => {
+            if let Some(resource) = param_json.get("resource") {
+                result.resources.push(resource.clone());
+            }
+        }
+        "patient" => {
+            // Check for valueReference first
+            if let Some(value_ref) = param_json.get("valueReference") {
+                if let Some(reference) = value_ref.get("reference") {
+                    if let Some(ref_str) = reference.as_str() {
+                        result.patient = Some(ref_str.to_string());
+                    }
+                }
+            } else if let Some(value_str) = param_json.get("valueString") {
+                if let Some(ref_str) = value_str.as_str() {
+                    result.patient = Some(ref_str.to_string());
+                }
+            }
+        }
+        "group" => {
+            // Check for valueReference first
+            if let Some(value_ref) = param_json.get("valueReference") {
+                if let Some(reference) = value_ref.get("reference") {
+                    if let Some(ref_str) = reference.as_str() {
+                        result.group = Some(ref_str.to_string());
+                    }
+                }
+            } else if let Some(value_str) = param_json.get("valueString") {
+                if let Some(ref_str) = value_str.as_str() {
+                    result.group = Some(ref_str.to_string());
+                }
+            }
+        }
+        "source" => {
+            if let Some(value_str) = param_json.get("valueString") {
+                if let Some(source_str) = value_str.as_str() {
+                    result.source = Some(source_str.to_string());
+                }
+            } else if let Some(value_uri) = param_json.get("valueUri") {
+                if let Some(source_str) = value_uri.as_str() {
+                    result.source = Some(source_str.to_string());
+                }
+            }
+        }
+        "_format" | "format" => {
+            if let Some(value_code) = param_json.get("valueCode") {
+                if let Some(format_str) = value_code.as_str() {
+                    result.format = Some(format_str.to_string());
+                }
+            } else if let Some(value_str) = param_json.get("valueString") {
+                if let Some(format_str) = value_str.as_str() {
+                    result.format = Some(format_str.to_string());
+                }
+            }
+        }
+        "header" => {
+            if let Some(value_bool) = param_json.get("valueBoolean") {
+                if let Some(bool_val) = value_bool.as_bool() {
+                    result.header = Some(bool_val);
+                } else {
+                    return Err("Header parameter must be a boolean value".to_string());
+                }
+            } else if param_json.get("valueString").is_some() 
+                   || param_json.get("valueCode").is_some() 
+                   || param_json.get("valueInteger").is_some() {
+                return Err("Header parameter must be a boolean value (use valueBoolean)".to_string());
+            }
+        }
+        _ => {
+            // Ignore unknown parameters
+            debug!("Ignoring unknown parameter: {}", name);
+        }
+    }
+    Ok(())
+}
+
+/// Extract all parameters from a Parameters resource in a version-independent way
+pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParameters, String> {
+    let mut result = ExtractedParameters::default();
     
-    // Extract parameters based on FHIR version - handle each version separately
-    match &params {
+    // Convert to JSON for version-independent processing
+    let params_json = match serde_json::to_value(&params) {
+        Ok(json) => json,
+        Err(e) => return Err(format!("Failed to serialize parameters: {}", e)),
+    };
+    
+    // The JSON structure after serialization wraps the actual Parameters in an enum variant
+    // We need to extract the actual Parameters object from the enum variant
+    let actual_params = match &params {
         #[cfg(feature = "R4")]
-        SofParameters::R4(p) => {
-            if let Some(param_list) = &p.parameter {
-                for param in param_list {
-                    if let Some(name_value) = &param.name.value {
-                        match name_value.as_str() {
-                            "viewResource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => view_definition = Some(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize viewResource: {}", e)),
-                                    }
-                                }
-                            }
-                            "viewReference" => {
-                                return Err("viewReference parameter is not yet supported".to_string());
-                            }
-                            "resource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => resources.push(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize resource: {}", e)),
-                                    }
-                                }
-                            }
-                            // TODO: Add support for other parameters
-                            "patient" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "group" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "source" => {
-                                // This specifies the data source
-                                // Will be implemented when we add source selection support
-                            }
-                            "_format" | "format" => {
-                                // Extract format parameter from the value choice type
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r4::ParametersParameterValue::Code(code) => {
-                                            if let Some(code_value) = &code.value {
-                                                format_param = Some(code_value.clone());
-                                            }
-                                        }
-                                        fhir::r4::ParametersParameterValue::String(string) => {
-                                            if let Some(string_value) = &string.value {
-                                                format_param = Some(string_value.clone());
-                                            }
-                                        }
-                                        _ => {} // Other value types not applicable for _format
-                                    }
-                                }
-                            }
-                            "_header" | "header" => {
-                                // Extract header parameter from the value choice type (boolean only)
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r4::ParametersParameterValue::Boolean(boolean) => {
-                                            if let Some(bool_value) = &boolean.value {
-                                                header_param = Some(*bool_value);
-                                            }
-                                        }
-                                        _ => return Err("Header parameter must be a boolean value".to_string()),
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        RunParameters::R4(_) => params_json.get("R4"),
         #[cfg(feature = "R4B")]
-        SofParameters::R4B(p) => {
-            if let Some(param_list) = &p.parameter {
-                for param in param_list {
-                    if let Some(name_value) = &param.name.value {
-                        match name_value.as_str() {
-                            "viewResource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => view_definition = Some(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize viewResource: {}", e)),
-                                    }
-                                }
-                            }
-                            "viewReference" => {
-                                return Err("viewReference parameter is not yet supported".to_string());
-                            }
-                            "resource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => resources.push(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize resource: {}", e)),
-                                    }
-                                }
-                            }
-                            // TODO: Add support for other parameters
-                            "patient" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "group" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "source" => {
-                                // This specifies the data source
-                                // Will be implemented when we add source selection support
-                            }
-                            "_format" | "format" => {
-                                // Extract format parameter from the value choice type
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r4b::ParametersParameterValue::Code(code) => {
-                                            if let Some(code_value) = &code.value {
-                                                format_param = Some(code_value.clone());
-                                            }
-                                        }
-                                        fhir::r4b::ParametersParameterValue::String(string) => {
-                                            if let Some(string_value) = &string.value {
-                                                format_param = Some(string_value.clone());
-                                            }
-                                        }
-                                        _ => {} // Other value types not applicable for _format
-                                    }
-                                }
-                            }
-                            "_header" | "header" => {
-                                // Extract header parameter from the value choice type (boolean only)
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r4b::ParametersParameterValue::Boolean(boolean) => {
-                                            if let Some(bool_value) = &boolean.value {
-                                                header_param = Some(*bool_value);
-                                            }
-                                        }
-                                        _ => return Err("Header parameter must be a boolean value".to_string()),
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        RunParameters::R4B(_) => params_json.get("R4B"),
         #[cfg(feature = "R5")]
-        SofParameters::R5(p) => {
-            if let Some(param_list) = &p.parameter {
-                for param in param_list {
-                    if let Some(name_value) = &param.name.value {
-                        match name_value.as_str() {
-                            "viewResource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => view_definition = Some(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize viewResource: {}", e)),
-                                    }
-                                }
-                            }
-                            "viewReference" => {
-                                return Err("viewReference parameter is not yet supported".to_string());
-                            }
-                            "resource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => resources.push(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize resource: {}", e)),
-                                    }
-                                }
-                            }
-                            // TODO: Add support for other parameters
-                            "patient" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "group" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "source" => {
-                                // This specifies the data source
-                                // Will be implemented when we add source selection support
-                            }
-                            "_format" | "format" => {
-                                // Extract format parameter from the value choice type
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r5::ParametersParameterValue::Code(code) => {
-                                            if let Some(code_value) = &code.value {
-                                                format_param = Some(code_value.clone());
-                                            }
-                                        }
-                                        fhir::r5::ParametersParameterValue::String(string) => {
-                                            if let Some(string_value) = &string.value {
-                                                format_param = Some(string_value.clone());
-                                            }
-                                        }
-                                        _ => {} // Other value types not applicable for _format
-                                    }
-                                }
-                            }
-                            "_header" | "header" => {
-                                // Extract header parameter from the value choice type (boolean only)
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r5::ParametersParameterValue::Boolean(boolean) => {
-                                            if let Some(bool_value) = &boolean.value {
-                                                header_param = Some(*bool_value);
-                                            }
-                                        }
-                                        _ => return Err("Header parameter must be a boolean value".to_string()),
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        RunParameters::R5(_) => params_json.get("R5"),
         #[cfg(feature = "R6")]
-        SofParameters::R6(p) => {
-            if let Some(param_list) = &p.parameter {
-                for param in param_list {
-                    if let Some(name_value) = &param.name.value {
-                        match name_value.as_str() {
-                            "viewResource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => view_definition = Some(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize viewResource: {}", e)),
-                                    }
-                                }
-                            }
-                            "viewReference" => {
-                                return Err("viewReference parameter is not yet supported".to_string());
-                            }
-                            "resource" => {
-                                if let Some(resource) = &param.resource {
-                                    match serde_json::to_value(resource) {
-                                        Ok(json_val) => resources.push(json_val),
-                                        Err(e) => return Err(format!("Failed to serialize resource: {}", e)),
-                                    }
-                                }
-                            }
-                            // TODO: Add support for other parameters
-                            "patient" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "group" => {
-                                // This is a filter parameter, not a resource parameter
-                                // Will be implemented when we add filtering support
-                            }
-                            "source" => {
-                                // This specifies the data source
-                                // Will be implemented when we add source selection support
-                            }
-                            "_format" | "format" => {
-                                // Extract format parameter from the value choice type
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r6::ParametersParameterValue::Code(code) => {
-                                            if let Some(code_value) = &code.value {
-                                                format_param = Some(code_value.clone());
-                                            }
-                                        }
-                                        fhir::r6::ParametersParameterValue::String(string) => {
-                                            if let Some(string_value) = &string.value {
-                                                format_param = Some(string_value.clone());
-                                            }
-                                        }
-                                        _ => {} // Other value types not applicable for _format
-                                    }
-                                }
-                            }
-                            "_header" | "header" => {
-                                // Extract header parameter from the value choice type (boolean only)
-                                if let Some(value) = &param.value {
-                                    match value {
-                                        fhir::r6::ParametersParameterValue::Boolean(boolean) => {
-                                            if let Some(bool_value) = &boolean.value {
-                                                header_param = Some(*bool_value);
-                                            }
-                                        }
-                                        _ => return Err("Header parameter must be a boolean value".to_string()),
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+        RunParameters::R6(_) => params_json.get("R6"),
+    }.unwrap_or(&params_json);
+    
+    // Extract parameter array
+    if let Some(param_array) = actual_params.get("parameter").and_then(|p| p.as_array()) {
+        for param in param_array {
+            // In the serialized FHIR structure, name is a complex type with a "value" field
+            let name = if let Some(name_obj) = param.get("name") {
+                if let Some(name_value) = name_obj.get("value") {
+                    name_value.as_str()
+                } else {
+                    // Try direct string access (for simpler test cases)
+                    name_obj.as_str()
                 }
+            } else {
+                None
+            };
+            
+            if let Some(name_str) = name {
+                process_parameter(name_str, param.clone(), &mut result)?;
             }
         }
     }
     
-    Ok((view_definition, if resources.is_empty() { None } else { Some(resources) }, format_param, header_param))
+    Ok(result)
 }
 
 /// Apply filtering to output data based on validated parameters
@@ -867,5 +715,132 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["id"], "1");
         assert_eq!(parsed[1]["id"], "2");
+    }
+    
+    #[test]
+    fn test_extract_viewreference_parameter() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewReference",
+                "valueReference": {
+                    "reference": "ViewDefinition/123"
+                }
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+            
+            assert_eq!(extracted.view_reference, Some("ViewDefinition/123".to_string()));
+        }
+    }
+    
+    #[test]
+    fn test_extract_patient_parameter() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "patient",
+                "valueReference": {
+                    "reference": "Patient/456"
+                }
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+            
+            assert_eq!(extracted.patient, Some("Patient/456".to_string()));
+        }
+    }
+    
+    #[test]
+    fn test_extract_group_parameter() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "group",
+                "valueString": "Group/my-group"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+            
+            assert_eq!(extracted.group, Some("Group/my-group".to_string()));
+        }
+    }
+    
+    #[test]
+    fn test_extract_source_parameter() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "source",
+                "valueString": "s3://bucket/path"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+            
+            assert_eq!(extracted.source, Some("s3://bucket/path".to_string()));
+        }
+    }
+    
+    #[test]
+    fn test_extract_multiple_parameters() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {
+                    "name": "viewResource",
+                    "resource": {
+                        "resourceType": "ViewDefinition",
+                        "status": "active",
+                        "resource": "Patient"
+                    }
+                },
+                {
+                    "name": "patient",
+                    "valueReference": {
+                        "reference": "Patient/123"
+                    }
+                },
+                {
+                    "name": "_format",
+                    "valueCode": "csv"
+                },
+                {
+                    "name": "header", 
+                    "valueBoolean": false
+                }
+            ]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+            
+            assert!(extracted.view_definition.is_some());
+            assert_eq!(extracted.patient, Some("Patient/123".to_string()));
+            assert_eq!(extracted.format, Some("csv".to_string()));
+            assert_eq!(extracted.header, Some(false));
+        }
     }
 }

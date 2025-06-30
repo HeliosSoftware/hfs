@@ -277,10 +277,10 @@ async fn test_format_parameter_with_csv_header_control() {
         ]
     });
     
-    // Test with _header=false query parameter
+    // Test with header=false query parameter
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_header", "false")
+        .add_query_param("header", "false")
         .json(&request_body)
         .await;
     
@@ -294,7 +294,7 @@ async fn test_format_parameter_with_csv_header_control() {
     // Should have only 1 line (no header)
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("test"));
-    assert!(!lines[0].contains("id"), "Header should not be present when _header=false");
+    assert!(!lines[0].contains("id"), "Header should not be present when header=false");
 }
 
 #[tokio::test]
@@ -327,7 +327,7 @@ async fn test_invalid_format_parameter_in_body() {
         .json(&request_body)
         .await;
     
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status_code(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     
     let json: serde_json::Value = response.json();
     assert_eq!(json["resourceType"], "OperationOutcome");

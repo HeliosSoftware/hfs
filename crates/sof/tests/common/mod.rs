@@ -126,10 +126,17 @@ async fn run_view_definition_handler(
                         format_from_body = Some(value_string.to_string());
                     }
                 }
-                Some("_header") | Some("header") => {
+                Some("header") => {
                     // Extract header from valueBoolean
                     if let Some(value_bool) = param["valueBoolean"].as_bool() {
                         header_from_body = Some(value_bool);
+                    } else if param.get("valueString").is_some() 
+                           || param.get("valueCode").is_some() 
+                           || param.get("valueInteger").is_some() {
+                        return error_response(
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "Header parameter must be a boolean value (use valueBoolean)",
+                        );
                     }
                 }
                 _ => {}
@@ -159,7 +166,7 @@ async fn run_view_definition_handler(
     let header_param = if let Some(header_bool) = header_from_body {
         Some(header_bool)
     } else {
-        match params.get("_header").map(|s| s.as_str()) {
+        match params.get("header").map(|s| s.as_str()) {
             Some("true") => Some(true),
             Some("false") => Some(false),
             _ => None,
@@ -300,18 +307,37 @@ async fn run_view_definition_get_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     _headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    // Check for required viewReference parameter
-    if !params.contains_key("viewReference") {
+    // Per FHIR spec, GET operations cannot use complex parameters
+    // Validate that no complex parameters are provided
+    if params.contains_key("viewReference") {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "viewReference parameter is required for GET requests",
+            "GET operations cannot use complex parameters like viewReference. Use POST instead.",
+        );
+    }
+    if params.contains_key("patient") {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "GET operations cannot use complex parameters like patient. Use POST instead.",
+        );
+    }
+    if params.contains_key("group") {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "GET operations cannot use complex parameters like group. Use POST instead.",
+        );
+    }
+    if params.contains_key("source") {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "GET operations cannot use the source parameter. Use POST instead.",
         );
     }
 
-    // For now, return not implemented
+    // For GET requests without a ViewDefinition, we cannot proceed
     error_response(
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        "viewReference parameter is not yet supported. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.",
+        axum::http::StatusCode::BAD_REQUEST,
+        "GET /ViewDefinition/$run requires a ViewDefinition to be provided. Since complex parameters cannot be used in GET requests, please use POST with viewResource or viewReference parameter.",
     )
 }
 

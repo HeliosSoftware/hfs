@@ -1,4 +1,4 @@
-//! Tests for _header/header parameter in the request body
+//! Tests for header parameter in the request body
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -13,7 +13,7 @@ async fn test_header_parameter_boolean_true() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "_header",
+                "name": "header",
                 "valueBoolean": true
             },
             {
@@ -56,7 +56,7 @@ async fn test_header_parameter_boolean_true() {
     let csv_text = response.text();
     let lines: Vec<&str> = csv_text.lines().collect();
     
-    // Should have header when valueBoolean is true
+    // Should have column headers when valueBoolean is true
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("id") && lines[0].contains("gender"));
     assert!(lines[1].contains("test-1") && lines[1].contains("male"));
@@ -113,9 +113,9 @@ async fn test_header_parameter_boolean_false() {
     let csv_text = response.text();
     let lines: Vec<&str> = csv_text.lines().collect();
     
-    // Should NOT have header when valueBoolean is false
+    // Should NOT have column headers when valueBoolean is false
     assert_eq!(lines.len(), 1);
-    assert!(!lines[0].contains("id,birthDate")); // No header row
+    assert!(!lines[0].contains("id,birthDate")); // No column header row
     assert!(lines[0].contains("test-2") && lines[0].contains("1990-01-01"));
 }
 
@@ -127,7 +127,7 @@ async fn test_header_parameter_overrides_query() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "_header",
+                "name": "header",
                 "valueBoolean": false  // Body says no header
             },
             {
@@ -160,7 +160,7 @@ async fn test_header_parameter_overrides_query() {
     // Query parameter says true, but body should override
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_header", "true")
+        .add_query_param("header", "true")
         .json(&request_body)
         .await;
     
@@ -171,7 +171,7 @@ async fn test_header_parameter_overrides_query() {
     
     // Body parameter (false) should override query parameter (true)
     assert_eq!(lines.len(), 1);
-    assert!(!lines[0].contains("id")); // No header
+    assert!(!lines[0].contains("id")); // No column headers
     assert!(lines[0].contains("test-3"));
 }
 
@@ -183,7 +183,7 @@ async fn test_header_parameter_without_format() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "_header",
+                "name": "header",
                 "valueBoolean": true
             },
             {
@@ -215,7 +215,7 @@ async fn test_header_parameter_without_format() {
         .json(&request_body)
         .await;
     
-    // Header parameter only applies to CSV, should get error with JSON format
+    // header parameter only applies to CSV, should get error with JSON format
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     
     let json: serde_json::Value = response.json();
@@ -234,7 +234,7 @@ async fn test_header_parameter_with_csv_accept() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "_header",
+                "name": "header",
                 "valueBoolean": false
             },
             {
@@ -273,7 +273,7 @@ async fn test_header_parameter_with_csv_accept() {
     let csv_text = response.text();
     let lines: Vec<&str> = csv_text.lines().collect();
     
-    // Header parameter false should remove headers even with CSV accept
+    // header parameter false should remove column headers even with CSV accept
     assert_eq!(lines.len(), 1);
     assert!(!lines[0].contains("id"));
     assert!(lines[0].contains("test-5"));
@@ -287,7 +287,7 @@ async fn test_invalid_header_parameter_type() {
         "resourceType": "Parameters",
         "parameter": [
             {
-                "name": "_header",
+                "name": "header",
                 "valueString": "yes"  // Should be boolean, not string
             },
             {
@@ -323,9 +323,16 @@ async fn test_invalid_header_parameter_type() {
         .await;
     
     // Should get bad request for non-boolean header value
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-    
+    let status = response.status_code();
     let json: serde_json::Value = response.json();
+    
+    if status != StatusCode::BAD_REQUEST {
+        // Debug output to understand what happened
+        eprintln!("Unexpected response status: {}", status);
+        eprintln!("Response body: {}", serde_json::to_string_pretty(&json).unwrap());
+    }
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    
     assert_eq!(json["resourceType"], "OperationOutcome");
     assert!(json["issue"][0]["details"]["text"]
         .as_str()
@@ -345,7 +352,7 @@ async fn test_both_format_and_header_in_body() {
                 "valueCode": "text/csv"
             },
             {
-                "name": "_header",
+                "name": "header",
                 "valueBoolean": true
             },
             {
