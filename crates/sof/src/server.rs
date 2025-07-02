@@ -26,19 +26,20 @@
 //! POST /ViewDefinition/$run
 //!   Body: Parameters resource containing ViewDefinition and data
 //!   Query Parameters (in specification order):
-//!     _format: Output format - json, ndjson, csv, parquet
+//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
 //!     header: CSV header control - true (default), false
+//!     source: Data source (type: string) - Not yet supported
 //!     _count: Limits the number of results (1-10000)
 //!     _page: Page number for paginated results (1-based)
 //!     _since: Return resources modified after this time (RFC3339)
 //!   Body Parameters (in FHIR Parameters resource):
 //!     _format: Output format (type: code)
 //!     header: CSV header control (type: boolean)
-//!     viewReference: Reference(s) to ViewDefinition(s) (type: Reference)
+//!     viewReference: Reference(s) to ViewDefinition(s) (type: Reference) - Not yet supported
 //!     viewResource: ViewDefinition(s) to use (type: ViewDefinition)
 //!     patient: Filter by patient (type: Reference)
 //!     group: Filter by group (type: Reference)
-//!     source: Data source (type: string)
+//!     source: Data source (type: string) - Not yet supported
 //!     _count: Result limit (type: integer)
 //!     _page: Page number (type: integer)
 //!     _since: Modification time filter (type: instant)
@@ -50,14 +51,16 @@
 //!   This endpoint is limited and typically requires POST for practical use.
 //!   
 //!   Supported Query Parameters (simple types only):
-//!     _format: Output format - json, ndjson, csv, parquet
+//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
 //!     header: CSV header control - true (default), false
+//!     source: Data source (type: string) - Not yet supported
 //!     _count: Limits the number of results (1-10000)
 //!     _page: Page number for paginated results (1-based)
 //!     _since: Return resources modified after this time (RFC3339)
 //!   
-//!   Unsupported Parameters (complex types - use POST instead):
+//!   Unsupported Parameters in GET (complex types - use POST instead):
 //!     viewReference: Cannot pass Reference types in GET
+//!     viewResource: Cannot pass a FHIR resource in GET
 //!     patient: Cannot pass Reference types in GET
 //!     group: Cannot pass Reference types in GET
 //!   
@@ -437,21 +440,23 @@ mod tests {
         let config = ServerConfig::default();
         let app = create_app_with_config(&config);
         let server = TestServer::new(app).unwrap();
-        
+
         let response = server
             .get("/ViewDefinition/$run")
             .add_query_param("source", "my-data-source")
             .add_query_param("_format", "json")
             .await;
-        
+
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-        
+
         let json: serde_json::Value = response.json();
         assert_eq!(json["resourceType"], "OperationOutcome");
-        assert!(json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("GET operations cannot use the source parameter"));
+        assert!(
+            json["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("GET operations cannot use the source parameter")
+        );
     }
 
     #[tokio::test]
@@ -467,10 +472,12 @@ mod tests {
             .await;
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
         let json: serde_json::Value = response.json();
-        assert!(json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("viewReference"));
+        assert!(
+            json["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("viewReference")
+        );
 
         // Test patient
         let server = TestServer::new(app.clone()).unwrap();
@@ -480,10 +487,12 @@ mod tests {
             .await;
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
         let json: serde_json::Value = response.json();
-        assert!(json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("patient"));
+        assert!(
+            json["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("patient")
+        );
 
         // Test group
         let server = TestServer::new(app.clone()).unwrap();
@@ -493,10 +502,12 @@ mod tests {
             .await;
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
         let json: serde_json::Value = response.json();
-        assert!(json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("group"));
+        assert!(
+            json["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("group")
+        );
 
         // Test source
         let server = TestServer::new(app.clone()).unwrap();
@@ -506,9 +517,11 @@ mod tests {
             .await;
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
         let json: serde_json::Value = response.json();
-        assert!(json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("source"));
+        assert!(
+            json["issue"][0]["details"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("source")
+        );
     }
 }

@@ -208,6 +208,8 @@ pub struct ExtractedParameters {
     pub patient: Option<String>,
     pub group: Option<String>,
     pub source: Option<String>,
+    pub count: Option<u32>,
+    pub page: Option<u32>,
 }
 
 
@@ -237,7 +239,7 @@ fn process_parameter(
                 }
             }
         }
-        "resource" => {
+        "resource" | "dataResource" => {
             if let Some(resource) = param_json.get("resource") {
                 result.resources.push(resource.clone());
             }
@@ -303,6 +305,42 @@ fn process_parameter(
                    || param_json.get("valueCode").is_some() 
                    || param_json.get("valueInteger").is_some() {
                 return Err("Header parameter must be a boolean value (use valueBoolean)".to_string());
+            }
+        }
+        "_count" => {
+            // Handle both valueInteger and valuePositiveInt
+            if let Some(value_int) = param_json.get("valueInteger") {
+                if let Some(int_val) = value_int.as_i64() {
+                    if int_val <= 0 {
+                        return Err("_count parameter must be greater than 0".to_string());
+                    }
+                    if int_val > 10000 {
+                        return Err("_count parameter cannot exceed 10000".to_string());
+                    }
+                    result.count = Some(int_val as u32);
+                }
+            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
+                if let Some(int_val) = value_pos_int.as_u64() {
+                    if int_val > 10000 {
+                        return Err("_count parameter cannot exceed 10000".to_string());
+                    }
+                    result.count = Some(int_val as u32);
+                }
+            }
+        }
+        "_page" => {
+            // Handle both valueInteger and valuePositiveInt
+            if let Some(value_int) = param_json.get("valueInteger") {
+                if let Some(int_val) = value_int.as_i64() {
+                    if int_val <= 0 {
+                        return Err("_page parameter must be greater than 0".to_string());
+                    }
+                    result.page = Some(int_val as u32);
+                }
+            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
+                if let Some(int_val) = value_pos_int.as_u64() {
+                    result.page = Some(int_val as u32);
+                }
             }
         }
         _ => {

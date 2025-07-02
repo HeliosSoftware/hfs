@@ -106,6 +106,9 @@ async fn run_view_definition_handler(
     let mut resources = Vec::new();
     let mut format_from_body = None;
     let mut header_from_body = None;
+    let mut patient_filter = None;
+    let mut count_from_body = None;
+    let mut page_from_body = None;
     
     if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
@@ -115,7 +118,29 @@ async fn run_view_definition_handler(
                 }
                 Some("resource") => {
                     if let Some(resource) = param["resource"].as_object() {
-                        resources.push(serde_json::Value::Object(resource.clone()));
+                        // Check if it's a Bundle
+                        if resource.get("resourceType") == Some(&serde_json::json!("Bundle")) {
+                            // Extract resources from bundle
+                            if let Some(entries) = resource.get("entry").and_then(|e| e.as_array()) {
+                                for entry in entries {
+                                    if let Some(res) = entry.get("resource") {
+                                        resources.push(res.clone());
+                                    }
+                                }
+                            }
+                        } else {
+                            resources.push(serde_json::Value::Object(resource.clone()));
+                        }
+                    }
+                }
+                Some("patient") => {
+                    // Handle patient parameter
+                    if let Some(value_ref) = param.get("valueReference") {
+                        if let Some(reference) = value_ref.get("reference").and_then(|r| r.as_str()) {
+                            patient_filter = Some(reference.to_string());
+                        }
+                    } else if let Some(value_str) = param.get("valueString").and_then(|v| v.as_str()) {
+                        patient_filter = Some(value_str.to_string());
                     }
                 }
                 Some("_format") | Some("format") => {
@@ -139,6 +164,55 @@ async fn run_view_definition_handler(
                         );
                     }
                 }
+                Some("_count") => {
+                    // Extract count from valueInteger or valuePositiveInt
+                    if let Some(value_int) = param.get("valueInteger").and_then(|v| v.as_i64()) {
+                        if value_int <= 0 {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "_count parameter must be greater than 0",
+                            );
+                        }
+                        if value_int > 10000 {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "_count parameter cannot exceed 10000",
+                            );
+                        }
+                        count_from_body = Some(value_int as u32);
+                    } else if let Some(value_pos) = param.get("valuePositiveInt").and_then(|v| v.as_u64()) {
+                        if value_pos > 10000 {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "_count parameter cannot exceed 10000",
+                            );
+                        }
+                        count_from_body = Some(value_pos as u32);
+                    }
+                }
+                Some("_page") => {
+                    // Extract page from valueInteger or valuePositiveInt
+                    if let Some(value_int) = param.get("valueInteger").and_then(|v| v.as_i64()) {
+                        if value_int <= 0 {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "_page parameter must be greater than 0",
+                            );
+                        }
+                        page_from_body = Some(value_int as u32);
+                    } else if let Some(value_pos) = param.get("valuePositiveInt").and_then(|v| v.as_u64()) {
+                        page_from_body = Some(value_pos as u32);
+                    }
+                }
+                Some("source") => {
+                    // Handle source parameter - not implemented
+                    if param.get("valueString").is_some() || param.get("valueUri").is_some() {
+                        return error_response(
+                            axum::http::StatusCode::NOT_IMPLEMENTED,
+                            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.",
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -151,6 +225,37 @@ async fn run_view_definition_handler(
             "No ViewDefinition provided",
         ),
     };
+    
+    // Apply patient filter if provided
+    if let Some(patient_ref) = patient_filter {
+        // Normalize the patient reference to always include "Patient/" prefix
+        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
+            patient_ref
+        } else {
+            format!("Patient/{}", patient_ref)
+        };
+        
+        resources = resources.into_iter().filter(|resource| {
+            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                match resource_type {
+                    "Patient" => {
+                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                            return format!("Patient/{}", id) == normalized_patient_ref;
+                        }
+                    }
+                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
+                        if let Some(subject) = resource.get("subject") {
+                            if let Some(reference) = subject.get("reference").and_then(|r| r.as_str()) {
+                                return reference == normalized_patient_ref;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }).collect();
+    }
     
     // Parse content type - body format takes precedence
     let format = format_from_body.as_ref()
@@ -228,7 +333,7 @@ async fn run_view_definition_handler(
     match run_view_definition(view_definition, bundle, content_type) {
         Ok(output) => {
             // Apply pagination if requested
-            let output = if let Some(paginated) = apply_pagination(output, &params, &content_type) {
+            let output = if let Some(paginated) = apply_pagination(output, &params, &content_type, count_from_body, page_from_body) {
                 paginated
             } else {
                 return error_response(
@@ -327,10 +432,12 @@ async fn run_view_definition_get_handler(
             "GET operations cannot use complex parameters like group. Use POST instead.",
         );
     }
+
+    // Check for source parameter - return NotImplemented
     if params.contains_key("source") {
         return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "GET operations cannot use the source parameter. Use POST instead.",
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.",
         );
     }
 
@@ -394,9 +501,16 @@ fn apply_pagination(
     output: Vec<u8>,
     params: &std::collections::HashMap<String, String>,
     content_type: &sof::ContentType,
+    count_from_body: Option<u32>,
+    page_from_body: Option<u32>,
 ) -> Option<Vec<u8>> {
-    let count = params.get("_count").and_then(|s| s.parse::<usize>().ok());
-    let page = params.get("_page").and_then(|s| s.parse::<usize>().ok());
+    // Body parameters take precedence over query parameters
+    let count = count_from_body
+        .map(|c| c as usize)
+        .or_else(|| params.get("_count").and_then(|s| s.parse::<usize>().ok()));
+    let page = page_from_body
+        .map(|p| p as usize)
+        .or_else(|| params.get("_page").and_then(|s| s.parse::<usize>().ok()));
     
     if count.is_none() && page.is_none() {
         return Some(output);

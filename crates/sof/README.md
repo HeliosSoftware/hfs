@@ -19,7 +19,11 @@ This crate provides two executable targets:
 
 ### `sof-cli` - Command Line Interface
 
-A full-featured command-line tool for running ViewDefinition transformations:
+A full-featured command-line (CLI) tool for running ViewDefinition transformations.
+The CLI tool accepts FHIR ViewDefinition and Bundle resources as input (either from
+files or stdin) and applies the SQL-on-FHIR transformation to produce structured
+output in formats like CSV, JSON, or other supported content types.
+
 
 ```bash
 # Basic CSV output (includes headers by default)
@@ -62,7 +66,11 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 
 ### `sof-server` - HTTP Server
 
-A high-performance HTTP server providing SQL-on-FHIR ViewDefinition transformation capabilities:
+A high-performance HTTP server providing SQL-on-FHIR ViewDefinition transformation capabilities.
+Use this server if you need a stateless, simple web service for SQL-on-FHIR implementations.  Should you
+need to perform SQL-on-FHIR transformations using server-stored ViewDefinitions and
+server-stored FHIR data, use the full capabilities of the Helios FHIR Server in [hfs](../hfs).
+
 
 ```bash
 # Start server with defaults
@@ -252,14 +260,14 @@ The `$run` operation accepts parameters either as query parameters or in a FHIR 
 All parameters follow the SQL-on-FHIR specification order.
 
 **Note on GET vs POST**: Per FHIR specification, GET operations cannot use complex datatypes. Therefore:
-- **GET requests**: Can only use simple parameters (_format, header, _count, _page, _since)
+- **GET requests**: Can only use simple parameters (_format, header, source, _count, _page, _since)
 - **POST requests**: Can use all parameters including complex types (viewReference, viewResource, patient, group, source, resource)
 
 Parameter table:
 
 | Name | Type | Use | Scope | Min | Max | Documentation |
 |------|------|-----|-------|-----|-----|---------------|
-| _format | code | in | type, instance | 1 | 1 | Output format - application/json, application/ndjson, text/csv, application/parquet |
+| _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
 | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
 | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
 | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
@@ -273,15 +281,17 @@ Parameter table:
 
 ##### Query Parameters
 
-All parameters except `viewReference`, `viewResource`, `patient`, `group`, `source` and `resource` can be provided as query parameters:
+All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as query parameters:
 
 - **_format**: Output format (required if not in Accept header)
-  - `application/json` or `json` - JSON array output (default)
+  - `application/json` - JSON array output (default)
   - `text/csv` or `csv` - CSV output
-  - `application/ndjson` or `ndjson` - Newline-delimited JSON
+  - `application/ndjson` - Newline-delimited JSON
+  - `application/parquet` - Parquet file 
 - **header**: Control CSV headers (only applies to CSV format)
   - `true` - Include headers (default for CSV)
   - `false` - Exclude headers
+- **source**: A String (not yet supported)
 - **_count**: Limit results (1-10000)
 - **_page**: Page number (1-based)
 - **_since**: Filter by modification time (RFC3339 format)

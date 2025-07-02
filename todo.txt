@@ -1,7 +1,8 @@
-
 - Need to fully test each of the parameters
-  - Accept application/fhir+json not valid
   - getReferenceKey - includes 'Patient'??
+  - Need to support application/parquet 
+  - sof-cli documentation doesn't mention all format types
+
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
 - Need a full UCUM conversion engine - Document where we are - should we provide a http call to ucum's service until we have a Rust implementation, or should we use https://github.com/FHIR/Ucum-java? 

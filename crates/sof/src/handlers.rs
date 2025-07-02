@@ -148,6 +148,14 @@ pub async fn run_view_definition_handler(
         .or(validated_params.patient.clone());
     let group_filter = extracted_params.group.or(validated_params.group.clone());
     let source_param = extracted_params.source.or(validated_params.source.clone());
+    
+    // Merge count and page parameters - body takes precedence over query
+    if let Some(count) = extracted_params.count {
+        validated_params.count = Some(count as usize);
+    }
+    if let Some(page) = extracted_params.page {
+        validated_params.page = Some(page as usize);
+    }
 
     // Handle source parameter - in a stateless server, we can't load from external sources
     if let Some(source) = source_param {
@@ -257,11 +265,6 @@ pub async fn run_view_definition_get_handler(
     if params.group.is_some() {
         return Err(ServerError::BadRequest(
             "GET operations cannot use complex parameters like group. Use POST instead.".to_string()
-        ));
-    }
-    if params.source.is_some() {
-        return Err(ServerError::BadRequest(
-            "GET operations cannot use the source parameter. Use POST instead.".to_string()
         ));
     }
 
@@ -511,7 +514,14 @@ fn filter_resources_by_patient_and_group(
 
     // Apply patient filter if provided
     if let Some(patient_ref) = patient_ref {
-        debug!("Filtering resources by patient: {}", patient_ref);
+        // Normalize the patient reference to always include "Patient/" prefix
+        let normalized_patient_ref = if patient_ref.starts_with("Patient/") {
+            patient_ref.to_string()
+        } else {
+            format!("Patient/{}", patient_ref)
+        };
+        debug!("Filtering resources by patient: {} (normalized: {})", patient_ref, normalized_patient_ref);
+        let patient_ref_to_match = normalized_patient_ref.as_str();
         filtered = filtered
             .into_iter()
             .filter(|resource| {
@@ -523,7 +533,7 @@ fn filter_resources_by_patient_and_group(
                         "Patient" => {
                             // Check if this is the patient themselves
                             if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                                return format!("Patient/{}", id) == patient_ref;
+                                return format!("Patient/{}", id) == patient_ref_to_match;
                             }
                         }
                         "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
@@ -532,7 +542,7 @@ fn filter_resources_by_patient_and_group(
                                 if let Some(reference) =
                                     subject.get("reference").and_then(|r| r.as_str())
                                 {
-                                    return reference == patient_ref;
+                                    return reference == patient_ref_to_match;
                                 }
                             }
                         }
@@ -542,7 +552,7 @@ fn filter_resources_by_patient_and_group(
                                 if let Some(reference) =
                                     subject.get("reference").and_then(|r| r.as_str())
                                 {
-                                    return reference == patient_ref;
+                                    return reference == patient_ref_to_match;
                                 }
                             }
                         }
@@ -552,7 +562,7 @@ fn filter_resources_by_patient_and_group(
                                 if let Some(reference) =
                                     patient.get("reference").and_then(|r| r.as_str())
                                 {
-                                    return reference == patient_ref;
+                                    return reference == patient_ref_to_match;
                                 }
                             }
                         }

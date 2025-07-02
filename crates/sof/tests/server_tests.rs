@@ -383,3 +383,39 @@ async fn test_run_view_definition_get_instance_level() {
         .unwrap()
         .contains("ViewDefinition lookup by ID"));
 }
+
+#[tokio::test]
+async fn test_run_view_definition_post_with_source_parameter() {
+    let server = common::test_server().await;
+    
+    // Create a request body with source parameter
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "source",
+            "valueString": "https://example.com/fhir-data"
+        }, {
+            "name": "viewResource",
+            "resource": {
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                "resource": "Patient",
+                "select": [{"column": [{"name": "id", "path": "id"}]}]
+            }
+        }]
+    });
+    
+    let response = server
+        .post("/ViewDefinition/$run")
+        .json(&request_body)
+        .await;
+    
+    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
+    
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(json["issue"][0]["details"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("The source parameter is not supported in this stateless implementation"));
+}

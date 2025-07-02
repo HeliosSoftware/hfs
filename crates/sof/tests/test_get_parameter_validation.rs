@@ -159,7 +159,7 @@ async fn test_get_explains_to_use_post() {
 }
 
 #[tokio::test]
-async fn test_get_with_source_parameter_fails() {
+async fn test_get_with_source_parameter_not_implemented() {
     let server = common::test_server().await;
     
     let response = server
@@ -171,15 +171,15 @@ async fn test_get_with_source_parameter_fails() {
     let status = response.status_code();
     let json: serde_json::Value = response.json();
     
-    if status != StatusCode::BAD_REQUEST {
+    if status != StatusCode::NOT_IMPLEMENTED {
         eprintln!("Unexpected status: {}", status);
         eprintln!("Response: {}", serde_json::to_string_pretty(&json).unwrap());
     }
     
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(json["resourceType"], "OperationOutcome");
     assert!(json["issue"][0]["details"]["text"]
         .as_str()
         .unwrap()
-        .contains("GET operations cannot use the source parameter"));
+        .contains("The source parameter is not supported in this stateless implementation"));
 }
