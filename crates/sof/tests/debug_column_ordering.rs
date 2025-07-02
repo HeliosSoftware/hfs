@@ -1,5 +1,5 @@
-use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde_json;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn debug_column_ordering() {
@@ -107,24 +107,29 @@ fn debug_column_ordering() {
         ]
     });
 
-    let view_definition: fhir::r4::ViewDefinition = serde_json::from_value(view_definition_json).unwrap();
+    let view_definition: fhir::r4::ViewDefinition =
+        serde_json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
     println!("=== Testing column ordering ===");
-    
+
     let result = run_view_definition(view_definition, bundle, ContentType::Json).unwrap();
     let result_str = String::from_utf8(result).unwrap();
-    
+
     println!("Result: {}", result_str);
-    
+
     let result_rows: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
-    
+
     println!("\nActual result:");
     for (i, row) in result_rows.iter().enumerate() {
         println!("Row {}: {:?}", i + 1, row);
     }
-    
+
     println!("\nExpected result (first row):");
-    println!("{{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E1\", \"f\": \"F1\", \"g\": \"G\", \"h\": \"H\"}}");
-    println!("{{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E2\", \"f\": \"F2\", \"g\": \"G\", \"h\": \"H\"}}");
+    println!(
+        "{{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E1\", \"f\": \"F1\", \"g\": \"G\", \"h\": \"H\"}}"
+    );
+    println!(
+        "{{\"a\": \"A\", \"b\": \"B\", \"c\": \"C\", \"d\": \"D\", \"e\": \"E2\", \"f\": \"F2\", \"g\": \"G\", \"h\": \"H\"}}"
+    );
 }

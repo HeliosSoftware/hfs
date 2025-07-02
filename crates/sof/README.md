@@ -45,7 +45,7 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 #### CLI Features
 
 - **Flexible Input**: Read ViewDefinitions and Bundles from files or stdin (but not both from stdin)
-- **Output Formats**: CSV (with/without headers), JSON, and other supported formats
+- **Output Formats**: CSV (with/without headers), JSON (pretty-printed array), NDJSON (newline-delimited), Parquet (planned)
 - **Output Options**: Write to stdout (default) or specified file with `-o`
 - **FHIR Version Support**: R4 by default; other versions (R4B, R5, R6) require compilation with feature flags
 - **Error Handling**: Clear, actionable error messages for debugging
@@ -55,7 +55,7 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 ```
 -v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
 -b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
--f, --format <FORMAT>          Output format [default: csv]
+-f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
     --fhir-version <VERSION>   FHIR version to use [default: R4] [possible values: R4*]
@@ -63,6 +63,29 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 
 * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
 ```
+
+#### Output Formats
+
+The CLI supports multiple output formats via the `-f/--format` parameter:
+
+- **csv** (default) - Comma-separated values format
+  - Includes headers by default
+  - Use `--no-headers` flag to exclude column headers
+  - All values are properly quoted according to CSV standards
+  
+- **json** - JSON array format
+  - Pretty-printed for readability
+  - Each row is a JSON object with column names as keys
+  - Suitable for further processing with JSON tools
+  
+- **ndjson** - Newline-delimited JSON format
+  - One JSON object per line
+  - Streaming-friendly format
+  - Ideal for processing large datasets
+  
+- **parquet** - Apache Parquet columnar format
+  - Efficient binary format (not yet implemented)
+  - Planned for future releases
 
 ### `sof-server` - HTTP Server
 

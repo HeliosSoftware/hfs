@@ -1,5 +1,5 @@
-use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde::{Deserialize, Serialize};
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use std::fs;
 use std::path::PathBuf;
 
@@ -33,14 +33,16 @@ struct TestResult {
     reason: Option<String>,
 }
 
-fn create_test_bundle(resources: &[serde_json::Value]) -> Result<SofBundle, Box<dyn std::error::Error>> {
+fn create_test_bundle(
+    resources: &[serde_json::Value],
+) -> Result<SofBundle, Box<dyn std::error::Error>> {
     let mut bundle_json = serde_json::json!({
         "resourceType": "Bundle",
         "id": "test-bundle",
         "type": "collection",
         "entry": []
     });
-    
+
     if let Some(entry_array) = bundle_json["entry"].as_array_mut() {
         for resource in resources {
             entry_array.push(serde_json::json!({
@@ -48,18 +50,26 @@ fn create_test_bundle(resources: &[serde_json::Value]) -> Result<SofBundle, Box<
             }));
         }
     }
-    
+
     let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
     Ok(SofBundle::R4(bundle))
 }
 
-fn parse_view_definition(view_json: &serde_json::Value) -> Result<SofViewDefinition, Box<dyn std::error::Error>> {
+fn parse_view_definition(
+    view_json: &serde_json::Value,
+) -> Result<SofViewDefinition, Box<dyn std::error::Error>> {
     let mut view_def = view_json.clone();
     if let Some(obj) = view_def.as_object_mut() {
-        obj.insert("resourceType".to_string(), serde_json::Value::String("ViewDefinition".to_string()));
-        obj.insert("status".to_string(), serde_json::Value::String("active".to_string()));
+        obj.insert(
+            "resourceType".to_string(),
+            serde_json::Value::String("ViewDefinition".to_string()),
+        );
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("active".to_string()),
+        );
     }
-    
+
     let view_definition: fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
     Ok(SofViewDefinition::R4(view_definition))
 }
@@ -74,7 +84,7 @@ fn run_single_test(test: &Test, bundle: &SofBundle) -> TestResult {
             };
         }
     };
-    
+
     let result = match run_view_definition(view_definition, bundle.clone(), ContentType::Json) {
         Ok(data) => data,
         Err(e) => {
@@ -84,7 +94,7 @@ fn run_single_test(test: &Test, bundle: &SofBundle) -> TestResult {
             };
         }
     };
-    
+
     let actual_rows: Vec<serde_json::Value> = match serde_json::from_slice(&result) {
         Ok(rows) => rows,
         Err(e) => {
@@ -94,9 +104,12 @@ fn run_single_test(test: &Test, bundle: &SofBundle) -> TestResult {
             };
         }
     };
-    
+
     if compare_results(&actual_rows, &test.expect) {
-        TestResult { passed: true, reason: None }
+        TestResult {
+            passed: true,
+            reason: None,
+        }
     } else {
         TestResult {
             passed: false,
@@ -113,13 +126,13 @@ fn compare_results(actual: &[serde_json::Value], expected: &[serde_json::Value])
     if actual.len() != expected.len() {
         return false;
     }
-    
+
     for (actual_row, expected_row) in actual.iter().zip(expected.iter()) {
         if !compare_json_values(actual_row, expected_row) {
             return false;
         }
     }
-    
+
     true
 }
 
@@ -151,45 +164,55 @@ fn compare_json_values(actual: &serde_json::Value, expected: &serde_json::Value)
 fn test_foreach_file() {
     let mut test_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     test_file.push("tests/sql-on-fhir-v2/tests/foreach.json");
-    
+
     if !test_file.exists() {
         println!("Test file not found: {:?}", test_file);
         panic!("foreach.json test file not found");
     }
-    
+
     let content = fs::read_to_string(test_file).expect("Failed to read test file");
     let test_case: TestCase = serde_json::from_str(&content).expect("Failed to parse test case");
-    
+
     // Check if we support the FHIR version
     let supports_r4 = test_case.fhir_version.contains(&"4.0.1".to_string());
     if !supports_r4 {
         panic!("Only R4 (4.0.1) is currently supported");
     }
-    
+
     let bundle = create_test_bundle(&test_case.resources).expect("Failed to create test bundle");
-    
+
     let mut passed = 0;
     let mut total = 0;
-    
+
     println!("\\n=== Running forEach tests ===");
-    
+
     for test in test_case.tests {
         total += 1;
         let test_result = run_single_test(&test, &bundle);
-        
+
         if test_result.passed {
             passed += 1;
             println!("✅ {}", test.title);
         } else {
-            println!("❌ {}: {}", test.title, test_result.reason.unwrap_or_default());
+            println!(
+                "❌ {}: {}",
+                test.title,
+                test_result.reason.unwrap_or_default()
+            );
         }
     }
-    
+
     println!("\\n=== RESULTS ===");
     println!("Passed: {}/{}", passed, total);
-    println!("Success rate: {:.1}%", (passed as f64 / total as f64) * 100.0);
-    
+    println!(
+        "Success rate: {:.1}%",
+        (passed as f64 / total as f64) * 100.0
+    );
+
     // For this test to pass, we want at least some improvement
     // You can adjust this threshold as needed
-    assert!(passed > 0, "No tests passed - implementation needs more work");
+    assert!(
+        passed > 0,
+        "No tests passed - implementation needs more work"
+    );
 }

@@ -1,5 +1,5 @@
-use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
-use fhir::r4::{ViewDefinition, Bundle};
+use fhir::r4::{Bundle, ViewDefinition};
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_where_clause_boolean_validation() {
@@ -23,18 +23,21 @@ fn test_where_clause_boolean_validation() {
             }
         ]
     }"#;
-    
+
     let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
-    
+
     let result = run_view_definition(
         SofViewDefinition::R4(view_def),
         SofBundle::R4(bundle),
-        ContentType::Json
+        ContentType::Json,
     );
-    
-    assert!(result.is_ok(), "Boolean comparison where clause should succeed");
-    
+
+    assert!(
+        result.is_ok(),
+        "Boolean comparison where clause should succeed"
+    );
+
     // Test 2: Valid boolean where clause (exists)
     let view_def_json = r#"{
         "resourceType": "ViewDefinition",
@@ -55,18 +58,18 @@ fn test_where_clause_boolean_validation() {
             }
         ]
     }"#;
-    
+
     let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
-    
+
     let result = run_view_definition(
         SofViewDefinition::R4(view_def),
         SofBundle::R4(bundle),
-        ContentType::Json
+        ContentType::Json,
     );
-    
+
     assert!(result.is_ok(), "exists() where clause should succeed");
-    
+
     // Test 3: Invalid non-boolean where clause (string property)
     let view_def_json = r#"{
         "resourceType": "ViewDefinition",
@@ -87,23 +90,26 @@ fn test_where_clause_boolean_validation() {
             }
         ]
     }"#;
-    
+
     let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
-    
+
     let result = run_view_definition(
         SofViewDefinition::R4(view_def),
         SofBundle::R4(bundle),
-        ContentType::Json
+        ContentType::Json,
     );
-    
+
     assert!(result.is_err(), "String property where clause should fail");
     if let Err(e) = result {
         let error_msg = e.to_string();
-        assert!(error_msg.contains("cannot be used as a boolean condition"), 
-                "Error should mention boolean condition requirement, got: {}", error_msg);
+        assert!(
+            error_msg.contains("cannot be used as a boolean condition"),
+            "Error should mention boolean condition requirement, got: {}",
+            error_msg
+        );
     }
-    
+
     // Test 4: Valid collection where clause
     let view_def_json = r#"{
         "resourceType": "ViewDefinition",
@@ -124,17 +130,20 @@ fn test_where_clause_boolean_validation() {
             }
         ]
     }"#;
-    
+
     let view_def: ViewDefinition = serde_json::from_str(view_def_json).unwrap();
     let bundle = create_test_bundle();
-    
+
     let result = run_view_definition(
         SofViewDefinition::R4(view_def),
         SofBundle::R4(bundle),
-        ContentType::Json
+        ContentType::Json,
     );
-    
-    assert!(result.is_ok(), "Collection where clause should succeed (checks for non-empty)");
+
+    assert!(
+        result.is_ok(),
+        "Collection where clause should succeed (checks for non-empty)"
+    );
 }
 
 fn create_test_bundle() -> Bundle {
@@ -147,14 +156,17 @@ fn create_test_bundle() -> Bundle {
             "given": ["John"]
         }]
     }"#;
-    
-    let bundle_json = format!(r#"{{
+
+    let bundle_json = format!(
+        r#"{{
         "resourceType": "Bundle",
         "type": "collection",
         "entry": [{{
             "resource": {}
         }}]
-    }}"#, patient_json);
-    
+    }}"#,
+        patient_json
+    );
+
     serde_json::from_str(&bundle_json).unwrap()
 }

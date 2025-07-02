@@ -118,13 +118,18 @@ async fn test_count_parameter_in_body_value_integer() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only 2 patients due to _count limit
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
-    assert_eq!(patients.len(), 2, "Expected 2 patients due to _count=2, got {}", patients.len());
+    assert_eq!(
+        patients.len(),
+        2,
+        "Expected 2 patients due to _count=2, got {}",
+        patients.len()
+    );
     assert_eq!(patients[0]["id"], "pt-1");
     assert_eq!(patients[1]["id"], "pt-2");
 }
@@ -160,13 +165,18 @@ async fn test_count_parameter_in_body_value_positive_int() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only 3 patients due to _count limit
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
-    assert_eq!(patients.len(), 3, "Expected 3 patients due to _count=3, got {}", patients.len());
+    assert_eq!(
+        patients.len(),
+        3,
+        "Expected 3 patients due to _count=3, got {}",
+        patients.len()
+    );
 }
 
 /// Test _count parameter validation - negative value
@@ -267,12 +277,17 @@ async fn test_count_parameter_with_csv_format() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let csv_text = response.text();
     let lines: Vec<&str> = csv_text.trim().split('\n').collect();
-    
+
     // Should have header + 2 data rows
-    assert_eq!(lines.len(), 3, "Expected 3 lines (header + 2 data rows), got {}", lines.len());
+    assert_eq!(
+        lines.len(),
+        3,
+        "Expected 3 lines (header + 2 data rows), got {}",
+        lines.len()
+    );
     assert!(lines[0].contains("id"));
     assert!(lines[1].contains("pt-1"));
     assert!(lines[2].contains("pt-2"));
@@ -310,13 +325,17 @@ async fn test_count_parameter_body_overrides_query() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only 2 patients (body parameter takes precedence)
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
-    assert_eq!(patients.len(), 2, "Body parameter should override query parameter");
+    assert_eq!(
+        patients.len(),
+        2,
+        "Body parameter should override query parameter"
+    );
 }
 
 /// Test _count with _page parameter
@@ -354,9 +373,9 @@ async fn test_count_with_page_parameter() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return page 2 with 2 items (patients 3 and 4)
     assert!(result.is_array());
     let patients = result.as_array().unwrap();

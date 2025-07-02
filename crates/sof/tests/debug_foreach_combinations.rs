@@ -1,5 +1,5 @@
-use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde_json;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn debug_foreach_combinations() {
@@ -57,26 +57,27 @@ fn debug_foreach_combinations() {
         ]
     });
 
-    let view_definition: fhir::r4::ViewDefinition = serde_json::from_value(view_definition_json).unwrap();
+    let view_definition: fhir::r4::ViewDefinition =
+        serde_json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
     println!("=== Running forEach combination debug test ===");
-    
+
     let result = run_view_definition(view_definition, bundle, ContentType::Json).unwrap();
     let result_str = String::from_utf8(result).unwrap();
-    
+
     println!("Result: {}", result_str);
-    
+
     // Parse and analyze the result
     let result_rows: Vec<serde_json::Value> = serde_json::from_str(&result_str).unwrap();
-    
+
     println!("\nAnalysis:");
     println!("Number of rows: {}", result_rows.len());
-    
+
     for (i, row) in result_rows.iter().enumerate() {
         println!("Row {}: {:?}", i + 1, row);
     }
-    
+
     println!("\nExpected result:");
     println!("Row 1: {{\"cont_family\": \"FC1.1\", \"pat_family\": \"F1.1\"}}");
     println!("Row 2: {{\"cont_family\": \"FC1.2\", \"pat_family\": \"F1.1\"}}");

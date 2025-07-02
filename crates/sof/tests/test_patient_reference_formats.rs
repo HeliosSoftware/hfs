@@ -87,9 +87,9 @@ async fn test_patient_parameter_with_full_reference() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only patient pt-1
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
@@ -127,9 +127,9 @@ async fn test_patient_parameter_with_bare_id() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only patient pt-1
     assert!(result.is_array(), "Expected array, got: {:?}", result);
     let patients = result.as_array().unwrap();
@@ -169,9 +169,9 @@ async fn test_patient_parameter_with_value_reference() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only patient pt-2
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
@@ -247,7 +247,7 @@ async fn test_observation_filtering_with_bare_patient_id() {
                 "resource": view_def
             },
             {
-                "name": "dataResource",
+                "name": "resource",
                 "resource": bundle
             },
             {
@@ -264,9 +264,9 @@ async fn test_observation_filtering_with_bare_patient_id() {
         .await;
 
     response.assert_status(StatusCode::OK);
-    
+
     let result = response.json::<serde_json::Value>();
-    
+
     // Should return only observation for patient pt-1
     assert!(result.is_array());
     let observations = result.as_array().unwrap();

@@ -16,10 +16,10 @@
 //! ```text
 //! -v, --view <VIEW>              Path to ViewDefinition JSON file (or use stdin if not provided)
 //! -b, --bundle <BUNDLE>          Path to FHIR Bundle JSON file (or use stdin if not provided)
-//! -f, --format <FORMAT>          Output format [default: csv]
+//! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
-//!     --fhir-version <VERSION>   FHIR version to use [default: R4] [possible values: R4*]
+//!     --fhir-version <VERSION>   FHIR version to use [default: R4]
 //! -h, --help                     Print help
 //!
 //! * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
@@ -71,7 +71,7 @@
 //!
 //! ## FHIR Version Support
 //!
-//! The CLI defaults to FHIR R4. To use other FHIR versions, the crate must be 
+//! The CLI defaults to FHIR R4. To use other FHIR versions, the crate must be
 //! compiled with the corresponding feature flags:
 //! - R4 (default, always available)
 //! - R4B (requires `--features R4B` at compile time)
@@ -87,19 +87,6 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-/// Command-line arguments for the SQL-on-FHIR CLI tool.
-///
-/// This struct defines all the command-line options and arguments that can be passed
-/// to the CLI tool. It uses the `clap` crate for argument parsing and validation.
-///
-/// # Examples
-///
-/// ```rust
-/// use clap::Parser;
-///
-/// // Parse arguments from command line
-/// let args = Args::parse();
-/// ```
 #[derive(Parser, Debug)]
 #[command(name = "sof-cli")]
 #[command(about = "SQL-on-FHIR CLI tool for running ViewDefinition transformations")]
@@ -112,8 +99,13 @@ struct Args {
     #[arg(long, short = 'b')]
     bundle: Option<PathBuf>,
 
-    /// Output format
-    #[arg(long, short = 'f', default_value = "csv")]
+    /// Output format (csv, json, ndjson, parquet)
+    #[arg(
+        long,
+        short = 'f',
+        default_value = "csv",
+        help = "Output format. Valid values: csv (default, includes headers), json, ndjson, parquet"
+    )]
     format: String,
 
     /// Exclude CSV headers (only for CSV format, headers are included by default)

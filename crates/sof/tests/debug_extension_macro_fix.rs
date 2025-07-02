@@ -1,4 +1,4 @@
-use fhirpath::{evaluate_expression, EvaluationContext};
+use fhirpath::{EvaluationContext, evaluate_expression};
 use serde_json;
 
 #[test]
@@ -15,45 +15,69 @@ fn debug_extension_macro_fix() {
             }
         ]
     });
-    
+
     // Parse into FHIR resource
-    let patient: fhir::r4::Patient = serde_json::from_value(patient_json)
-        .expect("Failed to parse patient");
-    
+    let patient: fhir::r4::Patient =
+        serde_json::from_value(patient_json).expect("Failed to parse patient");
+
     println!("Patient parsed successfully");
-    
+
     // Create context with the patient
-    let context = EvaluationContext::new(vec![
-        fhir::FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)))
-    ]);
-    
+    let context = EvaluationContext::new(vec![fhir::FhirResource::R4(Box::new(
+        fhir::r4::Resource::Patient(patient),
+    ))]);
+
     println!("Context created");
-    
+
     // Test the full extension expression that's failing in SQL-on-FHIR
     println!("\n=== Testing full extension expression ===");
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(code).first()", &context);
-    
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(code).first()",
+        &context,
+    );
+
     // Test step by step to see where it breaks
     println!("\n=== Step by step debugging ===");
     test_expression("extension", &context);
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex')", &context);
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value", &context);
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').valueCode", &context);
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(code)", &context);
-    test_expression("extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(String)", &context);
-    
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex')",
+        &context,
+    );
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value",
+        &context,
+    );
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').valueCode",
+        &context,
+    );
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(code)",
+        &context,
+    );
+    test_expression(
+        "extension('http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value.ofType(String)",
+        &context,
+    );
+
     println!("\n=== Testing alternative approaches ===");
-    test_expression("extension.where(url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').valueCode", &context);
-    test_expression("extension.where(url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value", &context);
+    test_expression(
+        "extension.where(url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').valueCode",
+        &context,
+    );
+    test_expression(
+        "extension.where(url = 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex').value",
+        &context,
+    );
 }
 
 fn test_expression(expr_str: &str, context: &EvaluationContext) {
     println!("\nTesting: {}", expr_str);
-    
+
     match evaluate_expression(expr_str, context) {
         Ok(result) => {
             println!("  Result: {:?}", result);
-        },
+        }
         Err(e) => {
             println!("  Error: {}", e);
         }

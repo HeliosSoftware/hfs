@@ -1,7 +1,7 @@
 //! Common test utilities for server tests
 
-use axum::{Router, Json};
 use axum::response::IntoResponse;
+use axum::{Json, Router};
 use axum_test::TestServer;
 
 /// Create a test server instance
@@ -14,14 +14,20 @@ pub async fn test_server() -> TestServer {
 fn create_test_app() -> Router {
     use axum::routing::{get, post};
     use tower_http::cors::CorsLayer;
-    
+
     // Import handlers from the sof crate
     // Note: We need to ensure these are properly exported from lib.rs
-    
+
     Router::new()
         .route("/metadata", get(capability_statement_handler))
-        .route("/ViewDefinition/$run", post(run_view_definition_handler).get(run_view_definition_get_handler))
-        .route("/ViewDefinition/:id/$run", get(run_view_definition_by_id_handler))
+        .route(
+            "/ViewDefinition/$run",
+            post(run_view_definition_handler).get(run_view_definition_get_handler),
+        )
+        .route(
+            "/ViewDefinition/:id/$run",
+            get(run_view_definition_by_id_handler),
+        )
         .route("/health", get(health_check))
         .layer(CorsLayer::permissive())
 }
@@ -30,7 +36,7 @@ fn create_test_app() -> Router {
 async fn capability_statement_handler() -> axum::response::Response {
     // This is a simplified version for testing
     // In production, this would use the actual handler from sof::server::handlers
-    
+
     let capability_statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
         "id": "sof-server",
@@ -67,12 +73,13 @@ async fn capability_statement_handler() -> axum::response::Response {
             }]
         }]
     });
-    
+
     (
         axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/fhir+json")],
         Json(capability_statement),
-    ).into_response()
+    )
+        .into_response()
 }
 
 async fn run_view_definition_handler(
@@ -82,17 +89,14 @@ async fn run_view_definition_handler(
 ) -> axum::response::Response {
     // This would use the actual handler in production
     // For now, we'll implement a basic version for testing
-    
-    use sof::{run_view_definition, ContentType, SofBundle, SofViewDefinition};
-    
+
+    use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+
     // Validate query parameters first
     if let Err(e) = validate_query_params(&params) {
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            &e,
-        );
+        return error_response(axum::http::StatusCode::BAD_REQUEST, &e);
     }
-    
+
     // Basic parameter parsing
     if body["resourceType"] != "Parameters" {
         return error_response(
@@ -100,7 +104,7 @@ async fn run_view_definition_handler(
             "Request body must be a Parameters resource",
         );
     }
-    
+
     // Extract ViewDefinition and resources
     let mut view_def_json = None;
     let mut resources = Vec::new();
@@ -109,19 +113,41 @@ async fn run_view_definition_handler(
     let mut patient_filter = None;
     let mut count_from_body = None;
     let mut page_from_body = None;
-    
+
     if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
             match param["name"].as_str() {
                 Some("viewResource") => {
                     view_def_json = param["resource"].as_object().cloned();
                 }
+                Some("viewReference") => {
+                    // viewReference is not implemented
+                    return error_response(
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                        "The viewReference parameter is not yet implemented. Please provide the ViewDefinition directly using the viewResource parameter.",
+                    );
+                }
+                Some("group") => {
+                    // group is not implemented
+                    return error_response(
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                        "The group parameter is not yet implemented.",
+                    );
+                }
+                Some("source") => {
+                    // source is not implemented
+                    return error_response(
+                        axum::http::StatusCode::NOT_IMPLEMENTED,
+                        "The source parameter is not yet implemented.",
+                    );
+                }
                 Some("resource") => {
                     if let Some(resource) = param["resource"].as_object() {
                         // Check if it's a Bundle
                         if resource.get("resourceType") == Some(&serde_json::json!("Bundle")) {
                             // Extract resources from bundle
-                            if let Some(entries) = resource.get("entry").and_then(|e| e.as_array()) {
+                            if let Some(entries) = resource.get("entry").and_then(|e| e.as_array())
+                            {
                                 for entry in entries {
                                     if let Some(res) = entry.get("resource") {
                                         resources.push(res.clone());
@@ -136,10 +162,13 @@ async fn run_view_definition_handler(
                 Some("patient") => {
                     // Handle patient parameter
                     if let Some(value_ref) = param.get("valueReference") {
-                        if let Some(reference) = value_ref.get("reference").and_then(|r| r.as_str()) {
+                        if let Some(reference) = value_ref.get("reference").and_then(|r| r.as_str())
+                        {
                             patient_filter = Some(reference.to_string());
                         }
-                    } else if let Some(value_str) = param.get("valueString").and_then(|v| v.as_str()) {
+                    } else if let Some(value_str) =
+                        param.get("valueString").and_then(|v| v.as_str())
+                    {
                         patient_filter = Some(value_str.to_string());
                     }
                 }
@@ -155,9 +184,10 @@ async fn run_view_definition_handler(
                     // Extract header from valueBoolean
                     if let Some(value_bool) = param["valueBoolean"].as_bool() {
                         header_from_body = Some(value_bool);
-                    } else if param.get("valueString").is_some() 
-                           || param.get("valueCode").is_some() 
-                           || param.get("valueInteger").is_some() {
+                    } else if param.get("valueString").is_some()
+                        || param.get("valueCode").is_some()
+                        || param.get("valueInteger").is_some()
+                    {
                         return error_response(
                             axum::http::StatusCode::BAD_REQUEST,
                             "Header parameter must be a boolean value (use valueBoolean)",
@@ -180,7 +210,9 @@ async fn run_view_definition_handler(
                             );
                         }
                         count_from_body = Some(value_int as u32);
-                    } else if let Some(value_pos) = param.get("valuePositiveInt").and_then(|v| v.as_u64()) {
+                    } else if let Some(value_pos) =
+                        param.get("valuePositiveInt").and_then(|v| v.as_u64())
+                    {
                         if value_pos > 10000 {
                             return error_response(
                                 axum::http::StatusCode::BAD_REQUEST,
@@ -200,32 +232,27 @@ async fn run_view_definition_handler(
                             );
                         }
                         page_from_body = Some(value_int as u32);
-                    } else if let Some(value_pos) = param.get("valuePositiveInt").and_then(|v| v.as_u64()) {
+                    } else if let Some(value_pos) =
+                        param.get("valuePositiveInt").and_then(|v| v.as_u64())
+                    {
                         page_from_body = Some(value_pos as u32);
-                    }
-                }
-                Some("source") => {
-                    // Handle source parameter - not implemented
-                    if param.get("valueString").is_some() || param.get("valueUri").is_some() {
-                        return error_response(
-                            axum::http::StatusCode::NOT_IMPLEMENTED,
-                            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.",
-                        );
                     }
                 }
                 _ => {}
             }
         }
     }
-    
+
     let view_def_json = match view_def_json {
         Some(v) => serde_json::Value::Object(v),
-        None => return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "No ViewDefinition provided",
-        ),
+        None => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "No ViewDefinition provided",
+            );
+        }
     };
-    
+
     // Apply patient filter if provided
     if let Some(patient_ref) = patient_filter {
         // Normalize the patient reference to always include "Patient/" prefix
@@ -234,39 +261,47 @@ async fn run_view_definition_handler(
         } else {
             format!("Patient/{}", patient_ref)
         };
-        
-        resources = resources.into_iter().filter(|resource| {
-            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                match resource_type {
-                    "Patient" => {
-                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                            return format!("Patient/{}", id) == normalized_patient_ref;
-                        }
-                    }
-                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
-                        if let Some(subject) = resource.get("subject") {
-                            if let Some(reference) = subject.get("reference").and_then(|r| r.as_str()) {
-                                return reference == normalized_patient_ref;
+
+        resources = resources
+            .into_iter()
+            .filter(|resource| {
+                if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                    match resource_type {
+                        "Patient" => {
+                            if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                                return format!("Patient/{}", id) == normalized_patient_ref;
                             }
                         }
+                        "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
+                            if let Some(subject) = resource.get("subject") {
+                                if let Some(reference) =
+                                    subject.get("reference").and_then(|r| r.as_str())
+                                {
+                                    return reference == normalized_patient_ref;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            false
-        }).collect();
+                false
+            })
+            .collect();
     }
-    
+
     // Parse content type - body format takes precedence
-    let format = format_from_body.as_ref()
+    let format = format_from_body
+        .as_ref()
         .map(|s| s.as_str())
         .or_else(|| params.get("_format").map(|s| s.as_str()));
     let accept = if format_from_body.is_some() {
         None // Ignore Accept header when body param is present
     } else {
-        headers.get(axum::http::header::ACCEPT).and_then(|h| h.to_str().ok())
+        headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|h| h.to_str().ok())
     };
-    
+
     // Convert header parameter - body takes precedence over query
     let header_param = if let Some(header_bool) = header_from_body {
         Some(header_bool)
@@ -277,7 +312,7 @@ async fn run_view_definition_handler(
             _ => None,
         }
     };
-    
+
     // Check if header parameter is being used with non-CSV format
     if header_param.is_some() && format_from_body.is_none() {
         // We have a header parameter but need to check if format is CSV
@@ -289,30 +324,31 @@ async fn run_view_definition_handler(
             );
         }
     }
-    
+
     let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,
         Err(e) => match e {
-            sof::SofError::UnsupportedContentType(_) => return error_response(
-                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                &e.to_string(),
-            ),
-            _ => return error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                &e.to_string(),
-            ),
-        }
+            sof::SofError::UnsupportedContentType(_) => {
+                return error_response(
+                    axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    &e.to_string(),
+                );
+            }
+            _ => return error_response(axum::http::StatusCode::BAD_REQUEST, &e.to_string()),
+        },
     };
-    
+
     // Create ViewDefinition and Bundle
     let view_definition = match serde_json::from_value::<fhir::r4::ViewDefinition>(view_def_json) {
         Ok(vd) => SofViewDefinition::R4(vd),
-        Err(e) => return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            &format!("Invalid ViewDefinition: {}", e),
-        ),
+        Err(e) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                &format!("Invalid ViewDefinition: {}", e),
+            );
+        }
     };
-    
+
     let bundle_json = serde_json::json!({
         "resourceType": "Bundle",
         "type": "collection",
@@ -320,20 +356,28 @@ async fn run_view_definition_handler(
             serde_json::json!({"resource": r})
         }).collect::<Vec<_>>()
     });
-    
+
     let bundle = match serde_json::from_value::<fhir::r4::Bundle>(bundle_json) {
         Ok(b) => SofBundle::R4(b),
-        Err(e) => return error_response(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to create Bundle: {}", e),
-        ),
+        Err(e) => {
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create Bundle: {}", e),
+            );
+        }
     };
-    
+
     // Execute ViewDefinition
     match run_view_definition(view_definition, bundle, content_type) {
         Ok(output) => {
             // Apply pagination if requested
-            let output = if let Some(paginated) = apply_pagination(output, &params, &content_type, count_from_body, page_from_body) {
+            let output = if let Some(paginated) = apply_pagination(
+                output,
+                &params,
+                &content_type,
+                count_from_body,
+                page_from_body,
+            ) {
                 paginated
             } else {
                 return error_response(
@@ -341,24 +385,22 @@ async fn run_view_definition_handler(
                     "Invalid pagination parameters",
                 );
             };
-            
+
             let mime_type = match content_type {
                 ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
                 ContentType::Json => "application/json",
                 ContentType::NdJson => "application/ndjson",
                 ContentType::Parquet => "application/parquet",
             };
-            
+
             (
                 axum::http::StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, mime_type)],
                 output,
-            ).into_response()
+            )
+                .into_response()
         }
-        Err(e) => error_response(
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            &e.to_string(),
-        ),
+        Err(e) => error_response(axum::http::StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
     }
 }
 
@@ -368,9 +410,9 @@ fn parse_content_type(
     header: Option<bool>,
 ) -> Result<sof::ContentType, sof::SofError> {
     use sof::ContentType;
-    
+
     let content_type_str = format.or(accept).unwrap_or("application/json");
-    
+
     let content_type_str = if content_type_str == "text/csv" {
         match header {
             Some(false) => "text/csv;header=false",
@@ -379,12 +421,11 @@ fn parse_content_type(
     } else {
         content_type_str
     };
-    
+
     ContentType::from_string(content_type_str)
 }
 
 fn error_response(status: axum::http::StatusCode, message: &str) -> axum::response::Response {
-    
     let operation_outcome = serde_json::json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -395,12 +436,11 @@ fn error_response(status: axum::http::StatusCode, message: &str) -> axum::respon
             }
         }]
     });
-    
+
     (status, Json(operation_outcome)).into_response()
 }
 
 async fn health_check() -> impl axum::response::IntoResponse {
-    
     Json(serde_json::json!({
         "status": "ok",
         "service": "sof-server",
@@ -455,7 +495,10 @@ async fn run_view_definition_by_id_handler(
 ) -> axum::response::Response {
     error_response(
         axum::http::StatusCode::NOT_IMPLEMENTED,
-        &format!("ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.", id),
+        &format!(
+            "ViewDefinition lookup by ID '{}' is not implemented. Use POST /ViewDefinition/$run with the ViewDefinition in the request body.",
+            id
+        ),
     )
 }
 
@@ -474,7 +517,7 @@ fn validate_query_params(params: &std::collections::HashMap<String, String>) -> 
             Err(_) => return Err("_count parameter must be a valid number".to_string()),
         }
     }
-    
+
     // Validate _page parameter
     if let Some(page_str) = params.get("_page") {
         match page_str.parse::<usize>() {
@@ -486,14 +529,17 @@ fn validate_query_params(params: &std::collections::HashMap<String, String>) -> 
             Err(_) => return Err("_page parameter must be a valid number".to_string()),
         }
     }
-    
+
     // Validate _since parameter
     if let Some(since_str) = params.get("_since") {
         if chrono::DateTime::parse_from_rfc3339(since_str).is_err() {
-            return Err(format!("_since parameter must be a valid RFC3339 timestamp: {}", since_str));
+            return Err(format!(
+                "_since parameter must be a valid RFC3339 timestamp: {}",
+                since_str
+            ));
         }
     }
-    
+
     Ok(())
 }
 
@@ -511,16 +557,16 @@ fn apply_pagination(
     let page = page_from_body
         .map(|p| p as usize)
         .or_else(|| params.get("_page").and_then(|s| s.parse::<usize>().ok()));
-    
+
     if count.is_none() && page.is_none() {
         return Some(output);
     }
-    
+
     match content_type {
         sof::ContentType::Json => {
             let output_str = String::from_utf8(output).ok()?;
             let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str).ok()?;
-            
+
             // Apply pagination
             if let Some(count) = count {
                 let page = page.unwrap_or(1);
@@ -532,13 +578,13 @@ fn apply_pagination(
                     records.clear();
                 }
             }
-            
+
             serde_json::to_string(&records).ok().map(|s| s.into_bytes())
         }
         sof::ContentType::NdJson => {
             let output_str = String::from_utf8(output).ok()?;
             let mut lines: Vec<&str> = output_str.lines().collect();
-            
+
             // Apply pagination
             if let Some(count) = count {
                 let page = page.unwrap_or(1);
@@ -550,7 +596,7 @@ fn apply_pagination(
                     lines.clear();
                 }
             }
-            
+
             Some(lines.join("\n").into_bytes())
         }
         sof::ContentType::Csv | sof::ContentType::CsvWithHeader => {
@@ -559,24 +605,24 @@ fn apply_pagination(
                 Err(e) => return Some(e.into_bytes()),
             };
             let lines: Vec<&str> = output_str.lines().collect();
-            
+
             if lines.is_empty() {
                 return Some(output_str.into_bytes());
             }
-            
+
             let has_header = matches!(content_type, sof::ContentType::CsvWithHeader);
             let header_offset = if has_header { 1 } else { 0 };
-            
+
             if lines.len() <= header_offset {
                 return Some(output_str.into_bytes());
             }
-            
+
             let (header_lines, mut data_lines) = if has_header {
                 (vec![lines[0]], lines[1..].to_vec())
             } else {
                 (vec![], lines.to_vec())
             };
-            
+
             // Apply pagination to data lines
             if let Some(count) = count {
                 let page = page.unwrap_or(1);
@@ -588,11 +634,11 @@ fn apply_pagination(
                     data_lines.clear();
                 }
             }
-            
+
             let mut result_lines = header_lines;
             result_lines.extend(data_lines);
             let result = result_lines.join("\n");
-            
+
             // Add final newline if original had one
             if output_str.ends_with('\n') && !result.ends_with('\n') {
                 Some(format!("{}\n", result).into_bytes())

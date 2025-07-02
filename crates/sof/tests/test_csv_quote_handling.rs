@@ -1,5 +1,5 @@
-use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde_json::json;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[cfg(feature = "R4")]
 #[tokio::test]
@@ -59,26 +59,26 @@ async fn test_getresourcekey_csv_quote_handling() {
     // Using R4 feature since that's what's enabled by default
     let view_def_r4: fhir::r4::ViewDefinition = serde_json::from_value(view_definition).unwrap();
     let bundle_r4: fhir::r4::Bundle = serde_json::from_value(bundle).unwrap();
-    
+
     let view_def = SofViewDefinition::R4(view_def_r4);
     let bundle = SofBundle::R4(bundle_r4);
 
     // Run the view definition with CSV output (with headers)
     let result = run_view_definition(view_def, bundle, ContentType::CsvWithHeader).unwrap();
     let csv_output = std::str::from_utf8(&result).unwrap();
-    
+
     // Split into lines to check each row
     let lines: Vec<&str> = csv_output.trim().split('\n').collect();
-    
+
     // Check header
     assert_eq!(lines[0], "id");
-    
+
     // Check that resource keys don't have extra quotes
     // They should be: Patient/269a6a02-37e2-bd1a-e079-fda944434a99
     // Not: """Patient/269a6a02-37e2-bd1a-e079-fda944434a99"""
     assert_eq!(lines[1], "Patient/269a6a02-37e2-bd1a-e079-fda944434a99");
     assert_eq!(lines[2], "Patient/269a6a02-37e2-bd1a-e079-fda944434a98");
-    
+
     // Ensure we're not getting triple quotes
     assert!(!lines[1].contains("\"\"\""));
     assert!(!lines[2].contains("\"\"\""));

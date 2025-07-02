@@ -1,6 +1,6 @@
-use sof::{run_view_definition, SofBundle, SofViewDefinition, ContentType};
 use fhir::r4::{Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn};
 use serde_json;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_extension_function_debug() {
@@ -18,7 +18,7 @@ fn test_extension_function_debug() {
                 "valueCode": "F"
             },
             {
-                "id": "race", 
+                "id": "race",
                 "url": "http://hl7.org/fhir/us/core/StructureDefinition/us-core-race",
                 "extension": [
                     {
@@ -37,10 +37,10 @@ fn test_extension_function_debug() {
             }
         ]
     });
-    
+
     let patient: Patient = serde_json::from_value(patient_json).unwrap();
-    
-    // Create test bundle 
+
+    // Create test bundle
     let bundle = Bundle {
         id: Some("test-bundle".to_string().into()),
         entry: Some(vec![fhir::r4::BundleEntry {
@@ -50,7 +50,7 @@ fn test_extension_function_debug() {
         }]),
         ..Default::default()
     };
-    
+
     // Create ViewDefinition to test extension function
     let view_def = ViewDefinition {
         id: Some("test-view".to_string().into()),
@@ -77,17 +77,17 @@ fn test_extension_function_debug() {
         }]),
         ..Default::default()
     };
-    
+
     // Execute the view definition
     let sof_view_def = SofViewDefinition::R4(view_def);
     let sof_bundle = SofBundle::R4(bundle);
     let result = run_view_definition(sof_view_def, sof_bundle, ContentType::Json);
-    
+
     match result {
         Ok(json_output) => {
             let json_str = String::from_utf8(json_output).unwrap();
             println!("Extension test output: {}", json_str);
-            
+
             // Parse the result to check values
             let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             if let Some(rows) = parsed.as_array() {

@@ -19,9 +19,9 @@
 //! - **Extensibility**: Easy addition of new FHIR versions or features
 //! - **Code Reuse**: Single implementation handles all supported versions
 
+use crate::SofError;
 use fhir::FhirResource;
 use fhirpath::EvaluationResult;
-use crate::SofError;
 
 /// Trait for abstracting ViewDefinition across FHIR versions.
 ///
@@ -58,7 +58,7 @@ pub trait ViewDefinitionTrait {
     type Where: ViewDefinitionWhereTrait;
     /// The constant definition type for this FHIR version
     type Constant: ViewDefinitionConstantTrait;
-    
+
     /// Returns the FHIR resource type this ViewDefinition processes
     fn resource(&self) -> Option<&str>;
     /// Returns the select statements that define output columns and structure
@@ -111,7 +111,7 @@ pub trait ViewDefinitionSelectTrait {
     type Column: ViewDefinitionColumnTrait;
     /// Recursive select type for nested structures
     type Select: ViewDefinitionSelectTrait;
-    
+
     /// Returns the column definitions for this select statement
     fn column(&self) -> Option<&[Self::Column]>;
     /// Returns nested select statements for hierarchical processing
@@ -291,8 +291,8 @@ pub trait ViewDefinitionConstantTrait {
 /// ```rust
 /// use sof::traits::{BundleTrait, ResourceTrait};
 ///
-/// fn analyze_bundle<B: BundleTrait>(bundle: &B) 
-/// where 
+/// fn analyze_bundle<B: BundleTrait>(bundle: &B)
+/// where
 ///     B::Resource: ResourceTrait
 /// {
 ///     let resources = bundle.entries();
@@ -306,7 +306,7 @@ pub trait ViewDefinitionConstantTrait {
 pub trait BundleTrait {
     /// The resource type for this FHIR version
     type Resource: ResourceTrait;
-    
+
     /// Returns references to all resources contained in this bundle's entries
     fn entries(&self) -> Vec<&Self::Resource>;
 }
@@ -360,82 +360,82 @@ pub trait ResourceTrait: Clone {
 mod r4_impl {
     use super::*;
     use fhir::r4::*;
-    
+
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
         type Where = ViewDefinitionWhere;
         type Constant = ViewDefinitionConstant;
-        
+
         fn resource(&self) -> Option<&str> {
             self.resource.value.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn where_clauses(&self) -> Option<&[Self::Where]> {
             self.r#where.as_deref()
         }
-        
+
         fn constants(&self) -> Option<&[Self::Constant]> {
             self.constant.as_deref()
         }
     }
-    
+
     impl ViewDefinitionSelectTrait for ViewDefinitionSelect {
         type Column = ViewDefinitionSelectColumn;
         type Select = ViewDefinitionSelect;
-        
+
         fn column(&self) -> Option<&[Self::Column]> {
             self.column.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn for_each(&self) -> Option<&str> {
             self.for_each.as_ref()?.value.as_deref()
         }
-        
+
         fn for_each_or_null(&self) -> Option<&str> {
             self.for_each_or_null.as_ref()?.value.as_deref()
         }
-        
+
         fn union_all(&self) -> Option<&[Self::Select]> {
             self.union_all.as_deref()
         }
     }
-    
+
     impl ViewDefinitionColumnTrait for ViewDefinitionSelectColumn {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
-        
+
         fn collection(&self) -> Option<bool> {
             self.collection.as_ref()?.value
         }
     }
-    
+
     impl ViewDefinitionWhereTrait for ViewDefinitionWhere {
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
     }
-    
+
     impl ViewDefinitionConstantTrait for ViewDefinitionConstant {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
-            
+
             if let Some(value) = &self.value {
                 let eval_result = match value {
                     ViewDefinitionConstantValue::String(s) => {
@@ -505,7 +505,7 @@ mod r4_impl {
                         EvaluationResult::String(c.value.clone().unwrap_or_default(), None)
                     }
                 };
-                
+
                 Ok(eval_result)
             } else {
                 Err(SofError::InvalidViewDefinition(format!(
@@ -515,28 +515,23 @@ mod r4_impl {
             }
         }
     }
-    
+
     impl BundleTrait for Bundle {
         type Resource = Resource;
-        
+
         fn entries(&self) -> Vec<&Self::Resource> {
             self.entry
                 .as_ref()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|e| e.resource.as_ref())
-                        .collect()
-                })
+                .map(|entries| entries.iter().filter_map(|e| e.resource.as_ref()).collect())
                 .unwrap_or_default()
         }
     }
-    
+
     impl ResourceTrait for Resource {
         fn resource_name(&self) -> &str {
             self.resource_name()
         }
-        
+
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R4(Box::new(self.clone()))
         }
@@ -552,82 +547,82 @@ mod r4_impl {
 mod r4b_impl {
     use super::*;
     use fhir::r4b::*;
-    
+
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
         type Where = ViewDefinitionWhere;
         type Constant = ViewDefinitionConstant;
-        
+
         fn resource(&self) -> Option<&str> {
             self.resource.value.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn where_clauses(&self) -> Option<&[Self::Where]> {
             self.r#where.as_deref()
         }
-        
+
         fn constants(&self) -> Option<&[Self::Constant]> {
             self.constant.as_deref()
         }
     }
-    
+
     impl ViewDefinitionSelectTrait for ViewDefinitionSelect {
         type Column = ViewDefinitionSelectColumn;
         type Select = ViewDefinitionSelect;
-        
+
         fn column(&self) -> Option<&[Self::Column]> {
             self.column.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn for_each(&self) -> Option<&str> {
             self.for_each.as_ref()?.value.as_deref()
         }
-        
+
         fn for_each_or_null(&self) -> Option<&str> {
             self.for_each_or_null.as_ref()?.value.as_deref()
         }
-        
+
         fn union_all(&self) -> Option<&[Self::Select]> {
             self.union_all.as_deref()
         }
     }
-    
+
     impl ViewDefinitionColumnTrait for ViewDefinitionSelectColumn {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
-        
+
         fn collection(&self) -> Option<bool> {
             self.collection.as_ref()?.value
         }
     }
-    
+
     impl ViewDefinitionWhereTrait for ViewDefinitionWhere {
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
     }
-    
+
     impl ViewDefinitionConstantTrait for ViewDefinitionConstant {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
-            
+
             if let Some(value) = &self.value {
                 let eval_result = match value {
                     ViewDefinitionConstantValue::String(s) => {
@@ -697,7 +692,7 @@ mod r4b_impl {
                         EvaluationResult::String(c.value.clone().unwrap_or_default(), None)
                     }
                 };
-                
+
                 Ok(eval_result)
             } else {
                 Err(SofError::InvalidViewDefinition(format!(
@@ -707,28 +702,23 @@ mod r4b_impl {
             }
         }
     }
-    
+
     impl BundleTrait for Bundle {
         type Resource = Resource;
-        
+
         fn entries(&self) -> Vec<&Self::Resource> {
             self.entry
                 .as_ref()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|e| e.resource.as_ref())
-                        .collect()
-                })
+                .map(|entries| entries.iter().filter_map(|e| e.resource.as_ref()).collect())
                 .unwrap_or_default()
         }
     }
-    
+
     impl ResourceTrait for Resource {
         fn resource_name(&self) -> &str {
             self.resource_name()
         }
-        
+
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R4B(Box::new(self.clone()))
         }
@@ -745,82 +735,82 @@ mod r4b_impl {
 mod r5_impl {
     use super::*;
     use fhir::r5::*;
-    
+
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
         type Where = ViewDefinitionWhere;
         type Constant = ViewDefinitionConstant;
-        
+
         fn resource(&self) -> Option<&str> {
             self.resource.value.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn where_clauses(&self) -> Option<&[Self::Where]> {
             self.r#where.as_deref()
         }
-        
+
         fn constants(&self) -> Option<&[Self::Constant]> {
             self.constant.as_deref()
         }
     }
-    
+
     impl ViewDefinitionSelectTrait for ViewDefinitionSelect {
         type Column = ViewDefinitionSelectColumn;
         type Select = ViewDefinitionSelect;
-        
+
         fn column(&self) -> Option<&[Self::Column]> {
             self.column.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn for_each(&self) -> Option<&str> {
             self.for_each.as_ref()?.value.as_deref()
         }
-        
+
         fn for_each_or_null(&self) -> Option<&str> {
             self.for_each_or_null.as_ref()?.value.as_deref()
         }
-        
+
         fn union_all(&self) -> Option<&[Self::Select]> {
             self.union_all.as_deref()
         }
     }
-    
+
     impl ViewDefinitionColumnTrait for ViewDefinitionSelectColumn {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
-        
+
         fn collection(&self) -> Option<bool> {
             self.collection.as_ref()?.value
         }
     }
-    
+
     impl ViewDefinitionWhereTrait for ViewDefinitionWhere {
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
     }
-    
+
     impl ViewDefinitionConstantTrait for ViewDefinitionConstant {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
-            
+
             if let Some(value) = &self.value {
                 // R5 implementation identical to R4
                 let eval_result = match value {
@@ -894,7 +884,7 @@ mod r5_impl {
                         EvaluationResult::Integer64(i.value.unwrap_or(0), None)
                     }
                 };
-                
+
                 Ok(eval_result)
             } else {
                 Err(SofError::InvalidViewDefinition(format!(
@@ -904,28 +894,28 @@ mod r5_impl {
             }
         }
     }
-    
+
     impl BundleTrait for Bundle {
         type Resource = Resource;
-        
+
         fn entries(&self) -> Vec<&Self::Resource> {
             self.entry
                 .as_ref()
                 .map(|entries| {
                     entries
                         .iter()
-                        .filter_map(|e| e.resource.as_deref())  // Note: R5 uses Box<Resource>
+                        .filter_map(|e| e.resource.as_deref()) // Note: R5 uses Box<Resource>
                         .collect()
                 })
                 .unwrap_or_default()
         }
     }
-    
+
     impl ResourceTrait for Resource {
         fn resource_name(&self) -> &str {
             self.resource_name()
         }
-        
+
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R5(Box::new(self.clone()))
         }
@@ -942,82 +932,82 @@ mod r5_impl {
 mod r6_impl {
     use super::*;
     use fhir::r6::*;
-    
+
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
         type Where = ViewDefinitionWhere;
         type Constant = ViewDefinitionConstant;
-        
+
         fn resource(&self) -> Option<&str> {
             self.resource.value.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn where_clauses(&self) -> Option<&[Self::Where]> {
             self.r#where.as_deref()
         }
-        
+
         fn constants(&self) -> Option<&[Self::Constant]> {
             self.constant.as_deref()
         }
     }
-    
+
     impl ViewDefinitionSelectTrait for ViewDefinitionSelect {
         type Column = ViewDefinitionSelectColumn;
         type Select = ViewDefinitionSelect;
-        
+
         fn column(&self) -> Option<&[Self::Column]> {
             self.column.as_deref()
         }
-        
+
         fn select(&self) -> Option<&[Self::Select]> {
             self.select.as_deref()
         }
-        
+
         fn for_each(&self) -> Option<&str> {
             self.for_each.as_ref()?.value.as_deref()
         }
-        
+
         fn for_each_or_null(&self) -> Option<&str> {
             self.for_each_or_null.as_ref()?.value.as_deref()
         }
-        
+
         fn union_all(&self) -> Option<&[Self::Select]> {
             self.union_all.as_deref()
         }
     }
-    
+
     impl ViewDefinitionColumnTrait for ViewDefinitionSelectColumn {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
-        
+
         fn collection(&self) -> Option<bool> {
             self.collection.as_ref()?.value
         }
     }
-    
+
     impl ViewDefinitionWhereTrait for ViewDefinitionWhere {
         fn path(&self) -> Option<&str> {
             self.path.value.as_deref()
         }
     }
-    
+
     impl ViewDefinitionConstantTrait for ViewDefinitionConstant {
         fn name(&self) -> Option<&str> {
             self.name.value.as_deref()
         }
-        
+
         fn to_evaluation_result(&self) -> Result<EvaluationResult, SofError> {
             let name = self.name().unwrap_or("unknown");
-            
+
             if let Some(value) = &self.value {
                 // R5 implementation identical to R4
                 let eval_result = match value {
@@ -1091,7 +1081,7 @@ mod r6_impl {
                         EvaluationResult::Integer(i.value.unwrap_or(0), None)
                     }
                 };
-                
+
                 Ok(eval_result)
             } else {
                 Err(SofError::InvalidViewDefinition(format!(
@@ -1101,28 +1091,28 @@ mod r6_impl {
             }
         }
     }
-    
+
     impl BundleTrait for Bundle {
         type Resource = Resource;
-        
+
         fn entries(&self) -> Vec<&Self::Resource> {
             self.entry
                 .as_ref()
                 .map(|entries| {
                     entries
                         .iter()
-                        .filter_map(|e| e.resource.as_deref())  // Note: R6 uses Box<Resource>
+                        .filter_map(|e| e.resource.as_deref()) // Note: R6 uses Box<Resource>
                         .collect()
                 })
                 .unwrap_or_default()
         }
     }
-    
+
     impl ResourceTrait for Resource {
         fn resource_name(&self) -> &str {
             self.resource_name()
         }
-        
+
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R6(Box::new(self.clone()))
         }

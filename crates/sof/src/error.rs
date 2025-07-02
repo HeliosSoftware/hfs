@@ -5,9 +5,9 @@
 //! generation for error responses.
 
 use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use sof::SofError;
 use std::fmt;
@@ -18,22 +18,22 @@ use std::fmt;
 pub enum ServerError {
     /// Invalid request parameters or body
     BadRequest(String),
-    
+
     /// Requested resource not found
     NotFound(String),
-    
+
     /// Unsupported media type or format
     UnsupportedMediaType(String),
-    
+
     /// Internal processing error from SOF engine
     ProcessingError(SofError),
-    
+
     /// JSON parsing error
     JsonError(serde_json::Error),
-    
+
     /// Generic internal server error
     InternalError(String),
-    
+
     /// Feature not implemented
     NotImplemented(String),
 }
@@ -60,7 +60,7 @@ impl From<SofError> for ServerError {
             SofError::UnsupportedContentType(_) => {
                 ServerError::UnsupportedMediaType(err.to_string())
             }
-            _ => ServerError::ProcessingError(err)
+            _ => ServerError::ProcessingError(err),
         }
     }
 }
@@ -74,16 +74,8 @@ impl From<serde_json::Error> for ServerError {
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let (status, error_code, details) = match &self {
-            ServerError::BadRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                "invalid",
-                msg.clone(),
-            ),
-            ServerError::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                "not-found",
-                msg.clone(),
-            ),
+            ServerError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "invalid", msg.clone()),
+            ServerError::NotFound(msg) => (StatusCode::NOT_FOUND, "not-found", msg.clone()),
             ServerError::UnsupportedMediaType(msg) => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "not-supported",
@@ -99,16 +91,12 @@ impl IntoResponse for ServerError {
                 "invalid",
                 format!("Invalid JSON: {}", err),
             ),
-            ServerError::InternalError(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "exception",
-                msg.clone(),
-            ),
-            ServerError::NotImplemented(msg) => (
-                StatusCode::NOT_IMPLEMENTED,
-                "not-supported",
-                msg.clone(),
-            ),
+            ServerError::InternalError(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "exception", msg.clone())
+            }
+            ServerError::NotImplemented(msg) => {
+                (StatusCode::NOT_IMPLEMENTED, "not-supported", msg.clone())
+            }
         };
 
         // Create FHIR OperationOutcome

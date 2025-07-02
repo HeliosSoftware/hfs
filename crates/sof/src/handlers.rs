@@ -88,6 +88,25 @@ pub async fn run_view_definition_handler(
     let extracted_params =
         extract_all_parameters(parameters).map_err(|e| ServerError::BadRequest(e))?;
 
+    // Check for not-yet-implemented parameters
+    if extracted_params.view_reference.is_some() {
+        return Err(ServerError::NotImplemented(
+            "The viewReference parameter is not yet implemented. Please provide the ViewDefinition directly using the viewResource parameter.".to_string()
+        ));
+    }
+
+    if extracted_params.group.is_some() {
+        return Err(ServerError::NotImplemented(
+            "The group parameter is not yet implemented.".to_string(),
+        ));
+    }
+
+    if extracted_params.source.is_some() {
+        return Err(ServerError::NotImplemented(
+            "The source parameter is not yet implemented.".to_string(),
+        ));
+    }
+
     // For backward compatibility, extract the legacy tuple format
     let view_def_json = extracted_params.view_definition;
     let resources_json = if extracted_params.resources.is_empty() {
@@ -148,7 +167,7 @@ pub async fn run_view_definition_handler(
         .or(validated_params.patient.clone());
     let group_filter = extracted_params.group.or(validated_params.group.clone());
     let source_param = extracted_params.source.or(validated_params.source.clone());
-    
+
     // Merge count and page parameters - body takes precedence over query
     if let Some(count) = extracted_params.count {
         validated_params.count = Some(count as usize);
@@ -209,7 +228,7 @@ pub async fn run_view_definition_handler(
 /// transform FHIR resources into a tabular format and returns the results synchronously.
 ///
 /// # FHIR GET Operation Constraints
-/// 
+///
 /// Per the FHIR specification, GET operations can only use simple input parameters.
 /// Complex datatypes like Reference, Identifier, and Resource cannot be passed as
 /// URL parameters. Therefore, this GET endpoint only supports:
@@ -254,24 +273,34 @@ pub async fn run_view_definition_get_handler(
     // Validate that no complex parameters are provided
     if params.view_reference.is_some() {
         return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like viewReference. Use POST instead.".to_string()
+            "GET operations cannot use complex parameters like viewReference. Use POST instead."
+                .to_string(),
         ));
     }
     if params.patient.is_some() {
         return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like patient. Use POST instead.".to_string()
+            "GET operations cannot use complex parameters like patient. Use POST instead."
+                .to_string(),
         ));
     }
     if params.group.is_some() {
         return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like group. Use POST instead.".to_string()
+            "GET operations cannot use complex parameters like group. Use POST instead."
+                .to_string(),
         ));
     }
 
     // Validate and parse query parameters (only simple types)
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let _validated_params =
+    let validated_params =
         validate_query_params(&params, accept_header).map_err(|e| ServerError::BadRequest(e))?;
+
+    // Check if source parameter is provided - it's not implemented
+    if validated_params.source.is_some() {
+        return Err(ServerError::NotImplemented(
+            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.".to_string()
+        ));
+    }
 
     // For GET requests without a ViewDefinition, we cannot proceed
     Err(ServerError::BadRequest(
@@ -520,7 +549,10 @@ fn filter_resources_by_patient_and_group(
         } else {
             format!("Patient/{}", patient_ref)
         };
-        debug!("Filtering resources by patient: {} (normalized: {})", patient_ref, normalized_patient_ref);
+        debug!(
+            "Filtering resources by patient: {} (normalized: {})",
+            patient_ref, normalized_patient_ref
+        );
         let patient_ref_to_match = normalized_patient_ref.as_str();
         filtered = filtered
             .into_iter()

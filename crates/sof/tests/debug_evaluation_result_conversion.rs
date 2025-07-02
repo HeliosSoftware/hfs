@@ -15,23 +15,24 @@ fn test_evaluation_result_conversion() {
             }
         ]
     });
-    
+
     // Parse as R4 Patient
-    let patient: fhir::r4::Patient = serde_json::from_value(patient_json).expect("Failed to parse patient");
-    
+    let patient: fhir::r4::Patient =
+        serde_json::from_value(patient_json).expect("Failed to parse patient");
+
     // Convert to EvaluationResult
     let eval_result = patient.into_evaluation_result();
-    
+
     println!("EvaluationResult structure:");
     println!("{:#?}", eval_result);
-    
+
     // Test individual extension conversion
     if let Some(extensions) = &patient.extension {
         if let Some(first_ext) = extensions.first() {
             println!("\nDirect extension conversion:");
             let ext_eval_result = first_ext.into_evaluation_result();
             println!("{:#?}", ext_eval_result);
-            
+
             // Test the value field specifically
             if let Some(value) = &first_ext.value {
                 println!("\nExtension value conversion:");

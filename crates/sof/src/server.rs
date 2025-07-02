@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_with_source_parameter_fails() {
+    async fn test_get_with_source_parameter_not_implemented() {
         let config = ServerConfig::default();
         let app = create_app_with_config(&config);
         let server = TestServer::new(app).unwrap();
@@ -444,10 +444,10 @@ mod tests {
         let response = server
             .get("/ViewDefinition/$run")
             .add_query_param("source", "my-data-source")
-            .add_query_param("_format", "json")
+            .add_query_param("_format", "application/json")
             .await;
 
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
 
         let json: serde_json::Value = response.json();
         assert_eq!(json["resourceType"], "OperationOutcome");
@@ -455,7 +455,7 @@ mod tests {
             json["issue"][0]["details"]["text"]
                 .as_str()
                 .unwrap()
-                .contains("GET operations cannot use the source parameter")
+                .contains("The source parameter is not supported in this stateless implementation")
         );
     }
 
@@ -509,19 +509,20 @@ mod tests {
                 .contains("group")
         );
 
-        // Test source
+        // Test source - now returns NOT_IMPLEMENTED instead of BAD_REQUEST
         let server = TestServer::new(app.clone()).unwrap();
         let response = server
             .get("/ViewDefinition/$run")
             .add_query_param("source", "my-source")
+            .add_query_param("_format", "application/json")
             .await;
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
         let json: serde_json::Value = response.json();
         assert!(
             json["issue"][0]["details"]["text"]
                 .as_str()
                 .unwrap()
-                .contains("source")
+                .contains("source parameter is not supported")
         );
     }
 }

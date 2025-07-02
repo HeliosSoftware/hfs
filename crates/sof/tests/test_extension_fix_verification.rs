@@ -1,5 +1,5 @@
-use sof::{run_view_definition, SofViewDefinition, SofBundle, ContentType};
 use serde_json;
+use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_extension_fix_verification() {
@@ -15,7 +15,7 @@ fn test_extension_fix_verification() {
             }
         ]
     });
-    
+
     // Create bundle with the patient
     let bundle_json = serde_json::json!({
         "resourceType": "Bundle",
@@ -27,11 +27,11 @@ fn test_extension_fix_verification() {
             }
         ]
     });
-    
+
     // Parse bundle
     let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
     let bundle = SofBundle::R4(bundle);
-    
+
     // Create ViewDefinition matching the failing test
     let view_definition_json = serde_json::json!({
         "resourceType": "ViewDefinition",
@@ -53,22 +53,25 @@ fn test_extension_fix_verification() {
             }
         ]
     });
-    
-    let view_definition: fhir::r4::ViewDefinition = serde_json::from_value(view_definition_json).unwrap();
+
+    let view_definition: fhir::r4::ViewDefinition =
+        serde_json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
-    
+
     println!("Running SQL-on-FHIR extension test...");
-    
+
     // Run the view definition
     let result = run_view_definition(view_definition, bundle, ContentType::Json).unwrap();
-    
+
     let result_str = String::from_utf8(result).unwrap();
     println!("Result: {}", result_str);
-    
+
     // Check if the result contains "F" instead of null
     if result_str.contains("\"birthsex\": \"F\"") {
         println!("✅ SUCCESS! Extension function is working correctly!");
-        println!("The fix for choice element type preservation and extension function is complete.");
+        println!(
+            "The fix for choice element type preservation and extension function is complete."
+        );
     } else if result_str.contains("\"birthsex\": null") {
         println!("❌ Extension function still returning null - needs further investigation");
         panic!("Extension function fix failed - still returning null instead of 'F'");

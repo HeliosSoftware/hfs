@@ -1,5 +1,6 @@
 - Need to fully test each of the parameters
   - getReferenceKey - includes 'Patient'??
+  - Support viewReference
   - Need to support application/parquet 
   - sof-cli documentation doesn't mention all format types
 
