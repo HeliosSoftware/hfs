@@ -40,6 +40,15 @@ cat view-definition.json | sof-cli --bundle patient-data.json --format csv
 
 # Read Bundle from stdin, ViewDefinition from file
 cat patient-bundle.json | sof-cli --view view-definition.json --format json
+
+# Filter resources modified after a specific date
+sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z -f csv
+
+# Limit results to first 100 rows
+sof-cli -v view-definition.json -b patient-data.json --count 100
+
+# Combine filters: recent resources limited to 50 results
+sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z --count 50
 ```
 
 #### CLI Features
@@ -47,6 +56,9 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 - **Flexible Input**: Read ViewDefinitions and Bundles from files or stdin (but not both from stdin)
 - **Output Formats**: CSV (with/without headers), JSON (pretty-printed array), NDJSON (newline-delimited), Parquet (planned)
 - **Output Options**: Write to stdout (default) or specified file with `-o`
+- **Result Filtering**: 
+  - Filter resources by modification time with `--since` (RFC3339 format)
+  - Limit number of results with `--count` (1-10000)
 - **FHIR Version Support**: R4 by default; other versions (R4B, R5, R6) require compilation with feature flags
 - **Error Handling**: Clear, actionable error messages for debugging
 
@@ -58,6 +70,8 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
+    --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+    --count <COUNT>            Limit the number of results (1-10000)
     --fhir-version <VERSION>   FHIR version to use [default: R4]
 -h, --help                     Print help
 

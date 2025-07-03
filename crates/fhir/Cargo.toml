@@ -17,6 +17,7 @@ clap = { version = "4.4", features = ["derive"] }
 fhir_macro = { path = "../fhir_macro" }
 fhirpath_support = { path = "../fhirpath_support", version = "0.1.0" } # Add version if needed, ensure path is correct
 time = "0.3.41"
+chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros
 rust_decimal = { version = "1.37.1", features = ["serde-with-arbitrary-precision", "macros"] }
 

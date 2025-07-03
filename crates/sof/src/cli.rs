@@ -19,6 +19,8 @@
 //! -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
+//!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
+//!     --count <COUNT>            Limit the number of results (1-10000)
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
 //! -h, --help                     Print help
 //!
@@ -57,6 +59,21 @@
 //! sof-cli -v view_definition.json -b patient_bundle.json -f json
 //! ```
 //!
+//! ### Filter by modification time
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json --since 2024-01-01T00:00:00Z
+//! ```
+//!
+//! ### Limit number of results
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json --count 100
+//! ```
+//!
+//! ### Combine filters
+//! ```bash
+//! sof-cli -v view_definition.json -b patient_bundle.json --since 2024-01-01T00:00:00Z --count 50
+//! ```
+//!
 //! ## Input Requirements
 //!
 //! - **ViewDefinition**: A FHIR ViewDefinition resource that defines the SQL transformation
@@ -80,9 +97,10 @@
 //!
 //! When compiled with additional features, use `--fhir-version` to specify the version.
 
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use fhir::FhirVersion;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use sof::{ContentType, RunOptions, SofBundle, SofViewDefinition, run_view_definition_with_options};
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -115,6 +133,14 @@ struct Args {
     /// Output file path (defaults to stdout)
     #[arg(long, short = 'o')]
     output: Option<PathBuf>,
+
+    /// Filter resources modified after this time (RFC3339 format, e.g., 2024-01-01T00:00:00Z)
+    #[arg(long)]
+    since: Option<String>,
+
+    /// Limit the number of results (1-10000)
+    #[arg(long)]
+    count: Option<usize>,
 
     /// FHIR version to use for parsing resources
     #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
@@ -236,8 +262,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ContentType::from_string(&args.format)?
     };
 
+    // Parse and validate the since parameter
+    let since = if let Some(since_str) = &args.since {
+        match DateTime::parse_from_rfc3339(since_str) {
+            Ok(dt) => Some(dt.with_timezone(&Utc)),
+            Err(_) => {
+                return Err(format!(
+                    "Invalid --since parameter: '{}'. Must be RFC3339 format (e.g., 2024-01-01T00:00:00Z)",
+                    since_str
+                ).into());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Validate the count parameter
+    let count = if let Some(c) = args.count {
+        if c == 0 {
+            return Err("--count parameter must be greater than 0".into());
+        }
+        if c > 10000 {
+            return Err("--count parameter cannot exceed 10000".into());
+        }
+        Some(c)
+    } else {
+        None
+    };
+
+    // Build run options
+    let options = RunOptions {
+        since,
+        count,
+        page: None,   // CLI doesn't support page parameter yet
+    };
+
     // Run the transformation
-    let result = run_view_definition(view_definition, bundle, content_type)?;
+    let result = run_view_definition_with_options(view_definition, bundle, content_type, options)?;
 
     // Output result
     match args.output {

@@ -2694,6 +2694,37 @@ fn generate_fhirpath_enum_impl(
             }
         });
         
+        // Generate get_last_updated method for Resource enum
+        let get_last_updated_arms = data.variants.iter().map(|variant| {
+            let variant_name = &variant.ident;
+            
+            match &variant.fields {
+                Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                    quote! {
+                        Self::#variant_name(resource) => {
+                            resource.meta.as_ref()
+                                .and_then(|m| m.last_updated.as_ref())
+                                .and_then(|lu| {
+                                    // Handle both Element<String> (which has .value) and Option<String>
+                                    let timestamp_str = if let Some(value) = lu.value.as_ref() {
+                                        value
+                                    } else {
+                                        return None;
+                                    };
+                                    ::chrono::DateTime::parse_from_rfc3339(timestamp_str).ok()
+                                })
+                                .map(|dt| dt.with_timezone(&::chrono::Utc))
+                        }
+                    }
+                }
+                _ => {
+                    quote! {
+                        Self::#variant_name { .. } => None,
+                    }
+                }
+            }
+        });
+        
         quote! {
             #into_evaluation_result_impl
             
@@ -2703,6 +2734,13 @@ fn generate_fhirpath_enum_impl(
                 pub fn resource_name(&self) -> &'static str {
                     match self {
                         #(#resource_name_arms)*
+                    }
+                }
+                
+                /// Returns the lastUpdated timestamp from the resource's metadata if available.
+                pub fn get_last_updated(&self) -> Option<::chrono::DateTime<::chrono::Utc>> {
+                    match self {
+                        #(#get_last_updated_arms)*
                     }
                 }
             }

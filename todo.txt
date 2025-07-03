@@ -1,10 +1,9 @@
 - Need to fully test each of the parameters
+  - test GET methods
   - getReferenceKey - includes 'Patient'??
   - Support viewReference
   - Need to support application/parquet 
   - _page is on hold
-  - test since
-  - test GET methods
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
