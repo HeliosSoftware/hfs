@@ -670,3 +670,263 @@ async fn test_patient_filtering_correct_format() {
     assert_eq!(results[0]["id"], "pt-1");
     assert_eq!(results[0]["family"], "Cole");
 }
+
+#[tokio::test]
+async fn test_since_parameter_in_post_body_valid() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "2023-01-01T00:00:00Z"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "example"
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    // Since _since filtering is not implemented, it should succeed but not filter
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    assert!(json.is_array());
+}
+
+#[tokio::test]
+async fn test_since_parameter_in_post_body_invalid() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "not-a-valid-timestamp"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(
+        json["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("_since parameter must be a valid RFC3339 timestamp")
+    );
+}
+
+#[tokio::test]
+async fn test_since_parameter_filtering() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "2023-06-01T00:00:00Z"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "lastUpdated", "path": "meta.lastUpdated"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "old-patient",
+                    "meta": {
+                        "lastUpdated": "2023-01-01T00:00:00Z"
+                    }
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "new-patient",
+                    "meta": {
+                        "lastUpdated": "2023-12-01T00:00:00Z"
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    assert!(json.is_array());
+    let results = json.as_array().unwrap();
+    
+    // Should only return the new patient (updated after 2023-06-01)
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"], "new-patient");
+    assert_eq!(results[0]["lastUpdated"], "2023-12-01T00:00:00Z");
+}
+
+#[tokio::test]
+async fn test_since_parameter_no_meta() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueInstant": "2023-06-01T00:00:00Z"
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "patient-without-meta"
+                    // No meta field
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "patient-with-meta",
+                    "meta": {
+                        "lastUpdated": "2023-12-01T00:00:00Z"
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    assert!(json.is_array());
+    let results = json.as_array().unwrap();
+    
+    // Should only return the patient with meta.lastUpdated after _since
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"], "patient-with-meta");
+}
+
+#[tokio::test]
+async fn test_since_parameter_wrong_value_type() {
+    let server = common::test_server().await;
+
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "_since",
+                "valueString": "2023-01-01T00:00:00Z"  // Wrong! Should be valueInstant or valueDateTime
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "status": "active",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"}
+                        ]
+                    }]
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["resourceType"], "OperationOutcome");
+    assert!(
+        json["issue"][0]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("_since parameter must use valueInstant or valueDateTime")
+    );
+}

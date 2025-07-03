@@ -238,6 +238,34 @@ async fn run_view_definition_handler(
                         page_from_body = Some(value_pos as u32);
                     }
                 }
+                Some("_since") => {
+                    // Check if any value[X] field exists
+                    let has_value_field = param.as_object().map_or(false, |obj| {
+                        obj.keys().any(|k| k.starts_with("value"))
+                    });
+                    
+                    // Extract and validate _since from valueInstant or valueDateTime
+                    if let Some(value_instant) = param.get("valueInstant").and_then(|v| v.as_str()) {
+                        if chrono::DateTime::parse_from_rfc3339(value_instant).is_err() {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                &format!("_since parameter must be a valid RFC3339 timestamp: {}", value_instant),
+                            );
+                        }
+                    } else if let Some(value_datetime) = param.get("valueDateTime").and_then(|v| v.as_str()) {
+                        if chrono::DateTime::parse_from_rfc3339(value_datetime).is_err() {
+                            return error_response(
+                                axum::http::StatusCode::BAD_REQUEST,
+                                &format!("_since parameter must be a valid RFC3339 timestamp: {}", value_datetime),
+                            );
+                        }
+                    } else if has_value_field {
+                        return error_response(
+                            axum::http::StatusCode::BAD_REQUEST,
+                            "_since parameter must use valueInstant or valueDateTime",
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -287,6 +315,48 @@ async fn run_view_definition_handler(
                 false
             })
             .collect();
+    }
+
+    // Apply _since filter if provided
+    let since_from_query = params.get("_since").map(|s| s.as_str());
+    let since_filter = if let Some(parameters) = body["parameter"].as_array() {
+        if let Some(param) = parameters.iter().find(|p| {
+            p.get("name").and_then(|n| n.as_str()) == Some("_since")
+        }) {
+            // Get from body parameter (takes precedence)
+            param.get("valueInstant")
+                .or_else(|| param.get("valueDateTime"))
+                .and_then(|v| v.as_str())
+        } else {
+            since_from_query
+        }
+    } else {
+        since_from_query
+    };
+
+    if let Some(since_str) = since_filter {
+        // Parse the _since timestamp
+        if let Ok(since_dt) = chrono::DateTime::parse_from_rfc3339(since_str) {
+            let since_utc = since_dt.with_timezone(&chrono::Utc);
+            
+            resources = resources
+                .into_iter()
+                .filter(|resource| {
+                    // Check if resource has meta.lastUpdated field
+                    if let Some(meta) = resource.get("meta") {
+                        if let Some(last_updated) = meta.get("lastUpdated").and_then(|lu| lu.as_str()) {
+                            // Parse the lastUpdated timestamp
+                            if let Ok(resource_updated) = chrono::DateTime::parse_from_rfc3339(last_updated) {
+                                // Compare timestamps - keep if resource was updated after _since
+                                return resource_updated.with_timezone(&chrono::Utc) > since_utc;
+                            }
+                        }
+                    }
+                    // If no meta.lastUpdated field, exclude the resource
+                    false
+                })
+                .collect();
+        }
     }
 
     // Parse content type - body format takes precedence

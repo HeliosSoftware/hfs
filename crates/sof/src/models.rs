@@ -210,6 +210,7 @@ pub struct ExtractedParameters {
     pub source: Option<String>,
     pub count: Option<u32>,
     pub page: Option<u32>,
+    pub since: Option<String>,
 }
 
 /// Helper function to process a single parameter in a version-independent way
@@ -218,10 +219,19 @@ fn process_parameter(
     param_json: serde_json::Value,
     result: &mut ExtractedParameters,
 ) -> Result<(), String> {
+    // Helper function to check if any value[X] field exists
+    let has_any_value_field = |param: &serde_json::Value| -> bool {
+        param.as_object().map_or(false, |obj| {
+            obj.keys().any(|k| k.starts_with("value"))
+        })
+    };
+
     match name {
         "viewResource" => {
             if let Some(resource) = param_json.get("resource") {
                 result.view_definition = Some(resource.clone());
+            } else if has_any_value_field(&param_json) {
+                return Err("viewResource parameter must contain a 'resource' field, not a value[X] field".to_string());
             }
         }
         "viewReference" => {
@@ -236,6 +246,8 @@ fn process_parameter(
                 if let Some(ref_str) = value_str.as_str() {
                     result.view_reference = Some(ref_str.to_string());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("viewReference parameter must use valueReference or valueString".to_string());
             }
         }
         "resource" => {
@@ -254,6 +266,8 @@ fn process_parameter(
                     // Not a Bundle, add the resource directly
                     result.resources.push(resource.clone());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("resource parameter must contain a 'resource' field, not a value[X] field".to_string());
             }
         }
         "patient" => {
@@ -268,6 +282,8 @@ fn process_parameter(
                 if let Some(ref_str) = value_str.as_str() {
                     result.patient = Some(ref_str.to_string());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("patient parameter must use valueReference or valueString".to_string());
             }
         }
         "group" => {
@@ -282,6 +298,8 @@ fn process_parameter(
                 if let Some(ref_str) = value_str.as_str() {
                     result.group = Some(ref_str.to_string());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("group parameter must use valueReference or valueString".to_string());
             }
         }
         "source" => {
@@ -293,6 +311,8 @@ fn process_parameter(
                 if let Some(source_str) = value_uri.as_str() {
                     result.source = Some(source_str.to_string());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("source parameter must use valueString or valueUri".to_string());
             }
         }
         "_format" | "format" => {
@@ -304,6 +324,8 @@ fn process_parameter(
                 if let Some(format_str) = value_str.as_str() {
                     result.format = Some(format_str.to_string());
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("_format parameter must use valueCode or valueString".to_string());
             }
         }
         "header" => {
@@ -341,6 +363,8 @@ fn process_parameter(
                     }
                     result.count = Some(int_val as u32);
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("_count parameter must use valueInteger or valuePositiveInt".to_string());
             }
         }
         "_page" => {
@@ -356,6 +380,40 @@ fn process_parameter(
                 if let Some(int_val) = value_pos_int.as_u64() {
                     result.page = Some(int_val as u32);
                 }
+            } else if has_any_value_field(&param_json) {
+                return Err("_page parameter must use valueInteger or valuePositiveInt".to_string());
+            }
+        }
+        "_since" => {
+            // Handle valueInstant (primary) or valueDateTime (alternate)
+            if let Some(value_instant) = param_json.get("valueInstant") {
+                if let Some(instant_str) = value_instant.as_str() {
+                    // Validate RFC3339 format
+                    match DateTime::parse_from_rfc3339(instant_str) {
+                        Ok(_) => result.since = Some(instant_str.to_string()),
+                        Err(_) => {
+                            return Err(format!(
+                                "_since parameter must be a valid RFC3339 timestamp: {}",
+                                instant_str
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(value_datetime) = param_json.get("valueDateTime") {
+                if let Some(datetime_str) = value_datetime.as_str() {
+                    // Validate RFC3339 format
+                    match DateTime::parse_from_rfc3339(datetime_str) {
+                        Ok(_) => result.since = Some(datetime_str.to_string()),
+                        Err(_) => {
+                            return Err(format!(
+                                "_since parameter must be a valid RFC3339 timestamp: {}",
+                                datetime_str
+                            ));
+                        }
+                    }
+                }
+            } else if has_any_value_field(&param_json) {
+                return Err("_since parameter must use valueInstant or valueDateTime".to_string());
             }
         }
         _ => {
@@ -438,9 +496,8 @@ pub fn apply_result_filtering(
     output_data: Vec<u8>,
     params: &ValidatedRunParams,
 ) -> Result<Vec<u8>, String> {
-    // For now, we'll apply simple pagination and count limiting
-    // The _since filtering would need to be implemented at the data source level
-    // which is beyond the scope of the current run_view_definition function
+    // Apply pagination and count limiting
+    // Note: _since filtering is applied at the resource level before ViewDefinition transformation
 
     match params.format {
         ContentType::Json | ContentType::NdJson => apply_json_filtering(output_data, params),
@@ -917,6 +974,270 @@ mod tests {
             assert_eq!(extracted.patient, Some("Patient/123".to_string()));
             assert_eq!(extracted.format, Some("csv".to_string()));
             assert_eq!(extracted.header, Some(false));
+        }
+    }
+
+    #[test]
+    fn test_extract_since_parameter_with_valueinstant() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_since",
+                "valueInstant": "2023-01-01T00:00:00Z"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+
+            assert_eq!(extracted.since, Some("2023-01-01T00:00:00Z".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_extract_since_parameter_with_valuedatetime() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_since",
+                "valueDateTime": "2023-01-01T00:00:00Z"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let extracted = extract_all_parameters(run_params).unwrap();
+
+            assert_eq!(extracted.since, Some("2023-01-01T00:00:00Z".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_extract_since_parameter_invalid() {
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_since",
+                "valueInstant": "not-a-valid-timestamp"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .contains("_since parameter must be a valid RFC3339 timestamp"));
+        }
+    }
+
+    #[test]
+    fn test_invalid_value_types_for_parameters() {
+        // Test _since with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_since",
+                "valueString": "2023-01-01T00:00:00Z"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "_since parameter must use valueInstant or valueDateTime");
+        }
+
+        // Test _count with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_count",
+                "valueString": "10"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "_count parameter must use valueInteger or valuePositiveInt");
+        }
+
+        // Test _page with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_page",
+                "valueString": "1"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "_page parameter must use valueInteger or valuePositiveInt");
+        }
+
+        // Test header with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "header",
+                "valueString": "true"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "Header parameter must be a boolean value (use valueBoolean)");
+        }
+
+        // Test _format with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "_format",
+                "valueBoolean": true
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "_format parameter must use valueCode or valueString");
+        }
+
+        // Test patient with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "patient",
+                "valueInteger": 123
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "patient parameter must use valueReference or valueString");
+        }
+
+        // Test group with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "group",
+                "valueBoolean": false
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "group parameter must use valueReference or valueString");
+        }
+
+        // Test source with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "source",
+                "valueInteger": 42
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "source parameter must use valueString or valueUri");
+        }
+
+        // Test viewReference with wrong value type
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewReference",
+                "valueBoolean": true
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "viewReference parameter must use valueReference or valueString");
+        }
+
+        // Test viewResource with value field instead of resource
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewResource",
+                "valueString": "ViewDefinition/123"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "viewResource parameter must contain a 'resource' field, not a value[X] field");
+        }
+
+        // Test resource parameter with value field
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "resource",
+                "valueString": "Patient/123"
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err(), "resource parameter must contain a 'resource' field, not a value[X] field");
         }
     }
 }

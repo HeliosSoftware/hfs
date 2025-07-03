@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Utc};
 use sof::{
     ContentType, SofBundle, SofViewDefinition, get_fhir_version_string,
     get_newest_enabled_fhir_version, run_view_definition,
@@ -175,6 +176,20 @@ pub async fn run_view_definition_handler(
     if let Some(page) = extracted_params.page {
         validated_params.page = Some(page as usize);
     }
+    
+    // Merge _since parameter - body takes precedence over query
+    if let Some(since_str) = extracted_params.since {
+        // Parse and validate the timestamp
+        match DateTime::parse_from_rfc3339(&since_str) {
+            Ok(dt) => validated_params.since = Some(dt.with_timezone(&Utc)),
+            Err(_) => {
+                return Err(ServerError::BadRequest(format!(
+                    "_since parameter must be a valid RFC3339 timestamp: {}",
+                    since_str
+                )));
+            }
+        }
+    }
 
     // Handle source parameter - in a stateless server, we can't load from external sources
     if let Some(source) = source_param {
@@ -190,6 +205,11 @@ pub async fn run_view_definition_handler(
             patient_filter.as_deref(),
             group_filter.as_deref(),
         )?;
+    }
+
+    // Apply _since filter if provided
+    if let Some(since) = validated_params.since {
+        filtered_resources = filter_resources_by_since(filtered_resources, since)?;
     }
 
     // Create Bundle from resources
@@ -614,6 +634,53 @@ fn filter_resources_by_patient_and_group(
         ));
     }
 
+    Ok(filtered)
+}
+
+/// Filter resources by their last updated time using the _since parameter
+///
+/// This function filters FHIR resources based on their meta.lastUpdated field,
+/// returning only resources that have been modified after the specified timestamp.
+///
+/// # Arguments
+/// * `resources` - Vector of FHIR resources as JSON values
+/// * `since` - DateTime filter - only include resources modified after this time
+///
+/// # Returns
+/// * `Ok(Vec<serde_json::Value>)` - Filtered resources
+/// * `Err(ServerError)` - If filtering fails
+fn filter_resources_by_since(
+    resources: Vec<serde_json::Value>,
+    since: DateTime<Utc>,
+) -> ServerResult<Vec<serde_json::Value>> {
+    debug!("Filtering resources modified since: {}", since);
+    
+    let filtered: Vec<serde_json::Value> = resources
+        .into_iter()
+        .filter(|resource| {
+            // Check if resource has meta.lastUpdated field
+            if let Some(meta) = resource.get("meta") {
+                if let Some(last_updated) = meta.get("lastUpdated").and_then(|lu| lu.as_str()) {
+                    // Parse the lastUpdated timestamp
+                    match DateTime::parse_from_rfc3339(last_updated) {
+                        Ok(resource_updated) => {
+                            // Compare timestamps - keep if resource was updated after _since
+                            return resource_updated.with_timezone(&Utc) > since;
+                        }
+                        Err(e) => {
+                            // Log warning but don't fail the entire request
+                            debug!("Failed to parse lastUpdated timestamp '{}': {}", last_updated, e);
+                        }
+                    }
+                }
+            }
+            // If no meta.lastUpdated field, exclude the resource
+            // This is conservative - we only include resources we know were updated after _since
+            false
+        })
+        .collect();
+    
+    debug!("Filtered {} resources by _since parameter", filtered.len());
     Ok(filtered)
 }
 

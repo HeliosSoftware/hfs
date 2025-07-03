@@ -362,6 +362,62 @@ async fn test_invalid_since_parameter() {
 }
 
 #[tokio::test]
+async fn test_since_parameter_query_filtering() {
+    let server = common::test_server().await;
+
+    let request_body = json!({
+        "resourceType": "Parameters",
+        "parameter": [{
+            "name": "viewResource",
+            "resource": {
+                "resourceType": "ViewDefinition",
+                "status": "active",
+                "resource": "Patient",
+                "select": [{
+                    "column": [
+                        {"name": "id", "path": "id"},
+                        {"name": "lastUpdated", "path": "meta.lastUpdated"}
+                    ]
+                }]
+            }
+        }, {
+            "name": "resource",
+            "resource": {
+                "resourceType": "Patient",
+                "id": "old-patient",
+                "meta": {
+                    "lastUpdated": "2023-01-01T00:00:00Z"
+                }
+            }
+        }, {
+            "name": "resource",
+            "resource": {
+                "resourceType": "Patient",
+                "id": "new-patient",
+                "meta": {
+                    "lastUpdated": "2023-12-01T00:00:00Z"
+                }
+            }
+        }]
+    });
+
+    // Test with _since as query parameter
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_query_param("_since", "2023-06-01T00:00:00Z")
+        .json(&request_body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    let results = json.as_array().unwrap();
+    
+    // Should only return the patient updated after 2023-06-01
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"], "new-patient");
+}
+
+#[tokio::test]
 async fn test_valid_since_parameter_formats() {
     let server = common::test_server().await;
 
