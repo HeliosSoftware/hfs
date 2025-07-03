@@ -411,7 +411,7 @@ async fn test_since_parameter_query_filtering() {
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
     let results = json.as_array().unwrap();
-    
+
     // Should only return the patient updated after 2023-06-01
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "new-patient");

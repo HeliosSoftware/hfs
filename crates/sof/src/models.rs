@@ -221,9 +221,9 @@ fn process_parameter(
 ) -> Result<(), String> {
     // Helper function to check if any value[X] field exists
     let has_any_value_field = |param: &serde_json::Value| -> bool {
-        param.as_object().map_or(false, |obj| {
-            obj.keys().any(|k| k.starts_with("value"))
-        })
+        param
+            .as_object()
+            .map_or(false, |obj| obj.keys().any(|k| k.starts_with("value")))
     };
 
     match name {
@@ -231,7 +231,10 @@ fn process_parameter(
             if let Some(resource) = param_json.get("resource") {
                 result.view_definition = Some(resource.clone());
             } else if has_any_value_field(&param_json) {
-                return Err("viewResource parameter must contain a 'resource' field, not a value[X] field".to_string());
+                return Err(
+                    "viewResource parameter must contain a 'resource' field, not a value[X] field"
+                        .to_string(),
+                );
             }
         }
         "viewReference" => {
@@ -247,7 +250,9 @@ fn process_parameter(
                     result.view_reference = Some(ref_str.to_string());
                 }
             } else if has_any_value_field(&param_json) {
-                return Err("viewReference parameter must use valueReference or valueString".to_string());
+                return Err(
+                    "viewReference parameter must use valueReference or valueString".to_string(),
+                );
             }
         }
         "resource" => {
@@ -267,7 +272,10 @@ fn process_parameter(
                     result.resources.push(resource.clone());
                 }
             } else if has_any_value_field(&param_json) {
-                return Err("resource parameter must contain a 'resource' field, not a value[X] field".to_string());
+                return Err(
+                    "resource parameter must contain a 'resource' field, not a value[X] field"
+                        .to_string(),
+                );
             }
         }
         "patient" => {
@@ -364,7 +372,9 @@ fn process_parameter(
                     result.count = Some(int_val as u32);
                 }
             } else if has_any_value_field(&param_json) {
-                return Err("_count parameter must use valueInteger or valuePositiveInt".to_string());
+                return Err(
+                    "_count parameter must use valueInteger or valuePositiveInt".to_string()
+                );
             }
         }
         "_page" => {
@@ -1034,9 +1044,11 @@ mod tests {
             let result = extract_all_parameters(run_params);
 
             assert!(result.is_err());
-            assert!(result
-                .unwrap_err()
-                .contains("_since parameter must be a valid RFC3339 timestamp"));
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("_since parameter must be a valid RFC3339 timestamp")
+            );
         }
     }
 
@@ -1057,7 +1069,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "_since parameter must use valueInstant or valueDateTime");
+            assert_eq!(
+                result.unwrap_err(),
+                "_since parameter must use valueInstant or valueDateTime"
+            );
         }
 
         // Test _count with wrong value type
@@ -1075,7 +1090,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "_count parameter must use valueInteger or valuePositiveInt");
+            assert_eq!(
+                result.unwrap_err(),
+                "_count parameter must use valueInteger or valuePositiveInt"
+            );
         }
 
         // Test _page with wrong value type
@@ -1093,7 +1111,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "_page parameter must use valueInteger or valuePositiveInt");
+            assert_eq!(
+                result.unwrap_err(),
+                "_page parameter must use valueInteger or valuePositiveInt"
+            );
         }
 
         // Test header with wrong value type
@@ -1111,7 +1132,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "Header parameter must be a boolean value (use valueBoolean)");
+            assert_eq!(
+                result.unwrap_err(),
+                "Header parameter must be a boolean value (use valueBoolean)"
+            );
         }
 
         // Test _format with wrong value type
@@ -1129,7 +1153,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "_format parameter must use valueCode or valueString");
+            assert_eq!(
+                result.unwrap_err(),
+                "_format parameter must use valueCode or valueString"
+            );
         }
 
         // Test patient with wrong value type
@@ -1147,7 +1174,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "patient parameter must use valueReference or valueString");
+            assert_eq!(
+                result.unwrap_err(),
+                "patient parameter must use valueReference or valueString"
+            );
         }
 
         // Test group with wrong value type
@@ -1165,7 +1195,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "group parameter must use valueReference or valueString");
+            assert_eq!(
+                result.unwrap_err(),
+                "group parameter must use valueReference or valueString"
+            );
         }
 
         // Test source with wrong value type
@@ -1183,7 +1216,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "source parameter must use valueString or valueUri");
+            assert_eq!(
+                result.unwrap_err(),
+                "source parameter must use valueString or valueUri"
+            );
         }
 
         // Test viewReference with wrong value type
@@ -1201,7 +1237,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "viewReference parameter must use valueReference or valueString");
+            assert_eq!(
+                result.unwrap_err(),
+                "viewReference parameter must use valueReference or valueString"
+            );
         }
 
         // Test viewResource with value field instead of resource
@@ -1219,7 +1258,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "viewResource parameter must contain a 'resource' field, not a value[X] field");
+            assert_eq!(
+                result.unwrap_err(),
+                "viewResource parameter must contain a 'resource' field, not a value[X] field"
+            );
         }
 
         // Test resource parameter with value field
@@ -1237,7 +1279,10 @@ mod tests {
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err(), "resource parameter must contain a 'resource' field, not a value[X] field");
+            assert_eq!(
+                result.unwrap_err(),
+                "resource parameter must contain a 'resource' field, not a value[X] field"
+            );
         }
     }
 }

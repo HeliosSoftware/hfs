@@ -74,10 +74,10 @@ async fn test_getresourcekey_csv_quote_handling() {
     assert_eq!(lines[0], "id");
 
     // Check that resource keys don't have extra quotes
-    // They should be: Patient/269a6a02-37e2-bd1a-e079-fda944434a99
-    // Not: """Patient/269a6a02-37e2-bd1a-e079-fda944434a99"""
-    assert_eq!(lines[1], "Patient/269a6a02-37e2-bd1a-e079-fda944434a99");
-    assert_eq!(lines[2], "Patient/269a6a02-37e2-bd1a-e079-fda944434a98");
+    // They should be: 269a6a02-37e2-bd1a-e079-fda944434a99
+    // Not: """269a6a02-37e2-bd1a-e079-fda944434a99"""
+    assert_eq!(lines[1], "269a6a02-37e2-bd1a-e079-fda944434a99");
+    assert_eq!(lines[2], "269a6a02-37e2-bd1a-e079-fda944434a98");
 
     // Ensure we're not getting triple quotes
     assert!(!lines[1].contains("\"\"\""));

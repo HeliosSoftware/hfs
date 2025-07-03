@@ -1,6 +1,4 @@
 - Need to fully test each of the parameters
-  - test GET methods
-  - getReferenceKey - includes 'Patient'??
   - Support viewReference
   - Need to support application/parquet 
   - _page is on hold

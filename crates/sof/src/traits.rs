@@ -537,7 +537,7 @@ mod r4_impl {
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R4(Box::new(self.clone()))
         }
-        
+
         fn get_last_updated(&self) -> Option<chrono::DateTime<chrono::Utc>> {
             self.get_last_updated()
         }
@@ -728,7 +728,7 @@ mod r4b_impl {
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R4B(Box::new(self.clone()))
         }
-        
+
         fn get_last_updated(&self) -> Option<chrono::DateTime<chrono::Utc>> {
             self.get_last_updated()
         }
@@ -929,7 +929,7 @@ mod r5_impl {
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R5(Box::new(self.clone()))
         }
-        
+
         fn get_last_updated(&self) -> Option<chrono::DateTime<chrono::Utc>> {
             self.get_last_updated()
         }
@@ -1130,7 +1130,7 @@ mod r6_impl {
         fn to_fhir_resource(&self) -> FhirResource {
             FhirResource::R6(Box::new(self.clone()))
         }
-        
+
         fn get_last_updated(&self) -> Option<chrono::DateTime<chrono::Utc>> {
             self.get_last_updated()
         }

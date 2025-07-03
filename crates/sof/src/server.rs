@@ -25,20 +25,20 @@
 //!
 //! POST /ViewDefinition/$run
 //!   Body: Parameters resource containing ViewDefinition and data
-//!   Query Parameters (in specification order):
+//!   Query Parameters (except viewReference, viewResource, patient, group, resource):
 //!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
-//!     header: CSV header control - true (default), false
+//!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _count: Limits the number of results (1-10000)
 //!     _page: Page number for paginated results (1-based)
-//!     _since: Return resources modified after this time (RFC3339)
+//!     _since: Return resources modified after this time (RFC3339 format, validates format only)
 //!   Body Parameters (in FHIR Parameters resource):
-//!     _format: Output format (type: code)
+//!     _format: Output format (type: code or string)
 //!     header: CSV header control (type: boolean)
 //!     viewReference: Reference(s) to ViewDefinition(s) (type: Reference) - Not yet supported
 //!     viewResource: ViewDefinition(s) to use (type: ViewDefinition)
 //!     patient: Filter by patient (type: Reference)
-//!     group: Filter by group (type: Reference)
+//!     group: Filter by group (type: Reference) - Not yet supported
 //!     source: Data source (type: string) - Not yet supported
 //!     _count: Result limit (type: integer)
 //!     _page: Page number (type: integer)
@@ -46,25 +46,6 @@
 //!     resource: FHIR resources to transform (type: Resource)
 //!   Returns: Transformed data in requested format
 //!
-//! GET /ViewDefinition/$run
-//!   IMPORTANT: Per FHIR specification, GET operations cannot use complex parameters.
-//!   This endpoint is limited and typically requires POST for practical use.
-//!   
-//!   Supported Query Parameters (simple types only):
-//!     _format: Output format - application/json, application/ndjson, text/csv, application/parquet
-//!     header: CSV header control - true (default), false
-//!     source: Data source (type: string) - Not yet supported
-//!     _count: Limits the number of results (1-10000)
-//!     _page: Page number for paginated results (1-based)
-//!     _since: Return resources modified after this time (RFC3339)
-//!   
-//!   Unsupported Parameters in GET (complex types - use POST instead):
-//!     viewReference: Cannot pass Reference types in GET
-//!     viewResource: Cannot pass a FHIR resource in GET
-//!     patient: Cannot pass Reference types in GET
-//!     group: Cannot pass Reference types in GET
-//!   
-//!   Returns: Error message explaining GET limitations
 //! ```
 //!
 //! ## Configuration
@@ -293,8 +274,7 @@ fn create_app_with_config(config: &ServerConfig) -> Router {
         .route("/metadata", get(handlers::capability_statement))
         .route(
             "/ViewDefinition/$run",
-            post(handlers::run_view_definition_handler)
-                .get(handlers::run_view_definition_get_handler),
+            post(handlers::run_view_definition_handler),
         )
         // Health check endpoint
         .route("/health", get(handlers::health_check))
@@ -433,96 +413,5 @@ mod tests {
         let json: serde_json::Value = response.json();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "sof-server");
-    }
-
-    #[tokio::test]
-    async fn test_get_with_source_parameter_not_implemented() {
-        let config = ServerConfig::default();
-        let app = create_app_with_config(&config);
-        let server = TestServer::new(app).unwrap();
-
-        let response = server
-            .get("/ViewDefinition/$run")
-            .add_query_param("source", "my-data-source")
-            .add_query_param("_format", "application/json")
-            .await;
-
-        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
-
-        let json: serde_json::Value = response.json();
-        assert_eq!(json["resourceType"], "OperationOutcome");
-        assert!(
-            json["issue"][0]["details"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("The source parameter is not supported in this stateless implementation")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_rejects_all_complex_parameters() {
-        let config = ServerConfig::default();
-        let app = create_app_with_config(&config);
-
-        // Test viewReference
-        let server = TestServer::new(app.clone()).unwrap();
-        let response = server
-            .get("/ViewDefinition/$run")
-            .add_query_param("viewReference", "ViewDefinition/123")
-            .await;
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-        let json: serde_json::Value = response.json();
-        assert!(
-            json["issue"][0]["details"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("viewReference")
-        );
-
-        // Test patient
-        let server = TestServer::new(app.clone()).unwrap();
-        let response = server
-            .get("/ViewDefinition/$run")
-            .add_query_param("patient", "Patient/456")
-            .await;
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-        let json: serde_json::Value = response.json();
-        assert!(
-            json["issue"][0]["details"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("patient")
-        );
-
-        // Test group
-        let server = TestServer::new(app.clone()).unwrap();
-        let response = server
-            .get("/ViewDefinition/$run")
-            .add_query_param("group", "Group/789")
-            .await;
-        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-        let json: serde_json::Value = response.json();
-        assert!(
-            json["issue"][0]["details"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("group")
-        );
-
-        // Test source - now returns NOT_IMPLEMENTED instead of BAD_REQUEST
-        let server = TestServer::new(app.clone()).unwrap();
-        let response = server
-            .get("/ViewDefinition/$run")
-            .add_query_param("source", "my-source")
-            .add_query_param("_format", "application/json")
-            .await;
-        assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
-        let json: serde_json::Value = response.json();
-        assert!(
-            json["issue"][0]["details"]["text"]
-                .as_str()
-                .unwrap()
-                .contains("source parameter is not supported")
-        );
     }
 }

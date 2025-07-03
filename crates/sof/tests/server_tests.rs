@@ -295,102 +295,6 @@ async fn test_run_view_definition_unsupported_format() {
 }
 
 #[tokio::test]
-async fn test_run_view_definition_get_without_reference() {
-    let server = common::test_server().await;
-
-    // GET request without viewReference should fail
-    let response = server.get("/ViewDefinition/$run").await;
-
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("GET /ViewDefinition/$run requires a ViewDefinition")
-    );
-}
-
-#[tokio::test]
-async fn test_run_view_definition_get_with_reference() {
-    let server = common::test_server().await;
-
-    // GET request with viewReference (not allowed per FHIR spec)
-    let response = server
-        .get("/ViewDefinition/$run")
-        .add_query_param("viewReference", "ViewDefinition/123")
-        .add_query_param("_format", "application/json")
-        .await;
-
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("GET operations cannot use complex parameters like viewReference")
-    );
-}
-
-#[tokio::test]
-async fn test_run_view_definition_get_with_query_params() {
-    let server = common::test_server().await;
-
-    // GET request with complex parameters should fail
-    let response = server
-        .get("/ViewDefinition/$run")
-        .add_query_param("viewReference", "ViewDefinition/my-view")
-        .add_query_param("_format", "text/csv")
-        .add_query_param("header", "present")
-        .add_query_param("_count", "100")
-        .add_query_param("_page", "2")
-        .add_query_param("_since", "2024-01-01T00:00:00Z")
-        .add_query_param("patient", "Patient/123")
-        .add_query_param("group", "Group/456")
-        .add_query_param("source", "my-data-source")
-        .await;
-
-    // Should fail because GET cannot use complex parameters like viewReference
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    // The error should mention the first complex parameter encountered
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("viewReference")
-    );
-}
-
-#[tokio::test]
-async fn test_run_view_definition_get_instance_level() {
-    let server = common::test_server().await;
-
-    // Instance-level GET request
-    let response = server
-        .get("/ViewDefinition/my-view-def/$run")
-        .add_query_param("_format", "application/json")
-        .await;
-
-    assert_eq!(response.status_code(), StatusCode::NOT_IMPLEMENTED);
-
-    let json: serde_json::Value = response.json();
-    assert_eq!(json["resourceType"], "OperationOutcome");
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("ViewDefinition lookup by ID")
-    );
-}
-
-#[tokio::test]
 async fn test_run_view_definition_post_with_source_parameter() {
     let server = common::test_server().await;
 
@@ -601,11 +505,15 @@ async fn test_patient_filtering_incorrect_format() {
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
-    
+
     // Without proper patient filter, both patients are returned
     assert!(json.is_array());
     let results = json.as_array().unwrap();
-    assert_eq!(results.len(), 2, "Both patients returned when filter not parsed");
+    assert_eq!(
+        results.len(),
+        2,
+        "Both patients returned when filter not parsed"
+    );
 }
 
 #[tokio::test]
@@ -662,7 +570,7 @@ async fn test_patient_filtering_correct_format() {
 
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
-    
+
     // With proper patient filter, only pt-1 is returned
     assert!(json.is_array());
     let results = json.as_array().unwrap();
@@ -819,7 +727,7 @@ async fn test_since_parameter_filtering() {
     let json: serde_json::Value = response.json();
     assert!(json.is_array());
     let results = json.as_array().unwrap();
-    
+
     // Should only return the new patient (updated after 2023-06-01)
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "new-patient");
@@ -881,7 +789,7 @@ async fn test_since_parameter_no_meta() {
     let json: serde_json::Value = response.json();
     assert!(json.is_array());
     let results = json.as_array().unwrap();
-    
+
     // Should only return the patient with meta.lastUpdated after _since
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["id"], "patient-with-meta");

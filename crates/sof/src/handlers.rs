@@ -49,22 +49,25 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 ///
 /// # Parameters (in specification order)
 ///
-/// All parameters can be provided in query string or request body (except viewResource which is body-only).
+/// Parameters can be provided as query parameters or in the request body (FHIR Parameters resource).
 /// Parameters in request body take precedence over query parameters.
 ///
-/// | Name | Type | Scope | Min | Max | Documentation |
-/// |------|------|-------|-----|-----|---------------|
-/// | _format | code | type, instance | 1 | 1 | Output format - json, ndjson, csv, parquet |
-/// | header | boolean | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-/// | viewReference | Reference | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. |
-/// | viewResource | ViewDefinition | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
-/// | patient | Reference | type, instance | 0 | * | Filter resources by patient. |
-/// | group | Reference | type, instance | 0 | * | Filter resources by group. |
-/// | source | string | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. |
-/// | _count | integer | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. |
-/// | _page | integer | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. |
-/// | _since | instant | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. |
-/// | resource | Resource | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
+/// | Name | Type | Use | Scope | Min | Max | Documentation |
+/// |------|------|-----|-------|-----|-----|---------------|
+/// | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
+/// | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
+/// | viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
+/// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
+/// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
+/// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
+/// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
+/// | _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
+/// | _page | integer | in | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. (1-based) |
+/// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
+/// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
+///
+/// ## Query Parameters
+/// All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters
 ///
 /// # Returns
 /// * `Ok(Response)` - The output of the operation is in the requested format, defined by the format parameter or accept header
@@ -176,7 +179,7 @@ pub async fn run_view_definition_handler(
     if let Some(page) = extracted_params.page {
         validated_params.page = Some(page as usize);
     }
-    
+
     // Merge _since parameter - body takes precedence over query
     if let Some(since_str) = extracted_params.since {
         // Parse and validate the timestamp
@@ -240,92 +243,6 @@ pub async fn run_view_definition_handler(
         filtered_output,
     )
         .into_response())
-}
-
-/// Handler for GET /ViewDefinition/$run - limited parameter support per FHIR specification
-///
-/// The `$run` operation on a ViewDefinition resource applies the view definition to
-/// transform FHIR resources into a tabular format and returns the results synchronously.
-///
-/// # FHIR GET Operation Constraints
-///
-/// Per the FHIR specification, GET operations can only use simple input parameters.
-/// Complex datatypes like Reference, Identifier, and Resource cannot be passed as
-/// URL parameters. Therefore, this GET endpoint only supports:
-/// - Simple parameters: _format, header, _count, _page, _since
-/// - NO complex parameters: viewReference, patient, group, source, viewResource, resource
-///
-/// For operations requiring complex parameters, use the POST endpoint instead.
-///
-/// # Arguments
-/// * `params` - Query parameters (simple types only)
-/// * `headers` - HTTP headers including Accept for content negotiation
-///
-/// # Supported Query Parameters
-///
-/// | Name | Type | Documentation |
-/// |------|------|---------------|
-/// | _format | code | Output format - json, ndjson, csv, parquet |
-/// | header | boolean | CSV header control - true (default), false |
-/// | _count | integer | Limits the number of results (1-10000) |
-/// | _page | integer | Page number for pagination (1-based) |
-/// | _since | instant | Filter by modification time (RFC3339 format) |
-///
-/// # Unsupported Parameters for GET
-/// - viewReference (Reference type - use POST instead)
-/// - patient (Reference type - use POST instead)
-/// - group (Reference type - use POST instead)
-/// - source (string type - use POST instead)
-/// - viewResource (ViewDefinition type - use POST instead)
-/// - resource (Resource type - use POST instead)
-///
-/// # Returns
-/// * `Ok(Response)` - The output in the requested format
-/// * `Err(ServerError)` - Various errors including attempts to use complex parameters
-pub async fn run_view_definition_get_handler(
-    Query(params): Query<RunQueryParams>,
-    headers: HeaderMap,
-) -> ServerResult<Response> {
-    info!("Handling GET ViewDefinition/$run request");
-    debug!("Query params: {:?}", params);
-
-    // Per FHIR spec, GET operations cannot use complex parameters
-    // Validate that no complex parameters are provided
-    if params.view_reference.is_some() {
-        return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like viewReference. Use POST instead."
-                .to_string(),
-        ));
-    }
-    if params.patient.is_some() {
-        return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like patient. Use POST instead."
-                .to_string(),
-        ));
-    }
-    if params.group.is_some() {
-        return Err(ServerError::BadRequest(
-            "GET operations cannot use complex parameters like group. Use POST instead."
-                .to_string(),
-        ));
-    }
-
-    // Validate and parse query parameters (only simple types)
-    let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
-    let validated_params =
-        validate_query_params(&params, accept_header).map_err(|e| ServerError::BadRequest(e))?;
-
-    // Check if source parameter is provided - it's not implemented
-    if validated_params.source.is_some() {
-        return Err(ServerError::NotImplemented(
-            "The source parameter is not supported in this stateless implementation. Please provide resources in the request body.".to_string()
-        ));
-    }
-
-    // For GET requests without a ViewDefinition, we cannot proceed
-    Err(ServerError::BadRequest(
-        "GET /ViewDefinition/$run requires a ViewDefinition to be provided. Since complex parameters cannot be used in GET requests, please use POST with viewResource or viewReference parameter.".to_string()
-    ))
 }
 
 /// Create the server's CapabilityStatement
@@ -654,7 +571,7 @@ fn filter_resources_by_since(
     since: DateTime<Utc>,
 ) -> ServerResult<Vec<serde_json::Value>> {
     debug!("Filtering resources modified since: {}", since);
-    
+
     let filtered: Vec<serde_json::Value> = resources
         .into_iter()
         .filter(|resource| {
@@ -669,7 +586,10 @@ fn filter_resources_by_since(
                         }
                         Err(e) => {
                             // Log warning but don't fail the entire request
-                            debug!("Failed to parse lastUpdated timestamp '{}': {}", last_updated, e);
+                            debug!(
+                                "Failed to parse lastUpdated timestamp '{}': {}",
+                                last_updated, e
+                            );
                         }
                     }
                 }
@@ -679,7 +599,7 @@ fn filter_resources_by_since(
             false
         })
         .collect();
-    
+
     debug!("Filtered {} resources by _since parameter", filtered.len());
     Ok(filtered)
 }

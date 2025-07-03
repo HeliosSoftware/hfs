@@ -100,7 +100,9 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use fhir::FhirVersion;
-use sof::{ContentType, RunOptions, SofBundle, SofViewDefinition, run_view_definition_with_options};
+use sof::{
+    ContentType, RunOptions, SofBundle, SofViewDefinition, run_view_definition_with_options,
+};
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -294,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = RunOptions {
         since,
         count,
-        page: None,   // CLI doesn't support page parameter yet
+        page: None, // CLI doesn't support page parameter yet
     };
 
     // Run the transformation

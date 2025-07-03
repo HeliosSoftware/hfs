@@ -2,8 +2,7 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 
 /// Implementation of the getResourceKey() function
 ///
-/// Returns a unique key identifying the current resource, typically in the format
-/// "ResourceType/id" (e.g., "Patient/123").
+/// Returns the ID of the current resource (e.g., "123" from a Patient with id "123").
 ///
 /// # Arguments
 ///
@@ -11,8 +10,8 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 ///
 /// # Returns
 ///
-/// * A string key identifying the resource
-/// * Empty if the resource doesn't have an id or resourceType
+/// * The ID of the resource
+/// * Empty if the resource doesn't have an id
 pub fn get_resource_key_function(
     invocation_base: &EvaluationResult,
 ) -> Result<EvaluationResult, EvaluationError> {
@@ -32,8 +31,8 @@ pub fn get_resource_key_function(
                 });
                 
             match (resource_type, id) {
-                (Some(rt), Some(id_str)) => {
-                    Ok(EvaluationResult::String(format!("{}/{}", rt, id_str), None))
+                (Some(_rt), Some(id_str)) => {
+                    Ok(EvaluationResult::String(id_str, None))
                 },
                 _ => Ok(EvaluationResult::Empty),
             }
@@ -44,9 +43,9 @@ pub fn get_resource_key_function(
 
 /// Implementation of the getReferenceKey([type]) function
 ///
-/// Extracts a unique key from a Reference object, optionally filtering by resource type.
+/// Extracts the ID portion from a Reference object, optionally filtering by resource type.
 /// The Reference object should have a "reference" field containing a string like
-/// "ResourceType/id".
+/// "ResourceType/id". This function returns just the ID part (e.g., "123" from "Patient/123").
 ///
 /// # Arguments
 ///
@@ -55,7 +54,7 @@ pub fn get_resource_key_function(
 ///
 /// # Returns
 ///
-/// * A string key from the reference
+/// * The ID portion of the reference (without the resource type prefix)
 /// * Empty if no reference found or type doesn't match
 pub fn get_reference_key_function(
     invocation_base: &EvaluationResult,
@@ -108,7 +107,7 @@ pub fn get_reference_key_function(
                 match reference_value {
                     EvaluationResult::String(ref_str, _) => {
                         // Parse the reference string (e.g., "Patient/123")
-                        if let Some((resource_type, _id)) = parse_reference(ref_str) {
+                        if let Some((resource_type, id)) = parse_reference(ref_str) {
                             // Check type filter if provided
                             if let Some(filter_type) = &type_filter {
                                 if resource_type != *filter_type {
@@ -116,8 +115,8 @@ pub fn get_reference_key_function(
                                 }
                             }
                             
-                            // Return the full reference string as the key
-                            Ok(EvaluationResult::String(ref_str.clone(), None))
+                            // Return just the ID part as the key
+                            Ok(EvaluationResult::String(id, None))
                         } else {
                             Ok(EvaluationResult::Empty)
                         }
@@ -174,7 +173,7 @@ mod tests {
         
         match result {
             EvaluationResult::String(key, _) => {
-                assert_eq!(key, "Patient/123");
+                assert_eq!(key, "123");
             },
             _ => panic!("Expected string result"),
         }
@@ -199,7 +198,7 @@ mod tests {
         
         match result {
             EvaluationResult::String(key, _) => {
-                assert_eq!(key, "Patient/456");
+                assert_eq!(key, "456");
             },
             _ => panic!("Expected string result"),
         }
@@ -210,7 +209,7 @@ mod tests {
         
         match result {
             EvaluationResult::String(key, _) => {
-                assert_eq!(key, "Patient/456");
+                assert_eq!(key, "456");
             },
             _ => panic!("Expected string result"),
         }

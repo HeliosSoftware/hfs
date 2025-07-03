@@ -903,12 +903,7 @@ pub fn run_view_definition(
     bundle: SofBundle,
     content_type: ContentType,
 ) -> Result<Vec<u8>, SofError> {
-    run_view_definition_with_options(
-        view_definition,
-        bundle,
-        content_type,
-        RunOptions::default(),
-    )
+    run_view_definition_with_options(view_definition, bundle, content_type, RunOptions::default())
 }
 
 /// Options for filtering and controlling ViewDefinition execution
@@ -954,14 +949,14 @@ pub fn run_view_definition_with_options(
 
     // Process the ViewDefinition to generate tabular data
     let processed_result = process_view_definition(view_definition, filtered_bundle)?;
-    
+
     // Apply pagination if needed
     let processed_result = if options.count.is_some() || options.page.is_some() {
         apply_pagination_to_result(processed_result, options.count, options.page)?
     } else {
         processed_result
     };
-    
+
     // Format the result according to the requested content type
     format_output(processed_result, content_type)
 }
@@ -2000,16 +1995,15 @@ fn create_iteration_context(
 }
 
 /// Filter a bundle's resources by their lastUpdated metadata
-fn filter_bundle_by_since(
-    bundle: SofBundle,
-    since: DateTime<Utc>,
-) -> Result<SofBundle, SofError> {
+fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<SofBundle, SofError> {
     match bundle {
         #[cfg(feature = "R4")]
         SofBundle::R4(mut b) => {
             if let Some(entries) = b.entry.as_mut() {
                 entries.retain(|entry| {
-                    entry.resource.as_ref()
+                    entry
+                        .resource
+                        .as_ref()
                         .and_then(|r| r.get_last_updated())
                         .map(|last_updated| last_updated > since)
                         .unwrap_or(false)
@@ -2021,7 +2015,9 @@ fn filter_bundle_by_since(
         SofBundle::R4B(mut b) => {
             if let Some(entries) = b.entry.as_mut() {
                 entries.retain(|entry| {
-                    entry.resource.as_ref()
+                    entry
+                        .resource
+                        .as_ref()
                         .and_then(|r| r.get_last_updated())
                         .map(|last_updated| last_updated > since)
                         .unwrap_or(false)
@@ -2033,7 +2029,9 @@ fn filter_bundle_by_since(
         SofBundle::R5(mut b) => {
             if let Some(entries) = b.entry.as_mut() {
                 entries.retain(|entry| {
-                    entry.resource.as_ref()
+                    entry
+                        .resource
+                        .as_ref()
                         .and_then(|r| r.get_last_updated())
                         .map(|last_updated| last_updated > since)
                         .unwrap_or(false)
@@ -2045,7 +2043,9 @@ fn filter_bundle_by_since(
         SofBundle::R6(mut b) => {
             if let Some(entries) = b.entry.as_mut() {
                 entries.retain(|entry| {
-                    entry.resource.as_ref()
+                    entry
+                        .resource
+                        .as_ref()
                         .and_then(|r| r.get_last_updated())
                         .map(|last_updated| last_updated > since)
                         .unwrap_or(false)
@@ -2069,7 +2069,7 @@ fn apply_pagination_to_result(
                 "Page number must be greater than 0".to_string(),
             ));
         }
-        
+
         let start_index = (page_num - 1) * limit;
         if start_index >= result.rows.len() {
             // Return empty result if page is beyond data
@@ -2079,7 +2079,7 @@ fn apply_pagination_to_result(
             result.rows = result.rows[start_index..end_index].to_vec();
         }
     }
-    
+
     Ok(result)
 }
 

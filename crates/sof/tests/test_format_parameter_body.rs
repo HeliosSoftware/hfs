@@ -82,13 +82,13 @@ async fn test_format_parameter_in_body_csv() {
             && lines[0].contains("given")
     );
     assert!(
-        lines[1].contains("Patient/pt-1")
+        lines[1].contains("pt-1")
             && lines[1].contains("2012-03-30")
             && lines[1].contains("Cole")
             && lines[1].contains("Joanie")
     );
     assert!(
-        lines[2].contains("Patient/pt-2")
+        lines[2].contains("pt-2")
             && lines[2].contains("2012-03-30")
             && lines[2].contains("Doe")
             && lines[2].contains("John")

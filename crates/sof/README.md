@@ -293,12 +293,7 @@ curl -X POST http://localhost:8080/ViewDefinition/$run \
 
 #### Parameters
 
-The `$run` operation accepts parameters either as query parameters or in a FHIR Parameters resource.
-All parameters follow the SQL-on-FHIR specification order.
-
-**Note on GET vs POST**: Per FHIR specification, GET operations cannot use complex datatypes. Therefore:
-- **GET requests**: Can only use simple parameters (_format, header, source, _count, _page, _since)
-- **POST requests**: Can use all parameters including complex types (viewReference, viewResource, patient, group, source, resource)
+The `$run` POST operation accepts parameters either as query parameters or in a FHIR Parameters resource.
 
 Parameter table:
 
@@ -318,11 +313,11 @@ Parameter table:
 
 ##### Query Parameters
 
-All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as query parameters:
+All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `resource` can be provided as POST query parameters:
 
 - **_format**: Output format (required if not in Accept header)
   - `application/json` - JSON array output (default)
-  - `text/csv` or `csv` - CSV output
+  - `text/csv` - CSV output
   - `application/ndjson` - Newline-delimited JSON
   - `application/parquet` - Parquet file 
 - **header**: Control CSV headers (only applies to CSV format)
@@ -393,35 +388,6 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_since=2024-01-01T00:00:
   -H "Content-Type: application/json" \
   -d '{...}'
 ```
-
-##### GET Endpoint - Limited by FHIR Specification
-
-**Important**: Per the FHIR specification, GET operations can only use simple input parameters. Complex datatypes like Reference, Identifier, and Resource cannot be passed as URL parameters.
-
-The GET endpoint exists but has severe limitations:
-
-```bash
-# GET /ViewDefinition/$run - WILL FAIL due to FHIR constraints
-# Cannot use viewReference, patient, group parameters in GET
-curl "http://localhost:8080/ViewDefinition/$run?_format=json&_count=50"
-```
-
-**Supported GET parameters** (simple types only):
-- `_format` - Output format
-- `header` - CSV header control
-- `source` - Data source (not implemented)
-- `_count` - Result limit
-- `_page` - Page number
-- `_since` - Modification time filter
-
-**Unsupported GET parameters** (complex types - use POST instead):
-- `viewReference` - Reference type (not allowed in GET)
-- `patient` - Reference type (not allowed in GET)
-- `group` - Reference type (not allowed in GET)
-- `viewResource` - Resource type (only in POST body)
-- `resource` - Resource type (only in POST body)
-
-**Recommendation**: Always use POST for the $run operation as it supports all parameters.
 
 ## Core Features
 
