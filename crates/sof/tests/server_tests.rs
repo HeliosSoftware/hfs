@@ -424,7 +424,7 @@ async fn test_run_view_definition_post_with_source_parameter() {
         json["issue"][0]["details"]["text"]
             .as_str()
             .unwrap()
-            .contains("The source parameter is not supported in this stateless implementation")
+            .contains("The source parameter is not yet implemented")
     );
 }
 
@@ -547,4 +547,126 @@ async fn test_post_source_not_implemented() {
             .unwrap()
             .contains("The source parameter is not yet implemented")
     );
+}
+
+#[tokio::test]
+async fn test_patient_filtering_incorrect_format() {
+    let server = common::test_server().await;
+
+    // This test demonstrates the issue: incorrect valueReference format
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "patient",
+                "valueReference": "Patient/pt-1"  // INCORRECT: should be an object
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "family", "path": "name.family"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "pt-1",
+                    "name": [{"family": "Cole"}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "pt-2",
+                    "name": [{"family": "Doe"}]
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    
+    // Without proper patient filter, both patients are returned
+    assert!(json.is_array());
+    let results = json.as_array().unwrap();
+    assert_eq!(results.len(), 2, "Both patients returned when filter not parsed");
+}
+
+#[tokio::test]
+async fn test_patient_filtering_correct_format() {
+    let server = common::test_server().await;
+
+    // Correct format for valueReference
+    let body = json!({
+        "resourceType": "Parameters",
+        "parameter": [
+            {
+                "name": "patient",
+                "valueReference": {
+                    "reference": "Patient/pt-1"  // CORRECT: object with reference property
+                }
+            },
+            {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [
+                            {"name": "id", "path": "id"},
+                            {"name": "family", "path": "name.family"}
+                        ]
+                    }]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "pt-1",
+                    "name": [{"family": "Cole"}]
+                }
+            },
+            {
+                "name": "resource",
+                "resource": {
+                    "resourceType": "Patient",
+                    "id": "pt-2",
+                    "name": [{"family": "Doe"}]
+                }
+            }
+        ]
+    });
+
+    let response = server
+        .post("/ViewDefinition/$run")
+        .add_header("Content-Type", "application/json")
+        .json(&body)
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    let json: serde_json::Value = response.json();
+    
+    // With proper patient filter, only pt-1 is returned
+    assert!(json.is_array());
+    let results = json.as_array().unwrap();
+    assert_eq!(results.len(), 1, "Only pt-1 should be returned");
+    assert_eq!(results[0]["id"], "pt-1");
+    assert_eq!(results[0]["family"], "Cole");
 }

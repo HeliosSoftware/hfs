@@ -2,7 +2,9 @@
   - getReferenceKey - includes 'Patient'??
   - Support viewReference
   - Need to support application/parquet 
-  - sof-cli documentation doesn't mention all format types
+  - _page is on hold
+  - test since
+  - test GET methods
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 

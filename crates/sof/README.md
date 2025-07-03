@@ -58,7 +58,7 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 -f, --format <FORMAT>          Output format (csv, json, ndjson, parquet) [default: csv]
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
-    --fhir-version <VERSION>   FHIR version to use [default: R4] [possible values: R4*]
+    --fhir-version <VERSION>   FHIR version to use [default: R4]
 -h, --help                     Print help
 
 * Additional FHIR versions (R4B, R5, R6) available when compiled with corresponding features
