@@ -301,8 +301,8 @@ Parameter table:
 |------|------|-----|-------|-----|-----|---------------|
 | _format | code | in | type, instance | 1 | 1 | Output format - `application/json`, `application/ndjson`, `text/csv`, `application/parquet` |
 | header | boolean | in | type, instance | 0 | 1 | This parameter only applies to `text/csv` requests. `true` (default) - return headers in the response, `false` - do not return headers. |
-| viewReference | Reference | in | type, instance | 0 | * | Reference(s) to ViewDefinition(s) to be used for data transformation. (not yet supported) |
-| viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
+| viewReference | Reference | in | type, instance | 0 | 1 | Reference to ViewDefinition to be used for data transformation. (not yet supported) |
+| viewResource | ViewDefinition | in | type | 0 | 1 | ViewDefinition to be used for data transformation. |
 | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
 | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
 | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |

@@ -209,6 +209,13 @@ fn process_parameter(
     match name {
         "viewResource" => {
             if let Some(resource) = param_json.get("resource") {
+                // Check if a ViewDefinition has already been provided
+                if result.view_definition.is_some() {
+                    return Err(
+                        "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
+                            .to_string(),
+                    );
+                }
                 result.view_definition = Some(resource.clone());
             } else if has_any_value_field(&param_json) {
                 return Err(
@@ -1149,6 +1156,48 @@ mod tests {
             assert_eq!(
                 result.unwrap_err(),
                 "resource parameter must contain a 'resource' field, not a value[X] field"
+            );
+        }
+
+        // Test multiple viewResource parameters - should fail
+        let params_json = serde_json::json!({
+            "resourceType": "Parameters",
+            "parameter": [{
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "resource": "Patient",
+                    "select": [{
+                        "column": [{
+                            "name": "id",
+                            "path": "id"
+                        }]
+                    }]
+                }
+            }, {
+                "name": "viewResource",
+                "resource": {
+                    "resourceType": "ViewDefinition",
+                    "resource": "Observation",
+                    "select": [{
+                        "column": [{
+                            "name": "id",
+                            "path": "id"
+                        }]
+                    }]
+                }
+            }]
+        });
+
+        #[cfg(feature = "R4")]
+        {
+            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let run_params = RunParameters::R4(params);
+            let result = extract_all_parameters(run_params);
+            assert!(result.is_err());
+            assert_eq!(
+                result.unwrap_err(),
+                "Only one viewResource parameter is allowed. Multiple ViewDefinitions are not supported"
             );
         }
     }
