@@ -30,7 +30,6 @@
 //!     header: CSV header control - true (default), false (only applies to CSV format)
 //!     source: Data source (type: string) - Not yet supported
 //!     _count: Limits the number of results (1-10000)
-//!     _page: Page number for paginated results (1-based)
 //!     _since: Return resources modified after this time (RFC3339 format, validates format only)
 //!   Body Parameters (in FHIR Parameters resource):
 //!     _format: Output format (type: code or string)
@@ -41,7 +40,6 @@
 //!     group: Filter by group (type: Reference) - Not yet supported
 //!     source: Data source (type: string) - Not yet supported
 //!     _count: Result limit (type: integer)
-//!     _page: Page number (type: integer)
 //!     _since: Modification time filter (type: instant)
 //!     resource: FHIR resources to transform (type: Resource)
 //!   Returns: Transformed data in requested format

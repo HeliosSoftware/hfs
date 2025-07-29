@@ -65,11 +65,10 @@ async fn test_pagination_parameters_combined() {
         ]
     });
 
-    // Test page 1 with count 2
+    // Test count 2 - should only return first 2 records
     let response = server
         .post("/ViewDefinition/$run")
         .add_query_param("_count", "2")
-        .add_query_param("_page", "1")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -81,11 +80,10 @@ async fn test_pagination_parameters_combined() {
     assert_eq!(rows[0]["id"], "1");
     assert_eq!(rows[1]["id"], "2");
 
-    // Test page 2 with count 2
+    // Test count 3 - should return first 3 records
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "2")
-        .add_query_param("_page", "2")
+        .add_query_param("_count", "3")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -93,15 +91,15 @@ async fn test_pagination_parameters_combined() {
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
     let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["id"], "3");
-    assert_eq!(rows[1]["id"], "4");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["id"], "1");
+    assert_eq!(rows[1]["id"], "2");
+    assert_eq!(rows[2]["id"], "3");
 
-    // Test page 3 with count 2 (should have only 1 result)
+    // Test count 5 - should return all 5 records
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "2")
-        .add_query_param("_page", "3")
+        .add_query_param("_count", "5")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -109,53 +107,9 @@ async fn test_pagination_parameters_combined() {
     assert_eq!(response.status_code(), StatusCode::OK);
     let json: serde_json::Value = response.json();
     let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["id"], "5");
-}
-
-#[tokio::test]
-async fn test_pagination_beyond_available_data() {
-    let server = common::test_server().await;
-
-    let request_body = json!({
-        "resourceType": "Parameters",
-        "parameter": [
-            {
-                "name": "viewResource",
-                "resource": {
-                    "resourceType": "ViewDefinition",
-                    "status": "active",
-                    "resource": "Patient",
-                    "select": [{
-                        "column": [{
-                            "name": "id",
-                            "path": "id"
-                        }]
-                    }]
-                }
-            },
-            {
-                "name": "resource",
-                "resource": {
-                    "resourceType": "Patient",
-                    "id": "single"
-                }
-            }
-        ]
-    });
-
-    // Request page 10 with only 1 resource available
-    let response = server
-        .post("/ViewDefinition/$run")
-        .add_query_param("_count", "10")
-        .add_query_param("_page", "10")
-        .json(&request_body)
-        .await;
-
-    assert_eq!(response.status_code(), StatusCode::OK);
-    let json: serde_json::Value = response.json();
-    let rows = json.as_array().unwrap();
-    assert_eq!(rows.len(), 0); // No data on page 10
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0]["id"], "1");
+    assert_eq!(rows[4]["id"], "5");
 }
 
 #[tokio::test]
@@ -224,40 +178,6 @@ async fn test_count_parameter_boundaries() {
             .as_str()
             .unwrap()
             .contains("_count parameter cannot exceed 10000")
-    );
-}
-
-#[tokio::test]
-async fn test_invalid_page_parameter() {
-    let server = common::test_server().await;
-
-    let request_body = json!({
-        "resourceType": "Parameters",
-        "parameter": [{
-            "name": "viewResource",
-            "resource": {
-                "resourceType": "ViewDefinition",
-                "status": "active",
-                "resource": "Patient",
-                "select": [{"column": [{"name": "id", "path": "id"}]}]
-            }
-        }]
-    });
-
-    // Test _page = 0 (invalid, must be 1-based)
-    let response = server
-        .post("/ViewDefinition/$run")
-        .add_query_param("_page", "0")
-        .json(&request_body)
-        .await;
-
-    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
-    let json: serde_json::Value = response.json();
-    assert!(
-        json["issue"][0]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("_page parameter must be greater than 0")
     );
 }
 
@@ -480,7 +400,6 @@ async fn test_combined_filtering_parameters() {
         .post("/ViewDefinition/$run")
         .add_query_param("_format", "application/json")
         .add_query_param("_count", "50")
-        .add_query_param("_page", "1")
         .add_query_param("_since", "2024-01-01T00:00:00Z")
         .add_query_param("patient", "Patient/123")
         .add_query_param("group", "Group/456")

@@ -62,7 +62,6 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
 /// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
 /// | _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
-/// | _page | integer | in | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. (1-based) |
 /// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
 /// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 ///
@@ -172,12 +171,9 @@ pub async fn run_view_definition_handler(
     let group_filter = extracted_params.group.or(validated_params.group.clone());
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
-    // Merge count and page parameters - body takes precedence over query
+    // Merge count parameter - body takes precedence over query
     if let Some(count) = extracted_params.count {
         validated_params.count = Some(count as usize);
-    }
-    if let Some(page) = extracted_params.page {
-        validated_params.page = Some(page as usize);
     }
 
     // Merge _since parameter - body takes precedence over query
@@ -269,7 +265,7 @@ fn create_capability_statement() -> serde_json::Value {
             "url": "http://localhost:8080"
         },
         "fhirVersion": fhir_version,
-        "format": ["json", "xml"],
+        "format": ["json"],
         "rest": [{
             "mode": "server",
             "operation": [{

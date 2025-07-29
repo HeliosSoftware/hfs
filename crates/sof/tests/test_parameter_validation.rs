@@ -14,7 +14,6 @@ struct RunQueryParams {
     format: Option<String>,
     header: Option<String>,
     count: Option<usize>,
-    page: Option<usize>,
     since: Option<String>,
 }
 
@@ -22,7 +21,6 @@ struct RunQueryParams {
 struct ValidatedRunParams {
     format: ContentType,
     count: Option<usize>,
-    page: Option<usize>,
     since: Option<DateTime<Utc>>,
 }
 
@@ -51,16 +49,6 @@ fn validate_query_params(
         None
     };
 
-    // Validate page parameter
-    let page = if let Some(p) = params.page {
-        if p == 0 {
-            return Err("_page parameter must be greater than 0 (1-based)".to_string());
-        }
-        Some(p)
-    } else {
-        None
-    };
-
     // Validate since parameter
     let since = if let Some(since_str) = &params.since {
         match DateTime::parse_from_rfc3339(since_str) {
@@ -79,7 +67,6 @@ fn validate_query_params(
     Ok(ValidatedRunParams {
         format,
         count,
-        page,
         since,
     })
 }
@@ -136,7 +123,7 @@ fn apply_json_filtering(
     let output_str =
         String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
 
-    if params.count.is_none() && params.page.is_none() {
+    if params.count.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -185,7 +172,7 @@ fn apply_csv_filtering(
     let output_str = String::from_utf8(output_data)
         .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
 
-    if params.count.is_none() && params.page.is_none() {
+    if params.count.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -226,38 +213,18 @@ fn apply_csv_filtering(
     }
 }
 
-/// Mock function to test pagination logic
+/// Mock function to test count limiting logic
 fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    let count = params.count.unwrap_or(records.len());
-    let page = params.page.unwrap_or(1);
-
-    // Calculate offset based on page (1-based)
-    let offset = (page - 1) * count;
-
-    if offset >= records.len() {
-        records.clear();
-        return;
+    if let Some(count) = params.count {
+        records.truncate(count);
     }
-
-    let end = std::cmp::min(offset + count, records.len());
-    *records = records[offset..end].to_vec();
 }
 
-/// Mock function to test line pagination
+/// Mock function to test line count limiting
 fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    let count = params.count.unwrap_or(lines.len());
-    let page = params.page.unwrap_or(1);
-
-    // Calculate offset based on page (1-based)
-    let offset = (page - 1) * count;
-
-    if offset >= lines.len() {
-        lines.clear();
-        return;
+    if let Some(count) = params.count {
+        lines.truncate(count);
     }
-
-    let end = std::cmp::min(offset + count, lines.len());
-    *lines = lines[offset..end].to_vec();
 }
 
 // Unit tests
@@ -268,14 +235,12 @@ fn test_validate_query_params_valid() {
         format: Some("application/json".to_string()),
         header: None,
         count: Some(10),
-        page: Some(2),
         since: Some("2023-01-01T00:00:00Z".to_string()),
     };
 
     let result = validate_query_params(&params, None).unwrap();
     assert_eq!(result.format, ContentType::Json);
     assert_eq!(result.count, Some(10));
-    assert_eq!(result.page, Some(2));
     assert!(result.since.is_some());
 }
 
@@ -285,7 +250,6 @@ fn test_validate_query_params_invalid_count() {
         format: None,
         header: None,
         count: Some(0),
-        page: None,
         since: None,
     };
 
@@ -304,7 +268,6 @@ fn test_validate_query_params_count_too_large() {
         format: None,
         header: None,
         count: Some(50000),
-        page: None,
         since: None,
     };
 
@@ -318,31 +281,11 @@ fn test_validate_query_params_count_too_large() {
 }
 
 #[test]
-fn test_validate_query_params_invalid_page() {
-    let params = RunQueryParams {
-        format: None,
-        header: None,
-        count: None,
-        page: Some(0),
-        since: None,
-    };
-
-    let result = validate_query_params(&params, None);
-    assert!(result.is_err());
-    assert!(
-        result
-            .unwrap_err()
-            .contains("_page parameter must be greater than 0")
-    );
-}
-
-#[test]
 fn test_validate_query_params_invalid_since() {
     let params = RunQueryParams {
         format: None,
         header: None,
         count: None,
-        page: None,
         since: Some("invalid-date".to_string()),
     };
 
@@ -392,7 +335,6 @@ fn test_apply_csv_filtering() {
     let params = ValidatedRunParams {
         format: ContentType::CsvWithHeader,
         count: Some(2),
-        page: Some(1),
         since: None,
     };
 
@@ -407,14 +349,13 @@ fn test_apply_csv_filtering() {
 }
 
 #[test]
-fn test_apply_csv_filtering_page_2() {
+fn test_apply_csv_filtering_with_count() {
     let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
         .as_bytes()
         .to_vec();
     let params = ValidatedRunParams {
         format: ContentType::CsvWithHeader,
         count: Some(2),
-        page: Some(2),
         since: None,
     };
 
@@ -422,10 +363,10 @@ fn test_apply_csv_filtering_page_2() {
     let result_str = String::from_utf8(result).unwrap();
 
     assert!(result_str.contains("id,name"));
-    assert!(!result_str.contains("1,John"));
-    assert!(!result_str.contains("2,Jane"));
-    assert!(result_str.contains("3,Bob"));
-    assert!(result_str.contains("4,Alice"));
+    assert!(result_str.contains("1,John"));
+    assert!(result_str.contains("2,Jane"));
+    assert!(!result_str.contains("3,Bob"));
+    assert!(!result_str.contains("4,Alice"));
 }
 
 #[test]
@@ -437,7 +378,6 @@ fn test_apply_json_filtering() {
     let params = ValidatedRunParams {
         format: ContentType::Json,
         count: Some(2),
-        page: Some(1),
         since: None,
     };
 
@@ -462,7 +402,6 @@ fn test_apply_ndjson_filtering() {
     let params = ValidatedRunParams {
         format: ContentType::NdJson,
         count: Some(2),
-        page: Some(2),
         since: None,
     };
 
@@ -474,9 +413,9 @@ fn test_apply_ndjson_filtering() {
     let first_record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     let second_record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
 
-    // Should be page 2, so records 3 and 4
-    assert_eq!(first_record["id"], "3");
-    assert_eq!(second_record["id"], "4");
+    // Should be first 2 records
+    assert_eq!(first_record["id"], "1");
+    assert_eq!(second_record["id"], "2");
 }
 
 // Helper function for NDJSON filtering test
@@ -487,7 +426,6 @@ fn apply_ndjson_filtering(
     let params_json = ValidatedRunParams {
         format: ContentType::NdJson,
         count: params.count,
-        page: params.page,
         since: params.since,
     };
     apply_json_filtering(output_data, &params_json)
@@ -500,28 +438,28 @@ fn test_pagination_edge_cases() {
     let params = ValidatedRunParams {
         format: ContentType::Json,
         count: Some(5),
-        page: Some(1),
         since: None,
     };
 
     apply_pagination_to_records(&mut empty_records, &params);
     assert_eq!(empty_records.len(), 0);
 
-    // Test pagination beyond available data
+    // Test count limiting with more records than limit
     let mut records = vec![
         serde_json::json!({"id": "1"}),
         serde_json::json!({"id": "2"}),
+        serde_json::json!({"id": "3"}),
+        serde_json::json!({"id": "4"}),
     ];
 
-    let params_beyond = ValidatedRunParams {
+    let params_limit = ValidatedRunParams {
         format: ContentType::Json,
-        count: Some(10),
-        page: Some(2),
+        count: Some(2),
         since: None,
     };
 
-    apply_pagination_to_records(&mut records, &params_beyond);
-    assert_eq!(records.len(), 0);
+    apply_pagination_to_records(&mut records, &params_limit);
+    assert_eq!(records.len(), 2);
 }
 
 #[test]
@@ -539,7 +477,6 @@ fn test_since_parameter_parsing() {
             format: None,
             header: None,
             count: None,
-            page: None,
             since: Some(timestamp.to_string()),
         };
 
@@ -565,7 +502,6 @@ fn test_since_parameter_parsing() {
             format: None,
             header: None,
             count: None,
-            page: None,
             since: Some(timestamp.to_string()),
         };
 

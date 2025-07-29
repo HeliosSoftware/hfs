@@ -29,7 +29,7 @@ it should use a `POST` request.
 
 Note: Per the FHIR specification, GET operations can only use simple input parameters.
 Complex datatypes like Reference, Identifier, and Resource cannot be passed as URL parameters.
-Therefore, GET requests are limited to simple parameters (_format, header, source, _count, _page, _since)
+Therefore, GET requests are limited to simple parameters (_format, header, source, _count, _since)
 while POST requests can use all parameters including complex types.
 
 The response format is determined by either:
@@ -45,7 +45,6 @@ The server MAY support additional filtering parameters:
 * `group` - filter resources by group
 * `_since` - filter resources by last updated time
 * `_count` - limit the number of results
-* `_page` - page number for paginated results
 
 If the server does not support some of the parameters, it should return an error and a FHIR `OperationOutcome` resource so the client can re-submit a request omitting the unsupported parameter.
 
@@ -64,7 +63,6 @@ If the `json` format is requested, the server should return an array of objects.
 | group | Reference | in | type, instance | 0 | * | Filter resources by group. See [Clarification](#group-parameter-clarification) for details. |
 | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. `source` may be interpreted as implementation specific and may be a Uri, a bucket name, or another method acceptable to the server. If `source` is absent, the transformation is performed on the data that resides on the server. |
 | _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. |
-| _page | integer | in | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. |
 | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. See [Clarification](#since-parameter-clarification) for details. |
 | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 | return | Binary | out | - | - | - | The output of the operation is in the requested format, defined by the format parameter or accept header |

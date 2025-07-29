@@ -23,10 +23,6 @@ pub struct RunQueryParams {
     #[serde(rename = "_count")]
     pub count: Option<usize>,
 
-    /// Page number for pagination
-    #[serde(rename = "_page")]
-    pub page: Option<usize>,
-
     /// Include only resources modified after this time
     #[serde(rename = "_since")]
     pub since: Option<String>,
@@ -57,9 +53,6 @@ pub struct ValidatedRunParams {
 
     /// Limit number of results (None means no limit)
     pub count: Option<usize>,
-
-    /// Page number for pagination (1-based, None means first page)
-    pub page: Option<usize>,
 
     /// Include only resources modified after this time
     pub since: Option<DateTime<Utc>>,
@@ -102,8 +95,7 @@ pub struct Reference {
 ///
 /// # Validation Rules
 /// * `_count` must be between 1 and 10000
-/// * `_page` must be >= 1 (1-based pagination)
-/// * `_since` must be a valid RFC3339 timestamp
+////// * `_since` must be a valid RFC3339 timestamp
 /// * `_format` takes precedence over Accept header
 pub fn validate_query_params(
     params: &RunQueryParams,
@@ -138,16 +130,6 @@ pub fn validate_query_params(
         None
     };
 
-    // Validate page parameter
-    let page = if let Some(p) = params.page {
-        if p == 0 {
-            return Err("_page parameter must be greater than 0 (1-based)".to_string());
-        }
-        Some(p)
-    } else {
-        None
-    };
-
     // Validate since parameter
     let since = if let Some(since_str) = &params.since {
         match DateTime::parse_from_rfc3339(since_str) {
@@ -166,7 +148,6 @@ pub fn validate_query_params(
     Ok(ValidatedRunParams {
         format,
         count,
-        page,
         since,
         view_reference: params.view_reference.clone(),
         patient: params.patient.clone(),
@@ -209,7 +190,6 @@ pub struct ExtractedParameters {
     pub group: Option<String>,
     pub source: Option<String>,
     pub count: Option<u32>,
-    pub page: Option<u32>,
     pub since: Option<String>,
 }
 
@@ -377,23 +357,6 @@ fn process_parameter(
                 );
             }
         }
-        "_page" => {
-            // Handle both valueInteger and valuePositiveInt
-            if let Some(value_int) = param_json.get("valueInteger") {
-                if let Some(int_val) = value_int.as_i64() {
-                    if int_val <= 0 {
-                        return Err("_page parameter must be greater than 0".to_string());
-                    }
-                    result.page = Some(int_val as u32);
-                }
-            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
-                if let Some(int_val) = value_pos_int.as_u64() {
-                    result.page = Some(int_val as u32);
-                }
-            } else if has_any_value_field(&param_json) {
-                return Err("_page parameter must use valueInteger or valuePositiveInt".to_string());
-            }
-        }
         "_since" => {
             // Handle valueInstant (primary) or valueDateTime (alternate)
             if let Some(value_instant) = param_json.get("valueInstant") {
@@ -496,7 +459,7 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
 /// * `Err(String)` - Error message if filtering fails
 ///
 /// # Supported Filters
-/// * Pagination - Applied using `_count` and `_page` parameters
+/// * Count limiting - Applied using `_count` parameter
 /// * Format-aware - Handles CSV headers correctly during pagination
 ///
 /// # Note
@@ -527,7 +490,7 @@ fn apply_json_filtering(
     let output_str =
         String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
 
-    if params.count.is_none() && params.page.is_none() {
+    if params.count.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -576,7 +539,7 @@ fn apply_csv_filtering(
     let output_str = String::from_utf8(output_data)
         .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
 
-    if params.count.is_none() && params.page.is_none() {
+    if params.count.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -617,38 +580,18 @@ fn apply_csv_filtering(
     }
 }
 
-/// Apply pagination to a vector of JSON records
+/// Apply count limiting to a vector of JSON records
 fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    let count = params.count.unwrap_or(records.len());
-    let page = params.page.unwrap_or(1);
-
-    // Calculate offset based on page (1-based)
-    let offset = (page - 1) * count;
-
-    if offset >= records.len() {
-        records.clear();
-        return;
+    if let Some(count) = params.count {
+        records.truncate(count);
     }
-
-    let end = std::cmp::min(offset + count, records.len());
-    *records = records[offset..end].to_vec();
 }
 
-/// Apply pagination to a vector of string lines
+/// Apply count limiting to a vector of string lines
 fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    let count = params.count.unwrap_or(lines.len());
-    let page = params.page.unwrap_or(1);
-
-    // Calculate offset based on page (1-based)
-    let offset = (page - 1) * count;
-
-    if offset >= lines.len() {
-        lines.clear();
-        return;
+    if let Some(count) = params.count {
+        lines.truncate(count);
     }
-
-    let end = std::cmp::min(offset + count, lines.len());
-    *lines = lines[offset..end].to_vec();
 }
 
 #[cfg(test)]
@@ -695,7 +638,6 @@ mod tests {
             format: Some("application/json".to_string()),
             header: None,
             count: Some(10),
-            page: Some(2),
             since: Some("2023-01-01T00:00:00Z".to_string()),
             view_reference: None,
             patient: None,
@@ -706,7 +648,6 @@ mod tests {
         let result = validate_query_params(&params, None).unwrap();
         assert_eq!(result.format, ContentType::Json);
         assert_eq!(result.count, Some(10));
-        assert_eq!(result.page, Some(2));
         assert!(result.since.is_some());
     }
 
@@ -716,7 +657,6 @@ mod tests {
             format: None,
             header: None,
             count: Some(0),
-            page: None,
             since: None,
             view_reference: None,
             patient: None,
@@ -734,35 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_query_params_invalid_page() {
-        let params = RunQueryParams {
-            format: None,
-            header: None,
-            count: None,
-            page: Some(0),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-        };
-
-        let result = validate_query_params(&params, None);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("_page parameter must be greater than 0")
-        );
-    }
-
-    #[test]
     fn test_validate_query_params_invalid_since() {
         let params = RunQueryParams {
             format: None,
             header: None,
             count: None,
-            page: None,
             since: Some("invalid-date".to_string()),
             view_reference: None,
             patient: None,
@@ -787,7 +703,6 @@ mod tests {
         let params = ValidatedRunParams {
             format: ContentType::CsvWithHeader,
             count: Some(2),
-            page: Some(1),
             since: None,
             view_reference: None,
             patient: None,
@@ -806,32 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_csv_filtering_page_2() {
-        let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
-            .as_bytes()
-            .to_vec();
-        let params = ValidatedRunParams {
-            format: ContentType::CsvWithHeader,
-            count: Some(2),
-            page: Some(2),
-            since: None,
-            view_reference: None,
-            patient: None,
-            group: None,
-            source: None,
-        };
-
-        let result = apply_csv_filtering(csv_data, &params).unwrap();
-        let result_str = String::from_utf8(result).unwrap();
-
-        assert!(result_str.contains("id,name"));
-        assert!(!result_str.contains("1,John"));
-        assert!(!result_str.contains("2,Jane"));
-        assert!(result_str.contains("3,Bob"));
-        assert!(result_str.contains("4,Alice"));
-    }
-
-    #[test]
     fn test_apply_json_filtering() {
         let json_data =
             r#"[{"id":"1","name":"John"},{"id":"2","name":"Jane"},{"id":"3","name":"Bob"}]"#
@@ -840,7 +729,6 @@ mod tests {
         let params = ValidatedRunParams {
             format: ContentType::Json,
             count: Some(2),
-            page: Some(1),
             since: None,
             view_reference: None,
             patient: None,
@@ -1093,27 +981,6 @@ mod tests {
             assert_eq!(
                 result.unwrap_err(),
                 "_count parameter must use valueInteger or valuePositiveInt"
-            );
-        }
-
-        // Test _page with wrong value type
-        let params_json = serde_json::json!({
-            "resourceType": "Parameters",
-            "parameter": [{
-                "name": "_page",
-                "valueString": "1"
-            }]
-        });
-
-        #[cfg(feature = "R4")]
-        {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
-            let run_params = RunParameters::R4(params);
-            let result = extract_all_parameters(run_params);
-            assert!(result.is_err());
-            assert_eq!(
-                result.unwrap_err(),
-                "_page parameter must use valueInteger or valuePositiveInt"
             );
         }
 

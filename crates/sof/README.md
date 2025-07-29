@@ -307,7 +307,6 @@ Parameter table:
 | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
 | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
 | _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
-| _page | integer | in | type, instance | 0 | 1 | Page number for paginated results, equivalent to the FHIR search `_page` parameter. (1-based) |
 | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
 | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
@@ -325,7 +324,6 @@ All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `
   - `false` - Exclude headers
 - **source**: A String (not yet supported)
 - **_count**: Limit results (1-10000)
-- **_page**: Page number (1-based)
 - **_since**: Filter by modification time (RFC3339 format)
 
 ##### Body Parameters
@@ -340,7 +338,6 @@ For POST requests, parameters can be provided in a FHIR Parameters resource:
 - **group**: As valueReference (not yet supported)
 - **source**: As valueString (not yet supported)
 - **_count**: As valueInteger
-- **_page**: As valueInteger
 - **_since**: As valueInstant
 - **resource**: As resource (can be repeated)
 
@@ -354,13 +351,8 @@ When the same parameter is specified in multiple places, the precedence order is
 ##### Examples
 
 ```bash
-# Paginated results - first 50 records as CSV
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=50&_page=1&_format=text/csv" \
-  -H "Content-Type: application/json" \
-  -d '{...}'
-
-# Get page 3 of results (records 201-300)
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=100&_page=3" \
+# Limit results - first 50 records as CSV
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=50&_format=text/csv" \
   -H "Content-Type: application/json" \
   -d '{...}'
 

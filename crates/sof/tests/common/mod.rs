@@ -112,7 +112,6 @@ async fn run_view_definition_handler(
     let mut header_from_body = None;
     let mut patient_filter = None;
     let mut count_from_body = None;
-    let mut page_from_body = None;
 
     if let Some(parameters) = body["parameter"].as_array() {
         for param in parameters {
@@ -220,22 +219,6 @@ async fn run_view_definition_handler(
                             );
                         }
                         count_from_body = Some(value_pos as u32);
-                    }
-                }
-                Some("_page") => {
-                    // Extract page from valueInteger or valuePositiveInt
-                    if let Some(value_int) = param.get("valueInteger").and_then(|v| v.as_i64()) {
-                        if value_int <= 0 {
-                            return error_response(
-                                axum::http::StatusCode::BAD_REQUEST,
-                                "_page parameter must be greater than 0",
-                            );
-                        }
-                        page_from_body = Some(value_int as u32);
-                    } else if let Some(value_pos) =
-                        param.get("valuePositiveInt").and_then(|v| v.as_u64())
-                    {
-                        page_from_body = Some(value_pos as u32);
                     }
                 }
                 Some("_since") => {
@@ -456,13 +439,9 @@ async fn run_view_definition_handler(
     match run_view_definition(view_definition, bundle, content_type) {
         Ok(output) => {
             // Apply pagination if requested
-            let output = if let Some(paginated) = apply_pagination(
-                output,
-                &params,
-                &content_type,
-                count_from_body,
-                page_from_body,
-            ) {
+            let output = if let Some(paginated) =
+                apply_pagination(output, &params, &content_type, count_from_body)
+            {
                 paginated
             } else {
                 return error_response(
@@ -603,18 +582,6 @@ fn validate_query_params(params: &std::collections::HashMap<String, String>) -> 
         }
     }
 
-    // Validate _page parameter
-    if let Some(page_str) = params.get("_page") {
-        match page_str.parse::<usize>() {
-            Ok(page) => {
-                if page == 0 {
-                    return Err("_page parameter must be greater than 0 (1-based)".to_string());
-                }
-            }
-            Err(_) => return Err("_page parameter must be a valid number".to_string()),
-        }
-    }
-
     // Validate _since parameter
     if let Some(since_str) = params.get("_since") {
         if chrono::DateTime::parse_from_rfc3339(since_str).is_err() {
@@ -633,17 +600,13 @@ fn apply_pagination(
     params: &std::collections::HashMap<String, String>,
     content_type: &sof::ContentType,
     count_from_body: Option<u32>,
-    page_from_body: Option<u32>,
 ) -> Option<Vec<u8>> {
     // Body parameters take precedence over query parameters
     let count = count_from_body
         .map(|c| c as usize)
         .or_else(|| params.get("_count").and_then(|s| s.parse::<usize>().ok()));
-    let page = page_from_body
-        .map(|p| p as usize)
-        .or_else(|| params.get("_page").and_then(|s| s.parse::<usize>().ok()));
 
-    if count.is_none() && page.is_none() {
+    if count.is_none() {
         return Some(output);
     }
 
@@ -652,16 +615,9 @@ fn apply_pagination(
             let output_str = String::from_utf8(output).ok()?;
             let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str).ok()?;
 
-            // Apply pagination
+            // Apply count limiting
             if let Some(count) = count {
-                let page = page.unwrap_or(1);
-                let offset = (page - 1) * count;
-                if offset < records.len() {
-                    let end = std::cmp::min(offset + count, records.len());
-                    records = records[offset..end].to_vec();
-                } else {
-                    records.clear();
-                }
+                records.truncate(count);
             }
 
             serde_json::to_string(&records).ok().map(|s| s.into_bytes())
@@ -670,16 +626,9 @@ fn apply_pagination(
             let output_str = String::from_utf8(output).ok()?;
             let mut lines: Vec<&str> = output_str.lines().collect();
 
-            // Apply pagination
+            // Apply count limiting
             if let Some(count) = count {
-                let page = page.unwrap_or(1);
-                let offset = (page - 1) * count;
-                if offset < lines.len() {
-                    let end = std::cmp::min(offset + count, lines.len());
-                    lines = lines[offset..end].to_vec();
-                } else {
-                    lines.clear();
-                }
+                lines.truncate(count);
             }
 
             Some(lines.join("\n").into_bytes())
@@ -708,16 +657,9 @@ fn apply_pagination(
                 (vec![], lines.to_vec())
             };
 
-            // Apply pagination to data lines
+            // Apply count limiting to data lines
             if let Some(count) = count {
-                let page = page.unwrap_or(1);
-                let offset = (page - 1) * count;
-                if offset < data_lines.len() {
-                    let end = std::cmp::min(offset + count, data_lines.len());
-                    data_lines = data_lines[offset..end].to_vec();
-                } else {
-                    data_lines.clear();
-                }
+                data_lines.truncate(count);
             }
 
             let mut result_lines = header_lines;
