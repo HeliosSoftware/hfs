@@ -1,6 +1,6 @@
-//! Tests for _count parameter in the request body
+//! Tests for _limit parameter in the request body
 //!
-//! This module tests that the _count parameter works when provided
+//! This module tests that the _limit parameter works when provided
 //! in the Parameters resource body, not just as a query parameter.
 
 use axum::http::StatusCode;
@@ -87,9 +87,9 @@ fn test_patients_bundle() -> serde_json::Value {
     })
 }
 
-/// Test _count parameter with valueInteger in request body
+/// Test _limit parameter with valueInteger in request body
 #[tokio::test]
-async fn test_count_parameter_in_body_value_integer() {
+async fn test_limit_parameter_in_body_value_integer() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -104,7 +104,7 @@ async fn test_count_parameter_in_body_value_integer() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valueInteger": 2
             }
         ]
@@ -121,22 +121,22 @@ async fn test_count_parameter_in_body_value_integer() {
 
     let result = response.json::<serde_json::Value>();
 
-    // Should return only 2 patients due to _count limit
+    // Should return only 2 patients due to _limit limit
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
     assert_eq!(
         patients.len(),
         2,
-        "Expected 2 patients due to _count=2, got {}",
+        "Expected 2 patients due to _limit=2, got {}",
         patients.len()
     );
     assert_eq!(patients[0]["id"], "pt-1");
     assert_eq!(patients[1]["id"], "pt-2");
 }
 
-/// Test _count parameter with valuePositiveInt in request body
+/// Test _limit parameter with valuePositiveInt in request body
 #[tokio::test]
-async fn test_count_parameter_in_body_value_positive_int() {
+async fn test_limit_parameter_in_body_value_positive_int() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -151,7 +151,7 @@ async fn test_count_parameter_in_body_value_positive_int() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valuePositiveInt": 3
             }
         ]
@@ -168,20 +168,20 @@ async fn test_count_parameter_in_body_value_positive_int() {
 
     let result = response.json::<serde_json::Value>();
 
-    // Should return only 3 patients due to _count limit
+    // Should return only 3 patients due to _limit limit
     assert!(result.is_array());
     let patients = result.as_array().unwrap();
     assert_eq!(
         patients.len(),
         3,
-        "Expected 3 patients due to _count=3, got {}",
+        "Expected 3 patients due to _limit=3, got {}",
         patients.len()
     );
 }
 
-/// Test _count parameter validation - negative value
+/// Test _limit parameter validation - negative value
 #[tokio::test]
-async fn test_count_parameter_negative_value() {
+async fn test_limit_parameter_negative_value() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -196,7 +196,7 @@ async fn test_count_parameter_negative_value() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valueInteger": -1
             }
         ]
@@ -211,9 +211,9 @@ async fn test_count_parameter_negative_value() {
     response.assert_status(StatusCode::BAD_REQUEST);
 }
 
-/// Test _count parameter validation - exceeds maximum
+/// Test _limit parameter validation - exceeds maximum
 #[tokio::test]
-async fn test_count_parameter_exceeds_maximum() {
+async fn test_limit_parameter_exceeds_maximum() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -228,7 +228,7 @@ async fn test_count_parameter_exceeds_maximum() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valueInteger": 10001
             }
         ]
@@ -243,9 +243,9 @@ async fn test_count_parameter_exceeds_maximum() {
     response.assert_status(StatusCode::BAD_REQUEST);
 }
 
-/// Test _count parameter with CSV output
+/// Test _limit parameter with CSV output
 #[tokio::test]
-async fn test_count_parameter_with_csv_format() {
+async fn test_limit_parameter_with_csv_format() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -260,7 +260,7 @@ async fn test_count_parameter_with_csv_format() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valueInteger": 2
             },
             {
@@ -295,7 +295,7 @@ async fn test_count_parameter_with_csv_format() {
 
 /// Test that _count parameter in body takes precedence over query parameter
 #[tokio::test]
-async fn test_count_parameter_body_overrides_query() {
+async fn test_limit_parameter_body_overrides_query() {
     let server = common::test_server().await;
 
     let parameters = json!({
@@ -310,7 +310,7 @@ async fn test_count_parameter_body_overrides_query() {
                 "resource": test_patients_bundle()
             },
             {
-                "name": "_count",
+                "name": "_limit",
                 "valueInteger": 2
             }
         ]

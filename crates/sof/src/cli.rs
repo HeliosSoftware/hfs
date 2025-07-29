@@ -20,7 +20,7 @@
 //!     --no-headers               Exclude CSV headers (only for CSV format)
 //! -o, --output <OUTPUT>          Output file path (defaults to stdout)
 //!     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
-//!     --count <COUNT>            Limit the number of results (1-10000)
+//!     --limit <LIMIT>            Limit the number of results (1-10000)
 //!     --fhir-version <VERSION>   FHIR version to use [default: R4]
 //! -h, --help                     Print help
 //!
@@ -66,12 +66,12 @@
 //!
 //! ### Limit number of results
 //! ```bash
-//! sof-cli -v view_definition.json -b patient_bundle.json --count 100
+//! sof-cli -v view_definition.json -b patient_bundle.json --limit 100
 //! ```
 //!
 //! ### Combine filters
 //! ```bash
-//! sof-cli -v view_definition.json -b patient_bundle.json --since 2024-01-01T00:00:00Z --count 50
+//! sof-cli -v view_definition.json -b patient_bundle.json --since 2024-01-01T00:00:00Z --limit 50
 //! ```
 //!
 //! ## Input Requirements
@@ -142,7 +142,7 @@ struct Args {
 
     /// Limit the number of results (1-10000)
     #[arg(long)]
-    count: Option<usize>,
+    limit: Option<usize>,
 
     /// FHIR version to use for parsing resources
     #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
@@ -279,13 +279,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Validate the count parameter
-    let count = if let Some(c) = args.count {
+    // Validate the limit parameter
+    let limit = if let Some(c) = args.limit {
         if c == 0 {
-            return Err("--count parameter must be greater than 0".into());
+            return Err("--limit parameter must be greater than 0".into());
         }
         if c > 10000 {
-            return Err("--count parameter cannot exceed 10000".into());
+            return Err("--limit parameter cannot exceed 10000".into());
         }
         Some(c)
     } else {
@@ -295,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build run options
     let options = RunOptions {
         since,
-        count,
+        limit,
         page: None, // CLI doesn't support page parameter yet
     };
 

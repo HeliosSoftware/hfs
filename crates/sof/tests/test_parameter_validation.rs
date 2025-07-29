@@ -13,14 +13,14 @@ use sof::ContentType;
 struct RunQueryParams {
     format: Option<String>,
     header: Option<String>,
-    count: Option<usize>,
+    limit: Option<usize>,
     since: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ValidatedRunParams {
     format: ContentType,
-    count: Option<usize>,
+    limit: Option<usize>,
     since: Option<DateTime<Utc>>,
 }
 
@@ -36,13 +36,13 @@ fn validate_query_params(
         params.header.as_deref(),
     )?;
 
-    // Validate count parameter
-    let count = if let Some(c) = params.count {
+    // Validate limit parameter
+    let limit = if let Some(c) = params.limit {
         if c == 0 {
-            return Err("_count parameter must be greater than 0".to_string());
+            return Err("_limit parameter must be greater than 0".to_string());
         }
         if c > 10000 {
-            return Err("_count parameter cannot exceed 10000".to_string());
+            return Err("_limit parameter cannot exceed 10000".to_string());
         }
         Some(c)
     } else {
@@ -66,7 +66,7 @@ fn validate_query_params(
 
     Ok(ValidatedRunParams {
         format,
-        count,
+        limit,
         since,
     })
 }
@@ -123,7 +123,7 @@ fn apply_json_filtering(
     let output_str =
         String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
 
-    if params.count.is_none() {
+    if params.limit.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -172,7 +172,7 @@ fn apply_csv_filtering(
     let output_str = String::from_utf8(output_data)
         .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
 
-    if params.count.is_none() {
+    if params.limit.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -213,17 +213,17 @@ fn apply_csv_filtering(
     }
 }
 
-/// Mock function to test count limiting logic
+/// Mock function to test limit limiting logic
 fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    if let Some(count) = params.count {
-        records.truncate(count);
+    if let Some(limit) = params.limit {
+        records.truncate(limit);
     }
 }
 
-/// Mock function to test line count limiting
+/// Mock function to test line limit limiting
 fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    if let Some(count) = params.count {
-        lines.truncate(count);
+    if let Some(limit) = params.limit {
+        lines.truncate(limit);
     }
 }
 
@@ -234,22 +234,22 @@ fn test_validate_query_params_valid() {
     let params = RunQueryParams {
         format: Some("application/json".to_string()),
         header: None,
-        count: Some(10),
+        limit: Some(10),
         since: Some("2023-01-01T00:00:00Z".to_string()),
     };
 
     let result = validate_query_params(&params, None).unwrap();
     assert_eq!(result.format, ContentType::Json);
-    assert_eq!(result.count, Some(10));
+    assert_eq!(result.limit, Some(10));
     assert!(result.since.is_some());
 }
 
 #[test]
-fn test_validate_query_params_invalid_count() {
+fn test_validate_query_params_invalid_limit() {
     let params = RunQueryParams {
         format: None,
         header: None,
-        count: Some(0),
+        limit: Some(0),
         since: None,
     };
 
@@ -258,16 +258,16 @@ fn test_validate_query_params_invalid_count() {
     assert!(
         result
             .unwrap_err()
-            .contains("_count parameter must be greater than 0")
+            .contains("_limit parameter must be greater than 0")
     );
 }
 
 #[test]
-fn test_validate_query_params_count_too_large() {
+fn test_validate_query_params_limit_too_large() {
     let params = RunQueryParams {
         format: None,
         header: None,
-        count: Some(50000),
+        limit: Some(50000),
         since: None,
     };
 
@@ -276,7 +276,7 @@ fn test_validate_query_params_count_too_large() {
     assert!(
         result
             .unwrap_err()
-            .contains("_count parameter cannot exceed 10000")
+            .contains("_limit parameter cannot exceed 10000")
     );
 }
 
@@ -285,7 +285,7 @@ fn test_validate_query_params_invalid_since() {
     let params = RunQueryParams {
         format: None,
         header: None,
-        count: None,
+        limit: None,
         since: Some("invalid-date".to_string()),
     };
 
@@ -334,7 +334,7 @@ fn test_apply_csv_filtering() {
         .to_vec();
     let params = ValidatedRunParams {
         format: ContentType::CsvWithHeader,
-        count: Some(2),
+        limit: Some(2),
         since: None,
     };
 
@@ -349,13 +349,13 @@ fn test_apply_csv_filtering() {
 }
 
 #[test]
-fn test_apply_csv_filtering_with_count() {
+fn test_apply_csv_filtering_with_limit() {
     let csv_data = "id,name\n1,John\n2,Jane\n3,Bob\n4,Alice\n"
         .as_bytes()
         .to_vec();
     let params = ValidatedRunParams {
         format: ContentType::CsvWithHeader,
-        count: Some(2),
+        limit: Some(2),
         since: None,
     };
 
@@ -377,7 +377,7 @@ fn test_apply_json_filtering() {
             .to_vec();
     let params = ValidatedRunParams {
         format: ContentType::Json,
-        count: Some(2),
+        limit: Some(2),
         since: None,
     };
 
@@ -401,7 +401,7 @@ fn test_apply_ndjson_filtering() {
 
     let params = ValidatedRunParams {
         format: ContentType::NdJson,
-        count: Some(2),
+        limit: Some(2),
         since: None,
     };
 
@@ -425,7 +425,7 @@ fn apply_ndjson_filtering(
 ) -> Result<Vec<u8>, String> {
     let params_json = ValidatedRunParams {
         format: ContentType::NdJson,
-        count: params.count,
+        limit: params.limit,
         since: params.since,
     };
     apply_json_filtering(output_data, &params_json)
@@ -437,14 +437,14 @@ fn test_pagination_edge_cases() {
     let mut empty_records: Vec<serde_json::Value> = Vec::new();
     let params = ValidatedRunParams {
         format: ContentType::Json,
-        count: Some(5),
+        limit: Some(5),
         since: None,
     };
 
     apply_pagination_to_records(&mut empty_records, &params);
     assert_eq!(empty_records.len(), 0);
 
-    // Test count limiting with more records than limit
+    // Test limit limiting with more records than limit
     let mut records = vec![
         serde_json::json!({"id": "1"}),
         serde_json::json!({"id": "2"}),
@@ -454,7 +454,7 @@ fn test_pagination_edge_cases() {
 
     let params_limit = ValidatedRunParams {
         format: ContentType::Json,
-        count: Some(2),
+        limit: Some(2),
         since: None,
     };
 
@@ -476,7 +476,7 @@ fn test_since_parameter_parsing() {
         let params = RunQueryParams {
             format: None,
             header: None,
-            count: None,
+            limit: None,
             since: Some(timestamp.to_string()),
         };
 
@@ -501,7 +501,7 @@ fn test_since_parameter_parsing() {
         let params = RunQueryParams {
             format: None,
             header: None,
-            count: None,
+            limit: None,
             since: Some(timestamp.to_string()),
         };
 

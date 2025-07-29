@@ -45,10 +45,10 @@ cat patient-bundle.json | sof-cli --view view-definition.json --format json
 sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z -f csv
 
 # Limit results to first 100 rows
-sof-cli -v view-definition.json -b patient-data.json --count 100
+sof-cli -v view-definition.json -b patient-data.json --limit 100
 
 # Combine filters: recent resources limited to 50 results
-sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z --count 50
+sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00Z --limit 50
 ```
 
 #### CLI Features
@@ -58,7 +58,7 @@ sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00
 - **Output Options**: Write to stdout (default) or specified file with `-o`
 - **Result Filtering**: 
   - Filter resources by modification time with `--since` (RFC3339 format)
-  - Limit number of results with `--count` (1-10000)
+  - Limit number of results with `--limit` (1-10000)
 - **FHIR Version Support**: R4 by default; other versions (R4B, R5, R6) require compilation with feature flags
 - **Error Handling**: Clear, actionable error messages for debugging
 
@@ -71,7 +71,7 @@ sof-cli -v view-definition.json -b patient-data.json --since 2024-01-01T00:00:00
     --no-headers               Exclude CSV headers (only for CSV format)
 -o, --output <OUTPUT>          Output file path (defaults to stdout)
     --since <SINCE>            Filter resources modified after this time (RFC3339 format)
-    --count <COUNT>            Limit the number of results (1-10000)
+    --limit <LIMIT>            Limit the number of results (1-10000)
     --fhir-version <VERSION>   FHIR version to use [default: R4]
 -h, --help                     Print help
 
@@ -306,7 +306,7 @@ Parameter table:
 | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
 | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
 | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
-| _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
+| _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
 | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
 | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 
@@ -323,7 +323,7 @@ All parameters except `viewReference`, `viewResource`, `patient`, `group`, and `
   - `true` - Include headers (default for CSV)
   - `false` - Exclude headers
 - **source**: A String (not yet supported)
-- **_count**: Limit results (1-10000)
+- **_limit**: Limit results (1-10000)
 - **_since**: Filter by modification time (RFC3339 format)
 
 ##### Body Parameters
@@ -337,7 +337,7 @@ For POST requests, parameters can be provided in a FHIR Parameters resource:
 - **patient**: As valueReference
 - **group**: As valueReference (not yet supported)
 - **source**: As valueString (not yet supported)
-- **_count**: As valueInteger
+- **_limit**: As valueInteger
 - **_since**: As valueInstant
 - **resource**: As resource (can be repeated)
 
@@ -352,12 +352,12 @@ When the same parameter is specified in multiple places, the precedence order is
 
 ```bash
 # Limit results - first 50 records as CSV
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_count=50&_format=text/csv" \
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_limit=50&_format=text/csv" \
   -H "Content-Type: application/json" \
   -d '{...}'
 
 # CSV without headers, limited to 20 results
-curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&header=false&_count=20" \
+curl -X POST "http://localhost:8080/ViewDefinition/$run?_format=text/csv&header=false&_limit=20" \
   -H "Content-Type: application/json" \
   -d '{...}'
 

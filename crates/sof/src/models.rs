@@ -20,8 +20,8 @@ pub struct RunQueryParams {
     pub header: Option<String>,
 
     /// Limit number of results
-    #[serde(rename = "_count")]
-    pub count: Option<usize>,
+    #[serde(rename = "_limit")]
+    pub limit: Option<usize>,
 
     /// Include only resources modified after this time
     #[serde(rename = "_since")]
@@ -52,7 +52,7 @@ pub struct ValidatedRunParams {
     pub format: ContentType,
 
     /// Limit number of results (None means no limit)
-    pub count: Option<usize>,
+    pub limit: Option<usize>,
 
     /// Include only resources modified after this time
     pub since: Option<DateTime<Utc>>,
@@ -94,7 +94,7 @@ pub struct Reference {
 /// * `Err(String)` - Validation error message
 ///
 /// # Validation Rules
-/// * `_count` must be between 1 and 10000
+/// * `_limit` must be between 1 and 10000
 ////// * `_since` must be a valid RFC3339 timestamp
 /// * `_format` takes precedence over Accept header
 pub fn validate_query_params(
@@ -117,13 +117,13 @@ pub fn validate_query_params(
     let format = parse_content_type(accept_header, params.format.as_deref(), header_bool)
         .map_err(|e| e.to_string())?;
 
-    // Validate count parameter
-    let count = if let Some(c) = params.count {
+    // Validate limit parameter
+    let limit = if let Some(c) = params.limit {
         if c == 0 {
-            return Err("_count parameter must be greater than 0".to_string());
+            return Err("_limit parameter must be greater than 0".to_string());
         }
         if c > 10000 {
-            return Err("_count parameter cannot exceed 10000".to_string());
+            return Err("_limit parameter cannot exceed 10000".to_string());
         }
         Some(c)
     } else {
@@ -147,7 +147,7 @@ pub fn validate_query_params(
 
     Ok(ValidatedRunParams {
         format,
-        count,
+        limit,
         since,
         view_reference: params.view_reference.clone(),
         patient: params.patient.clone(),
@@ -189,7 +189,7 @@ pub struct ExtractedParameters {
     pub patient: Option<String>,
     pub group: Option<String>,
     pub source: Option<String>,
-    pub count: Option<u32>,
+    pub limit: Option<u32>,
     pub since: Option<String>,
 }
 
@@ -332,28 +332,28 @@ fn process_parameter(
                 );
             }
         }
-        "_count" => {
+        "_limit" => {
             // Handle both valueInteger and valuePositiveInt
             if let Some(value_int) = param_json.get("valueInteger") {
                 if let Some(int_val) = value_int.as_i64() {
                     if int_val <= 0 {
-                        return Err("_count parameter must be greater than 0".to_string());
+                        return Err("_limit parameter must be greater than 0".to_string());
                     }
                     if int_val > 10000 {
-                        return Err("_count parameter cannot exceed 10000".to_string());
+                        return Err("_limit parameter cannot exceed 10000".to_string());
                     }
-                    result.count = Some(int_val as u32);
+                    result.limit = Some(int_val as u32);
                 }
             } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
                 if let Some(int_val) = value_pos_int.as_u64() {
                     if int_val > 10000 {
-                        return Err("_count parameter cannot exceed 10000".to_string());
+                        return Err("_limit parameter cannot exceed 10000".to_string());
                     }
-                    result.count = Some(int_val as u32);
+                    result.limit = Some(int_val as u32);
                 }
             } else if has_any_value_field(&param_json) {
                 return Err(
-                    "_count parameter must use valueInteger or valuePositiveInt".to_string()
+                    "_limit parameter must use valueInteger or valuePositiveInt".to_string()
                 );
             }
         }
@@ -459,7 +459,7 @@ pub fn extract_all_parameters(params: RunParameters) -> Result<ExtractedParamete
 /// * `Err(String)` - Error message if filtering fails
 ///
 /// # Supported Filters
-/// * Count limiting - Applied using `_count` parameter
+/// * Count limiting - Applied using `_limit` parameter
 /// * Format-aware - Handles CSV headers correctly during pagination
 ///
 /// # Note
@@ -490,7 +490,7 @@ fn apply_json_filtering(
     let output_str =
         String::from_utf8(output_data).map_err(|e| format!("Invalid UTF-8 in output: {}", e))?;
 
-    if params.count.is_none() {
+    if params.limit.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -539,7 +539,7 @@ fn apply_csv_filtering(
     let output_str = String::from_utf8(output_data)
         .map_err(|e| format!("Invalid UTF-8 in CSV output: {}", e))?;
 
-    if params.count.is_none() {
+    if params.limit.is_none() {
         return Ok(output_str.into_bytes());
     }
 
@@ -580,17 +580,17 @@ fn apply_csv_filtering(
     }
 }
 
-/// Apply count limiting to a vector of JSON records
+/// Apply limit limiting to a vector of JSON records
 fn apply_pagination_to_records(records: &mut Vec<serde_json::Value>, params: &ValidatedRunParams) {
-    if let Some(count) = params.count {
-        records.truncate(count);
+    if let Some(limit) = params.limit {
+        records.truncate(limit);
     }
 }
 
-/// Apply count limiting to a vector of string lines
+/// Apply limit limiting to a vector of string lines
 fn apply_pagination_to_lines(lines: &mut Vec<&str>, params: &ValidatedRunParams) {
-    if let Some(count) = params.count {
-        lines.truncate(count);
+    if let Some(limit) = params.limit {
+        lines.truncate(limit);
     }
 }
 
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_query_params_invalid_count() {
+    fn test_validate_query_params_invalid_limit() {
         let params = RunQueryParams {
             format: None,
             header: None,
@@ -702,7 +702,7 @@ mod tests {
             .to_vec();
         let params = ValidatedRunParams {
             format: ContentType::CsvWithHeader,
-            count: Some(2),
+            limit: Some(2),
             since: None,
             view_reference: None,
             patient: None,
@@ -728,7 +728,7 @@ mod tests {
                 .to_vec();
         let params = ValidatedRunParams {
             format: ContentType::Json,
-            count: Some(2),
+            limit: Some(2),
             since: None,
             view_reference: None,
             patient: None,
@@ -963,11 +963,11 @@ mod tests {
             );
         }
 
-        // Test _count with wrong value type
+        // Test _limit with wrong value type
         let params_json = serde_json::json!({
             "resourceType": "Parameters",
             "parameter": [{
-                "name": "_count",
+                "name": "_limit",
                 "valueString": "10"
             }]
         });
@@ -980,7 +980,7 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(
                 result.unwrap_err(),
-                "_count parameter must use valueInteger or valuePositiveInt"
+                "_limit parameter must use valueInteger or valuePositiveInt"
             );
         }
 

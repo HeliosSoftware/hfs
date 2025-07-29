@@ -68,7 +68,7 @@ async fn test_pagination_parameters_combined() {
     // Test count 2 - should only return first 2 records
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "2")
+        .add_query_param("_limit", "2")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -83,7 +83,7 @@ async fn test_pagination_parameters_combined() {
     // Test count 3 - should return first 3 records
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "3")
+        .add_query_param("_limit", "3")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -99,7 +99,7 @@ async fn test_pagination_parameters_combined() {
     // Test count 5 - should return all 5 records
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "5")
+        .add_query_param("_limit", "5")
         .add_query_param("_format", "application/json")
         .json(&request_body)
         .await;
@@ -113,7 +113,7 @@ async fn test_pagination_parameters_combined() {
 }
 
 #[tokio::test]
-async fn test_count_parameter_boundaries() {
+async fn test_limit_parameter_boundaries() {
     let server = common::test_server().await;
 
     let request_body = json!({
@@ -129,28 +129,28 @@ async fn test_count_parameter_boundaries() {
         }]
     });
 
-    // Test _count = 1 (minimum valid)
+    // Test _limit = 1 (minimum valid)
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "1")
+        .add_query_param("_limit", "1")
         .json(&request_body)
         .await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
 
-    // Test _count = 10000 (maximum valid)
+    // Test _limit = 10000 (maximum valid)
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "10000")
+        .add_query_param("_limit", "10000")
         .json(&request_body)
         .await;
 
     assert_eq!(response.status_code(), StatusCode::OK);
 
-    // Test _count = 0 (invalid)
+    // Test _limit = 0 (invalid)
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "0")
+        .add_query_param("_limit", "0")
         .json(&request_body)
         .await;
 
@@ -161,13 +161,13 @@ async fn test_count_parameter_boundaries() {
         json["issue"][0]["details"]["text"]
             .as_str()
             .unwrap()
-            .contains("_count parameter must be greater than 0")
+            .contains("_limit parameter must be greater than 0")
     );
 
-    // Test _count = 10001 (too large)
+    // Test _limit = 10001 (too large)
     let response = server
         .post("/ViewDefinition/$run")
-        .add_query_param("_count", "10001")
+        .add_query_param("_limit", "10001")
         .json(&request_body)
         .await;
 
@@ -177,7 +177,7 @@ async fn test_count_parameter_boundaries() {
         json["issue"][0]["details"]["text"]
             .as_str()
             .unwrap()
-            .contains("_count parameter cannot exceed 10000")
+            .contains("_limit parameter cannot exceed 10000")
     );
 }
 
@@ -399,7 +399,7 @@ async fn test_combined_filtering_parameters() {
     let response = server
         .post("/ViewDefinition/$run")
         .add_query_param("_format", "application/json")
-        .add_query_param("_count", "50")
+        .add_query_param("_limit", "50")
         .add_query_param("_since", "2024-01-01T00:00:00Z")
         .add_query_param("patient", "Patient/123")
         .add_query_param("group", "Group/456")

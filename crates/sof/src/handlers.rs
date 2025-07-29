@@ -61,7 +61,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
 /// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
 /// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. (not yet supported) |
-/// | _count | integer | in | type, instance | 0 | 1 | Limits the number of results, equivalent to the FHIR search `_count` parameter. (1-10000) |
+/// | _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
 /// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
 /// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
 ///
@@ -171,9 +171,9 @@ pub async fn run_view_definition_handler(
     let group_filter = extracted_params.group.or(validated_params.group.clone());
     let source_param = extracted_params.source.or(validated_params.source.clone());
 
-    // Merge count parameter - body takes precedence over query
-    if let Some(count) = extracted_params.count {
-        validated_params.count = Some(count as usize);
+    // Merge limit parameter - body takes precedence over query
+    if let Some(limit) = extracted_params.limit {
+        validated_params.limit = Some(limit as usize);
     }
 
     // Merge _since parameter - body takes precedence over query

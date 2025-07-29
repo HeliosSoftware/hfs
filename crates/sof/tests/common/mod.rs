@@ -193,19 +193,19 @@ async fn run_view_definition_handler(
                         );
                     }
                 }
-                Some("_count") => {
+                Some("_limit") => {
                     // Extract count from valueInteger or valuePositiveInt
                     if let Some(value_int) = param.get("valueInteger").and_then(|v| v.as_i64()) {
                         if value_int <= 0 {
                             return error_response(
                                 axum::http::StatusCode::BAD_REQUEST,
-                                "_count parameter must be greater than 0",
+                                "_limit parameter must be greater than 0",
                             );
                         }
                         if value_int > 10000 {
                             return error_response(
                                 axum::http::StatusCode::BAD_REQUEST,
-                                "_count parameter cannot exceed 10000",
+                                "_limit parameter cannot exceed 10000",
                             );
                         }
                         count_from_body = Some(value_int as u32);
@@ -215,7 +215,7 @@ async fn run_view_definition_handler(
                         if value_pos > 10000 {
                             return error_response(
                                 axum::http::StatusCode::BAD_REQUEST,
-                                "_count parameter cannot exceed 10000",
+                                "_limit parameter cannot exceed 10000",
                             );
                         }
                         count_from_body = Some(value_pos as u32);
@@ -567,18 +567,18 @@ async fn run_view_definition_by_id_handler(
 }
 
 fn validate_query_params(params: &std::collections::HashMap<String, String>) -> Result<(), String> {
-    // Validate _count parameter
-    if let Some(count_str) = params.get("_count") {
-        match count_str.parse::<usize>() {
+    // Validate _limit parameter
+    if let Some(limit_str) = params.get("_limit") {
+        match limit_str.parse::<usize>() {
             Ok(count) => {
                 if count == 0 {
-                    return Err("_count parameter must be greater than 0".to_string());
+                    return Err("_limit parameter must be greater than 0".to_string());
                 }
                 if count > 10000 {
-                    return Err("_count parameter cannot exceed 10000".to_string());
+                    return Err("_limit parameter cannot exceed 10000".to_string());
                 }
             }
-            Err(_) => return Err("_count parameter must be a valid number".to_string()),
+            Err(_) => return Err("_limit parameter must be a valid number".to_string()),
         }
     }
 
@@ -604,7 +604,7 @@ fn apply_pagination(
     // Body parameters take precedence over query parameters
     let count = count_from_body
         .map(|c| c as usize)
-        .or_else(|| params.get("_count").and_then(|s| s.parse::<usize>().ok()));
+        .or_else(|| params.get("_limit").and_then(|s| s.parse::<usize>().ok()));
 
     if count.is_none() {
         return Some(output);

@@ -912,7 +912,7 @@ pub struct RunOptions {
     /// Filter resources modified after this time
     pub since: Option<DateTime<Utc>>,
     /// Limit the number of results
-    pub count: Option<usize>,
+    pub limit: Option<usize>,
     /// Page number for pagination (1-based)
     pub page: Option<usize>,
 }
@@ -921,7 +921,7 @@ pub struct RunOptions {
 ///
 /// This function extends the basic `run_view_definition` with support for:
 /// - Filtering resources by modification time (`since`)
-/// - Limiting results (`count`)
+/// - Limiting results (`limit`)
 /// - Pagination (`page`)
 ///
 /// # Arguments
@@ -951,8 +951,8 @@ pub fn run_view_definition_with_options(
     let processed_result = process_view_definition(view_definition, filtered_bundle)?;
 
     // Apply pagination if needed
-    let processed_result = if options.count.is_some() || options.page.is_some() {
-        apply_pagination_to_result(processed_result, options.count, options.page)?
+    let processed_result = if options.limit.is_some() || options.page.is_some() {
+        apply_pagination_to_result(processed_result, options.limit, options.page)?
     } else {
         processed_result
     };
@@ -2059,10 +2059,10 @@ fn filter_bundle_by_since(bundle: SofBundle, since: DateTime<Utc>) -> Result<Sof
 /// Apply pagination to processed results
 fn apply_pagination_to_result(
     mut result: ProcessedResult,
-    count: Option<usize>,
+    limit: Option<usize>,
     page: Option<usize>,
 ) -> Result<ProcessedResult, SofError> {
-    if let Some(limit) = count {
+    if let Some(limit) = limit {
         let page_num = page.unwrap_or(1);
         if page_num == 0 {
             return Err(SofError::InvalidViewDefinition(
