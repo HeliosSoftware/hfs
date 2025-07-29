@@ -1,7 +1,7 @@
 - Need to fully test each of the parameters
   - Support viewReference
   - Need to support application/parquet 
-  - _page is on hold
+  - cardinality of viewReference and viewResource - changed to 0..1
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
