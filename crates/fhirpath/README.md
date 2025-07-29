@@ -289,8 +289,8 @@ The SQL on FHIR specification leverages FHIRPath to define flattened tabular vie
     *   [timeOfDay()](https://hl7.org/fhirpath/2025Jan/#timeofday--time): ✅
     *   [today()](https://hl7.org/fhirpath/2025Jan/#today--date): ✅
     *   [defineVariable()](https://hl7.org/fhirpath/2025Jan/#definevariablename-string--expr-expression) (STU): ❌
-    *   [lowBoundary()](https://hl7.org/fhirpath/2025Jan/#lowboundaryprecision-integer-decimal--date--datetime--time) (STU): ❌
-    *   [highBoundary()](https://hl7.org/fhirpath/2025Jan/#highboundaryprecision-integer-decimal--date--datetime--time) (STU): ❌
+    *   [lowBoundary()](https://hl7.org/fhirpath/2025Jan/#lowboundaryprecision-integer-decimal--date--datetime--time) (STU): ✅ (Full support for Decimal, Date, DateTime, and Time)
+    *   [highBoundary()](https://hl7.org/fhirpath/2025Jan/#highboundaryprecision-integer-decimal--date--datetime--time) (STU): ✅ (Full support for Decimal, Date, DateTime, and Time)
     *   [precision()](https://hl7.org/fhirpath/2025Jan/#precision--integer) (STU): ❌
 *   [Date/DateTime/Time Component Extraction](https://hl7.org/fhirpath/2025Jan/#extract-datedatetimetime-components) (STU): ✅ (All component functions implemented: yearOf, monthOf, dayOf, hourOf, minuteOf, secondOf, millisecondOf)
     
