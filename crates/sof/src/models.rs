@@ -637,7 +637,7 @@ mod tests {
         let params = RunQueryParams {
             format: Some("application/json".to_string()),
             header: None,
-            count: Some(10),
+            limit: Some(10),
             since: Some("2023-01-01T00:00:00Z".to_string()),
             view_reference: None,
             patient: None,
@@ -647,7 +647,7 @@ mod tests {
 
         let result = validate_query_params(&params, None).unwrap();
         assert_eq!(result.format, ContentType::Json);
-        assert_eq!(result.count, Some(10));
+        assert_eq!(result.limit, Some(10));
         assert!(result.since.is_some());
     }
 
@@ -656,7 +656,7 @@ mod tests {
         let params = RunQueryParams {
             format: None,
             header: None,
-            count: Some(0),
+            limit: Some(0),
             since: None,
             view_reference: None,
             patient: None,
@@ -669,7 +669,7 @@ mod tests {
         assert!(
             result
                 .unwrap_err()
-                .contains("_count parameter must be greater than 0")
+                .contains("_limit parameter must be greater than 0")
         );
     }
 
@@ -678,7 +678,7 @@ mod tests {
         let params = RunQueryParams {
             format: None,
             header: None,
-            count: None,
+            limit: None,
             since: Some("invalid-date".to_string()),
             view_reference: None,
             patient: None,
