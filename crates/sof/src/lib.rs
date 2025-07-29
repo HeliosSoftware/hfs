@@ -621,9 +621,19 @@ impl ContentType {
     /// ```rust
     /// use sof::ContentType;
     ///
-    /// // Standard CSV (includes headers by default)
-    /// let csv = ContentType::from_string("text/csv")?;
+    /// // Shortened format names
+    /// let csv = ContentType::from_string("csv")?;
     /// assert_eq!(csv, ContentType::CsvWithHeader);
+    ///
+    /// let json = ContentType::from_string("json")?;
+    /// assert_eq!(json, ContentType::Json);
+    ///
+    /// let ndjson = ContentType::from_string("ndjson")?;
+    /// assert_eq!(ndjson, ContentType::NdJson);
+    ///
+    /// // Full MIME types still supported
+    /// let csv_mime = ContentType::from_string("text/csv")?;
+    /// assert_eq!(csv_mime, ContentType::CsvWithHeader);
     ///
     /// // CSV with headers explicitly
     /// let csv_headers = ContentType::from_string("text/csv;header=true")?;
@@ -634,8 +644,8 @@ impl ContentType {
     /// assert_eq!(csv_no_headers, ContentType::Csv);
     ///
     /// // JSON format
-    /// let json = ContentType::from_string("application/json")?;
-    /// assert_eq!(json, ContentType::Json);
+    /// let json_mime = ContentType::from_string("application/json")?;
+    /// assert_eq!(json_mime, ContentType::Json);
     ///
     /// // Error for unsupported type
     /// assert!(ContentType::from_string("text/plain").is_err());
@@ -643,6 +653,12 @@ impl ContentType {
     /// ```
     pub fn from_string(s: &str) -> Result<Self, SofError> {
         match s {
+            // Shortened format names
+            "csv" => Ok(ContentType::CsvWithHeader),
+            "json" => Ok(ContentType::Json),
+            "ndjson" => Ok(ContentType::NdJson),
+            "parquet" => Ok(ContentType::Parquet),
+            // Full MIME types (for Accept header compatibility)
             "text/csv;header=false" => Ok(ContentType::Csv),
             "text/csv" | "text/csv;header=true" => Ok(ContentType::CsvWithHeader),
             "application/json" => Ok(ContentType::Json),
