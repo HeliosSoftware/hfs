@@ -1,3 +1,12 @@
+- Re-work crate names such that they can be unique for crates.io
+
+- Add Github Actions for build and release process
+
+- Re-work fhirpath to add a fhirpath server for eventual use with FHIR Path Lab
+
+- Setup hosting for fhirpath server
+- Setup hosting for sof-server
+
 - Need to fully test each of the parameters
   - Support viewReference
   - Need to support application/parquet 
