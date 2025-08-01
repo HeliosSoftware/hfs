@@ -1,5 +1,10 @@
 - Re-work crate names such that they can be unique for crates.io
 
+- Make repo public
+  - Cleanup main README.md
+  - Remove? hfs crate
+  - Update hero image
+
 - Add Github Actions for build and release process
 
 - Re-work fhirpath to add a fhirpath server for eventual use with FHIR Path Lab
