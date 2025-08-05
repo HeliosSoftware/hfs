@@ -11,3 +11,4 @@ crates/sof/output.csv
 .idea
 package-lock.json
 **/.claude/settings.local.json
+CLAUDE.md
