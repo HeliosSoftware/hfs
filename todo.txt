@@ -1,8 +1,6 @@
 - Make repo public
-  - Re-work crate names such that they can be unique for crates.io
   - Cleanup main README.md
     - Need a components section to explain what's in the repo
-  - Add MIT license
 
 - FHIRPath
   - Remove? hfs crate
