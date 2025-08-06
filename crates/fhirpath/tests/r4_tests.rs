@@ -1,8 +1,8 @@
-use fhir::r4;
-use fhirpath::{EvaluationContext, evaluate_expression};
-use fhirpath::evaluator::evaluate;
-use fhirpath::parser::parser;
-use fhirpath_support::EvaluationResult;
+use helios_fhir::r4;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhirpath::evaluator::evaluate;
+use helios_fhirpath::parser::parser;
+use helios_fhirpath_support::EvaluationResult;
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use rust_decimal::Decimal;
@@ -223,7 +223,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
 
     // Create an evaluation context with the resource
-    let mut context = EvaluationContext::new(vec![fhir::FhirResource::R4(Box::new(resource))]);
+    let mut context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
 
     // Enhanced context setup for tests: For patient example, we'll add a direct birth date access path
     if json_filename == "patient-example.json" {
@@ -515,7 +515,7 @@ fn test_real_fhir_patient_type() {
     }"#;
     
     let patient: r4::Patient = serde_json::from_str(patient_json).unwrap();
-    let fhir_resource = fhir::FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+    let fhir_resource = helios_fhir::FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
     
     // First, let's see what the context contains

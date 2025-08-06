@@ -1,4 +1,4 @@
-use fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use serde_json;
 
 #[test]
@@ -17,14 +17,14 @@ fn debug_extension_macro_fix() {
     });
 
     // Parse into FHIR resource
-    let patient: fhir::r4::Patient =
+    let patient: helios_fhir::r4::Patient =
         serde_json::from_value(patient_json).expect("Failed to parse patient");
 
     println!("Patient parsed successfully");
 
     // Create context with the patient
-    let context = EvaluationContext::new(vec![fhir::FhirResource::R4(Box::new(
-        fhir::r4::Resource::Patient(patient),
+    let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(
+        helios_fhir::r4::Resource::Patient(patient),
     ))]);
 
     println!("Context created");

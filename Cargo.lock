@@ -671,71 +671,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "fhir"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "fhir_macro",
- "fhirpath_support",
- "reqwest",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "time",
- "zip",
-]
-
-[[package]]
-name = "fhir_gen"
-version = "0.1.0"
-dependencies = [
- "clap",
- "fhir",
- "reqwest",
- "serde",
- "serde_json",
- "zip",
-]
-
-[[package]]
-name = "fhir_macro"
-version = "0.1.0"
-dependencies = [
- "fhirpath_support",
- "heck",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.95",
-]
-
-[[package]]
-name = "fhirpath"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "chumsky",
- "fhir",
- "fhirpath_support",
- "once_cell",
- "regex",
- "roxmltree",
- "rust_decimal",
- "rust_decimal_macros",
- "serde_json",
-]
-
-[[package]]
-name = "fhirpath_support"
-version = "0.1.0"
-dependencies = [
- "rust_decimal",
-]
-
-[[package]]
 name = "flate2"
 version = "1.0.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,11 +852,101 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hfs"
+name = "helios-fhir"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "helios-fhir-macro",
+ "helios-fhirpath-support",
+ "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "time",
+ "zip",
+]
+
+[[package]]
+name = "helios-fhir-gen"
 version = "0.1.0"
 dependencies = [
  "clap",
- "fhir",
+ "helios-fhir",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "zip",
+]
+
+[[package]]
+name = "helios-fhir-macro"
+version = "0.1.0"
+dependencies = [
+ "heck",
+ "helios-fhirpath-support",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.95",
+]
+
+[[package]]
+name = "helios-fhirpath"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chumsky",
+ "helios-fhir",
+ "helios-fhirpath-support",
+ "once_cell",
+ "regex",
+ "roxmltree",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde_json",
+]
+
+[[package]]
+name = "helios-fhirpath-support"
+version = "0.1.0"
+dependencies = [
+ "rust_decimal",
+]
+
+[[package]]
+name = "helios-hfs"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "helios-fhir",
+]
+
+[[package]]
+name = "helios-sof"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-test",
+ "chrono",
+ "clap",
+ "csv",
+ "helios-fhir",
+ "helios-fhirpath",
+ "helios-fhirpath-support",
+ "http 1.3.1",
+ "mime",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2091,31 +2116,6 @@ checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "sof"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "axum-test",
- "chrono",
- "clap",
- "csv",
- "fhir",
- "fhirpath",
- "fhirpath_support",
- "http 1.3.1",
- "mime",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

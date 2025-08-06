@@ -1,7 +1,7 @@
-use fhir::DecimalElement;
-use fhir::Element;
-use fhir::PreciseDecimal;
-use fhir::r4::*;
+use helios_fhir::DecimalElement;
+use helios_fhir::Element;
+use helios_fhir::PreciseDecimal;
+use helios_fhir::r4::*;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
 use serde_json;
@@ -800,7 +800,7 @@ fn test_deserialize_element_invalid_type() {
 
 // --- Tests for FhirSerde derive macro (_fieldName logic) ---
 
-use fhir_macro::FhirSerde;
+use helios_fhir_macro::FhirSerde;
 
 // Define a test struct that uses manual Serialize implementation
 #[derive(Debug, PartialEq, FhirSerde)]
@@ -838,7 +838,7 @@ struct FhirSerdeTestStruct {
 }
 
 #[test]
-fn test_fhir_serde_serialize() {
+fn test_helios_fhir_serde_serialize() {
     // Helper to create default extension
     let default_extension = || Extension {
         id: None,
@@ -1364,7 +1364,7 @@ fn test_flatten_serialization() {
 }
 
 #[test]
-fn test_fhir_serde_deserialize() {
+fn test_helios_fhir_serde_deserialize() {
     let decimal = Decimal::new(dec!(123.45));
     // Helper to create default extension
     let default_extension = || Extension {
@@ -1860,7 +1860,7 @@ fn test_timing_roundtrip_serialization() {
 }
 
 #[test]
-fn test_fhir_serde_deserialize_extension_with_primitive_extension() {
+fn test_helios_fhir_serde_deserialize_extension_with_primitive_extension() {
     // This test replicates the structure found in slm-codesystem.json
     // where an Extension has a value[x] (valueString) which itself has an extension (_valueString).
     let json_input = r#"

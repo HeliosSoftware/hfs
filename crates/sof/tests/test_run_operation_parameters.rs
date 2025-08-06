@@ -4,7 +4,7 @@
 //! for the $run operation.
 
 use serde_json::json;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 // Import the models module for parameter validation testing
 // Note: These would normally be internal modules, but for testing we need access
@@ -92,7 +92,7 @@ fn create_test_bundle(
 
     #[cfg(feature = "R4")]
     {
-        let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+        let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
         Ok(SofBundle::R4(bundle))
     }
 
@@ -108,7 +108,7 @@ fn create_view_definition(
 ) -> Result<SofViewDefinition, Box<dyn std::error::Error>> {
     #[cfg(feature = "R4")]
     {
-        let view_def: fhir::r4::ViewDefinition = serde_json::from_value(json)?;
+        let view_def: helios_fhir::r4::ViewDefinition = serde_json::from_value(json)?;
         Ok(SofViewDefinition::R4(view_def))
     }
 

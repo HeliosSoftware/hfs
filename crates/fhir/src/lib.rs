@@ -22,8 +22,8 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use fhir::r4::{Patient, HumanName};
-//! use fhir::PreciseDecimal;
+//! use helios_fhir::r4::{Patient, HumanName};
+//! use helios_fhir::PreciseDecimal;
 //! use rust_decimal::Decimal;
 //!
 //! // Create a patient with precise decimal handling
@@ -40,7 +40,7 @@
 //! let precise = PreciseDecimal::from(Decimal::new(12340, 3)); // 12.340
 //! ```
 
-use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use helios_fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Serialize,
@@ -91,7 +91,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use fhir::PreciseDecimal;
+/// use helios_fhir::PreciseDecimal;
 /// use rust_decimal::Decimal;
 ///
 /// // Create from Decimal (derives string representation)
@@ -122,7 +122,7 @@ pub struct PreciseDecimal {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::PreciseDecimal;
+/// use helios_fhir::PreciseDecimal;
 /// use rust_decimal::Decimal;
 ///
 /// let a = PreciseDecimal::from_parts(Some(Decimal::new(100, 1)), "10.0".to_string());
@@ -177,7 +177,7 @@ impl PreciseDecimal {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::PreciseDecimal;
+    /// use helios_fhir::PreciseDecimal;
     /// use rust_decimal::Decimal;
     ///
     /// // Create with successful parsing
@@ -217,7 +217,7 @@ impl PreciseDecimal {
     /// # Examples
     ///
     /// ```ignore
-    /// use fhir::PreciseDecimal;
+    /// use helios_fhir::PreciseDecimal;
     /// use rust_decimal::Decimal;
     ///
     /// // Regular decimal format
@@ -254,7 +254,7 @@ impl PreciseDecimal {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::PreciseDecimal;
+    /// use helios_fhir::PreciseDecimal;
     /// use rust_decimal::Decimal;
     ///
     /// let precise = PreciseDecimal::from(Decimal::new(1234, 2)); // 12.34
@@ -276,7 +276,7 @@ impl PreciseDecimal {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::PreciseDecimal;
+    /// use helios_fhir::PreciseDecimal;
     /// use rust_decimal::Decimal;
     ///
     /// let precise = PreciseDecimal::from_parts(
@@ -299,7 +299,7 @@ impl PreciseDecimal {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::PreciseDecimal;
+/// use helios_fhir::PreciseDecimal;
 /// use rust_decimal::Decimal;
 ///
 /// let decimal = Decimal::new(12345, 3); // 12.345
@@ -333,7 +333,7 @@ impl From<Decimal> for PreciseDecimal {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::PreciseDecimal;
+/// use helios_fhir::PreciseDecimal;
 /// use rust_decimal::Decimal;
 /// use serde_json;
 ///
@@ -377,7 +377,7 @@ impl Serialize for PreciseDecimal {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::PreciseDecimal;
+/// use helios_fhir::PreciseDecimal;
 /// use serde_json;
 ///
 /// // Deserialize from JSON number (trailing zeros are normalized)
@@ -481,9 +481,9 @@ pub mod r6;
 /// # Examples
 ///
 /// ```rust
-/// use fhir::{FhirResource, FhirVersion};
+/// use helios_fhir::{FhirResource, FhirVersion};
 /// # #[cfg(feature = "R4")]
-/// use fhir::r4::{Patient, HumanName};
+/// use helios_fhir::r4::{Patient, HumanName};
 ///
 /// # #[cfg(feature = "R4")]
 /// {
@@ -498,7 +498,7 @@ pub mod r6;
 ///     };
 ///
 ///     // Wrap in version-agnostic container
-///     let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+///     let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
 ///     assert_eq!(resource.version(), FhirVersion::R4);
 /// }
 /// ```
@@ -508,10 +508,10 @@ pub mod r6;
 /// Use the `version()` method to determine which FHIR version a resource uses:
 ///
 /// ```rust
-/// # use fhir::{FhirResource, FhirVersion};
+/// # use helios_fhir::{FhirResource, FhirVersion};
 /// # #[cfg(feature = "R4")]
 /// # {
-/// # let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(Default::default())));
+/// # let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(Default::default())));
 /// match resource.version() {
 ///     #[cfg(feature = "R4")]
 ///     FhirVersion::R4 => println!("This is an R4 resource"),
@@ -553,11 +553,11 @@ impl FhirResource {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::{FhirResource, FhirVersion};
+    /// use helios_fhir::{FhirResource, FhirVersion};
     ///
     /// # #[cfg(feature = "R5")]
     /// # {
-    /// # let resource = FhirResource::R5(Box::new(fhir::r5::Resource::Patient(Default::default())));
+    /// # let resource = FhirResource::R5(Box::new(helios_fhir::r5::Resource::Patient(Default::default())));
     /// let version = resource.version();
     /// assert_eq!(version, FhirVersion::R5);
     ///
@@ -614,7 +614,7 @@ impl FhirResource {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::FhirVersion;
+/// use helios_fhir::FhirVersion;
 ///
 /// // Version comparison
 /// # #[cfg(all(feature = "R4", feature = "R5"))]
@@ -637,7 +637,7 @@ impl FhirResource {
 ///
 /// ```rust,no_run
 /// use clap::Parser;
-/// use fhir::FhirVersion;
+/// use helios_fhir::FhirVersion;
 ///
 /// #[derive(Parser)]
 /// struct Args {
@@ -674,7 +674,7 @@ impl FhirVersion {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::FhirVersion;
+    /// use helios_fhir::FhirVersion;
     ///
     /// # #[cfg(feature = "R4")]
     /// assert_eq!(FhirVersion::R4.as_str(), "R4");
@@ -711,7 +711,7 @@ impl FhirVersion {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::FhirVersion;
+/// use helios_fhir::FhirVersion;
 ///
 /// # #[cfg(feature = "R5")]
 /// # {
@@ -736,7 +736,7 @@ impl std::fmt::Display for FhirVersion {
 /// # Examples
 ///
 /// ```rust
-/// use fhir::FhirVersion;
+/// use helios_fhir::FhirVersion;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -761,7 +761,7 @@ impl Default for FhirVersion {
 ///
 /// ```rust,no_run
 /// use clap::Parser;
-/// use fhir::FhirVersion;
+/// use helios_fhir::FhirVersion;
 ///
 /// #[derive(Parser)]
 /// struct Args {
@@ -899,7 +899,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use fhir::{Element, r4::Extension};
+/// use helios_fhir::{Element, r4::Extension};
 ///
 /// // Simple primitive value
 /// let simple: Element<String, Extension> = Element {
@@ -1346,7 +1346,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// use fhir::{DecimalElement, PreciseDecimal, r4::Extension};
+/// use helios_fhir::{DecimalElement, PreciseDecimal, r4::Extension};
 /// use rust_decimal::Decimal;
 ///
 /// // Create from a Decimal value
@@ -1411,7 +1411,7 @@ impl<E> DecimalElement<E> {
     /// # Examples
     ///
     /// ```rust
-    /// use fhir::{DecimalElement, r4::Extension};
+    /// use helios_fhir::{DecimalElement, r4::Extension};
     /// use rust_decimal::Decimal;
     ///
     /// // Create a simple decimal element
@@ -1434,7 +1434,7 @@ impl<E> DecimalElement<E> {
     /// This method is typically used when creating FHIR elements programmatically:
     ///
     /// ```rust
-    /// use fhir::{DecimalElement, r4::{Extension, Observation}};
+    /// use helios_fhir::{DecimalElement, r4::{Extension, Observation}};
     /// use rust_decimal::Decimal;
     ///
     /// let temperature = DecimalElement::<Extension>::new(Decimal::new(3672, 2)); // 36.72

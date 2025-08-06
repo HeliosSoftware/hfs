@@ -4,7 +4,7 @@
 //! logic for the $run operation.
 
 use chrono::{DateTime, Utc};
-use sof::ContentType;
+use helios_sof::ContentType;
 
 /// Mock structures to test parameter validation
 /// In a real implementation, these would be imported from the models module

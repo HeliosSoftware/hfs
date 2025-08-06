@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sof::{ContentType, SofParameters};
+use helios_sof::{ContentType, SofParameters};
 use tracing::debug;
 
 /// Query parameters for ViewDefinition/$run endpoint
@@ -161,7 +161,7 @@ pub fn parse_content_type(
     accept_header: Option<&str>,
     format_param: Option<&str>,
     header_param: Option<bool>,
-) -> Result<ContentType, sof::SofError> {
+) -> Result<ContentType, helios_sof::SofError> {
     // Query parameter takes precedence over Accept header
     let content_type_str = format_param.or(accept_header).unwrap_or("application/json");
 
@@ -766,7 +766,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -791,7 +791,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -811,7 +811,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -831,7 +831,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -871,7 +871,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -894,7 +894,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -914,7 +914,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let extracted = extract_all_parameters(run_params).unwrap();
 
@@ -934,7 +934,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
 
@@ -960,7 +960,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -981,7 +981,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1002,7 +1002,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1023,7 +1023,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1044,7 +1044,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1065,7 +1065,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1086,7 +1086,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1107,7 +1107,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1128,7 +1128,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1149,7 +1149,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());
@@ -1191,7 +1191,7 @@ mod tests {
 
         #[cfg(feature = "R4")]
         {
-            let params: fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
+            let params: helios_fhir::r4::Parameters = serde_json::from_value(params_json).unwrap();
             let run_params = RunParameters::R4(params);
             let result = extract_all_parameters(run_params);
             assert!(result.is_err());

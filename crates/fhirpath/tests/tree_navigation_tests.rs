@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
     use chumsky::Parser;
-    use fhirpath::evaluator::{EvaluationContext, evaluate};
-    use fhirpath::parser::parser;
-    use fhirpath_support::EvaluationResult;
+    use helios_fhirpath::evaluator::{EvaluationContext, evaluate};
+    use helios_fhirpath::parser::parser;
+    use helios_fhirpath_support::EvaluationResult;
     use std::collections::HashMap;
 
     // Helper function to create a test object

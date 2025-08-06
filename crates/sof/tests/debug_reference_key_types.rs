@@ -1,5 +1,5 @@
 use serde_json;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn debug_reference_key_wrong_type() {
@@ -24,7 +24,7 @@ fn debug_reference_key_wrong_type() {
         "entry": [{"resource": patient_json}]
     });
 
-    let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
+    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json).unwrap();
     let bundle = SofBundle::R4(bundle);
 
     // Create ViewDefinition for the failing test case
@@ -45,7 +45,7 @@ fn debug_reference_key_wrong_type() {
         ]
     });
 
-    let view_definition: fhir::r4::ViewDefinition =
+    let view_definition: helios_fhir::r4::ViewDefinition =
         serde_json::from_value(view_definition_json).unwrap();
     let view_definition = SofViewDefinition::R4(view_definition);
 
@@ -121,7 +121,7 @@ fn debug_reference_key_wrong_type() {
     });
 
     // Test getResourceKey()
-    let vd1: fhir::r4::ViewDefinition = serde_json::from_value(test_resource_key).unwrap();
+    let vd1: helios_fhir::r4::ViewDefinition = serde_json::from_value(test_resource_key).unwrap();
     let result1 = run_view_definition(
         SofViewDefinition::R4(vd1),
         bundle.clone(),
@@ -132,7 +132,7 @@ fn debug_reference_key_wrong_type() {
     println!("getResourceKey(): {}", result1_str);
 
     // Test getReferenceKey(Observation) - wrong type
-    let vd2: fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_wrong_type).unwrap();
+    let vd2: helios_fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_wrong_type).unwrap();
     let result2 = run_view_definition(
         SofViewDefinition::R4(vd2),
         bundle.clone(),
@@ -143,7 +143,7 @@ fn debug_reference_key_wrong_type() {
     println!("getReferenceKey(Observation): {}", result2_str);
 
     // Test getReferenceKey(Patient) - correct type
-    let vd3: fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_correct_type).unwrap();
+    let vd3: helios_fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_correct_type).unwrap();
     let result3 = run_view_definition(
         SofViewDefinition::R4(vd3),
         bundle.clone(),

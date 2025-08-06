@@ -1,5 +1,5 @@
 // This is a template r6.rs file.
-use fhir_macro::{FhirPath, FhirSerde};
+use helios_fhir_macro::{FhirPath, FhirSerde};
 use serde::{Deserialize, Serialize};
 use crate::Element;
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]

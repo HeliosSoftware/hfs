@@ -68,14 +68,14 @@ fn test_boolean_validation_improvements() {
 
     // Parse as FHIR resources directly to test validation
     println!("Testing comparison operation (should pass):");
-    let view_def1: Result<fhir::r4::ViewDefinition, _> = serde_json::from_str(view_with_comparison);
+    let view_def1: Result<helios_fhir::r4::ViewDefinition, _> = serde_json::from_str(view_with_comparison);
     assert!(
         view_def1.is_ok(),
         "Should parse ViewDefinition successfully"
     );
 
     println!("Testing simple member access 'name.family' (should fail):");
-    let view_def2: Result<fhir::r4::ViewDefinition, _> =
+    let view_def2: Result<helios_fhir::r4::ViewDefinition, _> =
         serde_json::from_str(view_with_simple_member);
     assert!(
         view_def2.is_ok(),
@@ -83,7 +83,7 @@ fn test_boolean_validation_improvements() {
     );
 
     println!("Testing boolean function 'name.exists()' (should pass):");
-    let view_def3: Result<fhir::r4::ViewDefinition, _> =
+    let view_def3: Result<helios_fhir::r4::ViewDefinition, _> =
         serde_json::from_str(view_with_boolean_function);
     assert!(
         view_def3.is_ok(),

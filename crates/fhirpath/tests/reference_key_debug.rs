@@ -1,4 +1,4 @@
-use fhirpath::{evaluate_expression, EvaluationContext};
+use helios_fhirpath::{evaluate_expression, EvaluationContext};
 use serde_json;
 
 #[test]
@@ -29,8 +29,8 @@ fn debug_reference_key_functions() {
     });
 
     // Parse into FHIR resources
-    let patient_p1: fhir::r4::Patient = serde_json::from_value(patient_p1_json).unwrap();
-    let patient_p2: fhir::r4::Patient = serde_json::from_value(patient_p2_json).unwrap();
+    let patient_p1: helios_fhir::r4::Patient = serde_json::from_value(patient_p1_json).unwrap();
+    let patient_p2: helios_fhir::r4::Patient = serde_json::from_value(patient_p2_json).unwrap();
 
     println!("=== Testing Reference Key Functions ===\n");
 
@@ -39,7 +39,7 @@ fn debug_reference_key_functions() {
         println!("--- Patient {} ---", name);
         
         let context = EvaluationContext::new(vec![
-            fhir::FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)))
+            helios_fhir::FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)))
         ]);
 
         // Test individual components

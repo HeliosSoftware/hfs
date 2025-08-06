@@ -1,4 +1,4 @@
-use fhirpath_support::{EvaluationError, EvaluationResult, TypeInfoResult};
+use helios_fhirpath_support::{EvaluationError, EvaluationResult, TypeInfoResult};
 use std::collections::HashMap;
 
 /// FHIRPath type() function implementation

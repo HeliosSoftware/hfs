@@ -1,4 +1,4 @@
-use fhir_macro::{FhirSerde, FhirPath};
+use helios_fhir_macro::{FhirSerde, FhirPath};
 use serde::{Serialize, Deserialize};
 
 use crate::{Element, DecimalElement};

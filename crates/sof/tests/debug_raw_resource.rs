@@ -19,7 +19,7 @@ fn test_raw_fhir_parsing() {
     println!("{}", serde_json::to_string_pretty(&patient_json).unwrap());
 
     // Parse as R4 Patient
-    let patient: fhir::r4::Patient =
+    let patient: helios_fhir::r4::Patient =
         serde_json::from_value(patient_json.clone()).expect("Failed to parse patient");
 
     // Serialize back to JSON to see what structure we get

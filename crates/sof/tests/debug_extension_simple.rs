@@ -1,5 +1,5 @@
 use serde_json;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_simple_extension_debug() {
@@ -25,7 +25,7 @@ fn test_simple_extension_debug() {
         ]
     });
 
-    let bundle: fhir::r4::Bundle =
+    let bundle: helios_fhir::r4::Bundle =
         serde_json::from_value(bundle_json).expect("Failed to parse bundle");
     let sof_bundle = SofBundle::R4(bundle);
 
@@ -50,7 +50,7 @@ fn test_simple_extension_debug() {
         }]
     });
 
-    let view_definition: fhir::r4::ViewDefinition =
+    let view_definition: helios_fhir::r4::ViewDefinition =
         serde_json::from_value(view).expect("Failed to parse ViewDefinition");
     let sof_view = SofViewDefinition::R4(view_definition);
 

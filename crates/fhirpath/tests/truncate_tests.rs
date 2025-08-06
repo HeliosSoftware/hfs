@@ -1,7 +1,7 @@
 use chumsky::Parser;
-use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::parser;
-use fhirpath_support::{EvaluationError, EvaluationResult};
+use helios_fhirpath::evaluator::{EvaluationContext, evaluate};
+use helios_fhirpath::parser::parser;
+use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 
 // Helper function to parse and evaluate
 fn eval(input: &str) -> Result<EvaluationResult, EvaluationError> {

@@ -1,4 +1,4 @@
-use sof::{ContentType, SofError};
+use helios_sof::{ContentType, SofError};
 
 #[test]
 fn test_shortened_format_names() -> Result<(), SofError> {

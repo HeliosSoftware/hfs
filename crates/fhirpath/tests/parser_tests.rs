@@ -1,5 +1,5 @@
 use chumsky::Parser;
-use fhirpath::parser::parser;
+use helios_fhirpath::parser::parser;
 use roxmltree::{Document, Node};
 use std::fs::File;
 use std::io::Read;

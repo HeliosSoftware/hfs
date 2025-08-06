@@ -35,7 +35,7 @@ fn create_test_app() -> Router {
 /// Placeholder handlers - these will be replaced with actual imports
 async fn capability_statement_handler() -> axum::response::Response {
     // This is a simplified version for testing
-    // In production, this would use the actual handler from sof::server::handlers
+    // In production, this would use the actual handler from helios_sof::server::handlers
 
     let capability_statement = serde_json::json!({
         "resourceType": "CapabilityStatement",
@@ -90,7 +90,7 @@ async fn run_view_definition_handler(
     // This would use the actual handler in production
     // For now, we'll implement a basic version for testing
 
-    use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+    use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
     // Validate query parameters first
     if let Err(e) = validate_query_params(&params) {
@@ -396,7 +396,7 @@ async fn run_view_definition_handler(
     let content_type = match parse_content_type(accept, format, header_param) {
         Ok(ct) => ct,
         Err(e) => match e {
-            sof::SofError::UnsupportedContentType(_) => {
+            helios_sof::SofError::UnsupportedContentType(_) => {
                 return error_response(
                     axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     &e.to_string(),
@@ -407,7 +407,7 @@ async fn run_view_definition_handler(
     };
 
     // Create ViewDefinition and Bundle
-    let view_definition = match serde_json::from_value::<fhir::r4::ViewDefinition>(view_def_json) {
+    let view_definition = match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
         Ok(vd) => SofViewDefinition::R4(vd),
         Err(e) => {
             return error_response(
@@ -425,7 +425,7 @@ async fn run_view_definition_handler(
         }).collect::<Vec<_>>()
     });
 
-    let bundle = match serde_json::from_value::<fhir::r4::Bundle>(bundle_json) {
+    let bundle = match serde_json::from_value::<helios_fhir::r4::Bundle>(bundle_json) {
         Ok(b) => SofBundle::R4(b),
         Err(e) => {
             return error_response(
@@ -472,8 +472,8 @@ fn parse_content_type(
     accept: Option<&str>,
     format: Option<&str>,
     header: Option<bool>,
-) -> Result<sof::ContentType, sof::SofError> {
-    use sof::ContentType;
+) -> Result<helios_sof::ContentType, helios_sof::SofError> {
+    use helios_sof::ContentType;
 
     let content_type_str = format.or(accept).unwrap_or("application/json");
 
@@ -598,7 +598,7 @@ fn validate_query_params(params: &std::collections::HashMap<String, String>) -> 
 fn apply_pagination(
     output: Vec<u8>,
     params: &std::collections::HashMap<String, String>,
-    content_type: &sof::ContentType,
+    content_type: &helios_sof::ContentType,
     count_from_body: Option<u32>,
 ) -> Option<Vec<u8>> {
     // Body parameters take precedence over query parameters
@@ -611,7 +611,7 @@ fn apply_pagination(
     }
 
     match content_type {
-        sof::ContentType::Json => {
+        helios_sof::ContentType::Json => {
             let output_str = String::from_utf8(output).ok()?;
             let mut records: Vec<serde_json::Value> = serde_json::from_str(&output_str).ok()?;
 
@@ -622,7 +622,7 @@ fn apply_pagination(
 
             serde_json::to_string(&records).ok().map(|s| s.into_bytes())
         }
-        sof::ContentType::NdJson => {
+        helios_sof::ContentType::NdJson => {
             let output_str = String::from_utf8(output).ok()?;
             let mut lines: Vec<&str> = output_str.lines().collect();
 
@@ -633,7 +633,7 @@ fn apply_pagination(
 
             Some(lines.join("\n").into_bytes())
         }
-        sof::ContentType::Csv | sof::ContentType::CsvWithHeader => {
+        helios_sof::ContentType::Csv | helios_sof::ContentType::CsvWithHeader => {
             let output_str = match String::from_utf8(output) {
                 Ok(s) => s,
                 Err(e) => return Some(e.into_bytes()),
@@ -644,7 +644,7 @@ fn apply_pagination(
                 return Some(output_str.into_bytes());
             }
 
-            let has_header = matches!(content_type, sof::ContentType::CsvWithHeader);
+            let has_header = matches!(content_type, helios_sof::ContentType::CsvWithHeader);
             let header_offset = if has_header { 1 } else { 0 };
 
             if lines.len() <= header_offset {

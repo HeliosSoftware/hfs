@@ -99,8 +99,8 @@
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use fhir::FhirVersion;
-use sof::{
+use helios_fhir::FhirVersion;
+use helios_sof::{
     ContentType, RunOptions, SofBundle, SofViewDefinition, run_view_definition_with_options,
 };
 use std::fs;
@@ -209,22 +209,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let view_definition: SofViewDefinition = match args.fhir_version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
-            let vd: fhir::r4::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r4::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R4(vd)
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
-            let vd: fhir::r4b::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r4b::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R4B(vd)
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
-            let vd: fhir::r5::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r5::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R5(vd)
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
-            let vd: fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
+            let vd: helios_fhir::r6::ViewDefinition = serde_json::from_str(&view_content)?;
             SofViewDefinition::R6(vd)
         }
     };
@@ -233,22 +233,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bundle: SofBundle = match args.fhir_version {
         #[cfg(feature = "R4")]
         FhirVersion::R4 => {
-            let b: fhir::r4::Bundle = serde_json::from_str(&bundle_content)?;
+            let b: helios_fhir::r4::Bundle = serde_json::from_str(&bundle_content)?;
             SofBundle::R4(b)
         }
         #[cfg(feature = "R4B")]
         FhirVersion::R4B => {
-            let b: fhir::r4b::Bundle = serde_json::from_str(&bundle_content)?;
+            let b: helios_fhir::r4b::Bundle = serde_json::from_str(&bundle_content)?;
             SofBundle::R4B(b)
         }
         #[cfg(feature = "R5")]
         FhirVersion::R5 => {
-            let b: fhir::r5::Bundle = serde_json::from_str(&bundle_content)?;
+            let b: helios_fhir::r5::Bundle = serde_json::from_str(&bundle_content)?;
             SofBundle::R5(b)
         }
         #[cfg(feature = "R6")]
         FhirVersion::R6 => {
-            let b: fhir::r6::Bundle = serde_json::from_str(&bundle_content)?;
+            let b: helios_fhir::r6::Bundle = serde_json::from_str(&bundle_content)?;
             SofBundle::R6(b)
         }
     };

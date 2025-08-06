@@ -1,7 +1,7 @@
 use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use chrono::{Local, Timelike};
-use fhir::{FhirResource, FhirVersion};
-use fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult};
+use helios_fhir::{FhirResource, FhirVersion};
+use helios_fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationResult};
 use regex::Regex;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -23,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 ///
 /// ```
 /// // Create a new empty context
-/// use fhirpath::evaluator::EvaluationContext;
-/// use fhirpath_support::EvaluationResult;
-/// use fhir::FhirVersion;
+/// use helios_fhirpath::evaluator::EvaluationContext;
+/// use helios_fhirpath_support::EvaluationResult;
+/// use helios_fhir::FhirVersion;
 ///
 /// let mut context = EvaluationContext::new_empty(FhirVersion::R4);
 ///
@@ -418,9 +418,9 @@ fn apply_decimal_multiplicative(
 /// # Examples
 ///
 /// ```
-/// use fhirpath::evaluator::{evaluate, EvaluationContext};
-/// use fhirpath::parser::parser;
-/// use fhirpath_support::EvaluationResult;
+/// use helios_fhirpath::evaluator::{evaluate, EvaluationContext};
+/// use helios_fhirpath::parser::parser;
+/// use helios_fhirpath_support::EvaluationResult;
 /// use chumsky::Parser;
 ///
 /// // Create a context

@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use sof::SofError;
+use helios_sof::SofError;
 use std::fmt;
 
 /// Server-specific error type that can be converted to HTTP responses

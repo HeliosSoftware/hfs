@@ -1,8 +1,8 @@
-use fhirpath_support::{EvaluationError, EvaluationResult};
+use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 use crate::parser::TypeSpecifier;
 use crate::fhir_type_hierarchy::capitalize_first_letter;
 use crate::evaluator::EvaluationContext;
-use fhir::{FhirVersion, FhirResourceTypeProvider};
+use helios_fhir::{FhirVersion, FhirResourceTypeProvider};
 
 /// Handles type operations for FHIR resources, supporting is/as operators.
 /// This module provides enhanced support for handling FHIR resource types
@@ -22,13 +22,13 @@ use fhir::{FhirVersion, FhirResourceTypeProvider};
 pub fn is_resource_type_for_version(type_name: &str, fhir_version: &FhirVersion) -> bool {
     match fhir_version {
         #[cfg(feature = "R4")]
-        FhirVersion::R4 => fhir::r4::Resource::is_resource_type(type_name),
+        FhirVersion::R4 => helios_fhir::r4::Resource::is_resource_type(type_name),
         #[cfg(feature = "R4B")]
-        FhirVersion::R4B => fhir::r4b::Resource::is_resource_type(type_name),
+        FhirVersion::R4B => helios_fhir::r4b::Resource::is_resource_type(type_name),
         #[cfg(feature = "R5")]
-        FhirVersion::R5 => fhir::r5::Resource::is_resource_type(type_name),
+        FhirVersion::R5 => helios_fhir::r5::Resource::is_resource_type(type_name),
         #[cfg(feature = "R6")]
-        FhirVersion::R6 => fhir::r6::Resource::is_resource_type(type_name),
+        FhirVersion::R6 => helios_fhir::r6::Resource::is_resource_type(type_name),
         #[allow(unreachable_patterns)]
         _ => false, // For versions not enabled by feature flags
     }

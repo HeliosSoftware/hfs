@@ -20,8 +20,8 @@
 //! - **Code Reuse**: Single implementation handles all supported versions
 
 use crate::SofError;
-use fhir::FhirResource;
-use fhirpath::EvaluationResult;
+use helios_fhir::FhirResource;
+use helios_fhirpath::EvaluationResult;
 
 /// Trait for abstracting ViewDefinition across FHIR versions.
 ///
@@ -39,7 +39,7 @@ use fhirpath::EvaluationResult;
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ViewDefinitionTrait;
+/// use helios_sof::traits::ViewDefinitionTrait;
 ///
 /// fn process_any_version<T: ViewDefinitionTrait>(vd: &T) {
 ///     if let Some(resource_type) = vd.resource() {
@@ -90,7 +90,7 @@ pub trait ViewDefinitionTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ViewDefinitionSelectTrait;
+/// use helios_sof::traits::ViewDefinitionSelectTrait;
 ///
 /// fn analyze_select<T: ViewDefinitionSelectTrait>(select: &T) {
 ///     if let Some(columns) = select.column() {
@@ -140,7 +140,7 @@ pub trait ViewDefinitionSelectTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ViewDefinitionColumnTrait;
+/// use helios_sof::traits::ViewDefinitionColumnTrait;
 ///
 /// fn describe_column<T: ViewDefinitionColumnTrait>(col: &T) {
 ///     if let Some(name) = col.name() {
@@ -188,7 +188,7 @@ pub trait ViewDefinitionColumnTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ViewDefinitionWhereTrait;
+/// use helios_sof::traits::ViewDefinitionWhereTrait;
 ///
 /// fn check_where_clause<T: ViewDefinitionWhereTrait>(where_clause: &T) {
 ///     if let Some(path) = where_clause.path() {
@@ -234,8 +234,8 @@ pub trait ViewDefinitionWhereTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ViewDefinitionConstantTrait;
-/// use fhirpath::EvaluationResult;
+/// use helios_sof::traits::ViewDefinitionConstantTrait;
+/// use helios_fhirpath::EvaluationResult;
 ///
 /// fn process_constant<T: ViewDefinitionConstantTrait>(constant: &T) -> Result<(), Box<dyn std::error::Error>> {
 ///     if let Some(name) = constant.name() {
@@ -289,7 +289,7 @@ pub trait ViewDefinitionConstantTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::{BundleTrait, ResourceTrait};
+/// use helios_sof::traits::{BundleTrait, ResourceTrait};
 ///
 /// fn analyze_bundle<B: BundleTrait>(bundle: &B)
 /// where
@@ -325,8 +325,8 @@ pub trait BundleTrait {
 /// # Examples
 ///
 /// ```rust
-/// use sof::traits::ResourceTrait;
-/// use fhir::FhirResource;
+/// use helios_sof::traits::ResourceTrait;
+/// use helios_fhir::FhirResource;
 ///
 /// fn process_resource<R: ResourceTrait>(resource: &R) {
 ///     println!("Processing {} resource", resource.resource_name());
@@ -361,7 +361,7 @@ pub trait ResourceTrait: Clone {
 #[cfg(feature = "R4")]
 mod r4_impl {
     use super::*;
-    use fhir::r4::*;
+    use helios_fhir::r4::*;
 
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
@@ -552,7 +552,7 @@ mod r4_impl {
 #[cfg(feature = "R4B")]
 mod r4b_impl {
     use super::*;
-    use fhir::r4b::*;
+    use helios_fhir::r4b::*;
 
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
@@ -744,7 +744,7 @@ mod r4b_impl {
 #[cfg(feature = "R5")]
 mod r5_impl {
     use super::*;
-    use fhir::r5::*;
+    use helios_fhir::r5::*;
 
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;
@@ -945,7 +945,7 @@ mod r5_impl {
 #[cfg(feature = "R6")]
 mod r6_impl {
     use super::*;
-    use fhir::r6::*;
+    use helios_fhir::r6::*;
 
     impl ViewDefinitionTrait for ViewDefinition {
         type Select = ViewDefinitionSelect;

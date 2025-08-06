@@ -1,9 +1,9 @@
-use fhir::FhirResource;
-use fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhir::FhirResource;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use serde_json;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
-fn create_test_patient_with_extension() -> fhir::r4::Patient {
+fn create_test_patient_with_extension() -> helios_fhir::r4::Patient {
     let patient_json = serde_json::json!({
         "resourceType": "Patient",
         "id": "pt1",
@@ -28,12 +28,12 @@ fn test_fhir_resource_structure_debug() {
     println!("{}", serde_json::to_string_pretty(&patient).unwrap());
 
     // Test 1: Convert to FhirResource and back to JSON to see what changes
-    let fhir_resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient.clone())));
+    let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient.clone())));
 
     // Serialize the FhirResource back to JSON to see if extensions are preserved
     match &fhir_resource {
         FhirResource::R4(boxed_resource) => {
-            if let fhir::r4::Resource::Patient(p) = boxed_resource.as_ref() {
+            if let helios_fhir::r4::Resource::Patient(p) = boxed_resource.as_ref() {
                 println!("\nAfter FhirResource conversion:");
                 println!("{}", serde_json::to_string_pretty(p).unwrap());
             }
@@ -118,7 +118,7 @@ fn test_fhir_resource_structure_debug() {
         ]
     });
 
-    let bundle: fhir::r4::Bundle =
+    let bundle: helios_fhir::r4::Bundle =
         serde_json::from_value(bundle_json).expect("Failed to parse bundle");
     let sof_bundle = SofBundle::R4(bundle);
 
@@ -148,7 +148,7 @@ fn test_fhir_resource_structure_debug() {
         }]
     });
 
-    let view_definition: fhir::r4::ViewDefinition =
+    let view_definition: helios_fhir::r4::ViewDefinition =
         serde_json::from_value(view).expect("Failed to parse ViewDefinition");
     let sof_view = SofViewDefinition::R4(view_definition);
 

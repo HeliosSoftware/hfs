@@ -1,5 +1,5 @@
-use fhirpath::{evaluate_expression, EvaluationContext};
-use fhir::FhirResource;
+use helios_fhirpath::{evaluate_expression, EvaluationContext};
+use helios_fhir::FhirResource;
 
 #[test]
 fn test_string_boundary_functions() {
@@ -37,8 +37,8 @@ fn test_fhir_types_detailed() {
         "birthDate": "1970-06"
     });
     
-    let patient: fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
-    let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![resource]);
     
     // Test type operations

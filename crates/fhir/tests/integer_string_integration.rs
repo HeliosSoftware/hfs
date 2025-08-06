@@ -1,7 +1,7 @@
 #[cfg(feature = "R6")]
 #[test]
 fn test_real_json_with_string_integers() {
-    use fhir::r6::Bundle;
+    use helios_fhir::r6::Bundle;
     use serde_json;
 
     // Simplified version of the problematic JSON with string integers
@@ -47,7 +47,7 @@ fn test_real_json_with_string_integers() {
         if let Some(entry) = entries.first() {
             if let Some(resource) = &entry.resource {
                 match &**resource {
-                    fhir::r6::Resource::SubscriptionStatus(sub_status) => {
+                    helios_fhir::r6::Resource::SubscriptionStatus(sub_status) => {
                         // Check events_since_subscription_start was parsed from string "2"
                         if let Some(events_count) = &sub_status.events_since_subscription_start {
                             if let Some(value) = &events_count.value {

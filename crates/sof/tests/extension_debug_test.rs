@@ -1,6 +1,6 @@
-use fhir::r4::{Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn};
+use helios_fhir::r4::{Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn};
 use serde_json;
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_extension_function_debug() {
@@ -43,9 +43,9 @@ fn test_extension_function_debug() {
     // Create test bundle
     let bundle = Bundle {
         id: Some("test-bundle".to_string().into()),
-        entry: Some(vec![fhir::r4::BundleEntry {
+        entry: Some(vec![helios_fhir::r4::BundleEntry {
             full_url: Some("urn:uuid:pt1".to_string().into()),
-            resource: Some(fhir::r4::Resource::Patient(patient)),
+            resource: Some(helios_fhir::r4::Resource::Patient(patient)),
             ..Default::default()
         }]),
         ..Default::default()

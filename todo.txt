@@ -1,21 +1,33 @@
-- Re-work crate names such that they can be unique for crates.io
-
 - Make repo public
+  - Re-work crate names such that they can be unique for crates.io
   - Cleanup main README.md
+    - Need a components section to explain what's in the repo
+  - Add MIT license
+
+- FHIRPath
   - Remove? hfs crate
-  - Update hero image
+  - Implement fhirpath-server
+  - Setup build process for fhirpath-server
+  - Setup hosting for fhirpath-server
+  - Integrate into https://fhirpath-lab.com/FhirPath
+  - Get listed here:  https://confluence.hl7.org/spaces/FHIRI/pages/161060129/FHIRPath+Implementations
+
+- SQL On FHIR
+  - source parameter - supporting both file path and AWS, and Google?
+  - group parameter
+  - parquet file(s)
+  - Chunked transfer encoding?
+  - Python Bindings
+  - Setup build process for sof-server and sof-cli
+  - Setup hosting for sof-server
+
+- Process on a pile of JSON
+
 
 - Add Github Actions for build and release process
 
 - Re-work fhirpath to add a fhirpath server for eventual use with FHIR Path Lab
-
-- Setup hosting for fhirpath server
-- Setup hosting for sof-server
-
-- Need to fully test each of the parameters
-  - Support viewReference
-  - Need to support application/parquet 
-  - Support the source parameter
+- Is there a documented fhirpath validator endpoint, and an apply?
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
@@ -25,10 +37,8 @@
 
 - Investigate the tests in https://github.com/FHIR/fhir-test-cases - are the fhirpath tests different for each FHIR version?
 
-- Write README.md for the root - homepage!
 - Modify fhir_gen to add Rust docs to r4.rs, others.
 
-- Is there a documented fhirpath validator endpoint, and an apply?
 
 - The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to 
   decide - could be helpful too in the future when we need to use it for Cassandra table separation

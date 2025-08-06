@@ -1,5 +1,5 @@
 [package]
-name = "sof"
+name = "helios-sof"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,17 +13,17 @@ path = "src/cli.rs"
 
 [features]
 default = ["R4"]
-R4 = ["fhir/R4", "fhirpath/R4"]
-R4B = ["fhir/R4B", "fhirpath/R4B"]
-R5 = ["fhir/R5", "fhirpath/R5"]
-R6 = ["fhir/R6", "fhirpath/R6"]
+R4 = ["helios-fhir/R4", "helios-fhirpath/R4"]
+R4B = ["helios-fhir/R4B", "helios-fhirpath/R4B"]
+R5 = ["helios-fhir/R5", "helios-fhirpath/R5"]
+R6 = ["helios-fhir/R6", "helios-fhirpath/R6"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive", "env"] }
 tokio = { version = "1.0", features = ["full"] }
-fhir = { path = "../fhir" }
-fhirpath = { path = "../fhirpath" }
-fhirpath_support = { path = "../fhirpath_support" }
+helios-fhir = { path = "../fhir" }
+helios-fhirpath = { path = "../fhirpath" }
+helios-fhirpath-support = { path = "../fhirpath-support" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 csv = "1.3"

@@ -1,15 +1,15 @@
 [package]
-name = "hfs"
+name = "helios-hfs"
 version = "0.1.0"
 edition = "2024"
 
 [features]
 default = ["R4"]
-R4 = ["fhir/R4"]
-R4B = ["fhir/R4B"]
-R5 = ["fhir/R5"]
-R6 = ["fhir/R6"]
+R4 = ["helios-fhir/R4"]
+R4B = ["helios-fhir/R4B"]
+R5 = ["helios-fhir/R5"]
+R6 = ["helios-fhir/R6"]
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
-fhir = { workspace = true }
+helios-fhir = { workspace = true }

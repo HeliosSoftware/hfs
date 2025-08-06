@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use fhir::{FhirResource, r4::Patient};
-    use fhirpath::{EvaluationContext, evaluate_expression};
+    use helios_fhir::{FhirResource, r4::Patient};
+    use helios_fhirpath::{EvaluationContext, evaluate_expression};
     use serde_json;
 
     #[test]
@@ -30,13 +30,13 @@ mod tests {
         }
 
         // Convert patient to FhirResource and EvaluationContext
-        let fhir_resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+        let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
         let mut context = EvaluationContext::new(vec![fhir_resource]);
 
         // Add the boolean constant
-        let is_deceased_constant = fhirpath_support::EvaluationResult::Boolean(
+        let is_deceased_constant = helios_fhirpath_support::EvaluationResult::Boolean(
             true,
-            Some(fhirpath_support::TypeInfoResult::new("FHIR", "boolean")),
+            Some(helios_fhirpath_support::TypeInfoResult::new("FHIR", "boolean")),
         );
         context.set_variable_result("is_deceased", is_deceased_constant);
 

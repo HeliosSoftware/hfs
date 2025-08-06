@@ -34,8 +34,8 @@
 //! ## Usage Example
 //!
 //! ```rust
-//! use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
-//! use fhir::FhirVersion;
+//! use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+//! use helios_fhir::FhirVersion;
 //!
 //! # #[cfg(feature = "R4")]
 //! # {
@@ -70,8 +70,8 @@
 //!     }]
 //! }"#;
 //!
-//! let view_definition: fhir::r4::ViewDefinition = serde_json::from_str(view_definition_json)?;
-//! let bundle: fhir::r4::Bundle = serde_json::from_str(bundle_json)?;
+//! let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_str(view_definition_json)?;
+//! let bundle: helios_fhir::r4::Bundle = serde_json::from_str(bundle_json)?;
 //!
 //! // Wrap in version-agnostic containers
 //! let sof_view = SofViewDefinition::R4(view_definition);
@@ -148,10 +148,10 @@
 //! The crate provides comprehensive error handling through [`SofError`]:
 //!
 //! ```rust,no_run
-//! use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
+//! use helios_sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 //!
-//! # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
-//! # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+//! # let view = SofViewDefinition::R4(helios_fhir::r4::ViewDefinition::default());
+//! # let bundle = SofBundle::R4(helios_fhir::r4::Bundle::default());
 //! # let content_type = ContentType::Json;
 //! match run_view_definition(view, bundle, content_type) {
 //!     Ok(output) => {
@@ -179,14 +179,14 @@
 pub mod traits;
 
 use chrono::{DateTime, Utc};
-use fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use traits::*;
 
 // Re-export commonly used types and traits for easier access
-pub use fhir::FhirVersion;
+pub use helios_fhir::FhirVersion;
 pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 
 /// Multi-version ViewDefinition container supporting version-agnostic operations.
@@ -205,9 +205,9 @@ pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 /// # Examples
 ///
 /// ```rust
-/// use sof::{SofViewDefinition, ContentType};
+/// use helios_sof::{SofViewDefinition, ContentType};
 /// # #[cfg(feature = "R4")]
-/// use fhir::r4::ViewDefinition;
+/// use helios_fhir::r4::ViewDefinition;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -227,20 +227,20 @@ pub use traits::{BundleTrait, ResourceTrait, ViewDefinitionTrait};
 /// let sof_view = SofViewDefinition::R4(view_def);
 ///
 /// // Check version
-/// assert_eq!(sof_view.version(), fhir::FhirVersion::R4);
+/// assert_eq!(sof_view.version(), helios_fhir::FhirVersion::R4);
 /// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone)]
 pub enum SofViewDefinition {
     #[cfg(feature = "R4")]
-    R4(fhir::r4::ViewDefinition),
+    R4(helios_fhir::r4::ViewDefinition),
     #[cfg(feature = "R4B")]
-    R4B(fhir::r4b::ViewDefinition),
+    R4B(helios_fhir::r4b::ViewDefinition),
     #[cfg(feature = "R5")]
-    R5(fhir::r5::ViewDefinition),
+    R5(helios_fhir::r5::ViewDefinition),
     #[cfg(feature = "R6")]
-    R6(fhir::r6::ViewDefinition),
+    R6(helios_fhir::r6::ViewDefinition),
 }
 
 impl SofViewDefinition {
@@ -256,26 +256,26 @@ impl SofViewDefinition {
     /// # Examples
     ///
     /// ```rust
-    /// use sof::SofViewDefinition;
-    /// use fhir::FhirVersion;
+    /// use helios_sof::SofViewDefinition;
+    /// use helios_fhir::FhirVersion;
     ///
     /// # #[cfg(feature = "R5")]
     /// # {
-    /// # let view_def = fhir::r5::ViewDefinition::default();
+    /// # let view_def = helios_fhir::r5::ViewDefinition::default();
     /// let sof_view = SofViewDefinition::R5(view_def);
-    /// assert_eq!(sof_view.version(), fhir::FhirVersion::R5);
+    /// assert_eq!(sof_view.version(), helios_fhir::FhirVersion::R5);
     /// # }
     /// ```
-    pub fn version(&self) -> fhir::FhirVersion {
+    pub fn version(&self) -> helios_fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofViewDefinition::R4(_) => fhir::FhirVersion::R4,
+            SofViewDefinition::R4(_) => helios_fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofViewDefinition::R4B(_) => fhir::FhirVersion::R4B,
+            SofViewDefinition::R4B(_) => helios_fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofViewDefinition::R5(_) => fhir::FhirVersion::R5,
+            SofViewDefinition::R5(_) => helios_fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofViewDefinition::R6(_) => fhir::FhirVersion::R6,
+            SofViewDefinition::R6(_) => helios_fhir::FhirVersion::R6,
         }
     }
 }
@@ -296,9 +296,9 @@ impl SofViewDefinition {
 /// # Examples
 ///
 /// ```rust
-/// use sof::SofBundle;
+/// use helios_sof::SofBundle;
 /// # #[cfg(feature = "R4")]
-/// use fhir::r4::Bundle;
+/// use helios_fhir::r4::Bundle;
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -318,20 +318,20 @@ impl SofViewDefinition {
 /// let sof_bundle = SofBundle::R4(bundle);
 ///
 /// // Check version compatibility
-/// assert_eq!(sof_bundle.version(), fhir::FhirVersion::R4);
+/// assert_eq!(sof_bundle.version(), helios_fhir::FhirVersion::R4);
 /// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Debug, Clone)]
 pub enum SofBundle {
     #[cfg(feature = "R4")]
-    R4(fhir::r4::Bundle),
+    R4(helios_fhir::r4::Bundle),
     #[cfg(feature = "R4B")]
-    R4B(fhir::r4b::Bundle),
+    R4B(helios_fhir::r4b::Bundle),
     #[cfg(feature = "R5")]
-    R5(fhir::r5::Bundle),
+    R5(helios_fhir::r5::Bundle),
     #[cfg(feature = "R6")]
-    R6(fhir::r6::Bundle),
+    R6(helios_fhir::r6::Bundle),
 }
 
 impl SofBundle {
@@ -347,26 +347,26 @@ impl SofBundle {
     /// # Examples
     ///
     /// ```rust
-    /// use sof::SofBundle;
-    /// use fhir::FhirVersion;
+    /// use helios_sof::SofBundle;
+    /// use helios_fhir::FhirVersion;
     ///
     /// # #[cfg(feature = "R4")]
     /// # {
-    /// # let bundle = fhir::r4::Bundle::default();
+    /// # let bundle = helios_fhir::r4::Bundle::default();
     /// let sof_bundle = SofBundle::R4(bundle);
-    /// assert_eq!(sof_bundle.version(), fhir::FhirVersion::R4);
+    /// assert_eq!(sof_bundle.version(), helios_fhir::FhirVersion::R4);
     /// # }
     /// ```
-    pub fn version(&self) -> fhir::FhirVersion {
+    pub fn version(&self) -> helios_fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofBundle::R4(_) => fhir::FhirVersion::R4,
+            SofBundle::R4(_) => helios_fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofBundle::R4B(_) => fhir::FhirVersion::R4B,
+            SofBundle::R4B(_) => helios_fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofBundle::R5(_) => fhir::FhirVersion::R5,
+            SofBundle::R5(_) => helios_fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofBundle::R6(_) => fhir::FhirVersion::R6,
+            SofBundle::R6(_) => helios_fhir::FhirVersion::R6,
         }
     }
 }
@@ -387,27 +387,27 @@ impl SofBundle {
 #[serde(untagged)]
 pub enum SofCapabilityStatement {
     #[cfg(feature = "R4")]
-    R4(fhir::r4::CapabilityStatement),
+    R4(helios_fhir::r4::CapabilityStatement),
     #[cfg(feature = "R4B")]
-    R4B(fhir::r4b::CapabilityStatement),
+    R4B(helios_fhir::r4b::CapabilityStatement),
     #[cfg(feature = "R5")]
-    R5(fhir::r5::CapabilityStatement),
+    R5(helios_fhir::r5::CapabilityStatement),
     #[cfg(feature = "R6")]
-    R6(fhir::r6::CapabilityStatement),
+    R6(helios_fhir::r6::CapabilityStatement),
 }
 
 impl SofCapabilityStatement {
     /// Returns the FHIR specification version of this CapabilityStatement.
-    pub fn version(&self) -> fhir::FhirVersion {
+    pub fn version(&self) -> helios_fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofCapabilityStatement::R4(_) => fhir::FhirVersion::R4,
+            SofCapabilityStatement::R4(_) => helios_fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofCapabilityStatement::R4B(_) => fhir::FhirVersion::R4B,
+            SofCapabilityStatement::R4B(_) => helios_fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofCapabilityStatement::R5(_) => fhir::FhirVersion::R5,
+            SofCapabilityStatement::R5(_) => helios_fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofCapabilityStatement::R6(_) => fhir::FhirVersion::R6,
+            SofCapabilityStatement::R6(_) => helios_fhir::FhirVersion::R6,
         }
     }
 }
@@ -428,27 +428,27 @@ impl SofCapabilityStatement {
 #[serde(untagged)]
 pub enum SofParameters {
     #[cfg(feature = "R4")]
-    R4(fhir::r4::Parameters),
+    R4(helios_fhir::r4::Parameters),
     #[cfg(feature = "R4B")]
-    R4B(fhir::r4b::Parameters),
+    R4B(helios_fhir::r4b::Parameters),
     #[cfg(feature = "R5")]
-    R5(fhir::r5::Parameters),
+    R5(helios_fhir::r5::Parameters),
     #[cfg(feature = "R6")]
-    R6(fhir::r6::Parameters),
+    R6(helios_fhir::r6::Parameters),
 }
 
 impl SofParameters {
     /// Returns the FHIR specification version of this Parameters.
-    pub fn version(&self) -> fhir::FhirVersion {
+    pub fn version(&self) -> helios_fhir::FhirVersion {
         match self {
             #[cfg(feature = "R4")]
-            SofParameters::R4(_) => fhir::FhirVersion::R4,
+            SofParameters::R4(_) => helios_fhir::FhirVersion::R4,
             #[cfg(feature = "R4B")]
-            SofParameters::R4B(_) => fhir::FhirVersion::R4B,
+            SofParameters::R4B(_) => helios_fhir::FhirVersion::R4B,
             #[cfg(feature = "R5")]
-            SofParameters::R5(_) => fhir::FhirVersion::R5,
+            SofParameters::R5(_) => helios_fhir::FhirVersion::R5,
             #[cfg(feature = "R6")]
-            SofParameters::R6(_) => fhir::FhirVersion::R6,
+            SofParameters::R6(_) => helios_fhir::FhirVersion::R6,
         }
     }
 }
@@ -469,10 +469,10 @@ impl SofParameters {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
+/// use helios_sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 ///
-/// # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
-/// # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+/// # let view = SofViewDefinition::R4(helios_fhir::r4::ViewDefinition::default());
+/// # let bundle = SofBundle::R4(helios_fhir::r4::Bundle::default());
 /// # let content_type = ContentType::Json;
 /// match run_view_definition(view, bundle, content_type) {
 ///     Ok(output) => {
@@ -562,7 +562,7 @@ pub enum SofError {
 /// # Examples
 ///
 /// ```rust
-/// use sof::ContentType;
+/// use helios_sof::ContentType;
 ///
 /// // Parse from string
 /// let csv_type = ContentType::from_string("text/csv")?;
@@ -574,7 +574,7 @@ pub enum SofError {
 /// // CSV without headers
 /// let csv_no_headers = ContentType::from_string("text/csv;header=false")?;
 /// assert_eq!(csv_no_headers, ContentType::Csv);
-/// # Ok::<(), sof::SofError>(())
+/// # Ok::<(), helios_sof::SofError>(())
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentType {
@@ -619,7 +619,7 @@ impl ContentType {
     /// # Examples
     ///
     /// ```rust
-    /// use sof::ContentType;
+    /// use helios_sof::ContentType;
     ///
     /// // Shortened format names
     /// let csv = ContentType::from_string("csv")?;
@@ -649,7 +649,7 @@ impl ContentType {
     ///
     /// // Error for unsupported type
     /// assert!(ContentType::from_string("text/plain").is_err());
-    /// # Ok::<(), sof::SofError>(())
+    /// # Ok::<(), helios_sof::SofError>(())
     /// ```
     pub fn from_string(s: &str) -> Result<Self, SofError> {
         match s {
@@ -678,13 +678,13 @@ pub fn get_fhir_version_string() -> &'static str {
 
     match newest_version {
         #[cfg(feature = "R4")]
-        fhir::FhirVersion::R4 => "4.0.1",
+        helios_fhir::FhirVersion::R4 => "4.0.1",
         #[cfg(feature = "R4B")]
-        fhir::FhirVersion::R4B => "4.3.0",
+        helios_fhir::FhirVersion::R4B => "4.3.0",
         #[cfg(feature = "R5")]
-        fhir::FhirVersion::R5 => "5.0.0",
+        helios_fhir::FhirVersion::R5 => "5.0.0",
         #[cfg(feature = "R6")]
-        fhir::FhirVersion::R6 => "6.0.0",
+        helios_fhir::FhirVersion::R6 => "6.0.0",
     }
 }
 
@@ -697,7 +697,7 @@ pub fn get_fhir_version_string() -> &'static str {
 /// # Examples
 ///
 /// ```rust
-/// use sof::{get_newest_enabled_fhir_version, FhirVersion};
+/// use helios_sof::{get_newest_enabled_fhir_version, FhirVersion};
 ///
 /// # #[cfg(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6"))]
 /// # {
@@ -709,15 +709,15 @@ pub fn get_fhir_version_string() -> &'static str {
 /// # Panics
 ///
 /// This function will panic at compile time if no FHIR version features are enabled.
-pub fn get_newest_enabled_fhir_version() -> fhir::FhirVersion {
+pub fn get_newest_enabled_fhir_version() -> helios_fhir::FhirVersion {
     #[cfg(feature = "R6")]
-    return fhir::FhirVersion::R6;
+    return helios_fhir::FhirVersion::R6;
 
     #[cfg(all(feature = "R5", not(feature = "R6")))]
-    return fhir::FhirVersion::R5;
+    return helios_fhir::FhirVersion::R5;
 
     #[cfg(all(feature = "R4B", not(feature = "R5"), not(feature = "R6")))]
-    return fhir::FhirVersion::R4B;
+    return helios_fhir::FhirVersion::R4B;
 
     #[cfg(all(
         feature = "R4",
@@ -725,7 +725,7 @@ pub fn get_newest_enabled_fhir_version() -> fhir::FhirVersion {
         not(feature = "R5"),
         not(feature = "R6")
     ))]
-    return fhir::FhirVersion::R4;
+    return helios_fhir::FhirVersion::R4;
 
     #[cfg(not(any(feature = "R4", feature = "R4B", feature = "R5", feature = "R6")))]
     panic!("At least one FHIR version feature must be enabled");
@@ -747,7 +747,7 @@ pub fn get_newest_enabled_fhir_version() -> fhir::FhirVersion {
 /// # Examples
 ///
 /// ```rust
-/// use sof::ProcessedRow;
+/// use helios_sof::ProcessedRow;
 /// use serde_json::Value;
 ///
 /// let row = ProcessedRow {
@@ -780,7 +780,7 @@ pub struct ProcessedRow {
 /// # Examples
 ///
 /// ```rust
-/// use sof::{ProcessedResult, ProcessedRow};
+/// use helios_sof::{ProcessedResult, ProcessedRow};
 /// use serde_json::Value;
 ///
 /// let result = ProcessedResult {
@@ -847,7 +847,7 @@ pub struct ProcessedResult {
 /// # Examples
 ///
 /// ```rust
-/// use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+/// use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
 ///
 /// # #[cfg(feature = "R4")]
 /// # {
@@ -863,7 +863,7 @@ pub struct ProcessedResult {
 ///         }]
 ///     }]
 /// });
-/// let view_def: fhir::r4::ViewDefinition = serde_json::from_value(view_json)?;
+/// let view_def: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_json)?;
 ///
 /// // Create a simple Bundle
 /// let bundle_json = serde_json::json!({
@@ -871,7 +871,7 @@ pub struct ProcessedResult {
 ///     "type": "collection",
 ///     "entry": []
 /// });
-/// let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+/// let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
 ///
 /// let sof_view = SofViewDefinition::R4(view_def);
 /// let sof_bundle = SofBundle::R4(bundle);
@@ -894,10 +894,10 @@ pub struct ProcessedResult {
 /// Common error scenarios:
 ///
 /// ```rust,no_run
-/// use sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
+/// use helios_sof::{SofError, SofViewDefinition, SofBundle, ContentType, run_view_definition};
 ///
-/// # let view = SofViewDefinition::R4(fhir::r4::ViewDefinition::default());
-/// # let bundle = SofBundle::R4(fhir::r4::Bundle::default());
+/// # let view = SofViewDefinition::R4(helios_fhir::r4::ViewDefinition::default());
+/// # let bundle = SofBundle::R4(helios_fhir::r4::Bundle::default());
 /// # let content_type = ContentType::Json;
 /// match run_view_definition(view, bundle, content_type) {
 ///     Ok(output) => {

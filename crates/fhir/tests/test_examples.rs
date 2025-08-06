@@ -12,7 +12,7 @@ fn test_r4_examples() {
         .join("data")
         .join("R4");
     println!("Testing R4 examples in directory: {:?}", examples_dir);
-    test_examples_in_dir::<fhir::r4::Resource>(&examples_dir);
+    test_examples_in_dir::<helios_fhir::r4::Resource>(&examples_dir);
 }
 
 #[cfg(feature = "R4B")]
@@ -22,7 +22,7 @@ fn test_r4b_examples() {
         .join("tests")
         .join("data")
         .join("R4B");
-    test_examples_in_dir::<fhir::r4b::Resource>(&examples_dir);
+    test_examples_in_dir::<helios_fhir::r4b::Resource>(&examples_dir);
 }
 
 #[cfg(feature = "R5")]
@@ -32,7 +32,7 @@ fn test_r5_examples() {
         .join("tests")
         .join("data")
         .join("R5");
-    test_examples_in_dir::<fhir::r5::Resource>(&examples_dir);
+    test_examples_in_dir::<helios_fhir::r5::Resource>(&examples_dir);
 }
 
 #[cfg(feature = "R6")]
@@ -42,7 +42,7 @@ fn test_r6_examples() {
         .join("tests")
         .join("data")
         .join("R6");
-    test_examples_in_dir::<fhir::r6::Resource>(&examples_dir);
+    test_examples_in_dir::<helios_fhir::r6::Resource>(&examples_dir);
 }
 
 // This function is no longer needed with our simplified approach

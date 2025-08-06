@@ -1,5 +1,5 @@
-use fhir::r4::{Bundle, ViewDefinition};
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_fhir::r4::{Bundle, ViewDefinition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]
 fn test_where_clause_boolean_validation() {

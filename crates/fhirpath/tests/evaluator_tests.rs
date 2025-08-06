@@ -1,9 +1,9 @@
 use chumsky::Parser;
-use fhir::FhirResource;
-use fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
-use fhirpath::evaluator::{EvaluationContext, evaluate};
-use fhirpath::parser::parser;
-use fhirpath_support::{EvaluationError, EvaluationResult};
+use helios_fhir::FhirResource;
+use helios_fhir::r4::{self, Boolean, Code, Date, Extension, ExtensionValue, String as FhirString};
+use helios_fhirpath::evaluator::{EvaluationContext, evaluate};
+use helios_fhirpath::parser::parser;
+use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -4412,7 +4412,7 @@ fn test_direct_string_operations() {
 #[test]
 fn test_resource_access() {
     // Remove duplicate imports, they are already at the top level
-    use fhir::r4::{Account, Code}; // Import only needed types locally if preferred, or rely on top-level
+    use helios_fhir::r4::{Account, Code}; // Import only needed types locally if preferred, or rely on top-level
     // Create a dummy R4 resource for testing
     let dummy_resource = r4::Resource::Account(Account {
         // Use imported Account

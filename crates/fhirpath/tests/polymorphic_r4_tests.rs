@@ -1,6 +1,6 @@
-use fhir::r4;
-use fhirpath::{EvaluationContext, evaluate_expression};
-use fhirpath_support::EvaluationResult;
+use helios_fhir::r4;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
+use helios_fhirpath_support::EvaluationResult;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
 
     // Create an evaluation context with the resource
-    let context = EvaluationContext::new(vec![fhir::FhirResource::R4(Box::new(resource))]);
+    let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
     Ok(context)
 }
 

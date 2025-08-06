@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 use std::fs;
 use std::path::PathBuf;
 
@@ -51,7 +51,7 @@ fn create_test_bundle(
         }
     }
 
-    let bundle: fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
+    let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json)?;
     Ok(SofBundle::R4(bundle))
 }
 
@@ -70,7 +70,7 @@ fn parse_view_definition(
         );
     }
 
-    let view_definition: fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
+    let view_definition: helios_fhir::r4::ViewDefinition = serde_json::from_value(view_def)?;
     Ok(SofViewDefinition::R4(view_definition))
 }
 

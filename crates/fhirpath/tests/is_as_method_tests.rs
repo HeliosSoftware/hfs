@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use fhirpath::{EvaluationContext, evaluate_expression};
-    use fhirpath_support::EvaluationResult;
+    use helios_fhirpath::{EvaluationContext, evaluate_expression};
+    use helios_fhirpath_support::EvaluationResult;
     use std::collections::HashMap;
 
     #[test]

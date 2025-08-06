@@ -1,5 +1,5 @@
-use fhirpath::{evaluate_expression, EvaluationContext};
-use fhir::FhirResource;
+use helios_fhirpath::{evaluate_expression, EvaluationContext};
+use helios_fhir::FhirResource;
 
 #[test]
 fn test_fhir_observation_boundary() {
@@ -16,8 +16,8 @@ fn test_fhir_observation_boundary() {
         }
     });
     
-    let observation: fhir::r4::Observation = serde_json::from_value(observation_json).unwrap();
-    let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Observation(observation)));
+    let observation: helios_fhir::r4::Observation = serde_json::from_value(observation_json).unwrap();
+    let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Observation(observation)));
     let context = EvaluationContext::new(vec![resource]);
     
     // Test the boundary function on Quantity value
@@ -43,8 +43,8 @@ fn test_fhir_datetime_observation_boundary() {
         "valueDateTime": "2010-10-10"
     });
     
-    let observation: fhir::r4::Observation = serde_json::from_value(observation_json).unwrap();
-    let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Observation(observation)));
+    let observation: helios_fhir::r4::Observation = serde_json::from_value(observation_json).unwrap();
+    let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Observation(observation)));
     let context = EvaluationContext::new(vec![resource]);
     
     // Test the boundary function on DateTime value
@@ -64,8 +64,8 @@ fn test_fhir_patient_boundary() {
         "birthDate": "1970-06"
     });
     
-    let patient: fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
-    let resource = FhirResource::R4(Box::new(fhir::r4::Resource::Patient(patient)));
+    let patient: helios_fhir::r4::Patient = serde_json::from_value(patient_json).unwrap();
+    let resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![resource]);
     
     // Test the boundary function on birthDate
