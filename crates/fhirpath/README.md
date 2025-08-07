@@ -4,8 +4,32 @@ This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https
 
 ## Table of Contents
  - [About FHIRPath](#about-fhirpath)
+   - [FHIR Specification and Resource Validation](#fhir-specification-and-resource-validation)
+   - [FHIR Search Parameter Definitions](#fhir-search-parameter-definitions)
+   - [FHIR Implementation Guides](#fhir-implementation-guides)
+   - [Clinical Decision Support](#clinical-decision-support)
+   - [Terminology Service Integration](#terminology-service-integration)
+   - [FHIR Resource Mapping and Transformation](#fhir-resource-mapping-and-transformation)
+   - [SQL on FHIR](#sql-on-fhir)
  - [Features Implemented](#features-implemented)
+   - [Expressions](#expressions)
+   - [Functions](#functions)
+   - [Operations](#operations)
+   - [Aggregates](#aggregates)
+   - [Lexical Elements](#lexical-elements)
+   - [Environment Variables](#environment-variables)
+   - [Types and Reflection](#types-and-reflection)
+   - [Type Safety and Strict Evaluation](#type-safety-and-strict-evaluation)
  - [Architecture](#architecture)
+   - [Overview](#overview)
+   - [FHIR Version Support](#fhir-version-support)
+   - [Evaluation Context](#evaluation-context)
+   - [Type System and Namespace Resolution](#type-system-and-namespace-resolution)
+   - [Code Generation Integration](#code-generation-integration)
+   - [Function Module Architecture](#function-module-architecture)
+ - [Executables](#executables)
+   - [`fhirpath-cli` - Command Line Interface](#fhirpath-cli---command-line-interface)
+   - [`fhirpath-server` - HTTP Server](#fhirpath-server---http-server)
  - [Performance](#performance)
 
 ## About FHIRPath
@@ -458,6 +482,378 @@ This modular approach enables:
 - Independent testing of each function group
 - Easy addition of new functions
 - Maintainable and organized code structure
+
+## Executables
+
+This crate provides two executable targets for FHIRPath expression evaluation:
+
+### `fhirpath-cli` - Command Line Interface
+
+A feature-rich command-line tool for evaluating FHIRPath expressions against FHIR resources.
+
+#### Installation
+
+```bash
+# Install from the workspace root
+cargo install --path crates/fhirpath --bin fhirpath-cli
+
+# Or build directly
+cargo build --release --bin fhirpath-cli
+```
+
+#### Features
+
+- **Expression Evaluation**: Execute FHIRPath expressions against FHIR resources
+- **Context Support**: Evaluate expressions with context for scoped evaluation
+- **Variables**: Define variables via command line or JSON file
+- **Parse Debug**: Generate AST visualizations for expression analysis
+- **FHIR Version Support**: Handle resources from any supported FHIR version
+- **JSON Output**: Results formatted as JSON for easy processing
+
+#### Command Line Options
+
+```text
+-e, --expression <EXPRESSION>      FHIRPath expression to evaluate
+-c, --context <CONTEXT>           Context expression to evaluate first
+-r, --resource <RESOURCE>         Path to FHIR resource JSON file (use '-' for stdin)
+-v, --variables <VARIABLES>       Path to variables JSON file
+    --var <KEY=VALUE>            Set a variable directly
+-o, --output <OUTPUT>            Output file path (defaults to stdout)
+    --parse-debug-tree           Output parse debug tree as JSON
+    --parse-debug                Output parse debug info
+    --trace                      Enable trace output
+    --fhir-version <VERSION>     FHIR version [default: R4]
+    --validate                   Validate expression before execution
+    --terminology-server <URL>   Terminology server URL
+-h, --help                       Print help
+```
+
+#### Usage Examples
+
+##### Basic Expression Evaluation
+```bash
+# Evaluate expression against a resource
+fhirpath-cli -e "Patient.name.family" -r patient.json
+
+# Get first given name
+fhirpath-cli -e "Patient.name.given.first()" -r patient.json
+
+# Filter telecom by system
+fhirpath-cli -e "Patient.telecom.where(system = 'email')" -r patient.json
+```
+
+##### Using Context Expressions
+```bash
+# Evaluate with context
+fhirpath-cli -c "Patient.name" -e "given.join(' ')" -r patient.json
+
+# Context with filtering
+fhirpath-cli -c "Patient.telecom.where(system = 'phone')" -e "value" -r patient.json
+```
+
+##### Working with Variables
+```bash
+# Variable from command line
+fhirpath-cli -e "value > %threshold" -r observation.json --var threshold=5.0
+
+# Multiple variables
+fhirpath-cli -e "%system = 'phone' and use = %use" -r patient.json \
+  --var system=phone --var use=mobile
+
+# Variables from JSON file
+cat > vars.json << EOF
+{
+  "threshold": 140,
+  "unit": "mm[Hg]"
+}
+EOF
+fhirpath-cli -e "value.value > %threshold and value.unit = %unit" \
+  -r observation.json -v vars.json
+```
+
+##### Parse Debug Features
+```bash
+# Generate parse debug tree (JSON format)
+fhirpath-cli -e "Patient.name.where(use = 'official').given.first()" \
+  --parse-debug-tree
+
+# Generate parse debug text
+fhirpath-cli -e "Patient.name.given.first() | Patient.name.family" \
+  --parse-debug
+```
+
+##### Using stdin
+```bash
+# Resource from stdin
+cat patient.json | fhirpath-cli -e "Patient.name.family" -r -
+
+# Pipe from other commands
+curl -s https://example.com/fhir/Patient/123 | \
+  fhirpath-cli -e "name.family" -r -
+```
+
+##### Output Options
+```bash
+# Output to file
+fhirpath-cli -e "Patient.name" -r patient.json -o names.json
+
+# Pretty printed JSON output (default)
+fhirpath-cli -e "Patient.identifier" -r patient.json
+```
+
+### `fhirpath-server` - HTTP Server
+
+An HTTP server providing FHIRPath expression evaluation via a REST API, compatible with [fhirpath-lab](https://fhirpath-lab.com/). 
+
+#### Installation
+
+```bash
+# Install from the workspace root
+cargo install --path crates/fhirpath --bin fhirpath-server
+
+# Or build directly
+cargo build --release --bin fhirpath-server
+```
+
+#### Features
+
+- **FHIRPath Evaluation API**: POST endpoint accepting FHIR Parameters resources
+- **Parse Debug Tree**: Generate and return AST visualizations
+- **Variable Support**: Pass variables to expressions via Parameters
+- **Context Expressions**: Support for context-based evaluation
+- **CORS Configuration**: Flexible cross-origin resource sharing
+- **Health Check**: Simple health status endpoint
+- **fhirpath-lab Compatible**: Full compatibility with the fhirpath-lab tool
+
+#### Configuration
+
+The server can be configured via command-line arguments or environment variables:
+
+| Environment Variable | CLI Argument | Description | Default |
+|---------------------|--------------|-------------|---------|
+| `FHIRPATH_SERVER_PORT` | `--port` | Server port | `3000` |
+| `FHIRPATH_SERVER_HOST` | `--host` | Server host | `127.0.0.1` |
+| `FHIRPATH_LOG_LEVEL` | `--log-level` | Log level (error/warn/info/debug/trace) | `info` |
+| `FHIRPATH_ENABLE_CORS` | `--enable-cors` | Enable CORS | `true` |
+| `FHIRPATH_CORS_ORIGINS` | `--cors-origins` | Allowed origins (comma-separated) | `*` |
+| `FHIRPATH_CORS_METHODS` | `--cors-methods` | Allowed methods | `GET,POST,OPTIONS` |
+| `FHIRPATH_CORS_HEADERS` | `--cors-headers` | Allowed headers | Common headers |
+
+#### Starting the Server
+
+```bash
+# Start with defaults
+fhirpath-server
+
+# Custom port and host
+fhirpath-server --port 8080 --host 0.0.0.0
+
+# With environment variables
+FHIRPATH_SERVER_PORT=8080 FHIRPATH_LOG_LEVEL=debug fhirpath-server
+
+# Production configuration
+fhirpath-server \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --log-level warn \
+  --cors-origins "https://fhirpath-lab.com,https://dev.fhirpath-lab.com"
+```
+
+#### API Endpoints
+
+##### POST / - Evaluate FHIRPath Expression
+
+Accepts a FHIR Parameters resource and returns evaluation results.
+
+**Request Body** (FHIR Parameters):
+```json
+{
+  "resourceType": "Parameters",
+  "parameter": [
+    {
+      "name": "expression",
+      "valueString": "Patient.name.given.first()"
+    },
+    {
+      "name": "resource",
+      "resource": {
+        "resourceType": "Patient",
+        "name": [{
+          "given": ["John", "James"],
+          "family": "Doe"
+        }]
+      }
+    }
+  ]
+}
+```
+
+**Response** (FHIR Parameters):
+```json
+{
+  "resourceType": "Parameters",
+  "id": "fhirpath",
+  "parameter": [
+    {
+      "name": "parameters",
+      "part": [
+        {
+          "name": "evaluator",
+          "valueString": "Helios FHIRPath-0.1.0"
+        },
+        {
+          "name": "expression",
+          "valueString": "Patient.name.given.first()"
+        },
+        {
+          "name": "resource",
+          "resource": { "...": "..." }
+        }
+      ]
+    },
+    {
+      "name": "result",
+      "valueString": "Resource",
+      "part": [
+        {
+          "name": "string",
+          "valueString": "John"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Supported Input Parameters**:
+- `expression` (required): FHIRPath expression to evaluate
+- `context` (optional): Context expression to evaluate first
+- `resource` (required): FHIR resource to evaluate against
+- `validate` (optional): Whether to validate the expression
+- `variables` (optional): Variables to pass to the expression
+- `terminologyServer` (optional): Terminology server URL
+
+**Additional Output Parameters** (when `validate` is true):
+- `parseDebugTree`: JSON representation of the expression AST
+- `parseDebug`: Text representation of the parse tree
+- `expectedReturnType`: Expected return type of the expression
+
+##### GET /health - Health Check
+
+Returns server health status.
+
+```bash
+curl http://localhost:3000/health
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "service": "fhirpath-server"
+}
+```
+
+#### Usage Examples
+
+##### Basic Evaluation
+```bash
+curl -X POST http://localhost:3000 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {
+        "name": "expression",
+        "valueString": "Patient.birthDate"
+      },
+      {
+        "name": "resource",
+        "resource": {
+          "resourceType": "Patient",
+          "birthDate": "1974-12-25"
+        }
+      }
+    ]
+  }'
+```
+
+##### With Context and Variables
+```bash
+curl -X POST http://localhost:3000 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {
+        "name": "context",
+        "valueString": "Observation.component"
+      },
+      {
+        "name": "expression",
+        "valueString": "value > %threshold"
+      },
+      {
+        "name": "variables",
+        "part": [
+          {
+            "name": "threshold",
+            "valueString": "140"
+          }
+        ]
+      },
+      {
+        "name": "resource",
+        "resource": {
+          "resourceType": "Observation",
+          "component": [
+            {"valueQuantity": {"value": 150}},
+            {"valueQuantity": {"value": 130}}
+          ]
+        }
+      }
+    ]
+  }'
+```
+
+##### With Parse Debug
+```bash
+curl -X POST http://localhost:3000 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "resourceType": "Parameters",
+    "parameter": [
+      {
+        "name": "expression",
+        "valueString": "Patient.name.given.first() | Patient.name.family"
+      },
+      {
+        "name": "validate",
+        "valueBoolean": true
+      },
+      {
+        "name": "resource",
+        "resource": {
+          "resourceType": "Patient",
+          "name": [{"given": ["John"], "family": "Doe"}]
+        }
+      }
+    ]
+  }'
+```
+
+#### Integration with fhirpath-lab
+
+The server is fully compatible with [fhirpath-lab](https://fhirpath-lab.com/). To use your local server with fhirpath-lab:
+
+1. Start the server with CORS enabled for fhirpath-lab domains:
+   ```bash
+   fhirpath-server --cors-origins "https://fhirpath-lab.com,http://localhost:3000"
+   ```
+
+2. In fhirpath-lab, configure the custom server URL to point to your local instance
+
+3. The server will properly handle all fhirpath-lab requests including parse debug tree generation
 
 ## Performance
 

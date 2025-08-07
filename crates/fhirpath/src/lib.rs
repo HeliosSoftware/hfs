@@ -286,6 +286,14 @@ mod subset_functions;
 mod trace_function;
 mod type_function;
 
+// Modules for CLI and server functionality
+pub mod cli;
+pub mod error;
+pub mod parse_debug;
+pub mod handlers;
+pub mod models;
+pub mod server;
+
 // Public modules needed for the public API
 pub mod evaluator;
 pub mod parser;

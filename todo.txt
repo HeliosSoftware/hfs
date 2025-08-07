@@ -1,10 +1,14 @@
 - Make repo public
   - Cleanup main README.md
     - Need a components section to explain what's in the repo
+  - Remove? hfs crate
 
 - FHIRPath
-  - Remove? hfs crate
   - Implement fhirpath-server
+  - Testr fhirpath-server and fhirpath-cli
+  - Are there unit tests for these two binaries??
+  - Add performance tests
+  - Unify the SofParameters and FhirPathParameters into something else - VersionIndependentParameters?
   - Setup build process for fhirpath-server
   - Setup hosting for fhirpath-server
   - Integrate into https://fhirpath-lab.com/FhirPath
@@ -20,7 +24,6 @@
   - Setup hosting for sof-server
 
 - Process on a pile of JSON
-
 
 - Add Github Actions for build and release process
 
