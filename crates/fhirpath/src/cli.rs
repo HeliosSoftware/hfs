@@ -453,3 +453,264 @@ fn evaluation_result_to_json_value(result: &EvaluationResult) -> Value {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn create_test_resource() -> Value {
+        json!({
+            "resourceType": "Patient",
+            "id": "example",
+            "name": [{
+                "family": "Doe",
+                "given": ["John", "James"]
+            }],
+            "birthDate": "1990-01-01",
+            "active": true
+        })
+    }
+
+    fn create_test_args(expression: &str, resource_path: PathBuf) -> Args {
+        Args {
+            expression: expression.to_string(),
+            context: None,
+            resource: resource_path,
+            variables: None,
+            var: vec![],
+            output: None,
+            parse_debug_tree: false,
+            parse_debug: false,
+            trace: false,
+            fhir_version: FhirVersion::R4,
+            validate: false,
+            terminology_server: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_var() {
+        assert_eq!(parse_var("key=value").unwrap(), ("key".to_string(), "value".to_string()));
+        assert_eq!(parse_var("complex=value=with=equals").unwrap(), ("complex".to_string(), "value=with=equals".to_string()));
+        assert!(parse_var("invalid").is_err());
+    }
+
+    #[test]
+    fn test_basic_expression_evaluation() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let args = create_test_args("Patient.name.family", resource_path);
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_context_expression() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let mut args = create_test_args("family", resource_path);
+        args.context = Some("Patient.name".to_string());
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_variables_from_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        let vars_path = temp_dir.path().join("vars.json");
+        
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+        fs::write(&vars_path, json!({
+            "threshold": 5,
+            "testString": "hello"
+        }).to_string()).unwrap();
+
+        let mut args = create_test_args("%testString", resource_path);
+        args.variables = Some(vars_path);
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_inline_variables() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let mut args = create_test_args("%myVar", resource_path);
+        args.var = vec![("myVar".to_string(), "test-value".to_string())];
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_output_to_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        let output_path = temp_dir.path().join("output.json");
+        
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let mut args = create_test_args("Patient.name.family", resource_path);
+        args.output = Some(output_path.clone());
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+        assert!(output_path.exists());
+        
+        let output_content = fs::read_to_string(output_path).unwrap();
+        assert!(output_content.contains("\"Doe\""));
+    }
+
+    #[test]
+    fn test_parse_debug_tree() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("dummy.json");
+        fs::write(&resource_path, "{}").unwrap();
+
+        let mut args = create_test_args("Patient.name.family", resource_path);
+        args.parse_debug_tree = true;
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_debug() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("dummy.json");
+        fs::write(&resource_path, "{}").unwrap();
+
+        let mut args = create_test_args("Patient.name.family", resource_path);
+        args.parse_debug = true;
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_resource_file() {
+        let args = create_test_args("Patient.name", PathBuf::from("/nonexistent/file.json"));
+        let result = run_cli(args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stdin_support() {
+        // This test would require mocking stdin, which is complex
+        // For now, we'll just test the read_input function with a regular file
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.json");
+        fs::write(&file_path, "test content").unwrap();
+        
+        let result = read_input(&file_path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test content");
+    }
+
+    #[test]
+    fn test_json_value_to_result_conversions() {
+        // Test null
+        let result = json_value_to_result(&Value::Null).unwrap();
+        assert!(matches!(result, EvaluationResult::Empty));
+
+        // Test boolean
+        let result = json_value_to_result(&json!(true)).unwrap();
+        assert!(matches!(result, EvaluationResult::Boolean(true, _)));
+
+        // Test integer
+        let result = json_value_to_result(&json!(42)).unwrap();
+        assert!(matches!(result, EvaluationResult::Integer(42, _)));
+
+        // Test string
+        let result = json_value_to_result(&json!("hello")).unwrap();
+        match result {
+            EvaluationResult::String(s, _) => assert_eq!(s, "hello"),
+            _ => panic!("Expected string result"),
+        }
+
+        // Test array/object (converted to string)
+        let result = json_value_to_result(&json!([1, 2, 3])).unwrap();
+        assert!(matches!(result, EvaluationResult::String(_, _)));
+    }
+
+    #[test]
+    fn test_result_to_json_single_value() {
+        let result = EvaluationResult::string("test".to_string());
+        let json_str = result_to_json(&result).unwrap();
+        let json: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json, json!("test"));
+    }
+
+    #[test]
+    fn test_result_to_json_collection() {
+        let result = EvaluationResult::collection(vec![
+            EvaluationResult::string("a".to_string()),
+            EvaluationResult::string("b".to_string()),
+        ]);
+        let json_str = result_to_json(&result).unwrap();
+        let json: Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json, json!(["a", "b"]));
+    }
+
+    #[test]
+    fn test_set_variable_json_types() {
+        let mut context = EvaluationContext::new(vec![]);
+        
+        // Test setting different JSON types
+        set_variable(&mut context, "str", "\"hello\"").unwrap();
+        set_variable(&mut context, "num", "42").unwrap();
+        set_variable(&mut context, "bool", "true").unwrap();
+        set_variable(&mut context, "plain", "plain text").unwrap();
+        
+        // Verify variables were set (would need getter methods to fully test)
+        assert!(set_variable(&mut context, "test", "value").is_ok());
+    }
+
+    #[test]
+    fn test_parse_fhir_resource_r4() {
+        #[cfg(feature = "R4")]
+        {
+            let json = create_test_resource();
+            let result = parse_fhir_resource(json, FhirVersion::R4);
+            assert!(result.is_ok());
+            assert!(matches!(result.unwrap(), FhirResource::R4(_)));
+        }
+    }
+
+    #[test]
+    fn test_terminology_server_option() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let mut args = create_test_args("Patient.name", resource_path);
+        args.terminology_server = Some("http://terminology.example.com".to_string());
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_trace_option() {
+        let temp_dir = TempDir::new().unwrap();
+        let resource_path = temp_dir.path().join("patient.json");
+        fs::write(&resource_path, create_test_resource().to_string()).unwrap();
+
+        let mut args = create_test_args("Patient.name", resource_path);
+        args.trace = true;
+        
+        let result = run_cli(args);
+        assert!(result.is_ok());
+    }
+}

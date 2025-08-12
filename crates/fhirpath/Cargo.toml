@@ -35,6 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 axum-test = "17.0"
+tempfile = "3.10"
 
 [[bin]]
 name = "fhirpath-cli"

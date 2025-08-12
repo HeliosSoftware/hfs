@@ -4,9 +4,9 @@
   - Remove? hfs crate
 
 - FHIRPath
-  - Implement fhirpath-server
-  - Testr fhirpath-server and fhirpath-cli
-  - Are there unit tests for these two binaries??
+  - Implement fhirpath-server - Done
+  - Test fhirpath-server and fhirpath-cli - Done
+  - Are there unit tests for these two binaries - Done
   - Add performance tests
   - Unify the SofParameters and FhirPathParameters into something else - VersionIndependentParameters?
   - Setup build process for fhirpath-server

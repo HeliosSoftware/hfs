@@ -291,6 +291,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for oneshot
+    use serde_json::json;
     
     #[tokio::test]
     async fn test_health_check() {
@@ -339,5 +340,175 @@ mod tests {
         
         // CORS preflight should return OK
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_server_config_default() {
+        let config = ServerConfig::default();
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.log_level, "info");
+        assert!(config.enable_cors);
+        assert_eq!(config.cors_origins, "*");
+        assert_eq!(config.cors_methods, "GET,POST,OPTIONS");
+        assert_eq!(config.cors_headers, "Accept,Accept-Language,Content-Type,Content-Language,Authorization");
+    }
+
+    #[test]
+    fn test_server_args_to_config() {
+        let args = ServerArgs {
+            port: 8080,
+            host: "0.0.0.0".to_string(),
+            log_level: "debug".to_string(),
+            enable_cors: false,
+            cors_origins: "http://example.com".to_string(),
+            cors_methods: "GET,POST".to_string(),
+            cors_headers: "Content-Type".to_string(),
+        };
+        
+        let config: ServerConfig = args.into();
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.log_level, "debug");
+        assert!(!config.enable_cors);
+        assert_eq!(config.cors_origins, "http://example.com");
+        assert_eq!(config.cors_methods, "GET,POST");
+        assert_eq!(config.cors_headers, "Content-Type");
+    }
+
+    #[tokio::test]
+    async fn test_cors_wildcard_configuration() {
+        let mut config = ServerConfig::default();
+        config.enable_cors = true;
+        config.cors_origins = "*".to_string();
+        config.cors_methods = "*".to_string();
+        config.cors_headers = "*".to_string();
+        
+        let app = create_app(&config);
+        
+        // Test with any origin
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/")
+            .header("Origin", "http://any-origin.com")
+            .body(Body::empty())
+            .unwrap();
+        
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_cors_specific_origins() {
+        let mut config = ServerConfig::default();
+        config.enable_cors = true;
+        config.cors_origins = "http://localhost:3000,http://localhost:4000".to_string();
+        
+        let app = create_app(&config);
+        
+        // Test with allowed origin
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_cors_disabled() {
+        let mut config = ServerConfig::default();
+        config.enable_cors = false;
+        
+        let app = create_app(&config);
+        
+        // Without CORS, OPTIONS request should still work but without CORS headers
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        
+        let response = app.oneshot(request).await.unwrap();
+        // The response status depends on route handling, but it should not crash
+        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn test_post_endpoint_exists() {
+        let config = ServerConfig::default();
+        let app = create_app(&config);
+        
+        // Create a minimal Parameters resource for testing
+        let parameters = json!({
+            "resourceType": "Parameters",
+            "parameter": []
+        });
+        
+        let request = Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("Content-Type", "application/json")
+            .body(Body::from(parameters.to_string()))
+            .unwrap();
+        
+        let response = app.oneshot(request).await.unwrap();
+        // We expect it to process the request (might fail due to missing parameters, but endpoint exists)
+        assert!(response.status() == StatusCode::OK || response.status() == StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_build_cors_layer_with_empty_values() {
+        let mut config = ServerConfig::default();
+        config.cors_origins = "".to_string();
+        config.cors_methods = "".to_string();
+        config.cors_headers = "".to_string();
+        
+        // Should not panic
+        let _cors_layer = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_with_mixed_values() {
+        let mut config = ServerConfig::default();
+        config.cors_origins = "http://localhost:3000,http://localhost:4000".to_string();
+        config.cors_methods = "GET,POST,PUT".to_string();
+        config.cors_headers = "*".to_string();
+        
+        // Should not panic and handle mixed wildcard/specific values
+        let _cors_layer = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_credentials_logic() {
+        // Test that credentials are disabled when using wildcards
+        let mut config = ServerConfig::default();
+        config.cors_origins = "*".to_string();
+        let _cors_layer = build_cors_layer(&config);
+        // No direct way to test this without inspecting the layer internals
+        // but the code should execute without panic
+        
+        // Test that credentials can be enabled with specific origins
+        config.cors_origins = "http://localhost:3000".to_string();
+        config.cors_methods = "GET,POST".to_string();
+        config.cors_headers = "Content-Type".to_string();
+        let _cors_layer = build_cors_layer(&config);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_host_address_handling() {
+        // The run_server function handles invalid host addresses
+        // We can't easily test run_server directly, but we can test
+        // that the server creation doesn't panic with various configs
+        let mut config = ServerConfig::default();
+        config.host = "invalid-host-@#$".to_string();
+        
+        // This would normally be handled in run_server with a fallback to 127.0.0.1
+        // Just verify the app can be created
+        let _app = create_app(&config);
     }
 }
