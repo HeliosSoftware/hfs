@@ -5,6 +5,7 @@ use helios_fhirpath_support::{EvaluationError, EvaluationResult, IntoEvaluationR
 use regex::Regex;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 /// Evaluation context for FHIRPath expressions
@@ -62,6 +63,11 @@ pub struct EvaluationContext {
     /// Holds the current accumulator value for the aggregate() function's $total variable
     /// Used to pass the current aggregation result between iterations
     pub current_aggregate_total: Option<EvaluationResult>,
+    
+    /// Collects trace outputs during expression evaluation
+    /// Each tuple contains (trace_name, traced_value)
+    /// Uses RefCell for interior mutability to allow collection during evaluation
+    pub trace_outputs: RefCell<Vec<(String, EvaluationResult)>>,
 }
 
 impl EvaluationContext {
@@ -111,6 +117,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
+            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
         }
     }
 
@@ -139,6 +146,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
+            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
         }
     }
 
@@ -164,6 +172,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
+            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
         }
     }
 
@@ -190,6 +199,21 @@ impl EvaluationContext {
             #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
             { panic!("No FHIR version feature enabled") }
         }
+    }
+
+    /// Clears all collected trace outputs
+    ///
+    /// This should be called at the start of each new evaluation to ensure
+    /// trace outputs from previous evaluations don't persist.
+    pub fn clear_trace_outputs(&self) {
+        self.trace_outputs.borrow_mut().clear();
+    }
+    
+    /// Gets the collected trace outputs
+    ///
+    /// Returns a clone of all trace outputs collected during evaluation
+    pub fn get_trace_outputs(&self) -> Vec<(String, EvaluationResult)> {
+        self.trace_outputs.borrow().clone()
     }
 
     /// Sets the strict mode for evaluation

@@ -91,7 +91,7 @@ mod tests {
 /// * `projection` - (Optional) An expression to evaluate against each item in the collection
 ///
 /// # Returns
-/// The original input collection, unmodified (side effect is logging)
+/// The original input collection, unmodified (side effect is collecting trace output)
 pub fn trace_function(
     invocation_base: &EvaluationResult,
     name: &str,
@@ -153,8 +153,8 @@ pub fn trace_function(
         invocation_base.clone()
     };
 
-    // Format and output the trace message
-    println!("TRACE - {}: {:?}", name, trace_value);
+    // Store the trace output in the context using RefCell
+    context.trace_outputs.borrow_mut().push((name.to_string(), trace_value));
 
     // Return the original input collection unchanged
     Ok(invocation_base.clone())

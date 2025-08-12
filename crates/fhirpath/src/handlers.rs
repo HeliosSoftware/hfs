@@ -107,6 +107,9 @@ pub async fn evaluate_fhirpath(
 
     // Prepare results collection
     let mut results = Vec::new();
+    
+    // Clear any previous trace outputs
+    context.clear_trace_outputs();
 
     // Evaluate with context if provided
     if let Some(context_expr) = &extracted.context {
@@ -136,11 +139,16 @@ pub async fn evaluate_fhirpath(
         };
 
         for context_value in context_items {
+            // Clear trace outputs before each evaluation
+            context.clear_trace_outputs();
+            
             // Evaluate expression with context value as current item
             match crate::evaluator::evaluate(&parsed_expr, &context, Some(&context_value)) {
                 Ok(result) => {
                     let context_path = format!("{}[{}]", context_expr, context_index);
-                    results.push(create_result_parameter(context_path, result)?);
+                    // Get trace outputs collected during this evaluation
+                    let trace_outputs = context.get_trace_outputs();
+                    results.push(create_result_parameter(context_path, result, trace_outputs)?);
                 }
                 Err(e) => {
                     warn!("Evaluation error for context {}: {}", context_index, e);
@@ -152,7 +160,9 @@ pub async fn evaluate_fhirpath(
         // Evaluate without context
         match evaluate_expression(&expression, &context) {
             Ok(result) => {
-                results.push(create_result_parameter("Resource".to_string(), result)?);
+                // Get trace outputs collected during evaluation
+                let trace_outputs = context.get_trace_outputs();
+                results.push(create_result_parameter("Resource".to_string(), result, trace_outputs)?);
             }
             Err(e) => {
                 return create_error_response(&expression, &extracted, e);
@@ -271,6 +281,7 @@ fn json_value_to_evaluation_result(value: &Value) -> FhirPathResult<EvaluationRe
 fn create_result_parameter(
     context_path: String,
     result: EvaluationResult,
+    trace_outputs: Vec<(String, EvaluationResult)>,
 ) -> FhirPathResult<Value> {
     let mut parts = Vec::new();
 
@@ -283,12 +294,68 @@ fn create_result_parameter(
     for value in result_items {
         parts.push(evaluation_result_to_result_value(value)?);
     }
+    
+    // Add trace outputs as parts
+    for (trace_name, trace_value) in trace_outputs {
+        let mut trace_parts = Vec::new();
+        
+        // Convert trace values to result parts
+        let trace_items = match trace_value {
+            EvaluationResult::Collection { items, .. } => items,
+            single_value => vec![single_value],
+        };
+        
+        for value in trace_items {
+            trace_parts.push(evaluation_result_to_result_value(value)?);
+        }
+        
+        // Create trace part with name and valueString
+        parts.push(json!({
+            "name": "trace",
+            "valueString": trace_name,
+            "part": trace_parts
+        }));
+    }
 
     Ok(json!({
         "name": "result",
         "valueString": context_path,
         "part": parts
     }))
+}
+
+/// Convert object map to JSON
+fn convert_object_to_json(map: &std::collections::HashMap<String, EvaluationResult>) -> Value {
+    let mut json_map = serde_json::Map::new();
+    
+    for (key, value) in map {
+        json_map.insert(key.clone(), convert_evaluation_result_to_json(value));
+    }
+    
+    json!(json_map)
+}
+
+/// Convert EvaluationResult to JSON Value
+fn convert_evaluation_result_to_json(result: &EvaluationResult) -> Value {
+    match result {
+        EvaluationResult::Empty => Value::Null,
+        EvaluationResult::Boolean(b, _) => json!(b),
+        EvaluationResult::String(s, _) => json!(s),
+        EvaluationResult::Integer(i, _) => json!(i),
+        EvaluationResult::Decimal(d, _) => json!(d.to_string()),
+        EvaluationResult::Date(d, _) => json!(d),
+        EvaluationResult::DateTime(dt, _) => json!(dt),
+        EvaluationResult::Time(t, _) => json!(t),
+        EvaluationResult::Quantity(v, u, _) => json!({"value": v, "unit": u}),
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
+        EvaluationResult::Integer64(i, _) => json!(i),
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(i, _) => json!(i),
+        EvaluationResult::Object { map, .. } => convert_object_to_json(map),
+        EvaluationResult::Collection { items, .. } => {
+            json!(items.iter().map(convert_evaluation_result_to_json).collect::<Vec<_>>())
+        }
+    }
 }
 
 /// Convert EvaluationResult to ResultValue
@@ -441,8 +508,35 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "valueInteger": i
             }))
         },
-        EvaluationResult::Object { .. } | EvaluationResult::Collection { .. } => {
-            // For complex types, convert to string representation
+        EvaluationResult::Object { map, type_info } => {
+            // For FHIR complex types, convert to JSON and use the extension mechanism
+            // as specified in the server-api.md for values that can't be represented
+            // as FHIR primitive types in Parameters
+            let json_value = convert_object_to_json(&map);
+            let string_value = serde_json::to_string(&json_value)
+                .unwrap_or_else(|_| json_value.to_string());
+
+            // Use the type name from type_info if available
+            let type_name = type_info.as_ref()
+                .map(|t| {
+                    if t.namespace == "FHIR" {
+                        t.name.clone()
+                    } else {
+                        format!("{}#{}", t.namespace, t.name)
+                    }
+                })
+                .unwrap_or_else(|| "complex".to_string());
+
+            Ok(json!({
+                "name": type_name,
+                "extension": [{
+                    "url": "http://fhir.forms-lab.com/StructureDefinition/json-value",
+                    "valueString": string_value
+                }]
+            }))
+        }
+        EvaluationResult::Collection { .. } => {
+            // For collections at this level, convert to string representation
             let string_value = format!("{:?}", result);
 
             Ok(json!({
