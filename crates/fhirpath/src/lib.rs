@@ -285,6 +285,7 @@ mod set_operations;
 mod subset_functions;
 mod trace_function;
 mod type_function;
+pub mod type_inference;
 
 // Modules for CLI and server functionality
 pub mod cli;

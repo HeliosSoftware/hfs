@@ -15,6 +15,7 @@ use crate::error::{FhirPathError, FhirPathResult};
 use crate::evaluator::EvaluationContext;
 use crate::models::{ExtractedParameters, FhirPathParameters, extract_parameters};
 use crate::parse_debug::{expression_to_debug_tree, generate_parse_debug};
+use crate::type_inference::{TypeContext, InferredType};
 use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
@@ -65,7 +66,33 @@ pub async fn evaluate_fhirpath(
 
         match crate::parser::parser().parse(expression.as_str()) {
             Ok(parsed) => {
-                let debug_tree = expression_to_debug_tree(&parsed);
+                // Create a type context with the resource type
+                let mut type_context = TypeContext::new();
+                
+                // Try to infer the root resource type from the resource JSON
+                if let Some(resource_type) = resource_json.get("resourceType").and_then(|rt| rt.as_str()) {
+                    type_context = type_context.with_root_type(InferredType::fhir(resource_type));
+                }
+                
+                // Add any variables from the context
+                for var in &extracted.variables {
+                    // Simple type inference for variables - could be improved
+                    let var_type = match &var.value {
+                        Value::Bool(_) => InferredType::system("Boolean"),
+                        Value::Number(n) => {
+                            if n.is_i64() {
+                                InferredType::system("Integer")
+                            } else {
+                                InferredType::system("Decimal")
+                            }
+                        }
+                        Value::String(_) => InferredType::system("String"),
+                        _ => InferredType::system("Any"),
+                    };
+                    type_context.variables.insert(var.name.clone(), var_type);
+                }
+                
+                let debug_tree = expression_to_debug_tree(&parsed, &type_context);
                 let debug_text = generate_parse_debug(&parsed);
                 (Some(debug_tree), Some(debug_text))
             }
