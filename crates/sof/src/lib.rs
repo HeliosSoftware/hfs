@@ -412,46 +412,11 @@ impl SofCapabilityStatement {
     }
 }
 
-/// Multi-version Parameters container supporting version-agnostic operations.
+/// Type alias for the version-independent Parameters container.
 ///
-/// This enum provides a unified interface for working with Parameters resources
-/// across different FHIR specification versions. Parameters are commonly used
-/// for operation inputs and outputs in FHIR.
-///
-/// # Supported Versions
-///
-/// - **R4**: FHIR 4.0.1 Parameters (normative)
-/// - **R4B**: FHIR 4.3.0 Parameters (ballot)
-/// - **R5**: FHIR 5.0.0 Parameters (ballot)
-/// - **R6**: FHIR 6.0.0 Parameters (draft)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SofParameters {
-    #[cfg(feature = "R4")]
-    R4(helios_fhir::r4::Parameters),
-    #[cfg(feature = "R4B")]
-    R4B(helios_fhir::r4b::Parameters),
-    #[cfg(feature = "R5")]
-    R5(helios_fhir::r5::Parameters),
-    #[cfg(feature = "R6")]
-    R6(helios_fhir::r6::Parameters),
-}
-
-impl SofParameters {
-    /// Returns the FHIR specification version of this Parameters.
-    pub fn version(&self) -> helios_fhir::FhirVersion {
-        match self {
-            #[cfg(feature = "R4")]
-            SofParameters::R4(_) => helios_fhir::FhirVersion::R4,
-            #[cfg(feature = "R4B")]
-            SofParameters::R4B(_) => helios_fhir::FhirVersion::R4B,
-            #[cfg(feature = "R5")]
-            SofParameters::R5(_) => helios_fhir::FhirVersion::R5,
-            #[cfg(feature = "R6")]
-            SofParameters::R6(_) => helios_fhir::FhirVersion::R6,
-        }
-    }
-}
+/// This alias provides backward compatibility while using the unified
+/// VersionIndependentParameters from the helios_fhir crate.
+pub type SofParameters = helios_fhir::VersionIndependentParameters;
 
 /// Comprehensive error type for SQL-on-FHIR operations.
 ///

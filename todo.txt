@@ -7,8 +7,8 @@
   - Implement fhirpath-server - Done
   - Test fhirpath-server and fhirpath-cli - Done
   - Are there unit tests for these two binaries - Done
-  - Add performance tests
-  - Unify the SofParameters and FhirPathParameters into something else - VersionIndependentParameters?
+  - Add performance tests - Done
+  - Unify the SofParameters and FhirPathParameters into something else - VersionIndependentParameters? - Done
   - Setup build process for fhirpath-server
   - Setup hosting for fhirpath-server
   - Integrate into https://fhirpath-lab.com/FhirPath

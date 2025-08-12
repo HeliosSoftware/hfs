@@ -457,6 +457,11 @@ pub mod r5;
 #[cfg(feature = "R6")]
 pub mod r6;
 
+pub mod parameters;
+
+// Re-export commonly used types from parameters module
+pub use parameters::{VersionIndependentParameters, ParameterValueAccessor};
+
 // Removed the FhirSerde trait definition
 
 /// Multi-version FHIR resource container supporting version-agnostic operations.
