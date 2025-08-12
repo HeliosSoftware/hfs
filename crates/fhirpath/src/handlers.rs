@@ -91,6 +91,16 @@ pub async fn evaluate_fhirpath(
             }
         };
 
+        // Parse the main expression once
+        use chumsky::Parser as ChumskyParser;
+        let parsed_expr = match crate::parser::parser().parse(expression.as_str()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                return create_error_response(&expression, &extracted, 
+                    format!("Parse error: {:?}", e));
+            }
+        };
+
         // For each context result, evaluate the main expression
         let mut context_index = 0;
         let context_items = match context_results {
@@ -99,18 +109,8 @@ pub async fn evaluate_fhirpath(
         };
 
         for context_value in context_items {
-            // Create scoped context
-            let mut scoped_context = EvaluationContext::new(vec![]);
-            // Copy variables
-            for var in &extracted.variables {
-                set_variable_from_json(&mut scoped_context, &var.name, &var.value)?;
-            }
-
-            // Set context value as current focus
-            scoped_context.set_variable_result("this", context_value);
-
-            // Evaluate expression
-            match evaluate_expression(&expression, &scoped_context) {
+            // Evaluate expression with context value as current item
+            match crate::evaluator::evaluate(&parsed_expr, &context, Some(&context_value)) {
                 Ok(result) => {
                     let context_path = format!("{}[{}]", context_expr, context_index);
                     results.push(create_result_parameter(context_path, result)?);
