@@ -2409,28 +2409,70 @@ fn generate_fhirpath_struct_impl(
         let field_key_str = get_fhirpath_field_name(field); // Use the specific FHIRPath naming helper
         let field_ty = &field.ty; // Get the field type
 
+        // Check if this field is a FHIR primitive type that needs special handling
+        let fhir_type_name = extract_fhir_primitive_type_name(field_ty);
+        
         // Generate code to handle the field based on whether it's Option
         let is_option = get_option_inner_type(field_ty).is_some();
 
         let field_handling_code = if is_option {
             // For Option<T>, evaluate the inner value only if Some
-            quote! {
-                if let Some(inner_value) = &self.#field_name_ident {
-                    let field_result = inner_value.into_evaluation_result();
-                    // Only insert if the inner evaluation is not Empty
+            if let Some(type_name) = fhir_type_name {
+                // Special handling for FHIR primitive types to preserve type information
+                quote! {
+                    if let Some(inner_value) = &self.#field_name_ident {
+                        let mut field_result = inner_value.into_evaluation_result();
+                        // Override type information for FHIR primitive types
+                        field_result = match field_result {
+                            helios_fhirpath_support::EvaluationResult::String(s, _) => {
+                                helios_fhirpath_support::EvaluationResult::fhir_string(s, #type_name)
+                            },
+                            _ => field_result,
+                        };
+                        // Only insert if the inner evaluation is not Empty
+                        if field_result != helios_fhirpath_support::EvaluationResult::Empty {
+                            map.insert(#field_key_str.to_string(), field_result);
+                        }
+                    }
+                    // If self.#field_name_ident is None, do nothing (don't insert Empty)
+                }
+            } else {
+                quote! {
+                    if let Some(inner_value) = &self.#field_name_ident {
+                        let field_result = inner_value.into_evaluation_result();
+                        // Only insert if the inner evaluation is not Empty
+                        if field_result != helios_fhirpath_support::EvaluationResult::Empty {
+                            map.insert(#field_key_str.to_string(), field_result);
+                        }
+                    }
+                    // If self.#field_name_ident is None, do nothing (don't insert Empty)
+                }
+            }
+        } else {
+            // For non-Option<T>, evaluate directly
+            if let Some(type_name) = fhir_type_name {
+                // Special handling for FHIR primitive types to preserve type information
+                quote! {
+                    let mut field_result = self.#field_name_ident.into_evaluation_result();
+                    // Override type information for FHIR primitive types
+                    field_result = match field_result {
+                        helios_fhirpath_support::EvaluationResult::String(s, _) => {
+                            helios_fhirpath_support::EvaluationResult::fhir_string(s, #type_name)
+                        },
+                        _ => field_result,
+                    };
+                    // Only insert if the evaluation is not Empty
                     if field_result != helios_fhirpath_support::EvaluationResult::Empty {
                         map.insert(#field_key_str.to_string(), field_result);
                     }
                 }
-                // If self.#field_name_ident is None, do nothing (don't insert Empty)
-            }
-        } else {
-            // For non-Option<T>, evaluate directly
-            quote! {
-                let field_result = self.#field_name_ident.into_evaluation_result();
-                // Only insert if the evaluation is not Empty
-                if field_result != helios_fhirpath_support::EvaluationResult::Empty {
-                    map.insert(#field_key_str.to_string(), field_result);
+            } else {
+                quote! {
+                    let field_result = self.#field_name_ident.into_evaluation_result();
+                    // Only insert if the evaluation is not Empty
+                    if field_result != helios_fhirpath_support::EvaluationResult::Empty {
+                        map.insert(#field_key_str.to_string(), field_result);
+                    }
                 }
             }
         };
@@ -2840,5 +2882,52 @@ fn extract_type_info_attributes(attrs: &[syn::Attribute], type_name: &Ident) -> 
     
     // Default: Assume FHIR namespace and use the type name
     ("\"FHIR\"".to_string(), format!("\"{}\"", type_name))
+}
+
+/// Extracts the FHIR type name from a type path for primitive FHIR types.
+/// Returns None if the type is not a recognized FHIR primitive type.
+fn extract_fhir_primitive_type_name(ty: &syn::Type) -> Option<&'static str> {
+    // Get the inner type if this is an Option<T>
+    let inner_type = if let Some(inner) = get_option_inner_type(ty) {
+        inner
+    } else {
+        ty
+    };
+    
+    // Check if this is a path type
+    if let syn::Type::Path(type_path) = inner_type {
+        if let Some(segment) = type_path.path.segments.last() {
+            let type_name = segment.ident.to_string();
+            
+            // Map FHIR type aliases to their lowercase primitive names
+            match type_name.as_str() {
+                "Uri" => Some("uri"),
+                "Code" => Some("code"),
+                "Id" => Some("id"),
+                "Oid" => Some("oid"),
+                "Uuid" => Some("uuid"),
+                "Canonical" => Some("canonical"),
+                "Url" => Some("url"),
+                "Markdown" => Some("markdown"),
+                "Base64Binary" => Some("base64Binary"),
+                "Instant" => Some("instant"),
+                "Date" => Some("date"),
+                "DateTime" => Some("dateTime"),
+                "Time" => Some("time"),
+                "String" => Some("string"),
+                "Boolean" => Some("boolean"),
+                "Integer" => Some("integer"),
+                "Integer64" => Some("integer64"),
+                "PositiveInt" => Some("positiveInt"),
+                "UnsignedInt" => Some("unsignedInt"),
+                "Decimal" => Some("decimal"),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 

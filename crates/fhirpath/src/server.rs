@@ -288,21 +288,56 @@ fn build_cors_layer(config: &ServerConfig) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
-    use axum_test::TestServer;
-
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for oneshot
+    
     #[tokio::test]
     async fn test_health_check() {
         let config = ServerConfig::default();
         let app = create_app(&config);
-        let server = TestServer::new(app).unwrap();
-
-        let response = server.get("/health").await;
-
-        assert_eq!(response.status_code(), StatusCode::OK);
-
-        let json: serde_json::Value = response.json();
+        
+        // Create a request to the health endpoint
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        
+        // Send the request and get the response
+        let response = app.oneshot(request).await.unwrap();
+        
+        // Check the status code
+        assert_eq!(response.status(), StatusCode::OK);
+        
+        // Check the response body
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "fhirpath-server");
+    }
+    
+    #[tokio::test]
+    async fn test_create_app_with_cors() {
+        let mut config = ServerConfig::default();
+        config.enable_cors = true;
+        config.cors_origins = "http://localhost:3000".to_string();
+        
+        let app = create_app(&config);
+        
+        // Test that the app can be created with CORS configuration
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/")
+            .header("Origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        
+        let response = app.oneshot(request).await.unwrap();
+        
+        // CORS preflight should return OK
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

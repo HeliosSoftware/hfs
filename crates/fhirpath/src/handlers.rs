@@ -273,34 +273,119 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
         EvaluationResult::Empty => Ok(json!({
             "name": "null"
         })),
-        EvaluationResult::Boolean(b, _) => Ok(json!({
-            "name": "boolean",
-            "valueBoolean": b
-        })),
-        EvaluationResult::String(s, _) => Ok(json!({
-            "name": "string",
-            "valueString": s
-        })),
-        EvaluationResult::Integer(i, _) => Ok(json!({
-            "name": "integer",
-            "valueInteger": i
-        })),
-        EvaluationResult::Decimal(d, _) => Ok(json!({
-            "name": "decimal",
-            "valueDecimal": d
-        })),
-        EvaluationResult::Date(d, _) => Ok(json!({
-            "name": "date",
-            "valueDate": d
-        })),
-        EvaluationResult::DateTime(dt, _) => Ok(json!({
-            "name": "dateTime",
-            "valueDateTime": dt
-        })),
-        EvaluationResult::Time(t, _) => Ok(json!({
-            "name": "time",
-            "valueTime": t
-        })),
+        EvaluationResult::Boolean(b, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "boolean".to_string()
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                "valueBoolean": b
+            }))
+        },
+        EvaluationResult::String(s, type_info) => {
+            // Use the type information if available, otherwise default to "string"
+            let type_name = if let Some(info) = type_info {
+                // Use the FHIR type name from the type info
+                info.name.clone()
+            } else {
+                "string".to_string()
+            };
+            
+            // Use the correct FHIR value property name based on the type
+            let value_property = match type_name.as_str() {
+                "uri" => "valueUri",
+                "url" => "valueUrl",
+                "canonical" => "valueCanonical",
+                "code" => "valueCode",
+                "oid" => "valueOid",
+                "id" => "valueId",
+                "uuid" => "valueUuid",
+                "markdown" => "valueMarkdown",
+                "base64Binary" => "valueBase64Binary",
+                _ => "valueString", // Default for string and other string-based types
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                value_property: s
+            }))
+        },
+        EvaluationResult::Integer(i, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "integer".to_string()
+            };
+            
+            // Use the correct FHIR value property name based on the type
+            let value_property = match type_name.as_str() {
+                "positiveInt" => "valuePositiveInt",
+                "unsignedInt" => "valueUnsignedInt",
+                _ => "valueInteger", // Default for integer type
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                value_property: i
+            }))
+        },
+        EvaluationResult::Decimal(d, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "decimal".to_string()
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                "valueDecimal": d
+            }))
+        },
+        EvaluationResult::Date(d, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "date".to_string()
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                "valueDate": d
+            }))
+        },
+        EvaluationResult::DateTime(dt, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "dateTime".to_string()
+            };
+            
+            // Use the correct FHIR value property name based on the type
+            let value_property = match type_name.as_str() {
+                "instant" => "valueInstant",
+                _ => "valueDateTime", // Default for dateTime type
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                value_property: dt
+            }))
+        },
+        EvaluationResult::Time(t, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "time".to_string()
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                "valueTime": t
+            }))
+        },
         EvaluationResult::Quantity(value, unit, _) => Ok(json!({
             "name": "quantity",
             "valueQuantity": {
@@ -308,7 +393,28 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "unit": unit
             }
         })),
-        _ => {
+        #[cfg(not(any(feature = "R4", feature = "R4B")))]
+        EvaluationResult::Integer64(i, type_info) => {
+            let type_name = if let Some(info) = type_info {
+                info.name.clone()
+            } else {
+                "integer64".to_string()
+            };
+            
+            Ok(json!({
+                "name": type_name,
+                "valueInteger": i
+            }))
+        },
+        #[cfg(any(feature = "R4", feature = "R4B"))]
+        EvaluationResult::Integer64(i, _) => {
+            // In R4/R4B, treat as regular integer
+            Ok(json!({
+                "name": "integer",
+                "valueInteger": i
+            }))
+        },
+        EvaluationResult::Object { .. } | EvaluationResult::Collection { .. } => {
             // For complex types, convert to string representation
             let string_value = format!("{:?}", result);
 
@@ -421,5 +527,76 @@ fn build_evaluation_response(
         "id": "fhirpath",
         "parameter": parameters
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use helios_fhirpath_support::{EvaluationResult, TypeInfoResult};
+
+    #[test]
+    fn test_uri_uses_value_uri() {
+        let result = EvaluationResult::fhir_string("http://example.com".to_string(), "uri");
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "uri");
+        assert_eq!(json_result["valueUri"], "http://example.com");
+        assert!(json_result.get("valueString").is_none());
+    }
+
+    #[test]
+    fn test_code_uses_value_code() {
+        let result = EvaluationResult::fhir_string("MR".to_string(), "code");
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "code");
+        assert_eq!(json_result["valueCode"], "MR");
+        assert!(json_result.get("valueString").is_none());
+    }
+
+    #[test]
+    fn test_id_uses_value_id() {
+        let result = EvaluationResult::fhir_string("12345".to_string(), "id");
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "id");
+        assert_eq!(json_result["valueId"], "12345");
+        assert!(json_result.get("valueString").is_none());
+    }
+
+    #[test]
+    fn test_string_uses_value_string() {
+        let result = EvaluationResult::fhir_string("Hello World".to_string(), "string");
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "string");
+        assert_eq!(json_result["valueString"], "Hello World");
+    }
+
+    #[test]
+    fn test_positive_int_uses_value_positive_int() {
+        let result = EvaluationResult::Integer(
+            42, 
+            Some(TypeInfoResult::new("FHIR", "positiveInt"))
+        );
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "positiveInt");
+        assert_eq!(json_result["valuePositiveInt"], 42);
+        assert!(json_result.get("valueInteger").is_none());
+    }
+
+    #[test]
+    fn test_instant_uses_value_instant() {
+        let result = EvaluationResult::DateTime(
+            "2023-01-01T12:00:00Z".to_string(),
+            Some(TypeInfoResult::new("FHIR", "instant"))
+        );
+        let json_result = evaluation_result_to_result_value(result).unwrap();
+        
+        assert_eq!(json_result["name"], "instant");
+        assert_eq!(json_result["valueInstant"], "2023-01-01T12:00:00Z");
+        assert!(json_result.get("valueDateTime").is_none());
+    }
 }
 
