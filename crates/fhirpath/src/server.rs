@@ -202,7 +202,7 @@ pub async fn run_server(config: ServerConfig) -> Result<(), Box<dyn std::error::
 }
 
 /// Create the axum application with all routes
-fn create_app(config: &ServerConfig) -> Router {
+pub fn create_app(config: &ServerConfig) -> Router {
     let mut app = Router::new()
         // Main evaluation endpoint
         .route("/", post(evaluate_fhirpath))

@@ -36,6 +36,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 axum-test = "17.0"
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+futures = "0.3"
 
 [[bin]]
 name = "fhirpath-cli"
@@ -44,4 +46,20 @@ path = "src/bin/fhirpath-cli.rs"
 [[bin]]
 name = "fhirpath-server"
 path = "src/bin/fhirpath-server.rs"
+
+[[bench]]
+name = "parser_benches"
+harness = false
+
+[[bench]]
+name = "evaluator_benches"
+harness = false
+
+[[bench]]
+name = "cli_benches"
+harness = false
+
+[[bench]]
+name = "server_benches"
+harness = false
 
