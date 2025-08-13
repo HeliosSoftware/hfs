@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 8388608
 
 jobs:
   test:
@@ -38,9 +39,19 @@ jobs:
           ${{ runner.os }}-cargo-
 
     - name: Run tests
-      run: cargo test --verbose
-      timeout-minutes: 20
+      run: |
+        echo "Stack size: $RUST_MIN_STACK"
+        cargo test --verbose -- --test-threads=1
+      timeout-minutes: 30
+
+    - name: Run server tests separately
+      run: |
+        echo "Stack size: $RUST_MIN_STACK"
+        cargo test --test server_tests -p helios-sof --verbose -- --nocapture
+      timeout-minutes: 10
 
     - name: Run tests with all features
-      run: cargo test --all-features --verbose
-      timeout-minutes: 20
+      run: |
+        echo "Stack size: $RUST_MIN_STACK"
+        cargo test --all-features --verbose -- --test-threads=1
+      timeout-minutes: 30

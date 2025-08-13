@@ -7,7 +7,16 @@ use axum_test::TestServer;
 /// Create a test server instance
 pub async fn test_server() -> TestServer {
     let app = create_test_app();
-    TestServer::new(app).expect("Failed to create test server")
+    match TestServer::new(app) {
+        Ok(server) => {
+            eprintln!("Test server created successfully");
+            server
+        }
+        Err(e) => {
+            eprintln!("Failed to create test server: {:?}", e);
+            panic!("Failed to create test server: {:?}", e);
+        }
+    }
 }
 
 /// Create the test application (copied from server.rs to avoid binary/lib conflicts)
