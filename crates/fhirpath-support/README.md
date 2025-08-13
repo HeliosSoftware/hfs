@@ -1,10 +1,10 @@
 # fhirpath_support
 
-The **fhirpath_support** crate serves as a bridge module that provides essential types and traits for integration between the FHIRPath evaluator, it's associated functions, and also the FHIR model code in the `fhir` module, and it's generated code that is created by `fhir_macro`.
+The **helios-fhirpath-support** crate serves as a bridge module that provides essential types and traits for integration between the FHIRPath evaluator, it's associated functions, and also the FHIR model code in the `fhir` module, and it's generated code that is created by `fhir_macro`.
 
 ## Purpose and Scope
 
-**fhirpath_support** acts as a communication layer that allows:
+**helios-fhirpath-support** acts as a communication layer that allows:
 
 - **FHIRPath evaluator** to work with unified result types
 - **FHIR data structures** to convert into FHIRPath-compatible formats  

@@ -4,7 +4,7 @@ This crate provides procedural macros that enable automatic code generation for 
 
 ## Overview
 
-The `fhir_macro` crate implements two essential derive macros that handle the complex serialization patterns required by the FHIR specification:
+The `helios-fhir-macro` crate implements two essential derive macros that handle the complex serialization patterns required by the FHIR specification:
 
 - **`#[derive(FhirSerde)]`** - Custom serialization/deserialization handling FHIR's JSON representation including it's extension pattern
 - **`#[derive(FhirPath)]`** - Automatic conversion to FHIRPath evaluation results for resource traversal

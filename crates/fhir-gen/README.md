@@ -1,10 +1,10 @@
-# fhir_gen
+# helios-fhir-gen
 
-The **fhir_gen** crate is module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions.
+The **helios-fhir-gen** crate is module that serves as the cornerstone for generating Rust code from official FHIR (Fast Healthcare Interoperability Resources) specifications. This tool transforms FHIR StructureDefinitions into Rust types, enabling type-safe interaction with FHIR resources across multiple specification versions.
 
 ## Purpose and Scope
 
-**fhir_gen** has a singular, focused responsibility: **generate Rust code for each supported FHIR version**. It bridges the gap between the JSON-based FHIR specification files and the strongly-typed Rust ecosystem, providing:
+**helios-fhir-gen** has a singular, focused responsibility: **generate Rust code for each supported FHIR version**. It bridges the gap between the JSON-based FHIR specification files and the strongly-typed Rust ecosystem, providing:
 
 - **Type-safe FHIR resource representations** with proper serialization/deserialization
 - **Multi-version support** for FHIR R4, R4B, R5, and R6
@@ -53,7 +53,7 @@ and maintained in this repo in the `resources` folder.
 For the latest upcoming release (R6), the specification files are automatically downloaded from `https://build.fhir.org/definitions.json.zip` during the build process. To trigger this download, build the crate with the R6 feature enabled:
 
 ```bash
-cargo build -p fhir_gen --features R6
+cargo build -p helios-fhir-gen --features R6
 ```
 
 The build script (`build.rs`) will automatically fetch the latest R6 specification files from HL7's build server and extract them to the `resources/R6/` directory, ensuring you always have the most current development version.  
@@ -67,15 +67,15 @@ The **fhir_gen** binary provides a simple command-line interface for code genera
 
 ```bash
 # Generate code for default version (R4)
-cargo run -p fhir_gen
+cargo run -p helios-fhir-gen
 
 # Generate code for a specific FHIR version
-cargo run -p fhir_gen R5
-cargo run -p fhir_gen R4B
-cargo run -p fhir_gen R6
+cargo run -p helios-fhir-gen R5
+cargo run -p helios-fhir-gen R4B
+cargo run -p helios-fhir-gen R6
 
 # Generate code for all supported versions
-cargo run -p fhir_gen --all
+cargo run -p helios-fhir-gen --all
 ```
 
 ### Available Commands
@@ -98,13 +98,13 @@ Options:
 
 ```bash
 # Generate only R5 code (for latest standard development)
-fhir_gen R5
+helios-fhir-gen R5
 
 # Generate all versions (for comprehensive compatibility)
-fhir_gen --all
+helios-fhir-gen --all
 
 # Use from build scripts or CI/CD
-./target/debug/fhir_gen R4
+./target/debug/helios-fhir-gen R4
 ```
 
 ### Output Location
@@ -146,7 +146,7 @@ Add to your build script or Makefile:
 ```bash
 # Complete build process
 export RUST_MIN_STACK=8388608
-cargo run -p fhir_gen -- --all
+cargo run -p helios-fhir-gen -- --all
 cargo build --features R4,R4B,R5,R6
 cargo test --features R4,R4B,R5,R6
 ```
@@ -246,7 +246,7 @@ Areas for potential enhancement:
 
 - `serde` and `serde_json` - JSON parsing and serialization
 - `clap` - Command-line argument parsing  
-- `fhir` - Access to FhirVersion enum (circular dependency managed carefully)
+- `helios-fhir` - Access to FhirVersion enum (circular dependency managed carefully)
 
 This lean dependency set ensures fast compilation and reduces the risk of dependency conflicts in the broader ecosystem.
 

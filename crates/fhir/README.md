@@ -22,10 +22,10 @@ The crate is organized around FHIR specification versions, with each version con
 
 ```rust
 // Access different FHIR versions
-use fhir::r4::Patient;   // FHIR R4 Patient resource
-use fhir::r4b::Patient;  // FHIR R4B Patient resource
-use fhir::r5::Patient;   // FHIR R5 Patient resource
-use fhir::r6::Patient;   // FHIR R6 Patient resource
+use helios_fhir::r4::Patient;   // FHIR R4 Patient resource
+use helios_fhir::r4b::Patient;  // FHIR R4B Patient resource
+use helios_fhir::r5::Patient;   // FHIR R5 Patient resource
+use helios_fhir::r6::Patient;   // FHIR R6 Patient resource
 ```
 
 ### Generated vs Hand-Coded Content
@@ -71,9 +71,9 @@ The crate uses Cargo feature flags to control which FHIR versions are compiled. 
 
 ```toml
 [dependencies]
-fhir = { version = "0.1.0", features = ["R5"] }           # R5 only
-fhir = { version = "0.1.0", features = ["R4", "R5"] }     # R4 and R5
-fhir = { version = "0.1.0" }                              # R4 (default)
+helios-fhir = { version = "0.1.0", features = ["R5"] }           # R5 only
+helios-fhir = { version = "0.1.0", features = ["R4", "R5"] }     # R4 and R5
+helios-fhir = { version = "0.1.0" }                              # R4 (default)
 ```
 
 
@@ -84,7 +84,7 @@ fhir = { version = "0.1.0" }                              # R4 (default)
 Every FHIR resource is represented as a strongly-typed Rust struct:
 
 ```rust
-use fhir::r5::{Patient, HumanName, Identifier};
+use helios_fhir::r5::{Patient, HumanName, Identifier};
 
 let patient = Patient {
     id: Some("patient-123".to_string()),
@@ -111,7 +111,7 @@ let patient = Patient {
 All FHIR data types are available as Rust structs:
 
 ```rust
-use fhir::r5::{Address, ContactPoint, CodeableConcept, Coding};
+use helios_fhir::r5::{Address, ContactPoint, CodeableConcept, Coding};
 
 let address = Address {
     line: Some(vec!["123 Main St".to_string()]),
@@ -128,7 +128,7 @@ let address = Address {
 FHIR primitive types are implemented with proper constraint handling:
 
 ```rust
-use fhir::r5::{Boolean, String as FhirString, Integer, Decimal};
+use helios_fhir::r5::{Boolean, String as FhirString, Integer, Decimal};
 
 // FHIR primitives include extension support
 let enabled: Boolean = true.into();
@@ -141,7 +141,7 @@ let count: Integer = 42.into();
 FHIR choice elements (ending in `[x]`) are represented as enums:
 
 ```rust
-use fhir::r5::{Observation, ObservationValue};
+use helios_fhir::r5::{Observation, ObservationValue};
 
 let observation = Observation {
     value: Some(ObservationValue::String("Normal".to_string())),
@@ -158,7 +158,7 @@ let observation = Observation {
 Each version provides a unified Resource enum containing all resource types:
 
 ```rust
-use fhir::r5::Resource;
+use helios_fhir::r5::Resource;
 
 let resource = Resource::Patient(patient);
 let json = serde_json::to_string(&resource)?;
@@ -174,7 +174,7 @@ let parsed: Resource = serde_json::from_str(&json)?;
 All generated types are fully compatible with official FHIR JSON representations:
 
 ```rust
-use fhir::r5::Patient;
+use helios_fhir::r5::Patient;
 use serde_json;
 
 // Deserialize from FHIR JSON
@@ -200,7 +200,7 @@ let json = serde_json::to_string_pretty(&patient)?;
 The crate includes specialized handling for FHIR's decimal precision requirements:
 
 ```rust
-use fhir::r5::Decimal;
+use helios_fhir::r5::Decimal;
 use rust_decimal::Decimal as RustDecimal;
 
 // Preserves original string precision
@@ -218,7 +218,7 @@ let calculated = precise_value + RustDecimal::new(1, 1); // add 0.1 = 12.440
 All FHIR types automatically implement FHIRPath-compatible traits:
 
 ```rust
-use fhir::r5::Patient;
+use helios_fhir::r5::Patient;
 use fhirpath_support::IntoEvaluationResult;
 
 let patient = Patient::default();
@@ -282,7 +282,7 @@ Tests verify:
 ### Basic Resource Creation
 
 ```rust
-use fhir::r5::{Patient, HumanName, ContactPoint};
+use helios_fhir::r5::{Patient, HumanName, ContactPoint};
 
 let patient = Patient {
     name: Some(vec![HumanName {
@@ -302,7 +302,7 @@ let patient = Patient {
 ### Working with Extensions
 
 ```rust
-use fhir::r5::{Patient, Extension};
+use helios_fhir::r5::{Patient, Extension};
 
 let mut patient = Patient::default();
 
@@ -317,7 +317,7 @@ patient.extension = Some(vec![Extension {
 ### Resource Collections and Bundles
 
 ```rust
-use fhir::r5::{Bundle, BundleEntry, Resource};
+use helios_fhir::r5::{Bundle, BundleEntry, Resource};
 
 let bundle = Bundle {
     entry: Some(vec![

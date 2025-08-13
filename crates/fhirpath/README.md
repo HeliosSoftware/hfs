@@ -402,7 +402,7 @@ The `EvaluationContext` provides the runtime environment for FHIRPath evaluation
 
 ```rust
 use fhirpath::evaluator::EvaluationContext;
-use fhir::FhirVersion;
+use helios_fhir::FhirVersion;
 
 // Create context with explicit FHIR version
 let context = EvaluationContext::new_empty(FhirVersion::R4);
@@ -437,7 +437,7 @@ The type system handles both FHIR and System namespaces:
 The implementation uses the `FhirResourceTypeProvider` trait to automatically detect resource types for each FHIR version:
 
 ```rust
-use fhir::FhirVersion;
+use helios_fhir::FhirVersion;
 use fhirpath::evaluator::EvaluationContext;
 
 // Context automatically detects FHIR version from resources
@@ -495,7 +495,7 @@ A feature-rich command-line tool for evaluating FHIRPath expressions against FHI
 
 ```bash
 # Install from the workspace root
-cargo install --path crates/fhirpath --bin fhirpath-cli
+cargo install --path crates/helios-fhirpath --bin fhirpath-cli
 
 # Or build directly
 cargo build --release --bin fhirpath-cli
@@ -609,7 +609,7 @@ An HTTP server providing FHIRPath expression evaluation via a REST API, compatib
 
 ```bash
 # Install from the workspace root
-cargo install --path crates/fhirpath --bin fhirpath-server
+cargo install --path crates/helios-fhirpath --bin fhirpath-server
 
 # Or build directly
 cargo build --release --bin fhirpath-server
