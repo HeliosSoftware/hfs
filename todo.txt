@@ -20,13 +20,11 @@
   - Python Bindings
   - Setup build process for sof-server and sof-cli
   - Setup hosting for sof-server
+  - Submit here:  https://github.com/FHIR/sql-on-fhir-v2?tab=readme-ov-file#registering-your-implementation
 
 - Process on a pile of JSON
 
 - Add Github Actions for build and release process
-
-- Re-work fhirpath to add a fhirpath server for eventual use with FHIR Path Lab
-- Is there a documented fhirpath validator endpoint, and an apply?
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
@@ -38,30 +36,10 @@
 
 - Modify fhir_gen to add Rust docs to r4.rs, others.
 
-
 - The cycle detection is over Box'ing types.  It only needs to be done on one, but not the other. e.g. Reference and Identifier - future item - Likely need a priority element to 
   decide - could be helpful too in the future when we need to use it for Cassandra table separation
 
 - Temporarily using strings for Date, DateTime, etc.  After we can prove parsing works, we will go back and code these as proper types.
-
-- Review all READMEs and decide on the outline of yours
-  - https://www.emilyomier.com/blog/argillas-readme
-  - https://github.com/neondatabase/neon
-  - https://github.com/refinedev/refine#readme
-  - https://github.com/astral-sh/uv  
-  - https://github.com/matiassingers/awesome-readme
-  - Emily's presentation
-  - MP
-  - Neon, uv
-
-    -Image
-    -Product Name: Helios FHIR Server
-    -Product tag line:  Build modern healthcare analytics applications.
-    -One sentence product description: The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.org/fhir) standard, built in Rust for high performance and targeted towards clinical analytics workloads.   
-    -Why use Helios FHIR Server?
-    -What do people build using the Helios FHIR Server?
-    -Quick Start
-    -Documentation (if not above)
 
 - Manually added ViewDefinition Structure Definition to profiles-resources.json (deleting integer64) for generating r4.rs.  Need to also add it to the others except for r6 (anticipating a ViewDefinition resource to be added to r6) (and adding back in integer64)
 
