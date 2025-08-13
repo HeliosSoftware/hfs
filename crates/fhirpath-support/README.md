@@ -86,7 +86,7 @@ pub trait IntoEvaluationResult {
 
 ```rust
 // Used in all FHIRPath function modules
-use fhirpath_support::{EvaluationError, EvaluationResult};
+use helios_fhirpath_support::{EvaluationError, EvaluationResult};
 ```
 
 **Modules using fhirpath_support**:
@@ -106,7 +106,7 @@ use fhirpath_support::{EvaluationError, EvaluationResult};
 **Public Re-export**: The fhirpath crate re-exports EvaluationResult for external consumers:
 
 ```rust
-pub use fhirpath_support::EvaluationResult;
+pub use helios_fhirpath_support::EvaluationResult;
 ```
 
 ### 2. **FHIR Data Structure Integration** (`crates/fhir`)
@@ -114,7 +114,7 @@ pub use fhirpath_support::EvaluationResult;
 **FHIR Type Conversion**: The main fhir crate imports fhirpath_support to enable FHIR data structures to work with FHIRPath:
 
 ```rust
-use fhirpath_support::{EvaluationResult, IntoEvaluationResult};
+use helios_fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 ```
 
 **Purpose**: Enables FHIR resources, data types, and elements to be seamlessly converted into FHIRPath-compatible formats for expression evaluation.

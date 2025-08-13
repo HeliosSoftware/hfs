@@ -1,6 +1,6 @@
-# fhir
+# FHIR 
 
-The **fhir** crate is the comprehensive FHIR (Fast Healthcare Interoperability Resources) specification model implementation that contains strongly-typed Rust representations of all FHIR data types, and resourcess for each supported version of the FHIR specification.
+The **helios-fhir** crate is the comprehensive FHIR (Fast Healthcare Interoperability Resources) specification model implementation that contains strongly-typed Rust representations of all FHIR data types, and resourcess for each supported version of the FHIR specification.
 
 ## Purpose and Scope
 

@@ -1,4 +1,4 @@
-# FHIRPath 
+# helios-fhirpath 
 
 This is an implementation of HL7's [FHIRPath Specification - 3.0.0-ballot](https://hl7.org/fhirpath/2025Jan/) written in Rust.
 
@@ -401,7 +401,7 @@ The implementation supports multiple FHIR versions (R4, R4B, R5, R6) through:
 The `EvaluationContext` provides the runtime environment for FHIRPath evaluation:
 
 ```rust
-use fhirpath::evaluator::EvaluationContext;
+use helios_fhirpath::evaluator::EvaluationContext;
 use helios_fhir::FhirVersion;
 
 // Create context with explicit FHIR version
@@ -438,7 +438,7 @@ The implementation uses the `FhirResourceTypeProvider` trait to automatically de
 
 ```rust
 use helios_fhir::FhirVersion;
-use fhirpath::evaluator::EvaluationContext;
+use helios_fhirpath::evaluator::EvaluationContext;
 
 // Context automatically detects FHIR version from resources
 let context = EvaluationContext::new(resources);
@@ -656,7 +656,7 @@ fhirpath-server \
   --host 0.0.0.0 \
   --port 8080 \
   --log-level warn \
-  --cors-origins "https://fhirpath-lab.com,https://dev.fhirpath-lab.com"
+  --cors-origins "https://fhirpath-lab.com,https://dev.fhirpath-lab.com,https://fhirpath-lab.azurewebsites.net,https://fhirpath-lab-dev.azurewebsites.net/,http://localhost:3000"
 ```
 
 #### API Endpoints

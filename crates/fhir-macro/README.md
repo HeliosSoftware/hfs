@@ -40,7 +40,7 @@ pub subject: Option<ActivityDefinitionSubject>,
 #### Usage Examples
 
 ```rust
-use fhir_macro::FhirSerde;
+use helios_fhir_macro::FhirSerde;
 
 // Basic struct with FHIR serialization
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, Default)]
@@ -102,8 +102,8 @@ The `FhirPath` derive macro automatically implements the `fhirpath_support::Into
 #### Usage Examples
 
 ```rust
-use fhir_macro::FhirPath;
-use fhirpath_support::{IntoEvaluationResult, EvaluationResult};
+use helios_fhir_macro::FhirPath;
+use helios_fhirpath_support::{IntoEvaluationResult, EvaluationResult};
 
 // Struct conversion to FHIRPath object
 #[derive(FhirPath)]
@@ -220,7 +220,7 @@ All generated FHIR types in the `fhir` crate automatically use these macros:
 
 ```rust
 // In crates/fhir/src/r4.rs, r4b.rs, r5.rs, r6.rs:
-use fhir_macro::{FhirSerde, FhirPath};
+use helios_fhir_macro::{FhirSerde, FhirPath};
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Patient {
@@ -241,7 +241,7 @@ The `FhirPath` derive enables seamless integration with the FHIRPath evaluator:
 
 ```rust
 // In crates/fhirpath/src/evaluator.rs:
-use fhirpath_support::IntoEvaluationResult;
+use helios_fhirpath_support::IntoEvaluationResult;
 
 // All FHIR types can be used directly in FHIRPath expressions
 fn evaluate_expression(resource: &Patient, path: &str) -> EvaluationResult {

@@ -388,7 +388,7 @@ curl -X POST "http://localhost:8080/ViewDefinition/$run?_since=2024-01-01T00:00:
 Transform FHIR resources using declarative ViewDefinitions:
 
 ```rust
-use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
 
 // Parse ViewDefinition and Bundle
 let view_definition: fhir::r4::ViewDefinition = serde_json::from_str(view_json)?;
@@ -509,7 +509,7 @@ Combine multiple select statements:
 Multiple output formats for different integration needs:
 
 ```rust
-use sof::ContentType;
+use helios_sof::ContentType;
 
 // CSV without headers
 let csv = run_view_definition(view, bundle, ContentType::Csv)?;
@@ -561,7 +561,7 @@ pub trait BundleTrait {
 Comprehensive error types for different failure scenarios:
 
 ```rust
-use sof::SofError;
+use helios_sof::SofError;
 
 match run_view_definition(view, bundle, format) {
     Ok(output) => println!("Success: {} bytes", output.len()),
@@ -601,8 +601,8 @@ Available features:
 ### Batch Processing Pipeline
 
 ```rust
-use sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
-use std::fs;
+use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
+use helios_std::fs;
 
 fn process_directory(view_path: &str, data_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
     let view_def = fs::read_to_string(view_path)?;
@@ -632,7 +632,7 @@ fn process_directory(view_path: &str, data_dir: &str) -> Result<(), Box<dyn std:
 ### Custom Error Handling
 
 ```rust
-use sof::{SofError, run_view_definition};
+use helios_sof::{SofError, run_view_definition};
 
 fn safe_transform(view: SofViewDefinition, bundle: SofBundle) -> Option<Vec<u8>> {
     match run_view_definition(view, bundle, ContentType::Json) {
