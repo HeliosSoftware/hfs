@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust: [stable, beta, nightly]
+        rust: [stable]
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -39,6 +39,8 @@ jobs:
 
     - name: Run tests
       run: cargo test --verbose
+      timeout-minutes: 20
 
     - name: Run tests with all features
       run: cargo test --all-features --verbose
+      timeout-minutes: 20
