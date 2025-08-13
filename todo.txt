@@ -1,7 +1,5 @@
 - Make repo public
-  - Cleanup main README.md
-    - Need a components section to explain what's in the repo
-  - Remove? hfs crate
+  - Add a CONTRIBUTING.md file
 
 - FHIRPath
   - Implement fhirpath-server - Done
