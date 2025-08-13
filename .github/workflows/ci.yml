@@ -22,11 +22,38 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Free up disk space
+      run: |
+        echo "Disk space before cleanup:"
+        df -h
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        sudo rm -rf /usr/local/lib/android
+        sudo apt-get clean
+        echo "Disk space after cleanup:"
+        df -h
+
+    - name: Install LLD linker
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang lld
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@v1
       with:
         toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
+
+    - name: Configure Rust to use LLD
+      run: |
+        mkdir -p ~/.cargo
+        cat >> ~/.cargo/config.toml << EOF
+        [target.x86_64-unknown-linux-gnu]
+        linker = "clang"
+        rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+        EOF
 
     - name: Cache cargo registry
       uses: actions/cache@v3
@@ -42,11 +69,34 @@ jobs:
     - name: Run server tests separately
       run: |
         echo "Stack size: $RUST_MIN_STACK"
+        echo "Available disk space:"
+        df -h
         cargo test --test server_tests -p helios-sof --verbose -- --nocapture
 
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Run unit tests
+      run: |
+        echo "Running unit tests..."
+        cargo test --lib --verbose
+
+    - name: Run integration tests
+      run: |
+        echo "Running integration tests..."
+        cargo test --test '*' --verbose
+
+    - name: Run doc tests
+      run: |
+        echo "Running doc tests..."
+        cargo test --doc --verbose
+
+    - name: Clean before all-features build
+      run: |
+        echo "Cleaning target directory to save space..."
+        cargo clean
+        echo "Available disk space after clean:"
+        df -h
 
     - name: Run tests with all features
-      run: cargo test --all-features --verbose
+      run: |
+        echo "Running tests with all features..."
+        cargo test --all-features --verbose
         

@@ -56,9 +56,13 @@ linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 ```
 
-4. **Set stack size** (add to `~/.bashrc` or `~/.zshrc`):
+4. **Set stack size and parallel build count** (add to `~/.bashrc` or `~/.zshrc`):
 ```bash
 export RUST_MIN_STACK=8388608
+```
+💡 **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs to 4 (or less):
+```bash
+export CARGO_BUILD_JOBS=4
 ```
 
 ## Installation
@@ -91,11 +95,6 @@ cargo run --bin sof-server
 # Start the FHIRPath server
 cargo run --bin fhirpath-server
 # Then POST expressions to http://localhost:3000/fhirpath
-```
-
-💡 **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs:
-```bash
-export CARGO_BUILD_JOBS=4
 ```
 
 # Architecture Overview
