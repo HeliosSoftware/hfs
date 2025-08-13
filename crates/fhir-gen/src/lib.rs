@@ -84,7 +84,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
 
     let version_path = output_path
         .as_ref()
-        .join(&format!("{}.rs", version.as_str().to_lowercase()));
+        .join(format!("{}.rs", version.as_str().to_lowercase()));
 
     // Create the version-specific output file with initial content
     std::fs::write(
@@ -244,7 +244,7 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Expects JSON files in the standard FHIR Bundle format with entries containing
 /// StructureDefinition resources, as provided by the official FHIR specification.
 fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
-    let file = File::open(path).map_err(|e| serde_json::Error::io(e))?;
+    let file = File::open(path).map_err(serde_json::Error::io)?;
     let reader = BufReader::new(file);
     serde_json::from_reader(reader)
 }
@@ -271,7 +271,7 @@ fn parse_structure_definitions<P: AsRef<Path>>(path: P) -> Result<Bundle> {
 fn is_valid_structure_definition(def: &StructureDefinition) -> bool {
     (def.kind == "complex-type" || def.kind == "primitive-type" || def.kind == "resource")
         && def.derivation.as_deref() == Some("specialization")
-        && def.r#abstract == false
+        && !def.r#abstract
 }
 
 /// Checks if a StructureDefinition represents a FHIR primitive type.
@@ -331,10 +331,10 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                     if is_valid_structure_definition(def) {
                         if let Some(snapshot) = &def.snapshot {
                             if let Some(elements) = &snapshot.element {
-                                all_elements.extend(elements.iter().map(|e| e));
+                                all_elements.extend(elements.iter());
                             }
                         }
-                        if def.kind == "resource" && def.r#abstract == false {
+                        if def.kind == "resource" && !def.r#abstract {
                             all_resources.push(&def.name);
                         }
                     }
@@ -355,8 +355,7 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                             let content = structure_definition_to_rust(def, &cycles);
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
-                                .write(true)
-                                .append(true)
+                                                .append(true)
                                 .open(output_path.as_ref())?;
                             writeln!(file, "{}", content)?;
                         }
@@ -378,7 +377,6 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                 generate_resource_enum(all_resources.iter().map(|s| s.to_string()).collect());
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
-                .write(true)
                 .append(true)
                 .open(output_path.as_ref())?;
             writeln!(file, "{}", resource_enum)?;

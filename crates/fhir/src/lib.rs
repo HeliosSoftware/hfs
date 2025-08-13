@@ -146,7 +146,7 @@ impl Eq for PreciseDecimal {}
 /// any valid decimal value.
 impl PartialOrd for PreciseDecimal {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.value.partial_cmp(&other.value)
+        Some(self.cmp(other))
     }
 }
 
@@ -980,8 +980,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
             where
@@ -993,8 +991,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
             where
@@ -1006,8 +1002,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
             where
@@ -1019,8 +1013,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
             where
@@ -1037,7 +1029,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
@@ -1047,7 +1039,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
@@ -1057,7 +1049,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
@@ -1067,7 +1059,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 }
 
@@ -1078,8 +1070,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er>
             where
@@ -1096,7 +1086,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
@@ -1106,7 +1096,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
@@ -1116,7 +1106,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
@@ -1126,7 +1116,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 }
 
@@ -1138,8 +1128,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
             where
@@ -1156,7 +1144,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
@@ -1166,7 +1154,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
@@ -1176,7 +1164,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
@@ -1186,7 +1174,7 @@ where
                                 extension: None,
                                 value: Some(value),
                             })
-                            .map_err(|e| e);
+;
                     }
                 }
 
@@ -1197,8 +1185,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
             where
@@ -1210,8 +1196,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
             fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
             where
@@ -1224,8 +1208,6 @@ where
                         extension: None,
                         value: Some(value),
                     })
-                    // Propagate the error from V::deserialize directly
-                    .map_err(|e| e)
             }
 
             // Handle null

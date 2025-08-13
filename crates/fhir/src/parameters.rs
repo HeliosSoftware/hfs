@@ -139,7 +139,7 @@ impl ParameterValueAccessor for crate::r4::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
             crate::r4::ParametersParameterValue::String(s) => 
-                s.value.as_ref().map(|v| v.as_str()),
+                s.value.as_deref(),
             _ => None,
         }
     }
@@ -174,7 +174,7 @@ impl ParameterValueAccessor for crate::r4b::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
             crate::r4b::ParametersParameterValue::String(s) => 
-                s.value.as_ref().map(|v| v.as_str()),
+                s.value.as_deref(),
             _ => None,
         }
     }
@@ -209,7 +209,7 @@ impl ParameterValueAccessor for crate::r5::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
             crate::r5::ParametersParameterValue::String(s) => 
-                s.value.as_ref().map(|v| v.as_str()),
+                s.value.as_deref(),
             _ => None,
         }
     }
@@ -244,7 +244,7 @@ impl ParameterValueAccessor for crate::r6::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
             crate::r6::ParametersParameterValue::String(s) => 
-                s.value.as_ref().map(|v| v.as_str()),
+                s.value.as_deref(),
             _ => None,
         }
     }

@@ -4,7 +4,6 @@ use helios_fhir::PreciseDecimal;
 use helios_fhir::r4::*;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
-use serde_json;
 
 #[test]
 fn test_serialize_decimal_with_value_present() {
