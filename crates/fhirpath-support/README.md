@@ -74,7 +74,7 @@ The universal conversion interface that enables any FHIR type to become a FHIRPa
 
 ```rust
 pub trait IntoEvaluationResult {
-    fn into_evaluation_result(&self) -> EvaluationResult;
+    fn to_evaluation_result(&self) -> EvaluationResult;
 }
 ```
 
@@ -126,7 +126,7 @@ use helios_fhirpath_support::{EvaluationResult, IntoEvaluationResult};
 ```rust
 /// Derives the `fhirpath_support::IntoEvaluationResult` trait.
 impl fhirpath_support::IntoEvaluationResult for GeneratedType {
-    fn into_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
+    fn to_evaluation_result(&self) -> fhirpath_support::EvaluationResult {
         // Generated conversion logic
     }
 }

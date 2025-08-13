@@ -1165,7 +1165,7 @@ fn evaluate_term(
 #[inline] // Suggest inlining this simple function call
 fn convert_resource_to_result(resource: &FhirResource) -> EvaluationResult {
     // Now that FhirResource implements IntoEvaluationResult, just call the method.
-    resource.into_evaluation_result()
+    resource.to_evaluation_result()
 }
 
 /// Evaluates a FHIRPath literal value

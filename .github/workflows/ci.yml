@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_MIN_STACK: 8388608
-  CARGO_BUILD_JOBS: 1
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   test:
@@ -65,35 +65,6 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
-
-    - name: Run server tests separately
-      run: |
-        echo "Stack size: $RUST_MIN_STACK"
-        echo "Available disk space:"
-        df -h
-        cargo test --test server_tests -p helios-sof --verbose -- --nocapture
-
-    - name: Run unit tests
-      run: |
-        echo "Running unit tests..."
-        cargo test --lib --verbose
-
-    - name: Run integration tests
-      run: |
-        echo "Running integration tests..."
-        cargo test --test '*' --verbose
-
-    - name: Run doc tests
-      run: |
-        echo "Running doc tests..."
-        cargo test --doc --verbose
-
-    - name: Clean before all-features build
-      run: |
-        echo "Cleaning target directory to save space..."
-        cargo clean
-        echo "Available disk space after clean:"
-        df -h
 
     - name: Run tests with all features
       run: |

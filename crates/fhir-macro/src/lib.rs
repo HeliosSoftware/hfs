@@ -1900,10 +1900,8 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             let primitive_type_parsed: Type = syn::parse_str(
                                                 primitive_type_str,
                                             )
-                                            .expect(&format!(
-                                                "Failed to parse primitive type string: {}",
-                                                primitive_type_str
-                                            ));
+                                            .unwrap_or_else(|_| panic!("Failed to parse primitive type string: {}",
+                                                primitive_type_str));
                                             quote! { #primitive_type_parsed } // Use the parsed primitive type
                                         }
                                     } else {
@@ -2415,13 +2413,13 @@ fn generate_fhirpath_struct_impl(
         // Generate code to handle the field based on whether it's Option
         let is_option = get_option_inner_type(field_ty).is_some();
 
-        let field_handling_code = if is_option {
+        if is_option {
             // For Option<T>, evaluate the inner value only if Some
             if let Some(type_name) = fhir_type_name {
                 // Special handling for FHIR primitive types to preserve type information
                 quote! {
                     if let Some(inner_value) = &self.#field_name_ident {
-                        let mut field_result = inner_value.into_evaluation_result();
+                        let mut field_result = inner_value.to_evaluation_result();
                         // Override type information for FHIR primitive types
                         field_result = match field_result {
                             helios_fhirpath_support::EvaluationResult::String(s, _) => {
@@ -2439,7 +2437,7 @@ fn generate_fhirpath_struct_impl(
             } else {
                 quote! {
                     if let Some(inner_value) = &self.#field_name_ident {
-                        let field_result = inner_value.into_evaluation_result();
+                        let field_result = inner_value.to_evaluation_result();
                         // Only insert if the inner evaluation is not Empty
                         if field_result != helios_fhirpath_support::EvaluationResult::Empty {
                             map.insert(#field_key_str.to_string(), field_result);
@@ -2453,7 +2451,7 @@ fn generate_fhirpath_struct_impl(
             if let Some(type_name) = fhir_type_name {
                 // Special handling for FHIR primitive types to preserve type information
                 quote! {
-                    let mut field_result = self.#field_name_ident.into_evaluation_result();
+                    let mut field_result = self.#field_name_ident.to_evaluation_result();
                     // Override type information for FHIR primitive types
                     field_result = match field_result {
                         helios_fhirpath_support::EvaluationResult::String(s, _) => {
@@ -2468,15 +2466,14 @@ fn generate_fhirpath_struct_impl(
                 }
             } else {
                 quote! {
-                    let field_result = self.#field_name_ident.into_evaluation_result();
+                    let field_result = self.#field_name_ident.to_evaluation_result();
                     // Only insert if the evaluation is not Empty
                     if field_result != helios_fhirpath_support::EvaluationResult::Empty {
                         map.insert(#field_key_str.to_string(), field_result);
                     }
                 }
             }
-        };
-        field_handling_code // Return the generated code for this field
+        } // Return the generated code for this field
     });
 
 
@@ -2486,7 +2483,7 @@ fn generate_fhirpath_struct_impl(
     
     quote! {
         impl #impl_generics helios_fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
-            fn into_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
+            fn to_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
                 // Use fully qualified path for HashMap
                 let mut map = std::collections::HashMap::new();
                 
@@ -2530,7 +2527,7 @@ fn generate_fhirpath_enum_impl(
         
         return quote! {
             impl #impl_generics helios_fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
-                fn into_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
+                fn to_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
                     // This should never be called for an empty enum
                     unreachable!("Empty enum should not be instantiated")
                 }
@@ -2568,7 +2565,7 @@ fn generate_fhirpath_enum_impl(
                     // Special handling for the Resource enum: add resourceType
                     quote! {
                         Self::#variant_name(value) => {
-                            let mut result = value.into_evaluation_result(); // Call on inner Box<ResourceStruct>
+                            let mut result = value.to_evaluation_result(); // Call on inner Box<ResourceStruct>
                             if let helios_fhirpath_support::EvaluationResult::Object { ref mut map, .. } = result {
                                 // Insert the resourceType field using the variant name
                                 map.insert(
@@ -2639,7 +2636,7 @@ fn generate_fhirpath_enum_impl(
                     quote! {
                         Self::#variant_name(value) => {
                             // Get the base evaluation result from the inner value
-                            let mut result = value.into_evaluation_result();
+                            let mut result = value.to_evaluation_result();
                             
                             // Add FHIR type information to preserve type for .ofType() operations
                             // Only override type info if it's not already set correctly
@@ -2703,7 +2700,7 @@ fn generate_fhirpath_enum_impl(
 
     let into_evaluation_result_impl = quote! {
         impl #impl_generics helios_fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
-            fn into_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
+            fn to_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
                  #body // Use the generated body (either Empty or the match statement)
             }
         }
@@ -2828,7 +2825,7 @@ pub fn type_info_derive(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     // Extract type_info attributes if present
-    let (namespace, type_name) = extract_type_info_attributes(&input.attrs, &name);
+    let (namespace, type_name) = extract_type_info_attributes(&input.attrs, name);
 
     let expanded = quote! {
         impl #impl_generics helios_fhirpath_support::TypeInfo for #name #ty_generics #where_clause {

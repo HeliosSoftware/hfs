@@ -120,7 +120,7 @@ let patient = Patient {
     name: Some(vec![...]),
 };
 
-let result = patient.into_evaluation_result();
+let result = patient.to_evaluation_result();
 // Results in EvaluationResult::Object with fields: id, active, name
 ```
 
@@ -246,7 +246,7 @@ use helios_fhirpath_support::IntoEvaluationResult;
 // All FHIR types can be used directly in FHIRPath expressions
 fn evaluate_expression(resource: &Patient, path: &str) -> EvaluationResult {
     // Patient automatically implements IntoEvaluationResult via #[derive(FhirPath)]
-    resource.into_evaluation_result()
+    resource.to_evaluation_result()
 }
 ```
 

@@ -26,12 +26,12 @@
 //!
 //! // Convert a string to an evaluation result
 //! let text = "Hello, FHIR!".to_string();
-//! let result = text.into_evaluation_result();
+//! let result = text.to_evaluation_result();
 //! assert_eq!(result, EvaluationResult::String("Hello, FHIR!".to_string(), None));
 //!
 //! // Work with collections
 //! let numbers = vec![1, 2, 3];
-//! let collection = numbers.into_evaluation_result();
+//! let collection = numbers.to_evaluation_result();
 //! assert_eq!(collection.count(), 3);
 //! ```
 
@@ -69,10 +69,10 @@ pub use type_info::TypeInfoResult;
 /// }
 ///
 /// impl IntoEvaluationResult for CustomType {
-///     fn into_evaluation_result(&self) -> EvaluationResult {
+///     fn to_evaluation_result(&self) -> EvaluationResult {
 ///         let mut map = std::collections::HashMap::new();
-///         map.insert("value".to_string(), self.value.into_evaluation_result());
-///         map.insert("active".to_string(), self.active.into_evaluation_result());
+///         map.insert("value".to_string(), self.value.to_evaluation_result());
+///         map.insert("active".to_string(), self.active.to_evaluation_result());
 ///         EvaluationResult::Object { map, type_info: None }
 ///     }
 /// }
@@ -82,7 +82,7 @@ pub trait IntoEvaluationResult {
     ///
     /// This method should transform the implementing type into the most appropriate
     /// `EvaluationResult` variant that represents the value's semantics in FHIRPath.
-    fn into_evaluation_result(&self) -> EvaluationResult;
+    fn to_evaluation_result(&self) -> EvaluationResult;
 }
 
 /// Universal result type for FHIRPath expression evaluation.
@@ -1146,7 +1146,7 @@ impl EvaluationResult {
 ///
 /// This is the most direct conversion for text values in the FHIRPath system.
 impl IntoEvaluationResult for String {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         EvaluationResult::string(self.clone())
     }
 }
@@ -1155,7 +1155,7 @@ impl IntoEvaluationResult for String {
 ///
 /// Enables direct use of Rust boolean values in FHIRPath expressions.
 impl IntoEvaluationResult for bool {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         EvaluationResult::boolean(*self)
     }
 }
@@ -1164,7 +1164,7 @@ impl IntoEvaluationResult for bool {
 ///
 /// Automatically promotes to `i64` for consistent integer handling.
 impl IntoEvaluationResult for i32 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         EvaluationResult::integer(*self as i64)
     }
 }
@@ -1173,7 +1173,7 @@ impl IntoEvaluationResult for i32 {
 ///
 /// This is the primary integer type used in FHIRPath evaluation.
 impl IntoEvaluationResult for i64 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         EvaluationResult::integer64(*self)
     }
 }
@@ -1183,7 +1183,7 @@ impl IntoEvaluationResult for i64 {
 /// Uses high-precision `Decimal` type to avoid floating-point errors.
 /// Returns `Empty` for invalid values like NaN or Infinity.
 impl IntoEvaluationResult for f64 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         Decimal::from_f64(*self)
             .map(EvaluationResult::decimal)
             .unwrap_or(EvaluationResult::Empty)
@@ -1194,7 +1194,7 @@ impl IntoEvaluationResult for f64 {
 ///
 /// This is the preferred conversion for precise decimal values in FHIR.
 impl IntoEvaluationResult for Decimal {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         EvaluationResult::decimal(*self)
     }
 }
@@ -1212,9 +1212,9 @@ impl<T> IntoEvaluationResult for Option<T>
 where
     T: IntoEvaluationResult,
 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         match self {
-            Some(value) => value.into_evaluation_result(),
+            Some(value) => value.to_evaluation_result(),
             None => EvaluationResult::Empty,
         }
     }
@@ -1228,10 +1228,10 @@ impl<T> IntoEvaluationResult for Vec<T>
 where
     T: IntoEvaluationResult,
 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
+    fn to_evaluation_result(&self) -> EvaluationResult {
         let collection: Vec<EvaluationResult> = self
             .iter()
-            .map(|item| item.into_evaluation_result())
+            .map(|item| item.to_evaluation_result())
             .collect();
         EvaluationResult::Collection {
             items: collection,
@@ -1249,8 +1249,8 @@ impl<T> IntoEvaluationResult for Box<T>
 where
     T: IntoEvaluationResult + ?Sized,
 {
-    fn into_evaluation_result(&self) -> EvaluationResult {
-        (**self).into_evaluation_result()
+    fn to_evaluation_result(&self) -> EvaluationResult {
+        (**self).to_evaluation_result()
     }
 }
 
@@ -1284,7 +1284,7 @@ pub fn convert_value_to_evaluation_result<T>(value: &T) -> EvaluationResult
 where
     T: IntoEvaluationResult + ?Sized,
 {
-    value.into_evaluation_result()
+    value.to_evaluation_result()
 }
 
 /// Formats a unit for display, converting calendar units to UCUM format with curly braces

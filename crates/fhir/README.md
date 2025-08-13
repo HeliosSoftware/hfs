@@ -224,7 +224,7 @@ use fhirpath_support::IntoEvaluationResult;
 let patient = Patient::default();
 
 // Convert to FHIRPath evaluation context
-let result = patient.into_evaluation_result();
+let result = patient.to_evaluation_result();
 
 // Use with FHIRPath expressions
 let name_result = evaluate("name.given", &patient)?;

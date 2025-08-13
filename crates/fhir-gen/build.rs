@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::fs;
 use std::fs::File;
 use std::io::copy;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 fn main() {
@@ -106,7 +106,7 @@ fn main() {
 /// This is a temporary workaround because the ViewDefinition FHIR Resource is not yet
 /// included in the latest R6 build from HL7's build server. This function should be
 /// removed once ViewDefinition is officially added to the R6 specification.
-fn insert_view_definition(resources_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn insert_view_definition(resources_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let profiles_resources_path = resources_dir.join("profiles-resources.json");
     let view_definition_path = resources_dir.join("view-definition-bundle-entry.json");
 

@@ -844,7 +844,7 @@ curl -X POST http://localhost:3000 \
 
 #### Integration with fhirpath-lab
 
-The server is fully compatible with [fhirpath-lab](https://fhirpath-lab.com/). To use your local server with fhirpath-lab:
+The server is compatible with [fhirpath-lab](https://fhirpath-lab.com/). To use your local server with fhirpath-lab:
 
 1. Start the server with CORS enabled for fhirpath-lab domains:
    ```bash
