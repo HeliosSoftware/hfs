@@ -460,7 +460,7 @@ pub mod r6;
 pub mod parameters;
 
 // Re-export commonly used types from parameters module
-pub use parameters::{VersionIndependentParameters, ParameterValueAccessor};
+pub use parameters::{ParameterValueAccessor, VersionIndependentParameters};
 
 // Removed the FhirSerde trait definition
 
@@ -974,45 +974,41 @@ where
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::BoolDeserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::BoolDeserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_i64<Er>(self, v: i64) -> Result<Self::Value, Er>
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::I64Deserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::I64Deserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_u64<Er>(self, v: u64) -> Result<Self::Value, Er>
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::U64Deserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::U64Deserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_f64<Er>(self, v: f64) -> Result<Self::Value, Er>
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::F64Deserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::F64Deserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_str<Er>(self, v: &str) -> Result<Self::Value, Er>
             where
@@ -1023,53 +1019,52 @@ where
                 // Try to handle numeric strings for integer types
                 if TypeId::of::<V>() == TypeId::of::<i64>() {
                     if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 }
 
                 // Fall back to normal string deserialization
-                V::deserialize(de::value::StrDeserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::StrDeserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_string<Er>(self, v: String) -> Result<Self::Value, Er>
             where
@@ -1080,54 +1075,53 @@ where
                 // Try to handle numeric strings for integer types
                 if TypeId::of::<V>() == TypeId::of::<i64>() {
                     if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 }
 
                 // Fall back to normal string deserialization
-                V::deserialize(de::value::StringDeserializer::new(v.clone()))
-                    .map(|value| Element {
-                        // Clone v for error message
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::StringDeserializer::new(v.clone())).map(|value| Element {
+                    // Clone v for error message
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_borrowed_str<Er>(self, v: &'de str) -> Result<Self::Value, Er>
             where
@@ -1138,76 +1132,73 @@ where
                 // Try to handle numeric strings for integer types
                 if TypeId::of::<V>() == TypeId::of::<i64>() {
                     if let Ok(int_val) = v.parse::<i64>() {
-                        return V::deserialize(de::value::I64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<i32>() {
                     if let Ok(int_val) = v.parse::<i32>() {
-                        return V::deserialize(de::value::I32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::I32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u64>() {
                     if let Ok(int_val) = v.parse::<u64>() {
-                        return V::deserialize(de::value::U64Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U64Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 } else if TypeId::of::<V>() == TypeId::of::<u32>() {
                     if let Ok(int_val) = v.parse::<u32>() {
-                        return V::deserialize(de::value::U32Deserializer::new(int_val))
-                            .map(|value| Element {
+                        return V::deserialize(de::value::U32Deserializer::new(int_val)).map(
+                            |value| Element {
                                 id: None,
                                 extension: None,
                                 value: Some(value),
-                            })
-;
+                            },
+                        );
                     }
                 }
 
                 // Fall back to normal string deserialization
-                V::deserialize(de::value::BorrowedStrDeserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::BorrowedStrDeserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_bytes<Er>(self, v: &[u8]) -> Result<Self::Value, Er>
             where
                 Er: de::Error,
             {
-                V::deserialize(de::value::BytesDeserializer::new(v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::BytesDeserializer::new(v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
             fn visit_byte_buf<Er>(self, v: Vec<u8>) -> Result<Self::Value, Er>
             where
                 Er: de::Error,
             {
                 // Use BytesDeserializer with a slice reference &v
-                V::deserialize(de::value::BytesDeserializer::new(&v))
-                    .map(|value| Element {
-                        id: None,
-                        extension: None,
-                        value: Some(value),
-                    })
+                V::deserialize(de::value::BytesDeserializer::new(&v)).map(|value| Element {
+                    id: None,
+                    extension: None,
+                    value: Some(value),
+                })
             }
 
             // Handle null
@@ -1735,8 +1726,8 @@ impl IntoEvaluationResult for FhirResource {
             FhirResource::R5(r) => (*r).to_evaluation_result(), // Call impl on inner Box<r5::Resource>
             #[cfg(feature = "R6")]
             FhirResource::R6(r) => (*r).to_evaluation_result(), // Call impl on inner Box<r6::Resource>
-                                                                  // Note: If no features are enabled, this match might be empty or non-exhaustive.
-                                                                  // This is generally okay as the enum itself wouldn't be usable.
+                                                                // Note: If no features are enabled, this match might be empty or non-exhaustive.
+                                                                // This is generally okay as the enum itself wouldn't be usable.
         }
     }
 }

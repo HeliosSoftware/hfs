@@ -16,25 +16,24 @@ use helios_fhir::ParameterValueAccessor;
 /// VersionIndependentParameters from the helios_fhir crate.
 pub type FhirPathParameters = helios_fhir::VersionIndependentParameters;
 
-
 /// Individual parameter in the Parameters resource
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Parameter {
     /// Name of the parameter
     pub name: String,
-    
+
     /// String value (for simple parameters)
     #[serde(rename = "valueString", skip_serializing_if = "Option::is_none")]
     pub value_string: Option<String>,
-    
+
     /// Boolean value
     #[serde(rename = "valueBoolean", skip_serializing_if = "Option::is_none")]
     pub value_boolean: Option<bool>,
-    
+
     /// Resource value
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<Value>,
-    
+
     /// Multi-part parameters (for variables)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<Vec<ParameterPart>>,
@@ -45,11 +44,11 @@ pub struct Parameter {
 pub struct ParameterPart {
     /// Name of the part
     pub name: String,
-    
+
     /// String value
     #[serde(rename = "valueString", skip_serializing_if = "Option::is_none")]
     pub value_string: Option<String>,
-    
+
     /// Any other value type
     #[serde(flatten)]
     pub value: Option<Value>,
@@ -60,19 +59,19 @@ pub struct ParameterPart {
 pub struct ExtractedParameters {
     /// The context expression to execute first
     pub context: Option<String>,
-    
+
     /// The FHIRPath expression to execute
     pub expression: Option<String>,
-    
+
     /// Whether to validate the expression
     pub validate: bool,
-    
+
     /// Variables to pass to the expression
     pub variables: Vec<Variable>,
-    
+
     /// The resource to execute against
     pub resource: Option<Value>,
-    
+
     /// Terminology server URL
     pub terminology_server: Option<String>,
 }
@@ -82,7 +81,7 @@ pub struct ExtractedParameters {
 pub struct Variable {
     /// Variable name
     pub name: String,
-    
+
     /// Variable value
     pub value: Value,
 }
@@ -92,15 +91,15 @@ pub struct Variable {
 pub struct ResultPart {
     /// Name of the part (data type or "trace")
     pub name: String,
-    
+
     /// String value for context path
     #[serde(rename = "valueString", skip_serializing_if = "Option::is_none")]
     pub value_string: Option<String>,
-    
+
     /// Parts for complex results
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part: Option<Vec<ResultValue>>,
-    
+
     /// Extension for non-representable values
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
@@ -111,35 +110,35 @@ pub struct ResultPart {
 pub struct ResultValue {
     /// Name (data type)
     pub name: String,
-    
+
     /// Various value types
     #[serde(rename = "valueString", skip_serializing_if = "Option::is_none")]
     pub value_string: Option<String>,
-    
+
     #[serde(rename = "valueBoolean", skip_serializing_if = "Option::is_none")]
     pub value_boolean: Option<bool>,
-    
+
     #[serde(rename = "valueInteger", skip_serializing_if = "Option::is_none")]
     pub value_integer: Option<i64>,
-    
+
     #[serde(rename = "valueDecimal", skip_serializing_if = "Option::is_none")]
     pub value_decimal: Option<f64>,
-    
+
     #[serde(rename = "valueDate", skip_serializing_if = "Option::is_none")]
     pub value_date: Option<String>,
-    
+
     #[serde(rename = "valueDateTime", skip_serializing_if = "Option::is_none")]
     pub value_date_time: Option<String>,
-    
+
     #[serde(rename = "valueTime", skip_serializing_if = "Option::is_none")]
     pub value_time: Option<String>,
-    
+
     #[serde(rename = "valueQuantity", skip_serializing_if = "Option::is_none")]
     pub value_quantity: Option<Value>,
-    
+
     #[serde(rename = "valueHumanName", skip_serializing_if = "Option::is_none")]
     pub value_human_name: Option<Value>,
-    
+
     /// Extension for JSON representation of complex values
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extension: Option<Vec<Extension>>,
@@ -150,7 +149,7 @@ pub struct ResultValue {
 pub struct Extension {
     /// Extension URL
     pub url: String,
-    
+
     /// String value containing JSON
     #[serde(rename = "valueString")]
     pub value_string: String,
@@ -167,7 +166,7 @@ pub fn create_json_extension(value: &Value) -> Extension {
 /// Extract parameters from the input Parameters resource
 pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParameters, String> {
     let mut extracted = ExtractedParameters::default();
-    
+
     // Process parameters based on version
     match params {
         #[cfg(feature = "R4")]
@@ -187,15 +186,15 @@ pub fn extract_parameters(params: FhirPathParameters) -> Result<ExtractedParamet
             extract_parameters_from_r6(parameters, &mut extracted)?;
         }
     }
-    
+
     if extracted.expression.is_none() {
         return Err("Missing required parameter: expression".to_string());
     }
-    
+
     if extracted.resource.is_none() {
         return Err("Missing required parameter: resource".to_string());
     }
-    
+
     Ok(extracted)
 }
 
@@ -204,7 +203,6 @@ fn extract_parameters_from_r4(
     parameters: helios_fhir::r4::Parameters,
     extracted: &mut ExtractedParameters,
 ) -> Result<(), String> {
-    
     for param in parameters.parameter.unwrap_or_default() {
         process_parameter_r4(&param, extracted)?;
     }
@@ -217,20 +215,26 @@ fn process_parameter_r4(
     extracted: &mut ExtractedParameters,
 ) -> Result<(), String> {
     let name = param.name.value.as_deref().unwrap_or("");
-    
+
     match name {
         "context" => {
-            extracted.context = param.value.as_ref()
+            extracted.context = param
+                .value
+                .as_ref()
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_string());
         }
         "expression" => {
-            extracted.expression = param.value.as_ref()
+            extracted.expression = param
+                .value
+                .as_ref()
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_string());
         }
         "validate" => {
-            extracted.validate = param.value.as_ref()
+            extracted.validate = param
+                .value
+                .as_ref()
                 .and_then(|v| v.as_boolean())
                 .unwrap_or(false);
         }
@@ -244,7 +248,7 @@ fn process_parameter_r4(
                         } else {
                             Value::Null
                         };
-                        
+
                         extracted.variables.push(Variable {
                             name: name.to_string(),
                             value,
@@ -254,11 +258,15 @@ fn process_parameter_r4(
             }
         }
         "resource" => {
-            extracted.resource = param.resource.as_ref()
+            extracted.resource = param
+                .resource
+                .as_ref()
                 .and_then(|r| serde_json::to_value(r).ok());
         }
         "terminologyServer" => {
-            extracted.terminology_server = param.value.as_ref()
+            extracted.terminology_server = param
+                .value
+                .as_ref()
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_string());
         }
@@ -266,7 +274,7 @@ fn process_parameter_r4(
             // Ignore unknown parameters
         }
     }
-    
+
     Ok(())
 }
 
@@ -275,15 +283,18 @@ fn parameter_value_to_json_r4(value: &helios_fhir::r4::ParametersParameterValue)
     // Convert FHIR parameter value to JSON
     // This is a simplified conversion - in production, you'd handle all value types
     match value {
-        helios_fhir::r4::ParametersParameterValue::String(s) => {
-            s.value.as_ref().map(|v| Value::String(v.clone())).unwrap_or(Value::Null)
-        },
+        helios_fhir::r4::ParametersParameterValue::String(s) => s
+            .value
+            .as_ref()
+            .map(|v| Value::String(v.clone()))
+            .unwrap_or(Value::Null),
         helios_fhir::r4::ParametersParameterValue::Boolean(b) => {
             b.value.map(Value::Bool).unwrap_or(Value::Null)
-        },
-        helios_fhir::r4::ParametersParameterValue::Integer(i) => {
-            i.value.map(|v| Value::Number(serde_json::Number::from(v))).unwrap_or(Value::Null)
         }
+        helios_fhir::r4::ParametersParameterValue::Integer(i) => i
+            .value
+            .map(|v| Value::Number(serde_json::Number::from(v)))
+            .unwrap_or(Value::Null),
         helios_fhir::r4::ParametersParameterValue::Decimal(d) => {
             serde_json::to_value(d).unwrap_or(Value::Null)
         }
@@ -303,29 +314,39 @@ fn extract_parameters_from_r4b(
     // For brevity, this follows the same pattern as R4
     for param in parameters.parameter.unwrap_or_default() {
         let name = param.name.value.as_deref().unwrap_or("");
-        
+
         match name {
             "context" => {
-                extracted.context = param.value.as_ref()
+                extracted.context = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "expression" => {
-                extracted.expression = param.value.as_ref()
+                extracted.expression = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "validate" => {
-                extracted.validate = param.value.as_ref()
+                extracted.validate = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_boolean())
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param.resource.as_ref()
+                extracted.resource = param
+                    .resource
+                    .as_ref()
                     .and_then(|r| serde_json::to_value(r).ok());
             }
             "terminologyServer" => {
-                extracted.terminology_server = param.value.as_ref()
+                extracted.terminology_server = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
@@ -344,29 +365,39 @@ fn extract_parameters_from_r5(
     // Similar implementation for R5
     for param in parameters.parameter.unwrap_or_default() {
         let name = param.name.value.as_deref().unwrap_or("");
-        
+
         match name {
             "context" => {
-                extracted.context = param.value.as_ref()
+                extracted.context = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "expression" => {
-                extracted.expression = param.value.as_ref()
+                extracted.expression = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "validate" => {
-                extracted.validate = param.value.as_ref()
+                extracted.validate = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_boolean())
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param.resource.as_ref()
+                extracted.resource = param
+                    .resource
+                    .as_ref()
                     .and_then(|r| serde_json::to_value(r).ok());
             }
             "terminologyServer" => {
-                extracted.terminology_server = param.value.as_ref()
+                extracted.terminology_server = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
@@ -385,29 +416,39 @@ fn extract_parameters_from_r6(
     // Similar implementation for R6
     for param in parameters.parameter.unwrap_or_default() {
         let name = param.name.value.as_deref().unwrap_or("");
-        
+
         match name {
             "context" => {
-                extracted.context = param.value.as_ref()
+                extracted.context = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "expression" => {
-                extracted.expression = param.value.as_ref()
+                extracted.expression = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }
             "validate" => {
-                extracted.validate = param.value.as_ref()
+                extracted.validate = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_boolean())
                     .unwrap_or(false);
             }
             "resource" => {
-                extracted.resource = param.resource.as_ref()
+                extracted.resource = param
+                    .resource
+                    .as_ref()
                     .and_then(|r| serde_json::to_value(r).ok());
             }
             "terminologyServer" => {
-                extracted.terminology_server = param.value.as_ref()
+                extracted.terminology_server = param
+                    .value
+                    .as_ref()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_string());
             }

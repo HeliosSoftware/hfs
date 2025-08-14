@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 

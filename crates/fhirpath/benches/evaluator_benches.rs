@@ -1,6 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use helios_fhirpath::{evaluate_expression, EvaluationContext};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use helios_fhir::FhirResource;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use serde_json::json;
 
 fn create_simple_patient() -> FhirResource {
@@ -28,7 +28,7 @@ fn create_simple_patient() -> FhirResource {
             }
         ]
     });
-    
+
     #[cfg(feature = "R4")]
     {
         let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
@@ -86,7 +86,7 @@ fn create_complex_patient() -> FhirResource {
             }
         ]
     });
-    
+
     #[cfg(feature = "R4")]
     {
         let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
@@ -143,7 +143,7 @@ fn create_observation() -> FhirResource {
             }
         ]
     });
-    
+
     #[cfg(feature = "R4")]
     {
         let resource: helios_fhir::r4::Resource = serde_json::from_value(obs_json).unwrap();
@@ -157,31 +157,23 @@ fn bench_simple_navigation(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/navigation");
     let patient = create_simple_patient();
     let context = EvaluationContext::new(vec![patient]);
-    
+
     group.bench_function("single_field", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.active"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.active"), &context))
     });
-    
+
     group.bench_function("nested_field", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.family"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.family"), &context))
     });
-    
+
     group.bench_function("deep_nested", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.given.first()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.given.first()"), &context))
     });
-    
+
     group.bench_function("indexed_access", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name[0].given[1]"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name[0].given[1]"), &context))
     });
-    
+
     group.finish();
 }
 
@@ -189,46 +181,46 @@ fn bench_collection_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/collections");
     let patient = create_complex_patient();
     let context = EvaluationContext::new(vec![patient]);
-    
+
     group.bench_function("where_simple", |b| {
         b.iter(|| {
-            evaluate_expression(black_box("Patient.telecom.where(system = 'email')"), &context)
-        })
-    });
-    
-    group.bench_function("where_complex", |b| {
-        b.iter(|| {
             evaluate_expression(
-                black_box("Patient.telecom.where(system = 'phone' and use = 'mobile')"), 
-                &context
+                black_box("Patient.telecom.where(system = 'email')"),
+                &context,
             )
         })
     });
-    
-    group.bench_function("select", |b| {
+
+    group.bench_function("where_complex", |b| {
         b.iter(|| {
-            evaluate_expression(black_box("Patient.name.select(given.first())"), &context)
+            evaluate_expression(
+                black_box("Patient.telecom.where(system = 'phone' and use = 'mobile')"),
+                &context,
+            )
         })
     });
-    
+
+    group.bench_function("select", |b| {
+        b.iter(|| evaluate_expression(black_box("Patient.name.select(given.first())"), &context))
+    });
+
     group.bench_function("exists", |b| {
         b.iter(|| {
-            evaluate_expression(black_box("Patient.telecom.where(system = 'email').exists()"), &context)
+            evaluate_expression(
+                black_box("Patient.telecom.where(system = 'email').exists()"),
+                &context,
+            )
         })
     });
-    
+
     group.bench_function("count", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.telecom.count()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.telecom.count()"), &context))
     });
-    
+
     group.bench_function("distinct", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.given.distinct()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.given.distinct()"), &context))
     });
-    
+
     group.finish();
 }
 
@@ -236,37 +228,32 @@ fn bench_string_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/strings");
     let patient = create_simple_patient();
     let context = EvaluationContext::new(vec![patient]);
-    
+
     group.bench_function("string_concat", |b| {
         b.iter(|| {
-            evaluate_expression(black_box("Patient.name.given.first() + ' ' + Patient.name.family"), &context)
+            evaluate_expression(
+                black_box("Patient.name.given.first() + ' ' + Patient.name.family"),
+                &context,
+            )
         })
     });
-    
+
     group.bench_function("upper", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.family.upper()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.family.upper()"), &context))
     });
-    
+
     group.bench_function("substring", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.family.substring(0, 3)"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.family.substring(0, 3)"), &context))
     });
-    
+
     group.bench_function("matches", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.family.matches('^Ch')"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.family.matches('^Ch')"), &context))
     });
-    
+
     group.bench_function("replace", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.name.family.replace('a', 'A')"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.name.family.replace('a', 'A')"), &context))
     });
-    
+
     group.finish();
 }
 
@@ -274,31 +261,28 @@ fn bench_type_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/types");
     let obs = create_observation();
     let context = EvaluationContext::new(vec![obs]);
-    
+
     group.bench_function("is_type", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Observation.is(Observation)"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Observation.is(Observation)"), &context))
     });
-    
+
     group.bench_function("ofType", |b| {
         b.iter(|| {
-            evaluate_expression(black_box("Observation.component.value.ofType(Quantity)"), &context)
+            evaluate_expression(
+                black_box("Observation.component.value.ofType(Quantity)"),
+                &context,
+            )
         })
     });
-    
+
     group.bench_function("as_type", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Observation.as(DomainResource)"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Observation.as(DomainResource)"), &context))
     });
-    
+
     group.bench_function("type_reflection", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Observation.type()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Observation.type()"), &context))
     });
-    
+
     group.finish();
 }
 
@@ -306,31 +290,23 @@ fn bench_date_time_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/datetime");
     let patient = create_simple_patient();
     let context = EvaluationContext::new(vec![patient]);
-    
+
     group.bench_function("date_comparison", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.birthDate > @1970-01-01"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.birthDate > @1970-01-01"), &context))
     });
-    
+
     group.bench_function("today", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("today()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("today()"), &context))
     });
-    
+
     group.bench_function("now", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("now()"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("now()"), &context))
     });
-    
+
     group.bench_function("date_arithmetic", |b| {
-        b.iter(|| {
-            evaluate_expression(black_box("Patient.birthDate + 1 year"), &context)
-        })
+        b.iter(|| evaluate_expression(black_box("Patient.birthDate + 1 year"), &context))
     });
-    
+
     group.finish();
 }
 
@@ -338,76 +314,78 @@ fn bench_extension_access(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/extensions");
     let patient = create_complex_patient();
     let context = EvaluationContext::new(vec![patient]);
-    
+
     group.bench_function("extension_by_url", |b| {
         b.iter(|| {
             evaluate_expression(
-                black_box("Patient.extension('http://example.org/birthPlace')"), 
-                &context
+                black_box("Patient.extension('http://example.org/birthPlace')"),
+                &context,
             )
         })
     });
-    
+
     group.bench_function("extension_value", |b| {
         b.iter(|| {
             evaluate_expression(
-                black_box("Patient.extension('http://example.org/birthPlace').value"), 
-                &context
+                black_box("Patient.extension('http://example.org/birthPlace').value"),
+                &context,
             )
         })
     });
-    
+
     group.bench_function("extension_typed_value", |b| {
         b.iter(|| {
             evaluate_expression(
-                black_box("Patient.extension('http://example.org/birthPlace').value.ofType(Address).city"), 
-                &context
+                black_box(
+                    "Patient.extension('http://example.org/birthPlace').value.ofType(Address).city",
+                ),
+                &context,
             )
         })
     });
-    
+
     group.finish();
 }
 
 fn bench_complex_expressions(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluator/complex");
-    
+
     group.bench_function("complex_filter_select", |b| {
         let patient = create_complex_patient();
         let patient_context = EvaluationContext::new(vec![patient]);
-        
+
         b.iter(|| {
             evaluate_expression(
-                black_box("Patient.name.where(use = 'official').given.select($this + ' ')"), 
-                &patient_context
+                black_box("Patient.name.where(use = 'official').given.select($this + ' ')"),
+                &patient_context,
             )
         })
     });
-    
+
     group.bench_function("quantity_comparison", |b| {
         let obs = create_observation();
         let obs_context = EvaluationContext::new(vec![obs]);
-        
+
         b.iter(|| {
             evaluate_expression(
-                black_box("Observation.component.where(value.ofType(Quantity).value > 100)"), 
-                &obs_context
+                black_box("Observation.component.where(value.ofType(Quantity).value > 100)"),
+                &obs_context,
             )
         })
     });
-    
+
     group.bench_function("union_operation", |b| {
         let patient = create_complex_patient();
         let patient_context = EvaluationContext::new(vec![patient]);
-        
+
         b.iter(|| {
             evaluate_expression(
-                black_box("Patient.name.given | Patient.name.family"), 
-                &patient_context
+                black_box("Patient.name.given | Patient.name.family"),
+                &patient_context,
             )
         })
     });
-    
+
     group.finish();
 }
 

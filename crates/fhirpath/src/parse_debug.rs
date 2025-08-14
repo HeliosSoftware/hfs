@@ -4,9 +4,9 @@
 //! into the JSON format expected by fhirpath-lab and other tools. The format includes
 //! expression types, names, arguments, and optional return type information.
 
-use crate::parser::{Expression, Term, Invocation, Literal, TypeSpecifier};
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use crate::type_inference::{TypeContext, infer_expression_type};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Convert a FHIRPath expression AST to a JSON debug tree
 ///
@@ -25,31 +25,31 @@ pub fn expression_to_debug_tree(expr: &Expression, context: &TypeContext) -> Val
 
 fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> Value {
     // Get the inferred type for this expression
-    let return_type = infer_expression_type(expr, context)
-        .map(|t| t.to_display_string());
-    
+    let return_type = infer_expression_type(expr, context).map(|t| t.to_display_string());
+
     let mut node = match expr {
         Expression::Term(term) => term_to_debug_tree(term, context),
-        
+
         Expression::Invocation(base_expr, invocation) => {
             // For invocations, we need to handle the structure differently
             // The invocation is the main node, and the base expression is its first argument
             let mut inv_node = invocation_to_debug_tree(invocation, context);
-            
+
             // Get existing arguments or create empty array
-            let mut args = inv_node.get("Arguments")
+            let mut args = inv_node
+                .get("Arguments")
                 .and_then(|a| a.as_array())
                 .cloned()
                 .unwrap_or_default();
-            
+
             // Insert the base expression as the first argument (implicit "that")
             let base_node = expression_to_debug_tree_inner(base_expr, context);
             args.insert(0, base_node);
-            
+
             inv_node["Arguments"] = json!(args);
             inv_node
         }
-        
+
         Expression::Indexer(expr, index) => {
             json!({
                 "ExpressionType": "IndexerExpression",
@@ -60,7 +60,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Polarity(op, expr) => {
             json!({
                 "ExpressionType": "UnaryExpression",
@@ -68,12 +68,12 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 "Arguments": vec![expression_to_debug_tree_inner(expr, context)]
             })
         }
-        
-        Expression::Multiplicative(left, op, right) |
-        Expression::Additive(left, op, right) |
-        Expression::Inequality(left, op, right) |
-        Expression::Equality(left, op, right) |
-        Expression::Membership(left, op, right) => {
+
+        Expression::Multiplicative(left, op, right)
+        | Expression::Additive(left, op, right)
+        | Expression::Inequality(left, op, right)
+        | Expression::Equality(left, op, right)
+        | Expression::Membership(left, op, right) => {
             json!({
                 "ExpressionType": "BinaryExpression",
                 "Name": op,
@@ -83,7 +83,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Type(expr, op, type_spec) => {
             json!({
                 "ExpressionType": "TypeExpression",
@@ -94,7 +94,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Union(left, right) => {
             json!({
                 "ExpressionType": "BinaryExpression",
@@ -105,7 +105,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::And(left, right) => {
             json!({
                 "ExpressionType": "BinaryExpression",
@@ -116,7 +116,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Or(left, op, right) => {
             json!({
                 "ExpressionType": "BinaryExpression",
@@ -127,7 +127,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Implies(left, right) => {
             json!({
                 "ExpressionType": "BinaryExpression",
@@ -138,7 +138,7 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
                 ]
             })
         }
-        
+
         Expression::Lambda(param, expr) => {
             let mut node = json!({
                 "ExpressionType": "LambdaExpression",
@@ -151,24 +151,24 @@ fn expression_to_debug_tree_inner(expr: &Expression, context: &TypeContext) -> V
             node
         }
     };
-    
+
     // Add return type if available
     if let Some(rt) = return_type {
         node["ReturnType"] = json!(rt);
     }
-    
+
     node
 }
 
 fn term_to_debug_tree(term: &Term, context: &TypeContext) -> Value {
     match term {
         Term::Literal(lit) => literal_to_debug_tree(lit),
-        
+
         Term::Invocation(invocation) => {
             // For a standalone invocation (e.g., at the start of an expression),
             // we need to add an implicit "builtin.that" as the context
             let mut inv_node = invocation_to_debug_tree(invocation, context);
-            
+
             // Add implicit "that" context as first argument for member access
             if matches!(invocation, Invocation::Member(_)) {
                 let that_node = json!({
@@ -178,31 +178,31 @@ fn term_to_debug_tree(term: &Term, context: &TypeContext) -> Value {
                         .map(|t| t.to_display_string())
                         .unwrap_or_else(|| "Any".to_string())
                 });
-                
+
                 let mut args = vec![that_node];
                 if let Some(existing_args) = inv_node.get("Arguments").and_then(|a| a.as_array()) {
                     args.extend(existing_args.clone());
                 }
                 inv_node["Arguments"] = json!(args);
             }
-            
+
             inv_node
         }
-        
+
         Term::ExternalConstant(name) => {
             let mut node = json!({
                 "ExpressionType": "VariableRefExpression",
                 "Name": name
             });
-            
+
             // Add type if variable is known
             if let Some(var_type) = context.variables.get(name) {
                 node["ReturnType"] = json!(var_type.to_display_string());
             }
-            
+
             node
         }
-        
+
         Term::Parenthesized(expr) => expression_to_debug_tree_inner(expr, context),
     }
 }
@@ -216,7 +216,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "null"
             })
         }
-        
+
         Literal::Boolean(b) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -224,7 +224,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.Boolean"
             })
         }
-        
+
         Literal::String(s) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -232,7 +232,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.String"
             })
         }
-        
+
         Literal::Number(n) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -240,7 +240,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.Decimal"
             })
         }
-        
+
         Literal::Integer(i) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -248,7 +248,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.Integer"
             })
         }
-        
+
         Literal::Date(d) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -256,7 +256,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.Date"
             })
         }
-        
+
         Literal::DateTime(date, time_opt) => {
             let value = match time_opt {
                 Some((time, tz_opt)) => match tz_opt {
@@ -271,7 +271,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.DateTime"
             })
         }
-        
+
         Literal::Time(t) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -279,7 +279,7 @@ fn literal_to_debug_tree(literal: &Literal) -> Value {
                 "ReturnType": "system.Time"
             })
         }
-        
+
         Literal::Quantity(value, unit) => {
             json!({
                 "ExpressionType": "ConstantExpression",
@@ -297,18 +297,20 @@ fn invocation_to_debug_tree(invocation: &Invocation, context: &TypeContext) -> V
                 "ExpressionType": "FunctionCallExpression",
                 "Name": name
             });
-            
+
             if !args.is_empty() {
-                node["Arguments"] = json!(args.iter()
-                    .map(|arg| expression_to_debug_tree_inner(arg, context))
-                    .collect::<Vec<_>>());
+                node["Arguments"] = json!(
+                    args.iter()
+                        .map(|arg| expression_to_debug_tree_inner(arg, context))
+                        .collect::<Vec<_>>()
+                );
             } else {
                 node["Arguments"] = json!([]);
             }
-            
+
             node
         }
-        
+
         Invocation::Member(name) => {
             json!({
                 "ExpressionType": "ChildExpression",
@@ -316,21 +318,21 @@ fn invocation_to_debug_tree(invocation: &Invocation, context: &TypeContext) -> V
                 "Arguments": []
             })
         }
-        
+
         Invocation::This => {
             json!({
                 "ExpressionType": "AxisExpression",
                 "Name": "builtin.this"
             })
         }
-        
+
         Invocation::Index => {
             json!({
                 "ExpressionType": "AxisExpression",
                 "Name": "builtin.index"
             })
         }
-        
+
         Invocation::Total => {
             json!({
                 "ExpressionType": "AxisExpression",
@@ -366,77 +368,75 @@ pub fn generate_parse_debug(expr: &Expression) -> String {
 
 fn generate_parse_debug_inner(expr: &Expression, output: &mut String, indent: usize) {
     let indent_str = "  ".repeat(indent);
-    
+
     match expr {
-        Expression::Term(term) => {
-            match term {
-                Term::Literal(lit) => output.push_str(&format!("{}{:?}\n", indent_str, lit)),
-                Term::Invocation(inv) => output.push_str(&format!("{}{:?}\n", indent_str, inv)),
-                Term::ExternalConstant(name) => output.push_str(&format!("{}%{}\n", indent_str, name)),
-                Term::Parenthesized(expr) => {
-                    output.push_str(&format!("{}(\n", indent_str));
-                    generate_parse_debug_inner(expr, output, indent + 1);
-                    output.push_str(&format!("{})\n", indent_str));
-                }
+        Expression::Term(term) => match term {
+            Term::Literal(lit) => output.push_str(&format!("{}{:?}\n", indent_str, lit)),
+            Term::Invocation(inv) => output.push_str(&format!("{}{:?}\n", indent_str, inv)),
+            Term::ExternalConstant(name) => output.push_str(&format!("{}%{}\n", indent_str, name)),
+            Term::Parenthesized(expr) => {
+                output.push_str(&format!("{}(\n", indent_str));
+                generate_parse_debug_inner(expr, output, indent + 1);
+                output.push_str(&format!("{})\n", indent_str));
             }
-        }
-        
+        },
+
         Expression::Invocation(expr, inv) => {
             generate_parse_debug_inner(expr, output, indent);
             output.push_str(&format!("{}.{:?}\n", indent_str, inv));
         }
-        
+
         Expression::Indexer(expr, index) => {
             generate_parse_debug_inner(expr, output, indent);
             output.push_str(&format!("{}[\n", indent_str));
             generate_parse_debug_inner(index, output, indent + 1);
             output.push_str(&format!("{}]\n", indent_str));
         }
-        
+
         Expression::Polarity(op, expr) => {
             output.push_str(&format!("{}{}\n", indent_str, op));
             generate_parse_debug_inner(expr, output, indent + 1);
         }
-        
-        Expression::Multiplicative(left, op, right) |
-        Expression::Additive(left, op, right) |
-        Expression::Inequality(left, op, right) |
-        Expression::Equality(left, op, right) |
-        Expression::Membership(left, op, right) => {
+
+        Expression::Multiplicative(left, op, right)
+        | Expression::Additive(left, op, right)
+        | Expression::Inequality(left, op, right)
+        | Expression::Equality(left, op, right)
+        | Expression::Membership(left, op, right) => {
             generate_parse_debug_inner(left, output, indent);
             output.push_str(&format!("{}{}\n", indent_str, op));
             generate_parse_debug_inner(right, output, indent + 1);
         }
-        
+
         Expression::Type(expr, op, type_spec) => {
             generate_parse_debug_inner(expr, output, indent);
             output.push_str(&format!("{}{} {:?}\n", indent_str, op, type_spec));
         }
-        
+
         Expression::Union(left, right) => {
             generate_parse_debug_inner(left, output, indent);
             output.push_str(&format!("{}|\n", indent_str));
             generate_parse_debug_inner(right, output, indent + 1);
         }
-        
+
         Expression::And(left, right) => {
             generate_parse_debug_inner(left, output, indent);
             output.push_str(&format!("{}and\n", indent_str));
             generate_parse_debug_inner(right, output, indent + 1);
         }
-        
+
         Expression::Or(left, op, right) => {
             generate_parse_debug_inner(left, output, indent);
             output.push_str(&format!("{}{}\n", indent_str, op));
             generate_parse_debug_inner(right, output, indent + 1);
         }
-        
+
         Expression::Implies(left, right) => {
             generate_parse_debug_inner(left, output, indent);
             output.push_str(&format!("{}implies\n", indent_str));
             generate_parse_debug_inner(right, output, indent + 1);
         }
-        
+
         Expression::Lambda(param, expr) => {
             if let Some(p) = param {
                 output.push_str(&format!("{}{} =>\n", indent_str, p));

@@ -266,7 +266,7 @@ fn last_day_of_month(year: i32, month: u32) -> Option<u32> {
     // Create the first day of the next month, then subtract one day
     let next_month = if month == 12 { 1 } else { month + 1 };
     let next_year = if month == 12 { year + 1 } else { year };
-    
+
     if let Some(first_of_next) = NaiveDate::from_ymd_opt(next_year, next_month, 1) {
         let last_of_current = first_of_next.pred_opt()?;
         Some(last_of_current.day())
@@ -281,10 +281,10 @@ fn calculate_datetime_low_boundary(datetime_str: &str) -> EvaluationResult {
     if let Some(t_pos) = datetime_str.find('T') {
         let date_part = &datetime_str[..t_pos];
         let time_part = &datetime_str[t_pos + 1..];
-        
+
         // Get timezone info if present
         let (time_only, _timezone) = extract_timezone(time_part);
-        
+
         // Determine precision based on time format
         let low_time = match time_only.len() {
             2 => format!("{}:00:00.000", time_only), // HH -> HH:00:00.000
@@ -292,15 +292,15 @@ fn calculate_datetime_low_boundary(datetime_str: &str) -> EvaluationResult {
             8 => format!("{}.000", time_only),       // HH:MM:SS -> HH:MM:SS.000
             _ => time_only.to_string(),              // Already precise or unknown format
         };
-        
+
         // Combine with date boundary and use the earliest timezone (+14:00 for low boundary)
         let low_date = match calculate_date_low_boundary(date_part) {
             EvaluationResult::Date(d, _) => d,
             _ => date_part.to_string(),
         };
-        
+
         let result_str = format!("{}T{}+14:00", low_date, low_time);
-        
+
         EvaluationResult::datetime(result_str)
     } else {
         // No time part, treat as date-only but convert to datetime with earliest timezone
@@ -318,10 +318,10 @@ fn calculate_datetime_high_boundary(datetime_str: &str) -> EvaluationResult {
     if let Some(t_pos) = datetime_str.find('T') {
         let date_part = &datetime_str[..t_pos];
         let time_part = &datetime_str[t_pos + 1..];
-        
+
         // Get timezone info if present
         let (time_only, _timezone) = extract_timezone(time_part);
-        
+
         // Determine precision based on time format
         let high_time = match time_only.len() {
             2 => format!("{}:59:59.999", time_only), // HH -> HH:59:59.999
@@ -329,15 +329,15 @@ fn calculate_datetime_high_boundary(datetime_str: &str) -> EvaluationResult {
             8 => format!("{}.999", time_only),       // HH:MM:SS -> HH:MM:SS.999
             _ => time_only.to_string(),              // Already precise or unknown format
         };
-        
+
         // Combine with date boundary and use the latest timezone (-12:00 for high boundary)
         let high_date = match calculate_date_high_boundary(date_part) {
             EvaluationResult::Date(d, _) => d,
             _ => date_part.to_string(),
         };
-        
+
         let result_str = format!("{}T{}-12:00", high_date, high_time);
-        
+
         EvaluationResult::datetime(result_str)
     } else {
         // No time part, treat as date-only but convert to datetime with latest timezone
@@ -358,7 +358,8 @@ fn extract_timezone(time_str: &str) -> (&str, &str) {
         (&time_str[..plus_pos], &time_str[plus_pos..])
     } else if let Some(minus_pos) = time_str.rfind('-') {
         // Make sure this is actually a timezone offset, not part of the date
-        if minus_pos > 2 { // Avoid confusion with time like "12:34-05:00"
+        if minus_pos > 2 {
+            // Avoid confusion with time like "12:34-05:00"
             (&time_str[..minus_pos], &time_str[minus_pos..])
         } else {
             (time_str, "")
@@ -420,13 +421,17 @@ fn looks_like_date(s: &str) -> bool {
         s.chars().all(|c| c.is_ascii_digit())
     } else if s.len() == 7 {
         // YYYY-MM
-        s.chars().enumerate().all(|(i, c)| {
-            if i == 4 { c == '-' } else { c.is_ascii_digit() }
-        })
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| if i == 4 { c == '-' } else { c.is_ascii_digit() })
     } else if s.len() == 10 {
         // YYYY-MM-DD
         s.chars().enumerate().all(|(i, c)| {
-            if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() }
+            if i == 4 || i == 7 {
+                c == '-'
+            } else {
+                c.is_ascii_digit()
+            }
         })
     } else {
         false
@@ -446,13 +451,17 @@ fn looks_like_time(s: &str) -> bool {
         s.chars().all(|c| c.is_ascii_digit())
     } else if s.len() == 5 {
         // HH:MM
-        s.chars().enumerate().all(|(i, c)| {
-            if i == 2 { c == ':' } else { c.is_ascii_digit() }
-        })
+        s.chars()
+            .enumerate()
+            .all(|(i, c)| if i == 2 { c == ':' } else { c.is_ascii_digit() })
     } else if s.len() == 8 {
         // HH:MM:SS
         s.chars().enumerate().all(|(i, c)| {
-            if i == 2 || i == 5 { c == ':' } else { c.is_ascii_digit() }
+            if i == 2 || i == 5 {
+                c == ':'
+            } else {
+                c.is_ascii_digit()
+            }
         })
     } else if s.len() > 8 && s.contains(':') && s.contains('.') {
         // HH:MM:SS.sss (rough check)
@@ -472,7 +481,10 @@ mod tests {
         // Test decimal with precision 1
         let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.0").unwrap());
         let result = low_boundary_function(&decimal_val).unwrap();
-        assert_eq!(result, EvaluationResult::decimal(Decimal::from_str("0.95").unwrap()));
+        assert_eq!(
+            result,
+            EvaluationResult::decimal(Decimal::from_str("0.95").unwrap())
+        );
     }
 
     #[test]
@@ -480,7 +492,10 @@ mod tests {
         // Test decimal with precision 1
         let decimal_val = EvaluationResult::decimal(Decimal::from_str("1.0").unwrap());
         let result = high_boundary_function(&decimal_val).unwrap();
-        assert_eq!(result, EvaluationResult::decimal(Decimal::from_str("1.05").unwrap()));
+        assert_eq!(
+            result,
+            EvaluationResult::decimal(Decimal::from_str("1.05").unwrap())
+        );
     }
 
     #[test]
@@ -518,8 +533,14 @@ mod tests {
     #[test]
     fn test_boundary_empty() {
         let empty = EvaluationResult::Empty;
-        assert_eq!(low_boundary_function(&empty).unwrap(), EvaluationResult::Empty);
-        assert_eq!(high_boundary_function(&empty).unwrap(), EvaluationResult::Empty);
+        assert_eq!(
+            low_boundary_function(&empty).unwrap(),
+            EvaluationResult::Empty
+        );
+        assert_eq!(
+            high_boundary_function(&empty).unwrap(),
+            EvaluationResult::Empty
+        );
     }
 
     #[test]

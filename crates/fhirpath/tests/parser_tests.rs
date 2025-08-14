@@ -188,8 +188,10 @@ fn test_multiple_expressions_from_file() {
     let mut known_failure_count = 0;
 
     // List of expressions known to fail parsing due to spec violations in test data
-    let known_parser_failures = ["@T14:34:28Z.is(Time)",       // Time literals cannot have timezone
-        "@T14:34:28+10:00.is(Time)"];
+    let known_parser_failures = [
+        "@T14:34:28Z.is(Time)", // Time literals cannot have timezone
+        "@T14:34:28+10:00.is(Time)",
+    ];
 
     for expr_str in expressions.iter() {
         if known_parser_failures.contains(&expr_str.as_str()) {
@@ -206,11 +208,7 @@ fn test_multiple_expressions_from_file() {
             success_count += 1;
         } else {
             failure_count += 1;
-            println!(
-                "Failed to parse: '{}', error: {:?}",
-                expr_str,
-                result.err()
-            );
+            println!("Failed to parse: '{}', error: {:?}", expr_str, result.err());
         }
     }
 

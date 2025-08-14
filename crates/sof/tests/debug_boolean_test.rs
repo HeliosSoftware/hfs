@@ -35,7 +35,9 @@ mod tests {
         // Add the boolean constant
         let is_deceased_constant = helios_fhirpath_support::EvaluationResult::Boolean(
             true,
-            Some(helios_fhirpath_support::TypeInfoResult::new("FHIR", "boolean")),
+            Some(helios_fhirpath_support::TypeInfoResult::new(
+                "FHIR", "boolean",
+            )),
         );
         context.set_variable_result("is_deceased", is_deceased_constant);
 

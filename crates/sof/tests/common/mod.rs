@@ -233,7 +233,8 @@ async fn run_view_definition_handler(
                 Some("_since") => {
                     // Check if any value[X] field exists
                     let has_value_field = param
-                        .as_object().is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")));
+                        .as_object()
+                        .is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")));
 
                     // Extract and validate _since from valueInstant or valueDateTime
                     if let Some(value_instant) = param.get("valueInstant").and_then(|v| v.as_str())
@@ -291,27 +292,27 @@ async fn run_view_definition_handler(
         };
 
         resources.retain(|resource| {
-                if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                    match resource_type {
-                        "Patient" => {
-                            if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                                return format!("Patient/{}", id) == normalized_patient_ref;
-                            }
+            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                match resource_type {
+                    "Patient" => {
+                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                            return format!("Patient/{}", id) == normalized_patient_ref;
                         }
-                        "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
-                            if let Some(subject) = resource.get("subject") {
-                                if let Some(reference) =
-                                    subject.get("reference").and_then(|r| r.as_str())
-                                {
-                                    return reference == normalized_patient_ref;
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
+                        if let Some(subject) = resource.get("subject") {
+                            if let Some(reference) =
+                                subject.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == normalized_patient_ref;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                false
-            });
+            }
+            false
+        });
     }
 
     // Apply _since filter if provided
@@ -339,28 +340,27 @@ async fn run_view_definition_handler(
             let since_utc = since_dt.with_timezone(&chrono::Utc);
 
             resources.retain(|resource| {
-                    // Check if resource has meta.lastUpdated field
-                    if let Some(meta) = resource.get("meta") {
-                        if let Some(last_updated) =
-                            meta.get("lastUpdated").and_then(|lu| lu.as_str())
+                // Check if resource has meta.lastUpdated field
+                if let Some(meta) = resource.get("meta") {
+                    if let Some(last_updated) = meta.get("lastUpdated").and_then(|lu| lu.as_str()) {
+                        // Parse the lastUpdated timestamp
+                        if let Ok(resource_updated) =
+                            chrono::DateTime::parse_from_rfc3339(last_updated)
                         {
-                            // Parse the lastUpdated timestamp
-                            if let Ok(resource_updated) =
-                                chrono::DateTime::parse_from_rfc3339(last_updated)
-                            {
-                                // Compare timestamps - keep if resource was updated after _since
-                                return resource_updated.with_timezone(&chrono::Utc) > since_utc;
-                            }
+                            // Compare timestamps - keep if resource was updated after _since
+                            return resource_updated.with_timezone(&chrono::Utc) > since_utc;
                         }
                     }
-                    // If no meta.lastUpdated field, exclude the resource
-                    false
-                });
+                }
+                // If no meta.lastUpdated field, exclude the resource
+                false
+            });
         }
     }
 
     // Parse content type - body format takes precedence
-    let format = format_from_body.as_deref()
+    let format = format_from_body
+        .as_deref()
         .or_else(|| params.get("_format").map(|s| s.as_str()));
     let accept = if format_from_body.is_some() {
         None // Ignore Accept header when body param is present
@@ -407,15 +407,16 @@ async fn run_view_definition_handler(
     };
 
     // Create ViewDefinition and Bundle
-    let view_definition = match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
-        Ok(vd) => SofViewDefinition::R4(vd),
-        Err(e) => {
-            return error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                &format!("Invalid ViewDefinition: {}", e),
-            );
-        }
-    };
+    let view_definition =
+        match serde_json::from_value::<helios_fhir::r4::ViewDefinition>(view_def_json) {
+            Ok(vd) => SofViewDefinition::R4(vd),
+            Err(e) => {
+                return error_response(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    &format!("Invalid ViewDefinition: {}", e),
+                );
+            }
+        };
 
     let bundle_json = serde_json::json!({
         "resourceType": "Bundle",

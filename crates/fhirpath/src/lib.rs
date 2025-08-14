@@ -290,9 +290,9 @@ pub mod type_inference;
 // Modules for CLI and server functionality
 pub mod cli;
 pub mod error;
-pub mod parse_debug;
 pub mod handlers;
 pub mod models;
+pub mod parse_debug;
 pub mod server;
 
 // Public modules needed for the public API

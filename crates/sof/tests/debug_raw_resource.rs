@@ -1,4 +1,3 @@
-
 #[test]
 fn test_raw_fhir_parsing() {
     // Test the raw FHIR parsing to see exactly what structure we get

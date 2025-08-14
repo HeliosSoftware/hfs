@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 
-
 /// FHIR Type Hierarchy module
 ///
 /// This module provides utility functions for FHIR type checking and string manipulation.
@@ -32,18 +31,10 @@ static FHIR_PRIMITIVE_TYPES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     s
 });
 
-
-
-
 /// Checks if a type is a FHIR primitive type
 pub fn is_fhir_primitive_type(type_name: &str) -> bool {
     FHIR_PRIMITIVE_TYPES.contains(type_name.to_lowercase().as_str())
 }
-
-
-
-
-
 
 /// Utility function to capitalize the first letter of a string
 ///
@@ -64,7 +55,3 @@ pub fn capitalize_first_letter(s: &str) -> String {
         }
     }
 }
-
-
-
-

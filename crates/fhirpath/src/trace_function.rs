@@ -154,7 +154,10 @@ pub fn trace_function(
     };
 
     // Store the trace output in the context using RefCell
-    context.trace_outputs.borrow_mut().push((name.to_string(), trace_value));
+    context
+        .trace_outputs
+        .borrow_mut()
+        .push((name.to_string(), trace_value));
 
     // Return the original input collection unchanged
     Ok(invocation_base.clone())

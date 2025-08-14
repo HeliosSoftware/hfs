@@ -363,5 +363,4 @@ mod tests {
             assert_eq!(extensions[1], extension2);
         }
     }
-
 }

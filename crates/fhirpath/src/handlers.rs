@@ -15,7 +15,7 @@ use crate::error::{FhirPathError, FhirPathResult};
 use crate::evaluator::EvaluationContext;
 use crate::models::{ExtractedParameters, FhirPathParameters, extract_parameters};
 use crate::parse_debug::{expression_to_debug_tree, generate_parse_debug};
-use crate::type_inference::{TypeContext, InferredType};
+use crate::type_inference::{InferredType, TypeContext};
 use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
@@ -68,12 +68,14 @@ pub async fn evaluate_fhirpath(
             Ok(parsed) => {
                 // Create a type context with the resource type
                 let mut type_context = TypeContext::new();
-                
+
                 // Try to infer the root resource type from the resource JSON
-                if let Some(resource_type) = resource_json.get("resourceType").and_then(|rt| rt.as_str()) {
+                if let Some(resource_type) =
+                    resource_json.get("resourceType").and_then(|rt| rt.as_str())
+                {
                     type_context = type_context.with_root_type(InferredType::fhir(resource_type));
                 }
-                
+
                 // Add any variables from the context
                 for var in &extracted.variables {
                     // Simple type inference for variables - could be improved
@@ -91,7 +93,7 @@ pub async fn evaluate_fhirpath(
                     };
                     type_context.variables.insert(var.name.clone(), var_type);
                 }
-                
+
                 let debug_tree = expression_to_debug_tree(&parsed, &type_context);
                 let debug_text = generate_parse_debug(&parsed);
                 (Some(debug_tree), Some(debug_text))
@@ -107,7 +109,7 @@ pub async fn evaluate_fhirpath(
 
     // Prepare results collection
     let mut results = Vec::new();
-    
+
     // Clear any previous trace outputs
     context.clear_trace_outputs();
 
@@ -126,8 +128,11 @@ pub async fn evaluate_fhirpath(
         let parsed_expr = match crate::parser::parser().parse(expression.as_str()) {
             Ok(parsed) => parsed,
             Err(e) => {
-                return create_error_response(&expression, &extracted, 
-                    format!("Parse error: {:?}", e));
+                return create_error_response(
+                    &expression,
+                    &extracted,
+                    format!("Parse error: {:?}", e),
+                );
             }
         };
 
@@ -140,14 +145,18 @@ pub async fn evaluate_fhirpath(
         for (context_index, context_value) in context_items.into_iter().enumerate() {
             // Clear trace outputs before each evaluation
             context.clear_trace_outputs();
-            
+
             // Evaluate expression with context value as current item
             match crate::evaluator::evaluate(&parsed_expr, &context, Some(&context_value)) {
                 Ok(result) => {
                     let context_path = format!("{}[{}]", context_expr, context_index);
                     // Get trace outputs collected during this evaluation
                     let trace_outputs = context.get_trace_outputs();
-                    results.push(create_result_parameter(context_path, result, trace_outputs)?);
+                    results.push(create_result_parameter(
+                        context_path,
+                        result,
+                        trace_outputs,
+                    )?);
                 }
                 Err(e) => {
                     warn!("Evaluation error for context {}: {}", context_index, e);
@@ -160,7 +169,11 @@ pub async fn evaluate_fhirpath(
             Ok(result) => {
                 // Get trace outputs collected during evaluation
                 let trace_outputs = context.get_trace_outputs();
-                results.push(create_result_parameter("Resource".to_string(), result, trace_outputs)?);
+                results.push(create_result_parameter(
+                    "Resource".to_string(),
+                    result,
+                    trace_outputs,
+                )?);
             }
             Err(e) => {
                 return create_error_response(&expression, &extracted, e);
@@ -292,21 +305,21 @@ fn create_result_parameter(
     for value in result_items {
         parts.push(evaluation_result_to_result_value(value)?);
     }
-    
+
     // Add trace outputs as parts
     for (trace_name, trace_value) in trace_outputs {
         let mut trace_parts = Vec::new();
-        
+
         // Convert trace values to result parts
         let trace_items = match trace_value {
             EvaluationResult::Collection { items, .. } => items,
             single_value => vec![single_value],
         };
-        
+
         for value in trace_items {
             trace_parts.push(evaluation_result_to_result_value(value)?);
         }
-        
+
         // Create trace part with name and valueString
         parts.push(json!({
             "name": "trace",
@@ -325,11 +338,11 @@ fn create_result_parameter(
 /// Convert object map to JSON
 fn convert_object_to_json(map: &std::collections::HashMap<String, EvaluationResult>) -> Value {
     let mut json_map = serde_json::Map::new();
-    
+
     for (key, value) in map {
         json_map.insert(key.clone(), convert_evaluation_result_to_json(value));
     }
-    
+
     json!(json_map)
 }
 
@@ -351,7 +364,12 @@ fn convert_evaluation_result_to_json(result: &EvaluationResult) -> Value {
         EvaluationResult::Integer64(i, _) => json!(i),
         EvaluationResult::Object { map, .. } => convert_object_to_json(map),
         EvaluationResult::Collection { items, .. } => {
-            json!(items.iter().map(convert_evaluation_result_to_json).collect::<Vec<_>>())
+            json!(
+                items
+                    .iter()
+                    .map(convert_evaluation_result_to_json)
+                    .collect::<Vec<_>>()
+            )
         }
     }
 }
@@ -371,12 +389,12 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             } else {
                 "boolean".to_string()
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 "valueBoolean": b
             }))
-        },
+        }
         EvaluationResult::String(s, type_info) => {
             // Use the type information if available, otherwise default to "string"
             let type_name = if let Some(info) = type_info {
@@ -385,7 +403,7 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             } else {
                 "string".to_string()
             };
-            
+
             // Use the correct FHIR value property name based on the type
             let value_property = match type_name.as_str() {
                 "uri" => "valueUri",
@@ -399,85 +417,85 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "base64Binary" => "valueBase64Binary",
                 _ => "valueString", // Default for string and other string-based types
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 value_property: s
             }))
-        },
+        }
         EvaluationResult::Integer(i, type_info) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
                 "integer".to_string()
             };
-            
+
             // Use the correct FHIR value property name based on the type
             let value_property = match type_name.as_str() {
                 "positiveInt" => "valuePositiveInt",
                 "unsignedInt" => "valueUnsignedInt",
                 _ => "valueInteger", // Default for integer type
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 value_property: i
             }))
-        },
+        }
         EvaluationResult::Decimal(d, type_info) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
                 "decimal".to_string()
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 "valueDecimal": d
             }))
-        },
+        }
         EvaluationResult::Date(d, type_info) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
                 "date".to_string()
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 "valueDate": d
             }))
-        },
+        }
         EvaluationResult::DateTime(dt, type_info) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
                 "dateTime".to_string()
             };
-            
+
             // Use the correct FHIR value property name based on the type
             let value_property = match type_name.as_str() {
                 "instant" => "valueInstant",
                 _ => "valueDateTime", // Default for dateTime type
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 value_property: dt
             }))
-        },
+        }
         EvaluationResult::Time(t, type_info) => {
             let type_name = if let Some(info) = type_info {
                 info.name.clone()
             } else {
                 "time".to_string()
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 "valueTime": t
             }))
-        },
+        }
         EvaluationResult::Quantity(value, unit, _) => Ok(json!({
             "name": "quantity",
             "valueQuantity": {
@@ -492,12 +510,12 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
             } else {
                 "integer64".to_string()
             };
-            
+
             Ok(json!({
                 "name": type_name,
                 "valueInteger": i
             }))
-        },
+        }
         #[cfg(any(feature = "R4", feature = "R4B"))]
         EvaluationResult::Integer64(i, _) => {
             // In R4/R4B, treat as regular integer
@@ -505,17 +523,18 @@ fn evaluation_result_to_result_value(result: EvaluationResult) -> FhirPathResult
                 "name": "integer",
                 "valueInteger": i
             }))
-        },
+        }
         EvaluationResult::Object { map, type_info } => {
             // For FHIR complex types, convert to JSON and use the extension mechanism
             // as specified in the server-api.md for values that can't be represented
             // as FHIR primitive types in Parameters
             let json_value = convert_object_to_json(&map);
-            let string_value = serde_json::to_string(&json_value)
-                .unwrap_or_else(|_| json_value.to_string());
+            let string_value =
+                serde_json::to_string(&json_value).unwrap_or_else(|_| json_value.to_string());
 
             // Use the type name from type_info if available
-            let type_name = type_info.as_ref()
+            let type_name = type_info
+                .as_ref()
                 .map(|t| {
                     if t.namespace == "FHIR" {
                         t.name.clone()
@@ -657,7 +676,7 @@ mod tests {
     fn test_uri_uses_value_uri() {
         let result = EvaluationResult::fhir_string("http://example.com".to_string(), "uri");
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "uri");
         assert_eq!(json_result["valueUri"], "http://example.com");
         assert!(json_result.get("valueString").is_none());
@@ -667,7 +686,7 @@ mod tests {
     fn test_code_uses_value_code() {
         let result = EvaluationResult::fhir_string("MR".to_string(), "code");
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "code");
         assert_eq!(json_result["valueCode"], "MR");
         assert!(json_result.get("valueString").is_none());
@@ -677,7 +696,7 @@ mod tests {
     fn test_id_uses_value_id() {
         let result = EvaluationResult::fhir_string("12345".to_string(), "id");
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "id");
         assert_eq!(json_result["valueId"], "12345");
         assert!(json_result.get("valueString").is_none());
@@ -687,19 +706,17 @@ mod tests {
     fn test_string_uses_value_string() {
         let result = EvaluationResult::fhir_string("Hello World".to_string(), "string");
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "string");
         assert_eq!(json_result["valueString"], "Hello World");
     }
 
     #[test]
     fn test_positive_int_uses_value_positive_int() {
-        let result = EvaluationResult::Integer(
-            42, 
-            Some(TypeInfoResult::new("FHIR", "positiveInt"))
-        );
+        let result =
+            EvaluationResult::Integer(42, Some(TypeInfoResult::new("FHIR", "positiveInt")));
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "positiveInt");
         assert_eq!(json_result["valuePositiveInt"], 42);
         assert!(json_result.get("valueInteger").is_none());
@@ -709,13 +726,12 @@ mod tests {
     fn test_instant_uses_value_instant() {
         let result = EvaluationResult::DateTime(
             "2023-01-01T12:00:00Z".to_string(),
-            Some(TypeInfoResult::new("FHIR", "instant"))
+            Some(TypeInfoResult::new("FHIR", "instant")),
         );
         let json_result = evaluation_result_to_result_value(result).unwrap();
-        
+
         assert_eq!(json_result["name"], "instant");
         assert_eq!(json_result["valueInstant"], "2023-01-01T12:00:00Z");
         assert!(json_result.get("valueDateTime").is_none());
     }
 }
-

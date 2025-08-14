@@ -123,13 +123,13 @@ impl VersionIndependentParameters {
 pub trait ParameterValueAccessor {
     /// Extracts a string value if the parameter contains valueString.
     fn as_string(&self) -> Option<&str>;
-    
+
     /// Extracts a boolean value if the parameter contains valueBoolean.
     fn as_boolean(&self) -> Option<bool>;
-    
+
     /// Extracts an integer value if the parameter contains valueInteger.
     fn as_integer(&self) -> Option<i64>;
-    
+
     /// Extracts a decimal value if the parameter contains valueDecimal.
     fn as_decimal(&self) -> Option<&crate::PreciseDecimal>;
 }
@@ -138,32 +138,28 @@ pub trait ParameterValueAccessor {
 impl ParameterValueAccessor for crate::r4::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
-            crate::r4::ParametersParameterValue::String(s) => 
-                s.value.as_deref(),
+            crate::r4::ParametersParameterValue::String(s) => s.value.as_deref(),
             _ => None,
         }
     }
-    
+
     fn as_boolean(&self) -> Option<bool> {
         match self {
-            crate::r4::ParametersParameterValue::Boolean(b) => 
-                b.value,
+            crate::r4::ParametersParameterValue::Boolean(b) => b.value,
             _ => None,
         }
     }
-    
+
     fn as_integer(&self) -> Option<i64> {
         match self {
-            crate::r4::ParametersParameterValue::Integer(i) => 
-                i.value.map(|v| v as i64),
+            crate::r4::ParametersParameterValue::Integer(i) => i.value.map(|v| v as i64),
             _ => None,
         }
     }
-    
+
     fn as_decimal(&self) -> Option<&crate::PreciseDecimal> {
         match self {
-            crate::r4::ParametersParameterValue::Decimal(d) => 
-                d.value.as_ref(),
+            crate::r4::ParametersParameterValue::Decimal(d) => d.value.as_ref(),
             _ => None,
         }
     }
@@ -173,32 +169,28 @@ impl ParameterValueAccessor for crate::r4::ParametersParameterValue {
 impl ParameterValueAccessor for crate::r4b::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
-            crate::r4b::ParametersParameterValue::String(s) => 
-                s.value.as_deref(),
+            crate::r4b::ParametersParameterValue::String(s) => s.value.as_deref(),
             _ => None,
         }
     }
-    
+
     fn as_boolean(&self) -> Option<bool> {
         match self {
-            crate::r4b::ParametersParameterValue::Boolean(b) => 
-                b.value,
+            crate::r4b::ParametersParameterValue::Boolean(b) => b.value,
             _ => None,
         }
     }
-    
+
     fn as_integer(&self) -> Option<i64> {
         match self {
-            crate::r4b::ParametersParameterValue::Integer(i) => 
-                i.value.map(|v| v as i64),
+            crate::r4b::ParametersParameterValue::Integer(i) => i.value.map(|v| v as i64),
             _ => None,
         }
     }
-    
+
     fn as_decimal(&self) -> Option<&crate::PreciseDecimal> {
         match self {
-            crate::r4b::ParametersParameterValue::Decimal(d) => 
-                d.value.as_ref(),
+            crate::r4b::ParametersParameterValue::Decimal(d) => d.value.as_ref(),
             _ => None,
         }
     }
@@ -208,32 +200,28 @@ impl ParameterValueAccessor for crate::r4b::ParametersParameterValue {
 impl ParameterValueAccessor for crate::r5::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
-            crate::r5::ParametersParameterValue::String(s) => 
-                s.value.as_deref(),
+            crate::r5::ParametersParameterValue::String(s) => s.value.as_deref(),
             _ => None,
         }
     }
-    
+
     fn as_boolean(&self) -> Option<bool> {
         match self {
-            crate::r5::ParametersParameterValue::Boolean(b) => 
-                b.value,
+            crate::r5::ParametersParameterValue::Boolean(b) => b.value,
             _ => None,
         }
     }
-    
+
     fn as_integer(&self) -> Option<i64> {
         match self {
-            crate::r5::ParametersParameterValue::Integer(i) => 
-                i.value.map(|v| v as i64),
+            crate::r5::ParametersParameterValue::Integer(i) => i.value.map(|v| v as i64),
             _ => None,
         }
     }
-    
+
     fn as_decimal(&self) -> Option<&crate::PreciseDecimal> {
         match self {
-            crate::r5::ParametersParameterValue::Decimal(d) => 
-                d.value.as_ref(),
+            crate::r5::ParametersParameterValue::Decimal(d) => d.value.as_ref(),
             _ => None,
         }
     }
@@ -243,32 +231,28 @@ impl ParameterValueAccessor for crate::r5::ParametersParameterValue {
 impl ParameterValueAccessor for crate::r6::ParametersParameterValue {
     fn as_string(&self) -> Option<&str> {
         match self {
-            crate::r6::ParametersParameterValue::String(s) => 
-                s.value.as_deref(),
+            crate::r6::ParametersParameterValue::String(s) => s.value.as_deref(),
             _ => None,
         }
     }
-    
+
     fn as_boolean(&self) -> Option<bool> {
         match self {
-            crate::r6::ParametersParameterValue::Boolean(b) => 
-                b.value,
+            crate::r6::ParametersParameterValue::Boolean(b) => b.value,
             _ => None,
         }
     }
-    
+
     fn as_integer(&self) -> Option<i64> {
         match self {
-            crate::r6::ParametersParameterValue::Integer(i) => 
-                i.value.map(|v| v as i64),
+            crate::r6::ParametersParameterValue::Integer(i) => i.value.map(|v| v as i64),
             _ => None,
         }
     }
-    
+
     fn as_decimal(&self) -> Option<&crate::PreciseDecimal> {
         match self {
-            crate::r6::ParametersParameterValue::Decimal(d) => 
-                d.value.as_ref(),
+            crate::r6::ParametersParameterValue::Decimal(d) => d.value.as_ref(),
             _ => None,
         }
     }
@@ -277,7 +261,7 @@ impl ParameterValueAccessor for crate::r6::ParametersParameterValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     #[cfg(feature = "R4")]
     fn test_version_detection() {
@@ -285,7 +269,7 @@ mod tests {
         let version_independent = VersionIndependentParameters::R4(params);
         assert_eq!(version_independent.version(), FhirVersion::R4);
     }
-    
+
     #[test]
     #[cfg(feature = "R4")]
     fn test_json_conversion() {

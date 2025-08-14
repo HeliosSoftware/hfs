@@ -18,25 +18,21 @@ pub fn get_resource_key_function(
     match invocation_base {
         EvaluationResult::Object { map, .. } => {
             // Extract resourceType and id
-            let resource_type = map.get("resourceType")
-                .and_then(|rt| match rt {
-                    EvaluationResult::String(s, _) => Some(s.clone()),
-                    _ => None,
-                });
-                
-            let id = map.get("id")
-                .and_then(|id_val| match id_val {
-                    EvaluationResult::String(s, _) => Some(s.clone()),
-                    _ => None,
-                });
-                
+            let resource_type = map.get("resourceType").and_then(|rt| match rt {
+                EvaluationResult::String(s, _) => Some(s.clone()),
+                _ => None,
+            });
+
+            let id = map.get("id").and_then(|id_val| match id_val {
+                EvaluationResult::String(s, _) => Some(s.clone()),
+                _ => None,
+            });
+
             match (resource_type, id) {
-                (Some(_rt), Some(id_str)) => {
-                    Ok(EvaluationResult::String(id_str, None))
-                },
+                (Some(_rt), Some(id_str)) => Ok(EvaluationResult::String(id_str, None)),
                 _ => Ok(EvaluationResult::Empty),
             }
-        },
+        }
         _ => Ok(EvaluationResult::Empty),
     }
 }
@@ -66,19 +62,17 @@ pub fn get_reference_key_function(
             "Function 'getReferenceKey' expects 0 or 1 argument (type filter)".to_string(),
         ));
     }
-    
+
     // Extract optional type filter
     let type_filter = if args.is_empty() {
         None
     } else {
         match &args[0] {
-            EvaluationResult::String(s, _) => {
-                Some(s.clone())
-            },
+            EvaluationResult::String(s, _) => Some(s.clone()),
             EvaluationResult::Empty => {
                 // When a bare type identifier evaluates to Empty, treat as no filter
                 None
-            },
+            }
             // Handle type identifiers - extract the type name from type info
             result if result.type_name() == "Type" => {
                 // For type arguments like 'Patient', extract the type name
@@ -91,15 +85,16 @@ pub fn get_reference_key_function(
                 } else {
                     None
                 }
-            },
+            }
             _ => {
-                return Err(EvaluationError::TypeError(
-                    format!("getReferenceKey type filter must be a string or type, got: {:?}", &args[0]),
-                ));
+                return Err(EvaluationError::TypeError(format!(
+                    "getReferenceKey type filter must be a string or type, got: {:?}",
+                    &args[0]
+                )));
             }
         }
     };
-    
+
     match invocation_base {
         EvaluationResult::Object { map, .. } => {
             // Look for the reference field
@@ -114,19 +109,19 @@ pub fn get_reference_key_function(
                                     return Ok(EvaluationResult::Empty);
                                 }
                             }
-                            
+
                             // Return just the ID part as the key
                             Ok(EvaluationResult::String(id, None))
                         } else {
                             Ok(EvaluationResult::Empty)
                         }
-                    },
+                    }
                     _ => Ok(EvaluationResult::Empty),
                 }
             } else {
                 Ok(EvaluationResult::Empty)
             }
-        },
+        }
         _ => Ok(EvaluationResult::Empty),
     }
 }
@@ -163,22 +158,22 @@ mod tests {
             "id".to_string(),
             EvaluationResult::String("123".to_string(), None),
         );
-        
+
         let resource = EvaluationResult::Object {
             map: resource_map,
             type_info: None,
         };
-        
+
         let result = get_resource_key_function(&resource).unwrap();
-        
+
         match result {
             EvaluationResult::String(key, _) => {
                 assert_eq!(key, "123");
-            },
+            }
             _ => panic!("Expected string result"),
         }
     }
-    
+
     #[test]
     fn test_get_reference_key_function() {
         // Create a test reference
@@ -187,52 +182,52 @@ mod tests {
             "reference".to_string(),
             EvaluationResult::String("Patient/456".to_string(), None),
         );
-        
+
         let reference = EvaluationResult::Object {
             map: reference_map,
             type_info: None,
         };
-        
+
         // Test without type filter
         let result = get_reference_key_function(&reference, &[]).unwrap();
-        
+
         match result {
             EvaluationResult::String(key, _) => {
                 assert_eq!(key, "456");
-            },
+            }
             _ => panic!("Expected string result"),
         }
-        
+
         // Test with matching type filter
         let type_filter = EvaluationResult::String("Patient".to_string(), None);
         let result = get_reference_key_function(&reference, &[type_filter]).unwrap();
-        
+
         match result {
             EvaluationResult::String(key, _) => {
                 assert_eq!(key, "456");
-            },
+            }
             _ => panic!("Expected string result"),
         }
-        
+
         // Test with non-matching type filter
         let wrong_type_filter = EvaluationResult::String("Observation".to_string(), None);
         let result = get_reference_key_function(&reference, &[wrong_type_filter]).unwrap();
-        
+
         assert!(matches!(result, EvaluationResult::Empty));
     }
-    
+
     #[test]
     fn test_parse_reference() {
         assert_eq!(
             parse_reference("Patient/123"),
             Some(("Patient".to_string(), "123".to_string()))
         );
-        
+
         assert_eq!(
             parse_reference("Observation/obs-001"),
             Some(("Observation".to_string(), "obs-001".to_string()))
         );
-        
+
         assert_eq!(parse_reference("InvalidReference"), None);
         assert_eq!(parse_reference("/"), None);
         assert_eq!(parse_reference("Patient/"), None);

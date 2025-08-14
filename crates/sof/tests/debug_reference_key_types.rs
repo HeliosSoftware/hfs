@@ -131,7 +131,8 @@ fn debug_reference_key_wrong_type() {
     println!("getResourceKey(): {}", result1_str);
 
     // Test getReferenceKey(Observation) - wrong type
-    let vd2: helios_fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_wrong_type).unwrap();
+    let vd2: helios_fhir::r4::ViewDefinition =
+        serde_json::from_value(test_ref_key_wrong_type).unwrap();
     let result2 = run_view_definition(
         SofViewDefinition::R4(vd2),
         bundle.clone(),
@@ -142,7 +143,8 @@ fn debug_reference_key_wrong_type() {
     println!("getReferenceKey(Observation): {}", result2_str);
 
     // Test getReferenceKey(Patient) - correct type
-    let vd3: helios_fhir::r4::ViewDefinition = serde_json::from_value(test_ref_key_correct_type).unwrap();
+    let vd3: helios_fhir::r4::ViewDefinition =
+        serde_json::from_value(test_ref_key_correct_type).unwrap();
     let result3 = run_view_definition(
         SofViewDefinition::R4(vd3),
         bundle.clone(),

@@ -81,13 +81,24 @@ mod tests {
                         EvaluationResult::Object { map, .. } => {
                             let namespace = map.get("namespace").unwrap();
                             let name = map.get("name").unwrap();
-                            
-                            assert_eq!(namespace, &EvaluationResult::String(expected_namespace.to_string(), None), 
-                                      "Wrong namespace for {}", expr);
-                            assert_eq!(name, &EvaluationResult::String(expected_name.to_string(), None), 
-                                      "Wrong name for {}", expr);
+
+                            assert_eq!(
+                                namespace,
+                                &EvaluationResult::String(expected_namespace.to_string(), None),
+                                "Wrong namespace for {}",
+                                expr
+                            );
+                            assert_eq!(
+                                name,
+                                &EvaluationResult::String(expected_name.to_string(), None),
+                                "Wrong name for {}",
+                                expr
+                            );
                         }
-                        _ => panic!("Expected Object in collection for {}, got {:?}", expr, items[0]),
+                        _ => panic!(
+                            "Expected Object in collection for {}, got {:?}",
+                            expr, items[0]
+                        ),
                     }
                 }
                 _ => panic!("Expected Collection for {}, got {:?}", expr, result),
@@ -116,8 +127,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Integer".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Integer".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -136,21 +153,24 @@ mod tests {
         match result {
             EvaluationResult::Collection { items: types, .. } => {
                 assert_eq!(types.len(), 3);
-                
+
                 // Check each type object
                 for type_obj in &types {
                     match type_obj {
                         EvaluationResult::Object { map, .. } => {
                             let namespace = map.get("namespace").unwrap();
                             let name = map.get("name").unwrap();
-                            
-                            assert_eq!(namespace, &EvaluationResult::String("System".to_string(), None));
-                            
+
+                            assert_eq!(
+                                namespace,
+                                &EvaluationResult::String("System".to_string(), None)
+                            );
+
                             let name_str = match name {
                                 EvaluationResult::String(s, _) => s,
                                 _ => panic!("Expected string name"),
                             };
-                            
+
                             assert!(["Integer", "String", "Boolean"].contains(&name_str.as_str()));
                         }
                         _ => panic!("Expected Object in collection, got {:?}", type_obj),
@@ -176,8 +196,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Object".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -197,8 +223,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Object".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -213,8 +245,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("String".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("String".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -238,8 +276,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Object".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Object".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -259,8 +303,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("String".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("String".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -279,8 +329,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Integer".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Integer".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -308,8 +364,14 @@ mod tests {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
                     EvaluationResult::Object { map, .. } => {
-                        assert_eq!(map.get("namespace").unwrap(), &EvaluationResult::String("System".to_string(), None));
-                        assert_eq!(map.get("name").unwrap(), &EvaluationResult::String("Type".to_string(), None));
+                        assert_eq!(
+                            map.get("namespace").unwrap(),
+                            &EvaluationResult::String("System".to_string(), None)
+                        );
+                        assert_eq!(
+                            map.get("name").unwrap(),
+                            &EvaluationResult::String("Type".to_string(), None)
+                        );
                     }
                     _ => panic!("Expected Object in collection, got {:?}", items[0]),
                 }
@@ -319,7 +381,9 @@ mod tests {
 
         // Type used in conditional - accessing the name property
         let result = evaluate(
-            &parser().parse("$this.type().name = 'Object' implies $this.id.exists()").unwrap(),
+            &parser()
+                .parse("$this.type().name = 'Object' implies $this.id.exists()")
+                .unwrap(),
             &context,
             None,
         )
@@ -327,4 +391,3 @@ mod tests {
         assert_eq!(result, EvaluationResult::boolean(true));
     }
 }
-

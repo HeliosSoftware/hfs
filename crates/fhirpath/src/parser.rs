@@ -784,12 +784,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // Create a separate string parser for external constants
     let string_for_external = just('\'')
-        .ignore_then(
-            none_of("\'\\")
-                .or(esc)
-                .repeated()
-                .collect::<String>(),
-        )
+        .ignore_then(none_of("\'\\").or(esc).repeated().collect::<String>())
         .then_ignore(just('\''))
         .padded();
 

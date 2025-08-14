@@ -88,8 +88,7 @@ pub async fn run_view_definition_handler(
     let parameters = parse_parameters(body)?;
 
     // Extract all parameters including filters
-    let extracted_params =
-        extract_all_parameters(parameters).map_err(ServerError::BadRequest)?;
+    let extracted_params = extract_all_parameters(parameters).map_err(ServerError::BadRequest)?;
 
     // Check for not-yet-implemented parameters
     if extracted_params.view_reference.is_some() {
@@ -330,9 +329,10 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let view_def: helios_fhir::r4::ViewDefinition = serde_json::from_value(json).map_err(|e| {
-                ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
-            })?;
+            let view_def: helios_fhir::r4::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid R4 ViewDefinition: {}", e))
+                })?;
             Ok(SofViewDefinition::R4(view_def))
         }
         #[cfg(feature = "R4B")]
@@ -345,16 +345,18 @@ fn parse_view_definition(json: serde_json::Value) -> ServerResult<SofViewDefinit
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let view_def: helios_fhir::r5::ViewDefinition = serde_json::from_value(json).map_err(|e| {
-                ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
-            })?;
+            let view_def: helios_fhir::r5::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid R5 ViewDefinition: {}", e))
+                })?;
             Ok(SofViewDefinition::R5(view_def))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let view_def: helios_fhir::r6::ViewDefinition = serde_json::from_value(json).map_err(|e| {
-                ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
-            })?;
+            let view_def: helios_fhir::r6::ViewDefinition =
+                serde_json::from_value(json).map_err(|e| {
+                    ServerError::BadRequest(format!("Invalid R6 ViewDefinition: {}", e))
+                })?;
             Ok(SofViewDefinition::R6(view_def))
         }
     }
@@ -422,30 +424,34 @@ fn create_bundle_from_resources(resources: Vec<serde_json::Value>) -> ServerResu
     match newest_version {
         #[cfg(feature = "R4")]
         helios_fhir::FhirVersion::R4 => {
-            let bundle: helios_fhir::r4::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
-                ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
-            })?;
+            let bundle: helios_fhir::r4::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    ServerError::InternalError(format!("Failed to create R4 Bundle: {}", e))
+                })?;
             Ok(SofBundle::R4(bundle))
         }
         #[cfg(feature = "R4B")]
         helios_fhir::FhirVersion::R4B => {
-            let bundle: helios_fhir::r4b::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
-                ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
-            })?;
+            let bundle: helios_fhir::r4b::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    ServerError::InternalError(format!("Failed to create R4B Bundle: {}", e))
+                })?;
             Ok(SofBundle::R4B(bundle))
         }
         #[cfg(feature = "R5")]
         helios_fhir::FhirVersion::R5 => {
-            let bundle: helios_fhir::r5::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
-                ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
-            })?;
+            let bundle: helios_fhir::r5::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    ServerError::InternalError(format!("Failed to create R5 Bundle: {}", e))
+                })?;
             Ok(SofBundle::R5(bundle))
         }
         #[cfg(feature = "R6")]
         helios_fhir::FhirVersion::R6 => {
-            let bundle: helios_fhir::r6::Bundle = serde_json::from_value(bundle_json).map_err(|e| {
-                ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
-            })?;
+            let bundle: helios_fhir::r6::Bundle =
+                serde_json::from_value(bundle_json).map_err(|e| {
+                    ServerError::InternalError(format!("Failed to create R6 Bundle: {}", e))
+                })?;
             Ok(SofBundle::R6(bundle))
         }
     }
@@ -488,51 +494,51 @@ fn filter_resources_by_patient_and_group(
         );
         let patient_ref_to_match = normalized_patient_ref.as_str();
         filtered.retain(|resource| {
-                // Check if resource belongs to patient compartment
-                // This is a simplified implementation - in production, this would
-                // need to check all patient compartment definitions
-                if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
-                    match resource_type {
-                        "Patient" => {
-                            // Check if this is the patient themselves
-                            if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
-                                return format!("Patient/{}", id) == patient_ref_to_match;
+            // Check if resource belongs to patient compartment
+            // This is a simplified implementation - in production, this would
+            // need to check all patient compartment definitions
+            if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
+                match resource_type {
+                    "Patient" => {
+                        // Check if this is the patient themselves
+                        if let Some(id) = resource.get("id").and_then(|i| i.as_str()) {
+                            return format!("Patient/{}", id) == patient_ref_to_match;
+                        }
+                    }
+                    "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
+                        // Check subject reference
+                        if let Some(subject) = resource.get("subject") {
+                            if let Some(reference) =
+                                subject.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == patient_ref_to_match;
                             }
                         }
-                        "Observation" | "Condition" | "MedicationRequest" | "Procedure" => {
-                            // Check subject reference
-                            if let Some(subject) = resource.get("subject") {
-                                if let Some(reference) =
-                                    subject.get("reference").and_then(|r| r.as_str())
-                                {
-                                    return reference == patient_ref_to_match;
-                                }
+                    }
+                    "Encounter" => {
+                        // Check subject reference
+                        if let Some(subject) = resource.get("subject") {
+                            if let Some(reference) =
+                                subject.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == patient_ref_to_match;
                             }
                         }
-                        "Encounter" => {
-                            // Check subject reference
-                            if let Some(subject) = resource.get("subject") {
-                                if let Some(reference) =
-                                    subject.get("reference").and_then(|r| r.as_str())
-                                {
-                                    return reference == patient_ref_to_match;
-                                }
-                            }
-                        }
-                        _ => {
-                            // For other resource types, check if they have a patient reference
-                            if let Some(patient) = resource.get("patient") {
-                                if let Some(reference) =
-                                    patient.get("reference").and_then(|r| r.as_str())
-                                {
-                                    return reference == patient_ref_to_match;
-                                }
+                    }
+                    _ => {
+                        // For other resource types, check if they have a patient reference
+                        if let Some(patient) = resource.get("patient") {
+                            if let Some(reference) =
+                                patient.get("reference").and_then(|r| r.as_str())
+                            {
+                                return reference == patient_ref_to_match;
                             }
                         }
                     }
                 }
-                false
-            });
+            }
+            false
+        });
     }
 
     // Apply group filter if provided

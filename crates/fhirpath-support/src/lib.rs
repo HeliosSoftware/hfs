@@ -1297,7 +1297,7 @@ fn format_unit_for_display(unit: &str) -> String {
         "year" => "{year}".to_string(),
         "month" => "{month}".to_string(),
         "day" => "{day}".to_string(),
-        
+
         // Short UCUM codes and other units - display as-is
         // Note: "wk", "a", "mo", "d" etc. should NOT get braces when displaying
         other => other.to_string(),

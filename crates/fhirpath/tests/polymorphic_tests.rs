@@ -356,4 +356,3 @@ fn test_more_complex_polymorphic_expressions() {
     // Should return the object since it matches
     assert!(matches!(result, EvaluationResult::Object { .. }));
 }
-

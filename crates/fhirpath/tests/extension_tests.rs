@@ -46,7 +46,9 @@ fn create_patient_context() -> EvaluationContext {
     let mut extension_obj = HashMap::new();
     extension_obj.insert(
         "url".to_string(),
-        EvaluationResult::string("http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string()),
+        EvaluationResult::string(
+            "http://hl7.org/fhir/StructureDefinition/patient-birthTime".to_string(),
+        ),
     );
     extension_obj.insert(
         "valueDateTime".to_string(),
@@ -57,7 +59,11 @@ fn create_patient_context() -> EvaluationContext {
     let mut birthdate_ext_obj = HashMap::new();
     birthdate_ext_obj.insert(
         "extension".to_string(),
-        EvaluationResult::Collection { items: vec![EvaluationResult::object(extension_obj.clone())], has_undefined_order: false, type_info: None },
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::object(extension_obj.clone())],
+            has_undefined_order: false,
+            type_info: None,
+        },
     );
 
     // Add _birthDate to patient
@@ -70,7 +76,11 @@ fn create_patient_context() -> EvaluationContext {
     let mut underscore_birthdate = HashMap::new();
     underscore_birthdate.insert(
         "extension".to_string(),
-        EvaluationResult::Collection { items: vec![EvaluationResult::object(extension_obj)], has_undefined_order: false, type_info: None },
+        EvaluationResult::Collection {
+            items: vec![EvaluationResult::object(extension_obj)],
+            has_undefined_order: false,
+            type_info: None,
+        },
     );
 
     // Set as context - both the patient and the _birthDate object for different tests

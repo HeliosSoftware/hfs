@@ -3755,7 +3755,7 @@ fn patient_context() -> EvaluationContext {
                 url: "http://example.com/precision".to_string().into(), // Remove Some(), url is not Option
                 value: Some(ExtensionValue::String("day".to_string().into())), // Use imported ExtensionValue, .to_string().into()
                 ..Default::default()
-            }])
+            }]),
         }),
         deceased: Some(r4::PatientDeceased::Boolean(Boolean {
             // Use imported Boolean

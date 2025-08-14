@@ -79,4 +79,3 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
     let context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
     Ok(context)
 }
-

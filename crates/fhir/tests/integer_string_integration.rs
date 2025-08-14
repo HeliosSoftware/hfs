@@ -37,10 +37,17 @@ fn test_real_json_with_string_integers() {
 
     // This should now succeed with our fix
     let result: Result<Bundle, _> = serde_json::from_str(json_content);
-    assert!(result.is_ok(), "Failed to deserialize Bundle with string integers: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to deserialize Bundle with string integers: {:?}",
+        result.err()
+    );
 
     let bundle = result.unwrap();
-    assert_eq!(bundle.id.as_ref().and_then(|e| e.value.as_ref()), Some(&"test-bundle".to_string()));
+    assert_eq!(
+        bundle.id.as_ref().and_then(|e| e.value.as_ref()),
+        Some(&"test-bundle".to_string())
+    );
 
     // Check that the integer fields were properly parsed
     if let Some(entries) = &bundle.entry {
@@ -51,7 +58,10 @@ fn test_real_json_with_string_integers() {
                         // Check events_since_subscription_start was parsed from string "2"
                         if let Some(events_count) = &sub_status.events_since_subscription_start {
                             if let Some(value) = &events_count.value {
-                                assert_eq!(*value, 2i64, "eventsSinceSubscriptionStart should be 2");
+                                assert_eq!(
+                                    *value, 2i64,
+                                    "eventsSinceSubscriptionStart should be 2"
+                                );
                             }
                         }
 

@@ -4,8 +4,8 @@
 //! including parameter parsing and content type negotiation.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use helios_sof::{ContentType, SofParameters};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// Query parameters for ViewDefinition/$run endpoint
@@ -202,7 +202,8 @@ fn process_parameter(
     // Helper function to check if any value[X] field exists
     let has_any_value_field = |param: &serde_json::Value| -> bool {
         param
-            .as_object().is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")))
+            .as_object()
+            .is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")))
     };
 
     match name {

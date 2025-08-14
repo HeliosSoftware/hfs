@@ -114,10 +114,12 @@ fn test_simple_foreach() {
     println!("Actual result: {:#?}", actual_rows);
 
     // Expected: 4 rows (2 per patient, one for each name)
-    let expected = [serde_json::json!({"id": "pt1", "family": "F1.1"}),
+    let expected = [
+        serde_json::json!({"id": "pt1", "family": "F1.1"}),
         serde_json::json!({"id": "pt1", "family": "F1.2"}),
         serde_json::json!({"id": "pt2", "family": "F2.1"}),
-        serde_json::json!({"id": "pt2", "family": "F2.2"})];
+        serde_json::json!({"id": "pt2", "family": "F2.2"}),
+    ];
 
     assert_eq!(
         actual_rows.len(),

@@ -27,7 +27,9 @@ fn test_fhir_resource_structure_debug() {
     println!("{}", serde_json::to_string_pretty(&patient).unwrap());
 
     // Test 1: Convert to FhirResource and back to JSON to see what changes
-    let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient.clone())));
+    let fhir_resource = FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(
+        patient.clone(),
+    )));
 
     // Serialize the FhirResource back to JSON to see if extensions are preserved
     match &fhir_resource {

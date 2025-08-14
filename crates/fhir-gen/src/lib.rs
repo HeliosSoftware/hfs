@@ -89,8 +89,7 @@ fn process_single_version(version: &FhirVersion, output_path: impl AsRef<Path>) 
     // Create the version-specific output file with initial content
     std::fs::write(
         &version_path,
-        "use helios_fhir_macro::{FhirSerde, FhirPath};\nuse serde::{Serialize, Deserialize};\n
-use crate::{Element, DecimalElement};\n\n",
+        "use helios_fhir_macro::{FhirPath, FhirSerde};\nuse serde::{Deserialize, Serialize};\n\nuse crate::{DecimalElement, Element};\n\n",
     )?;
 
     // Process all JSON files in the resources/{FhirVersion} directory
@@ -213,9 +212,10 @@ fn visit_dirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
                 if ext == "json" {
                     if let Some(filename) = path.file_name() {
                         let filename = filename.to_string_lossy();
-                        if !filename.contains("conceptmap") 
-                            && !filename.contains("valueset") 
-                            && !filename.contains("bundle-entry") {
+                        if !filename.contains("conceptmap")
+                            && !filename.contains("valueset")
+                            && !filename.contains("bundle-entry")
+                        {
                             json_files.push(path);
                         }
                     }
@@ -355,9 +355,9 @@ fn generate_code(bundle: Bundle, output_path: impl AsRef<Path>) -> io::Result<()
                             let content = structure_definition_to_rust(def, &cycles);
                             let mut file = std::fs::OpenOptions::new()
                                 .create(true)
-                                                .append(true)
+                                .append(true)
                                 .open(output_path.as_ref())?;
-                            writeln!(file, "{}", content)?;
+                            write!(file, "{}", content)?;
                         }
                     }
                     Resource::SearchParameter(_param) => {
@@ -622,10 +622,10 @@ fn generate_primitive_type(sd: &StructureDefinition) -> String {
 
     // Generate a type alias using Element<T, Extension> or DecimalElement<Extension> for decimal type
     if type_name == "decimal" {
-        output.push_str("pub type Decimal = DecimalElement<Extension>;\n");
+        output.push_str("pub type Decimal = DecimalElement<Extension>;\n\n");
     } else {
         output.push_str(&format!(
-            "pub type {} = Element<{}, Extension>;\n",
+            "pub type {} = Element<{}, Extension>;\n\n",
             capitalize_first_letter(type_name),
             value_type
         ));
@@ -1026,11 +1026,7 @@ fn generate_element_definition(
 fn extract_content_reference_id(content_ref: &str) -> &str {
     if let Some(fragment_start) = content_ref.find('#') {
         let fragment = &content_ref[fragment_start + 1..];
-        if !fragment.is_empty() {
-            fragment
-        } else {
-            ""
-        }
+        if !fragment.is_empty() { fragment } else { "" }
     } else {
         ""
     }

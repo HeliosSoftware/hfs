@@ -380,4 +380,3 @@ mod tests {
         assert_eq!(result, EvaluationResult::boolean(false));
     }
 }
-

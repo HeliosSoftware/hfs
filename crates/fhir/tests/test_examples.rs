@@ -113,10 +113,12 @@ fn compare_json_values(
                 // Check if this is a valid null-skipping transformation
                 // (reserialized array contains only the non-null values from original)
                 let orig_non_null: Vec<&Value> = orig_arr.iter().filter(|v| !v.is_null()).collect();
-                let is_null_skipping_transformation = 
-                    orig_non_null.len() == reser_arr.len() &&
-                    orig_non_null.iter().zip(reser_arr.iter()).all(|(orig, reser)| *orig == reser);
-                
+                let is_null_skipping_transformation = orig_non_null.len() == reser_arr.len()
+                    && orig_non_null
+                        .iter()
+                        .zip(reser_arr.iter())
+                        .all(|(orig, reser)| *orig == reser);
+
                 if !is_null_skipping_transformation {
                     // If arrays have different lengths and it's not a null-skipping case,
                     // report the whole array as different
@@ -140,11 +142,11 @@ fn compare_json_values(
                         } else {
                             false
                         }
-                    },
+                    }
                     // All other mismatches are real differences
                     _ => false,
                 };
-                
+
                 if !is_valid_conversion {
                     differences.push((path, original.clone(), reserialized.clone()));
                 }
@@ -182,11 +184,26 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
 
     // List of problematic files to skip with reasons
     let skip_files = [
-        ("diagnosticreport-example-f202-bloodculture.json", "Contains null where struct TempCodeableReference expected"),
-        ("permission-example-bundle-residual.json", "Contains null where struct TempPermissionRuleLimit expected"),
-        ("diagnosticreport-example-dxa.json", "Contains null in conclusionCode array where struct TempCodeableReference expected"),
-        ("servicerequest-example-glucose.json", "Contains null in asNeededFor array where struct TempCodeableConcept expected"),
-        ("diagnosticreport-example-f201-brainct.json", "Contains null in conclusionCode array where struct TempCodeableReference expected"),
+        (
+            "diagnosticreport-example-f202-bloodculture.json",
+            "Contains null where struct TempCodeableReference expected",
+        ),
+        (
+            "permission-example-bundle-residual.json",
+            "Contains null where struct TempPermissionRuleLimit expected",
+        ),
+        (
+            "diagnosticreport-example-dxa.json",
+            "Contains null in conclusionCode array where struct TempCodeableReference expected",
+        ),
+        (
+            "servicerequest-example-glucose.json",
+            "Contains null in asNeededFor array where struct TempCodeableConcept expected",
+        ),
+        (
+            "diagnosticreport-example-f201-brainct.json",
+            "Contains null in conclusionCode array where struct TempCodeableReference expected",
+        ),
     ];
 
     for entry in fs::read_dir(dir).unwrap() {
@@ -195,7 +212,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
 
         if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
             let filename = path.file_name().unwrap().to_string_lossy();
-            
+
             // Check if this file should be skipped
             if let Some((_, reason)) = skip_files.iter().find(|(name, _)| *name == filename) {
                 println!("Skipping file: {} - Reason: {}", filename, reason);
@@ -220,7 +237,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                         println!("Skipping Questionnaire resource");
                                         continue;
                                     }
-                                    
+
                                     // Skip ClinicalImpression resources for R6 (not yet implemented)
                                     if resource_type_str == "ClinicalImpression" {
                                         println!("Skipping ClinicalImpression resource");
@@ -246,23 +263,28 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                                         &json_value,
                                                         &resource_json,
                                                     );
-                                                    
+
                                                     if !diff_paths.is_empty() {
                                                         println!(
                                                             "Found {} significant differences between original and reserialized JSON:",
                                                             diff_paths.len()
                                                         );
-                                                        for (path, orig_val, new_val) in &diff_paths {
+                                                        for (path, orig_val, new_val) in &diff_paths
+                                                        {
                                                             println!("  Path: {}", path);
                                                             println!(
                                                                 "    Original: {}",
-                                                                serde_json::to_string_pretty(orig_val)
-                                                                    .unwrap_or_default()
+                                                                serde_json::to_string_pretty(
+                                                                    orig_val
+                                                                )
+                                                                .unwrap_or_default()
                                                             );
                                                             println!(
                                                                 "    Reserialized: {}",
-                                                                serde_json::to_string_pretty(new_val)
-                                                                    .unwrap_or_default()
+                                                                serde_json::to_string_pretty(
+                                                                    new_val
+                                                                )
+                                                                .unwrap_or_default()
                                                             );
                                                         }
 

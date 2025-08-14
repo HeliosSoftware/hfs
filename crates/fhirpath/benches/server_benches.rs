@@ -1,9 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
 fn bench_request_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("server/parsing");
-    
+
     group.bench_function("simple_parameters", |b| {
         let json = json!({
             "resourceType": "Parameters",
@@ -23,7 +23,7 @@ fn bench_request_parsing(c: &mut Criterion) {
                 }
             ]
         });
-        
+
         b.iter(|| {
             let value = black_box(&json);
             // Simulate parsing by accessing fields
@@ -33,7 +33,7 @@ fn bench_request_parsing(c: &mut Criterion) {
             let _ = value["parameter"][1]["resource"]["resourceType"].as_str();
         })
     });
-    
+
     group.bench_function("complex_parameters", |b| {
         let json = json!({
             "resourceType": "Parameters",
@@ -71,7 +71,7 @@ fn bench_request_parsing(c: &mut Criterion) {
                 }
             ]
         });
-        
+
         b.iter(|| {
             let value = black_box(&json);
             // Simulate parsing by accessing various fields
@@ -92,13 +92,13 @@ fn bench_request_parsing(c: &mut Criterion) {
             }
         })
     });
-    
+
     group.finish();
 }
 
 fn bench_response_serialization(c: &mut Criterion) {
     let mut group = c.benchmark_group("server/serialization");
-    
+
     group.bench_function("simple_response", |b| {
         let response = json!({
             "resourceType": "Parameters",
@@ -129,13 +129,13 @@ fn bench_response_serialization(c: &mut Criterion) {
                 }
             ]
         });
-        
+
         b.iter(|| {
             let json_str = serde_json::to_string(black_box(&response)).unwrap();
             black_box(json_str)
         })
     });
-    
+
     group.bench_function("complex_response", |b| {
         let mut result_parts = vec![];
         for i in 0..10 {
@@ -144,7 +144,7 @@ fn bench_response_serialization(c: &mut Criterion) {
                 "valueString": format!("Result{}", i)
             }));
         }
-        
+
         let response = json!({
             "resourceType": "Parameters",
             "id": "fhirpath",
@@ -177,19 +177,19 @@ fn bench_response_serialization(c: &mut Criterion) {
                 }
             ]
         });
-        
+
         b.iter(|| {
             let json_str = serde_json::to_string(black_box(&response)).unwrap();
             black_box(json_str)
         })
     });
-    
+
     group.finish();
 }
 
 fn bench_large_bundle_processing(c: &mut Criterion) {
     let mut group = c.benchmark_group("server/bundle");
-    
+
     // Create a bundle with many resources
     let mut entries = vec![];
     for i in 0..50 {
@@ -209,13 +209,13 @@ fn bench_large_bundle_processing(c: &mut Criterion) {
             }
         }));
     }
-    
+
     let large_bundle = json!({
         "resourceType": "Bundle",
         "type": "collection",
         "entry": entries
     });
-    
+
     group.bench_function("parse_bundle", |b| {
         b.iter(|| {
             let bundle = black_box(&large_bundle);
@@ -229,14 +229,14 @@ fn bench_large_bundle_processing(c: &mut Criterion) {
             }
         })
     });
-    
+
     group.bench_function("serialize_bundle", |b| {
         b.iter(|| {
             let json_str = serde_json::to_string(black_box(&large_bundle)).unwrap();
             black_box(json_str)
         })
     });
-    
+
     group.finish();
 }
 

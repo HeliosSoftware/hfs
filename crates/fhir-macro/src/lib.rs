@@ -1,21 +1,21 @@
 //! # FHIR Macro - Procedural Macros for FHIR Implementation
 //!
-//! This crate provides procedural macros that enable automatic code generation for FHIR 
-//! (Fast Healthcare Interoperability Resources) implementations in Rust. It contains the 
-//! core macro functionality that powers serialization, deserialization, and FHIRPath 
+//! This crate provides procedural macros that enable automatic code generation for FHIR
+//! (Fast Healthcare Interoperability Resources) implementations in Rust. It contains the
+//! core macro functionality that powers serialization, deserialization, and FHIRPath
 //! evaluation across the entire FHIR ecosystem.
 //!
 //! ## Overview
 //!
 //! The `fhir_macro` crate implements two essential derive macros:
 //!
-//! - **`#[derive(FhirSerde)]`** - Custom serialization/deserialization handling FHIR's 
+//! - **`#[derive(FhirSerde)]`** - Custom serialization/deserialization handling FHIR's
 //!   JSON representation including its extension pattern
-//! - **`#[derive(FhirPath)]`** - Automatic conversion to FHIRPath evaluation results for 
+//! - **`#[derive(FhirPath)]`** - Automatic conversion to FHIRPath evaluation results for
 //!   resource traversal
 //!
-//! These macros are automatically applied to thousands of generated FHIR types, eliminating 
-//! the need for hand-written serialization code while ensuring compliance with FHIR's 
+//! These macros are automatically applied to thousands of generated FHIR types, eliminating
+//! the need for hand-written serialization code while ensuring compliance with FHIR's
 //! complex serialization requirements.
 //!
 //! ## FHIR Serialization Challenges
@@ -30,7 +30,7 @@
 //! {
 //!   "status": "active",
 //!   "_status": {
-//!     "id": "status-1", 
+//!     "id": "status-1",
 //!     "extension": [...]
 //!   }
 //! }
@@ -651,7 +651,7 @@ fn extract_inner_element_type(type_name: &str) -> &str {
 ///
 /// The generated code handles several FHIR-specific patterns:
 ///
-/// 1. **Element Extension Pattern**: 
+/// 1. **Element Extension Pattern**:
 ///    ```json
 ///    { "field": "value", "_field": {"id": "...", "extension": []} }
 ///    ```
@@ -679,15 +679,17 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
         Data::Enum(ref data) => {
             // Handle enum serialization
             let mut match_arms = Vec::new();
-            
+
             for variant in &data.variants {
                 let variant_name = &variant.ident;
-                
+
                 // Get the rename attribute if present
                 let mut rename = None;
                 for attr in &variant.attrs {
                     if attr.path().is_ident("fhir_serde") {
-                        if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                        if let Ok(list) =
+                            attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+                        {
                             for meta in list {
                                 if let Meta::NameValue(nv) = meta {
                                     if nv.path.is_ident("rename") {
@@ -702,20 +704,20 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                         }
                     }
                 }
-                
+
                 // Use the rename value or the variant name as a string
                 let variant_key = rename.unwrap_or_else(|| variant_name.to_string());
-                
+
                 // Handle different variant field types
                 match &variant.fields {
                     Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                         // Newtype variant (e.g., String(String))
                         let field = fields.unnamed.first().unwrap();
                         let field_ty = &field.ty;
-                        
+
                         // Check if this is a primitive type that might have extensions
                         let (is_element, is_decimal_element, _, _) = get_element_info(field_ty);
-                        
+
                         if is_element || is_decimal_element {
                             // For Element types, we need special handling for the _fieldName pattern
                             let underscore_variant_key = format!("_{}", variant_key);
@@ -725,13 +727,11 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 Self::#variant_name(value) => {
                                     // Check if the element has id or extension that needs to be serialized
                                     let has_extension = value.id.is_some() || value.extension.is_some();
-                                    
                                     // Serialize the primitive value
                                     if value.value.is_some() {
                                         // Use serialize_entry for SerializeMap
                                         state.serialize_entry(#variant_key, &value.value)?;
                                     }
-                                        
                                     // Serialize the extension part if present
                                     if has_extension {
                                         #[derive(serde::Serialize)]
@@ -741,16 +741,13 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                             #[serde(skip_serializing_if = "Option::is_none")]
                                             extension: &'a Option<Vec<Extension>>,
                                         }
-                                            
                                         let extension_part = IdAndExtensionHelper {
                                             id: &value.id,
                                             extension: &value.extension,
                                         };
-                                            
                                         // Use serialize_entry for SerializeMap
                                         state.serialize_entry(#underscore_variant_key, &extension_part)?;
                                     }
-                                    
                                     // Don't return Result here, just continue
                                 }
                             });
@@ -763,7 +760,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 }
                             });
                         }
-                    },
+                    }
                     Fields::Unnamed(_) => {
                         // Tuple variant with multiple fields
                         match_arms.push(quote! {
@@ -771,7 +768,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 state.serialize_entry(#variant_key, value)?;
                             }
                         });
-                    },
+                    }
                     Fields::Named(_fields) => {
                         // Struct variant
                         match_arms.push(quote! {
@@ -779,7 +776,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 state.serialize_entry(#variant_key, self)?;
                             }
                         });
-                    },
+                    }
                     Fields::Unit => {
                         // Unit variant
                         match_arms.push(quote! {
@@ -787,30 +784,30 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                 state.serialize_entry(#variant_key, &())?;
                             }
                         });
-                    },
+                    }
                 }
             }
-            
+
             // Generate the enum serialization implementation
             quote! {
                 // Count the number of fields to serialize (always 1 for an enum variant)
                 let count = 1;
-                
+
                 // Import SerializeMap trait to access serialize_entry method
                 use serde::ser::SerializeMap;
-                
+
                 // Create a serialization state
                 let mut state = serializer.serialize_map(Some(count))?;
-                
+
                 // Match on self to determine which variant to serialize
                 match self {
                     #(#match_arms)*
                 }
-                                
+
                 // End the map serialization
                 state.end()
             }
-        },
+        }
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
@@ -1402,8 +1399,7 @@ mod tests {
 
         // Test with a path that *doesn't* end in Element/DecimalElement
         let ty_non_element_path: Type = parse_str("some::module::RegularStruct").unwrap();
-        let (is_element, is_decimal, is_option, is_vec) =
-            get_element_info(&ty_non_element_path);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_non_element_path);
         assert!(!is_element);
         assert!(!is_decimal);
         assert!(!is_option);
@@ -1411,8 +1407,7 @@ mod tests {
 
         // Test with a path that *does* end in Element (simulating alias)
         // We use the actual Element type parsed earlier for this simulation
-        let (is_element, is_decimal, is_option, is_vec) =
-            get_element_info(&ty_simulated_alias);
+        let (is_element, is_decimal, is_option, is_vec) = get_element_info(&ty_simulated_alias);
         assert!(is_element);
         assert!(!is_decimal);
         assert!(!is_option);
@@ -1557,11 +1552,11 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
         Data::Enum(ref data) => {
             // For enums, we need to deserialize from a map with a single key-value pair
             // where the key is the variant name and the value is the variant data
-            
+
             // Generate a visitor for the enum
             let enum_name = name.to_string();
             let variants = &data.variants;
-            
+
             let mut variant_matches = Vec::new(); // Stores the generated match arms
             let mut variant_names = Vec::new(); // Stores the string names for error messages/expecting
 
@@ -1573,7 +1568,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 let mut rename = None;
                 for attr in &variant.attrs {
                     if attr.path().is_ident("fhir_serde") {
-                        if let Ok(list) = attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated) {
+                        if let Ok(list) =
+                            attr.parse_args_with(Punctuated::<Meta, token::Comma>::parse_terminated)
+                        {
                             for meta in list {
                                 if let Meta::NameValue(nv) = meta {
                                     if nv.path.is_ident("rename") {
@@ -1588,7 +1585,9 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                             }
                         }
                     }
-                    if rename.is_some() { break; }
+                    if rename.is_some() {
+                        break;
+                    }
                 }
 
                 // Use the rename value or the variant name as a string for the JSON key
@@ -1615,25 +1614,40 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                 // Need to re-determine the base type here
                                 let base_type = get_base_type(field_ty);
                                 if let Type::Path(type_path) = base_type {
-                                     if let Some(last_segment) = type_path.path.segments.last() {
-                                         if last_segment.ident == "Element" {
-                                             // Direct Element<V, E>
-                                             if let PathArguments::AngleBracketed(generics) = &last_segment.arguments {
-                                                 if let Some(GenericArgument::Type(inner_v_type)) = generics.args.first() {
-                                                     quote! { #inner_v_type }
-                                                 } else { panic!("Element missing generic argument V"); }
-                                             } else { panic!("Element missing angle bracketed arguments"); }
-                                         } else {
-                                             // Alias
-                                             let alias_name = last_segment.ident.to_string();
-                                             let primitive_type_str = extract_inner_element_type(&alias_name);
-                                             let primitive_type_parsed: Type = syn::parse_str(primitive_type_str).expect("Failed to parse primitive type string");
-                                             quote! { #primitive_type_parsed }
-                                         }
-                                     } else { panic!("Could not get last segment of Element type path"); }
-                                 } else { panic!("Element type is not a Type::Path"); }
+                                    if let Some(last_segment) = type_path.path.segments.last() {
+                                        if last_segment.ident == "Element" {
+                                            // Direct Element<V, E>
+                                            if let PathArguments::AngleBracketed(generics) =
+                                                &last_segment.arguments
+                                            {
+                                                if let Some(GenericArgument::Type(inner_v_type)) =
+                                                    generics.args.first()
+                                                {
+                                                    quote! { #inner_v_type }
+                                                } else {
+                                                    panic!("Element missing generic argument V");
+                                                }
+                                            } else {
+                                                panic!("Element missing angle bracketed arguments");
+                                            }
+                                        } else {
+                                            // Alias
+                                            let alias_name = last_segment.ident.to_string();
+                                            let primitive_type_str =
+                                                extract_inner_element_type(&alias_name);
+                                            let primitive_type_parsed: Type = syn::parse_str(
+                                                primitive_type_str,
+                                            )
+                                            .expect("Failed to parse primitive type string");
+                                            quote! { #primitive_type_parsed }
+                                        }
+                                    } else {
+                                        panic!("Could not get last segment of Element type path");
+                                    }
+                                } else {
+                                    panic!("Element type is not a Type::Path");
+                                }
                             };
-
 
                             quote! {
                                 // Check if parts exist *before* potentially moving them
@@ -1690,28 +1704,28 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     }
                     Fields::Unnamed(_) => {
                         // Tuple variant
-                         quote! {
-                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                             let inner_value = serde::Deserialize::deserialize(value)
-                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
-                             Ok(#name::#variant_name(inner_value)) // Use variant_name directly
-                         }
-                    },
+                        quote! {
+                            let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                            let inner_value = serde::Deserialize::deserialize(value)
+                                .map_err(|e| serde::de::Error::custom(format!("Error deserializing tuple variant {}: {}", #variant_key, e)))?;
+                            Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                        }
+                    }
                     Fields::Named(_) => {
                         // Struct variant
-                         quote! {
-                             let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
-                             let inner_value = serde::Deserialize::deserialize(value)
-                                 .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
-                             Ok(#name::#variant_name(inner_value)) // Use variant_name directly
-                         }
-                    },
+                        quote! {
+                            let value = value_part.ok_or_else(|| serde::de::Error::missing_field(#variant_key))?;
+                            let inner_value = serde::Deserialize::deserialize(value)
+                                .map_err(|e| serde::de::Error::custom(format!("Error deserializing struct variant {}: {}", #variant_key, e)))?;
+                            Ok(#name::#variant_name(inner_value)) // Use variant_name directly
+                        }
+                    }
                     Fields::Unit => {
                         // Unit variant
-                         quote! {
-                             Ok(#name::#variant_name) // Use variant_name directly
-                         }
-                    },
+                        quote! {
+                            Ok(#name::#variant_name) // Use variant_name directly
+                        }
+                    }
                 }; // End match variant.fields
 
                 // Push the complete match arm
@@ -1754,7 +1768,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                         formatter.write_str(concat!("a ", #enum_name, " enum"))
                     }
-                    
+
                     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
                     where
                         A: serde::de::MapAccess<'de>,
@@ -1845,7 +1859,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                 // Use the visitor to deserialize the enum (no longer needs variants)
                 deserializer.deserialize_map(EnumVisitor) // Removed variants passing
             };
-        },
+        }
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
@@ -1900,8 +1914,12 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
                                             let primitive_type_parsed: Type = syn::parse_str(
                                                 primitive_type_str,
                                             )
-                                            .unwrap_or_else(|_| panic!("Failed to parse primitive type string: {}",
-                                                primitive_type_str));
+                                            .unwrap_or_else(|_| {
+                                                panic!(
+                                                    "Failed to parse primitive type string: {}",
+                                                    primitive_type_str
+                                                )
+                                            });
                                             quote! { #primitive_type_parsed } // Use the parsed primitive type
                                         }
                                     } else {
@@ -2220,7 +2238,6 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
     }
 }
 
-
 //=============================================================================
 // FHIRPath Derive Macro and Implementation Functions
 //=============================================================================
@@ -2274,7 +2291,7 @@ fn generate_deserialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStr
 /// }
 ///
 /// // Usage in FHIRPath evaluation
-/// let patient = Patient { 
+/// let patient = Patient {
 ///     id: Some("123".to_string()),
 ///     active: Some(Boolean::from(true)),
 ///     implicit_rules: None,  // Filtered out
@@ -2322,8 +2339,12 @@ pub fn fhir_path_derive(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let trait_impl = match &input.data {
-        Data::Struct(data) => generate_fhirpath_struct_impl(name, data, &impl_generics, &ty_generics, where_clause),
-        Data::Enum(data) => generate_fhirpath_enum_impl(name, data, &impl_generics, &ty_generics, where_clause),
+        Data::Struct(data) => {
+            generate_fhirpath_struct_impl(name, data, &impl_generics, &ty_generics, where_clause)
+        }
+        Data::Enum(data) => {
+            generate_fhirpath_enum_impl(name, data, &impl_generics, &ty_generics, where_clause)
+        }
         Data::Union(_) => panic!("FhirPath derive macro does not support unions."),
     };
 
@@ -2389,7 +2410,6 @@ fn get_fhirpath_field_name(field: &syn::Field) -> String {
     field.ident.as_ref().unwrap().to_string()
 }
 
-
 fn generate_fhirpath_struct_impl(
     name: &Ident,
     data: &syn::DataStruct,
@@ -2409,7 +2429,6 @@ fn generate_fhirpath_struct_impl(
 
         // Check if this field is a FHIR primitive type that needs special handling
         let fhir_type_name = extract_fhir_primitive_type_name(field_ty);
-        
         // Generate code to handle the field based on whether it's Option
         let is_option = get_option_inner_type(field_ty).is_some();
 
@@ -2476,19 +2495,18 @@ fn generate_fhirpath_struct_impl(
         } // Return the generated code for this field
     });
 
-
     // Determine the type name to use for type info
     // For now, we'll use the struct name as the type name
     let type_name_str = name.to_string();
-    
+
     quote! {
         impl #impl_generics helios_fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
             fn to_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
                 // Use fully qualified path for HashMap
                 let mut map = std::collections::HashMap::new();
-                
+
                 #(#field_conversions)* // Expand the field conversion logic
-                
+
                 // Return a typed object with FHIR type information
                 helios_fhirpath_support::EvaluationResult::typed_object(
                     map,
@@ -2500,7 +2518,6 @@ fn generate_fhirpath_struct_impl(
     }
 }
 
-
 fn generate_fhirpath_enum_impl(
     name: &Ident,
     data: &syn::DataEnum,
@@ -2508,11 +2525,10 @@ fn generate_fhirpath_enum_impl(
     ty_generics: &syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
 ) -> proc_macro2::TokenStream {
-
     // Handle empty enums (like initial R6 Resource enum)
     if data.variants.is_empty() {
         let is_resource_enum = name == "Resource";
-        
+
         let additional_impl = if is_resource_enum {
             quote! {
                 impl #impl_generics crate::FhirResourceTypeProvider for #name #ty_generics #where_clause {
@@ -2524,7 +2540,7 @@ fn generate_fhirpath_enum_impl(
         } else {
             quote! {}
         };
-        
+
         return quote! {
             impl #impl_generics helios_fhirpath_support::IntoEvaluationResult for #name #ty_generics #where_clause {
                 fn to_evaluation_result(&self) -> helios_fhirpath_support::EvaluationResult {
@@ -2532,17 +2548,20 @@ fn generate_fhirpath_enum_impl(
                     unreachable!("Empty enum should not be instantiated")
                 }
             }
-            
+
             #additional_impl
         };
     }
 
     // Check if the enum being derived is the top-level Resource enum
     let is_resource_enum = name == "Resource";
-    
+
     // If this is a Resource enum, collect all variant names for the FhirResourceTypeProvider trait
     let resource_type_names: Vec<String> = if is_resource_enum {
-        data.variants.iter().map(|variant| variant.ident.to_string()).collect()
+        data.variants
+            .iter()
+            .map(|variant| variant.ident.to_string())
+            .collect()
     } else {
         Vec::new()
     };
@@ -2581,7 +2600,6 @@ fn generate_fhirpath_enum_impl(
                     // For other enums (like choice types), preserve type information from the variant
                     // Extract type information from the variant name or rename attribute
                     let variant_name_str = variant_name.to_string();
-                    
                     // Check for fhir_serde rename attribute to get the FHIR field name
                     let mut fhir_field_name = variant_name_str.clone();
                     for attr in &variant.attrs {
@@ -2601,7 +2619,7 @@ fn generate_fhirpath_enum_impl(
                             }
                         }
                     }
-                    
+
                     // Extract FHIR type from choice element field name (e.g., "valueCode" -> "code")
                     let fhir_type = if fhir_field_name.starts_with("value") && fhir_field_name.len() > 5 {
                         // Convert first character to lowercase for FHIR primitive types
@@ -2632,12 +2650,10 @@ fn generate_fhirpath_enum_impl(
                             Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
                         }
                     };
-                    
                     quote! {
                         Self::#variant_name(value) => {
                             // Get the base evaluation result from the inner value
                             let mut result = value.to_evaluation_result();
-                            
                             // Add FHIR type information to preserve type for .ofType() operations
                             // Only override type info if it's not already set correctly
                             result = match result {
@@ -2666,7 +2682,6 @@ fn generate_fhirpath_enum_impl(
                                 },
                                 _ => result, // For other types, return as-is
                             };
-                            
                             result
                         }
                     }
@@ -2705,18 +2720,21 @@ fn generate_fhirpath_enum_impl(
             }
         }
     };
-    
+
     // Generate additional FhirResourceTypeProvider implementation for Resource enums
     if is_resource_enum {
-        let resource_type_literals: Vec<_> = resource_type_names.iter().map(|name| {
-            quote! { #name }
-        }).collect();
-        
+        let resource_type_literals: Vec<_> = resource_type_names
+            .iter()
+            .map(|name| {
+                quote! { #name }
+            })
+            .collect();
+
         // Generate resource_name method for Resource enum
         let resource_name_arms = data.variants.iter().map(|variant| {
             let variant_name = &variant.ident;
             let variant_name_str = variant_name.to_string();
-            
+
             match &variant.fields {
                 Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                     // Newtype variant (expected for Resource enum)
@@ -2732,11 +2750,11 @@ fn generate_fhirpath_enum_impl(
                 }
             }
         });
-        
+
         // Generate get_last_updated method for Resource enum
         let get_last_updated_arms = data.variants.iter().map(|variant| {
             let variant_name = &variant.ident;
-            
+
             match &variant.fields {
                 Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                     quote! {
@@ -2763,10 +2781,10 @@ fn generate_fhirpath_enum_impl(
                 }
             }
         });
-        
+
         quote! {
             #into_evaluation_result_impl
-            
+
             impl #impl_generics #name #ty_generics #where_clause {
                 /// Returns the resource type name as a string.
                 /// This is equivalent to the resourceType field in FHIR JSON.
@@ -2775,7 +2793,7 @@ fn generate_fhirpath_enum_impl(
                         #(#resource_name_arms)*
                     }
                 }
-                
+
                 /// Returns the lastUpdated timestamp from the resource's metadata if available.
                 pub fn get_last_updated(&self) -> Option<::chrono::DateTime<::chrono::Utc>> {
                     match self {
@@ -2783,7 +2801,7 @@ fn generate_fhirpath_enum_impl(
                     }
                 }
             }
-            
+
             impl #impl_generics crate::FhirResourceTypeProvider for #name #ty_generics #where_clause {
                 fn get_resource_type_names() -> Vec<&'static str> {
                     vec![#(#resource_type_literals),*]
@@ -2832,7 +2850,7 @@ pub fn type_info_derive(input: TokenStream) -> TokenStream {
             fn type_namespace() -> &'static str {
                 #namespace
             }
-            
+
             fn type_name() -> &'static str {
                 #type_name
             }
@@ -2851,7 +2869,7 @@ fn extract_type_info_attributes(attrs: &[syn::Attribute], type_name: &Ident) -> 
             {
                 let mut namespace = None;
                 let mut name = None;
-                
+
                 for meta in list {
                     if let Meta::NameValue(nv) = meta {
                         if nv.path.is_ident("namespace") {
@@ -2869,14 +2887,14 @@ fn extract_type_info_attributes(attrs: &[syn::Attribute], type_name: &Ident) -> 
                         }
                     }
                 }
-                
+
                 if let (Some(ns), Some(n)) = (namespace, name) {
                     return (format!("\"{}\"", ns), format!("\"{}\"", n));
                 }
             }
         }
     }
-    
+
     // Default: Assume FHIR namespace and use the type name
     ("\"FHIR\"".to_string(), format!("\"{}\"", type_name))
 }
@@ -2890,12 +2908,12 @@ fn extract_fhir_primitive_type_name(ty: &syn::Type) -> Option<&'static str> {
     } else {
         ty
     };
-    
+
     // Check if this is a path type
     if let syn::Type::Path(type_path) = inner_type {
         if let Some(segment) = type_path.path.segments.last() {
             let type_name = segment.ident.to_string();
-            
+
             // Map FHIR type aliases to their lowercase primitive names
             match type_name.as_str() {
                 "Uri" => Some("uri"),
@@ -2927,4 +2945,3 @@ fn extract_fhir_primitive_type_name(ty: &syn::Type) -> Option<&'static str> {
         None
     }
 }
-

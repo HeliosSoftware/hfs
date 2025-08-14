@@ -1,5 +1,5 @@
-use helios_fhirpath::{evaluate_expression, EvaluationContext};
 use helios_fhir::FhirResource;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use serde_json::json;
 
 #[test]
@@ -45,33 +45,47 @@ fn test_uri_type_preservation() {
     // Parse the JSON into a FHIR resource
     let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(resource));
-    
+
     // Create evaluation context
     let context = EvaluationContext::new(vec![fhir_resource]);
-    
+
     // Test 1: Get the system field and check its type
     let result = evaluate_expression("identifier[0].type.coding[0].system", &context).unwrap();
-    
+
     // Verify the value is correct
     if let helios_fhirpath_support::EvaluationResult::String(value, _type_info) = &result {
         assert_eq!(value, "http://terminology.hl7.org/CodeSystem/v2-0203");
-        
+
         // Test 2: Check the type using type() function
-        let type_result = evaluate_expression("identifier[0].type.coding[0].system.type().name", &context).unwrap();
-        
+        let type_result =
+            evaluate_expression("identifier[0].type.coding[0].system.type().name", &context)
+                .unwrap();
+
         if let helios_fhirpath_support::EvaluationResult::String(type_name, _) = type_result {
             // This should be "uri" but currently returns "String"
             println!("Type name: {}", type_name);
-            assert_eq!(type_name, "uri", "Expected 'uri' type but got '{}'", type_name);
+            assert_eq!(
+                type_name, "uri",
+                "Expected 'uri' type but got '{}'",
+                type_name
+            );
         } else {
             panic!("Expected string result from type().name");
         }
-        
+
         // Also check the namespace
-        let namespace_result = evaluate_expression("identifier[0].type.coding[0].system.type().namespace", &context).unwrap();
+        let namespace_result = evaluate_expression(
+            "identifier[0].type.coding[0].system.type().namespace",
+            &context,
+        )
+        .unwrap();
         if let helios_fhirpath_support::EvaluationResult::String(namespace, _) = namespace_result {
             println!("Namespace: {}", namespace);
-            assert_eq!(namespace, "FHIR", "Expected 'FHIR' namespace but got '{}'", namespace);
+            assert_eq!(
+                namespace, "FHIR",
+                "Expected 'FHIR' namespace but got '{}'",
+                namespace
+            );
         }
     } else {
         panic!("Expected string result");
@@ -101,13 +115,18 @@ fn test_code_type_preservation() {
     let resource: helios_fhir::r4::Resource = serde_json::from_value(patient_json).unwrap();
     let fhir_resource = FhirResource::R4(Box::new(resource));
     let context = EvaluationContext::new(vec![fhir_resource]);
-    
+
     // Check code field type
-    let type_result = evaluate_expression("identifier[0].type.coding[0].code.type().name", &context).unwrap();
-    
+    let type_result =
+        evaluate_expression("identifier[0].type.coding[0].code.type().name", &context).unwrap();
+
     if let helios_fhirpath_support::EvaluationResult::String(type_name, _) = type_result {
         println!("Code type name: {}", type_name);
-        assert_eq!(type_name, "code", "Expected 'code' type but got '{}'", type_name);
+        assert_eq!(
+            type_name, "code",
+            "Expected 'code' type but got '{}'",
+            type_name
+        );
     } else {
         panic!("Expected string result from type().name");
     }

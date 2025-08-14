@@ -1840,15 +1840,17 @@ fn test_timing_roundtrip_serialization() {
         serde_json::from_str(json_input).expect("Deserialization failed");
 
     // Serialize back to JSON
-    let reserialized_json = serde_json::to_string(&deserialized_struct)
-        .expect("Serialization failed");
-    
+    let reserialized_json =
+        serde_json::to_string(&deserialized_struct).expect("Serialization failed");
+
     // Parse reserialized JSON to compare
     let reserialized_value: serde_json::Value = serde_json::from_str(&reserialized_json).unwrap();
 
     // The _event field should be preserved in roundtrip
     let original_event = &original_value["timingTiming"]["_event"];
-    let reserialized_event = reserialized_value["timingTiming"].get("_event").unwrap_or(&serde_json::Value::Null);
+    let reserialized_event = reserialized_value["timingTiming"]
+        .get("_event")
+        .unwrap_or(&serde_json::Value::Null);
     assert_eq!(
         original_event,
         reserialized_event,

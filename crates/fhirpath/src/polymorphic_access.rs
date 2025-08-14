@@ -828,7 +828,6 @@ pub fn apply_polymorphic_type_operation(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,8 +900,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn test_is_type_operation() {
         let obs = create_observation_with_quantity();
@@ -944,7 +941,6 @@ mod tests {
         let result =
             apply_polymorphic_type_operation(&value_quantity, "as", "Quantity", None).unwrap();
         assert_eq!(result, value_quantity);
-
 
         // Test with an Observation object
         let obj = EvaluationResult::Object {

@@ -63,7 +63,7 @@ pub struct EvaluationContext {
     /// Holds the current accumulator value for the aggregate() function's $total variable
     /// Used to pass the current aggregation result between iterations
     pub current_aggregate_total: Option<EvaluationResult>,
-    
+
     /// Collects trace outputs during expression evaluation
     /// Each tuple contains (trace_name, traced_value)
     /// Uses RefCell for interior mutability to allow collection during evaluation
@@ -87,24 +87,32 @@ impl EvaluationContext {
     /// A new `EvaluationContext` instance with the provided resources
     pub fn new(resources: Vec<FhirResource>) -> Self {
         // Infer FHIR version from the first resource, or default to R4
-        let fhir_version = resources.first()
-            .map(|r| r.version())
-            .unwrap_or_else(|| {
-                #[cfg(feature = "R4")]
-                { FhirVersion::R4 }
-                #[cfg(not(feature = "R4"))]
+        let fhir_version = resources.first().map(|r| r.version()).unwrap_or_else(|| {
+            #[cfg(feature = "R4")]
+            {
+                FhirVersion::R4
+            }
+            #[cfg(not(feature = "R4"))]
+            {
+                // If R4 is not available, use the first available version
+                #[cfg(feature = "R4B")]
                 {
-                    // If R4 is not available, use the first available version
-                    #[cfg(feature = "R4B")]
-                    { FhirVersion::R4B }
-                    #[cfg(all(not(feature = "R4B"), feature = "R5"))]
-                    { FhirVersion::R5 }
-                    #[cfg(all(not(feature = "R4B"), not(feature = "R5"), feature = "R6"))]
-                    { FhirVersion::R6 }
-                    #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
-                    { panic!("No FHIR version feature enabled") }
+                    FhirVersion::R4B
                 }
-            });
+                #[cfg(all(not(feature = "R4B"), feature = "R5"))]
+                {
+                    FhirVersion::R5
+                }
+                #[cfg(all(not(feature = "R4B"), not(feature = "R5"), feature = "R6"))]
+                {
+                    FhirVersion::R6
+                }
+                #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
+                {
+                    panic!("No FHIR version feature enabled")
+                }
+            }
+        });
 
         // Set 'this' to the first resource if available
         let this = resources.first().map(convert_resource_to_result);
@@ -117,7 +125,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
-            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
+            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
         }
     }
 
@@ -146,7 +154,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
-            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
+            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
         }
     }
 
@@ -172,7 +180,7 @@ impl EvaluationContext {
             is_strict_mode: false,          // Default to non-strict mode
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
-            trace_outputs: RefCell::new(Vec::new()),      // Initialize trace outputs
+            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
         }
     }
 
@@ -186,18 +194,28 @@ impl EvaluationContext {
     /// A new empty `EvaluationContext` instance with default version
     pub fn new_empty_with_default_version() -> Self {
         #[cfg(feature = "R4")]
-        { Self::new_empty(FhirVersion::R4) }
+        {
+            Self::new_empty(FhirVersion::R4)
+        }
         #[cfg(not(feature = "R4"))]
         {
             // If R4 is not available, use the first available version
             #[cfg(feature = "R4B")]
-            { Self::new_empty(FhirVersion::R4B) }
+            {
+                Self::new_empty(FhirVersion::R4B)
+            }
             #[cfg(all(not(feature = "R4B"), feature = "R5"))]
-            { Self::new_empty(FhirVersion::R5) }
+            {
+                Self::new_empty(FhirVersion::R5)
+            }
             #[cfg(all(not(feature = "R4B"), not(feature = "R5"), feature = "R6"))]
-            { Self::new_empty(FhirVersion::R6) }
+            {
+                Self::new_empty(FhirVersion::R6)
+            }
             #[cfg(not(any(feature = "R4B", feature = "R5", feature = "R6")))]
-            { panic!("No FHIR version feature enabled") }
+            {
+                panic!("No FHIR version feature enabled")
+            }
         }
     }
 
@@ -208,7 +226,7 @@ impl EvaluationContext {
     pub fn clear_trace_outputs(&self) {
         self.trace_outputs.borrow_mut().clear();
     }
-    
+
     /// Gets the collected trace outputs
     ///
     /// Returns a clone of all trace outputs collected during evaluation
@@ -1090,7 +1108,7 @@ fn evaluate_term(
                 if !name.starts_with('%') {
                     // Non-prefixed names should NOT check variables - only object properties and resourceType
                     // Variables should only be accessible with the % prefix per FHIRPath specification
-                    
+
                     // Check if it matches the resourceType of the base_context
                     if let EvaluationResult::Object {
                         map: obj_map,
@@ -1553,7 +1571,7 @@ fn evaluate_invocation(
                                 base_name,
                             ))) = &**base_expr
                             {
-                                    Some(TypeSpecifier::QualifiedIdentifier(
+                                Some(TypeSpecifier::QualifiedIdentifier(
                                     base_name.clone(),
                                     Some(member_name.clone()),
                                 ))
@@ -1582,18 +1600,22 @@ fn evaluate_invocation(
 
                     // Evaluate the condition expression, handle potential error
                     // Use global context for resource expressions, current context for variables
-                    let condition_invocation_base = if expression_starts_with_resource_identifier(condition_expr, context) {
-                        None  // Global context for expressions like "Patient.name.exists()"
-                    } else {
-                        Some(invocation_base)  // Current context for expressions like "$total.empty()"
-                    };
+                    let condition_invocation_base =
+                        if expression_starts_with_resource_identifier(condition_expr, context) {
+                            None // Global context for expressions like "Patient.name.exists()"
+                        } else {
+                            Some(invocation_base) // Current context for expressions like "$total.empty()"
+                        };
                     let condition_result =
                         evaluate(condition_expr, context, condition_invocation_base)?;
                     let condition_bool = condition_result.to_boolean_for_logic()?; // Use logic conversion
 
                     if matches!(condition_bool, EvaluationResult::Boolean(true, _)) {
-                        // Condition is true, evaluate the trueResult expression, propagate error  
-                        let true_invocation_base = if expression_starts_with_resource_identifier(true_result_expr, context) {
+                        // Condition is true, evaluate the trueResult expression, propagate error
+                        let true_invocation_base = if expression_starts_with_resource_identifier(
+                            true_result_expr,
+                            context,
+                        ) {
                             None
                         } else {
                             Some(invocation_base)
@@ -1603,11 +1625,15 @@ fn evaluate_invocation(
                         // Condition is false or empty
                         if let Some(otherwise_expr) = otherwise_result_expr {
                             // Evaluate the otherwiseResult expression if present, propagate error
-                            let otherwise_invocation_base = if expression_starts_with_resource_identifier(otherwise_expr, context) {
-                                None
-                            } else {
-                                Some(invocation_base)
-                            };
+                            let otherwise_invocation_base =
+                                if expression_starts_with_resource_identifier(
+                                    otherwise_expr,
+                                    context,
+                                ) {
+                                    None
+                                } else {
+                                    Some(invocation_base)
+                                };
                             evaluate(otherwise_expr, context, otherwise_invocation_base)
                         } else {
                             // Otherwise result is omitted, return empty collection
@@ -1705,7 +1731,8 @@ fn evaluate_invocation(
                             }
                             _ => {
                                 // For other expressions, evaluate normally and try to extract string
-                                let evaluated = evaluate(&args_exprs[0], context, current_item_for_args)?;
+                                let evaluated =
+                                    evaluate(&args_exprs[0], context, current_item_for_args)?;
                                 match evaluated {
                                     EvaluationResult::String(s, _) => Some(s),
                                     _ => None,
@@ -1717,16 +1744,19 @@ fn evaluate_invocation(
                             "Function 'getReferenceKey' expects 0 or 1 argument".to_string(),
                         ));
                     };
-                    
+
                     // Convert type filter to EvaluationResult array format expected by the function
                     let args_for_function = if let Some(type_str) = type_filter {
                         vec![EvaluationResult::String(type_str, None)]
                     } else {
                         vec![]
                     };
-                    
+
                     // Call the getReferenceKey function with proper arguments
-                    crate::reference_key_functions::get_reference_key_function(invocation_base, &args_for_function)
+                    crate::reference_key_functions::get_reference_key_function(
+                        invocation_base,
+                        &args_for_function,
+                    )
                 }
                 // Add other functions taking lambdas here (e.g., any)
                 _ => {
@@ -2551,10 +2581,7 @@ fn call_function(
                             parts[0].len() == 2
                                 && parts[1].len() == 2
                                 && parts[2].len() >= 2
-                                && parts[2]
-                                    .split('.')
-                                    .next()
-                                    .is_some_and(|sec| sec.len() == 2)
+                                && parts[2].split('.').next().is_some_and(|sec| sec.len() == 2)
                                 && parts
                                     .iter()
                                     .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
@@ -2608,10 +2635,7 @@ fn call_function(
                             parts[0].len() == 2
                                 && parts[1].len() == 2
                                 && parts[2].len() >= 2
-                                && parts[2]
-                                    .split('.')
-                                    .next()
-                                    .is_some_and(|sec| sec.len() == 2)
+                                && parts[2].split('.').next().is_some_and(|sec| sec.len() == 2)
                                 && parts
                                     .iter()
                                     .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
@@ -3133,7 +3157,7 @@ fn call_function(
                     "Function 'join' expects 0 or 1 argument (separator)".to_string(),
                 ));
             }
-            
+
             let separator = if args.is_empty() {
                 // Default to empty separator when no arguments provided
                 ""
@@ -3144,7 +3168,7 @@ fn call_function(
                         "join requires a singleton separator argument".to_string(),
                     ));
                 }
-                
+
                 match &args[0] {
                     EvaluationResult::String(sep, _) => sep,
                     EvaluationResult::Empty => return Ok(EvaluationResult::Empty), // join({}) -> {}
@@ -3155,7 +3179,7 @@ fn call_function(
                     }
                 }
             };
-            
+
             // Handle the base collection
             match invocation_base {
                 EvaluationResult::Collection { items, .. } => {
@@ -3176,11 +3200,9 @@ fn call_function(
                 }
                 EvaluationResult::Empty => Ok(EvaluationResult::string(String::new())), // {}.join(sep) -> ""
                 EvaluationResult::String(s, _) => Ok(EvaluationResult::string(s.clone())), // Single string -> same string
-                _ => {
-                    Err(EvaluationError::TypeError(
-                        "join requires string items or a collection of strings".to_string(),
-                    ))
-                }
+                _ => Err(EvaluationError::TypeError(
+                    "join requires string items or a collection of strings".to_string(),
+                )),
             }
         }
         "round" => {
@@ -4224,10 +4246,7 @@ fn call_function(
             // Returns a collection with all immediate child nodes of all items in the input collection
             Ok(match invocation_base {
                 EvaluationResult::Empty => EvaluationResult::Empty,
-                EvaluationResult::Object {
-                    map,
-                    type_info: _,
-                } => {
+                EvaluationResult::Object { map, type_info: _ } => {
                     // Get all values in the map (excluding the resourceType field)
                     let mut children: Vec<EvaluationResult> = Vec::new();
                     for (key, value) in map {
@@ -5090,7 +5109,6 @@ fn apply_type_operation(
         EvaluationResult::Collection { items, .. } if items.len() == 1 => &items[0],
         _ => value,
     };
-    
 
     // Determine if the type_spec refers to a non-System FHIR type
     let (is_fhir_type_for_poly, type_name_for_poly, namespace_for_poly_opt) = match type_spec {
@@ -5103,10 +5121,24 @@ fn apply_type_operation(
         }
         TypeSpecifier::QualifiedIdentifier(type_name, _) => {
             // Unqualified: could be System primitive, FHIR primitive, or resource type
-            let is_fhir_prim = crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase());
-            let is_system_prim = matches!(type_name.as_str(), "Boolean" | "String" | "Integer" | "Decimal" | "Date" | "DateTime" | "Time" | "Quantity");
-            let is_resource_type = crate::resource_type::is_resource_type_for_version(type_name, &context.fhir_version);
-            
+            let is_fhir_prim =
+                crate::fhir_type_hierarchy::is_fhir_primitive_type(&type_name.to_lowercase());
+            let is_system_prim = matches!(
+                type_name.as_str(),
+                "Boolean"
+                    | "String"
+                    | "Integer"
+                    | "Decimal"
+                    | "Date"
+                    | "DateTime"
+                    | "Time"
+                    | "Quantity"
+            );
+            let is_resource_type = crate::resource_type::is_resource_type_for_version(
+                type_name,
+                &context.fhir_version,
+            );
+
             // Route primitives and resource types to resource_type module
             if is_system_prim || is_fhir_prim || is_resource_type {
                 (false, String::new(), None) // Handle by resource_type
@@ -5140,7 +5172,8 @@ fn apply_type_operation(
     // Fallback to crate::resource_type for System types, 'ofType', or if not handled by polymorphic_access
     match op {
         "is" => {
-            let is_result = crate::resource_type::is_of_type_with_context(actual_value, type_spec, context)?;
+            let is_result =
+                crate::resource_type::is_of_type_with_context(actual_value, type_spec, context)?;
             Ok(EvaluationResult::boolean(is_result))
         }
         "as" => {
@@ -5412,8 +5445,7 @@ fn compare_equality(
             if l_cmp == EvaluationResult::Empty || r_cmp == EvaluationResult::Empty {
                 return Ok(EvaluationResult::Empty); // Return Ok(Empty)
             }
-            
-            
+
             Ok(match (&l_cmp, &r_cmp) {
                 // Use references to l_cmp and r_cmp
                 // Wrap result in Ok
@@ -5492,9 +5524,7 @@ fn compare_equality(
                         Some(ordering) => {
                             EvaluationResult::boolean(ordering == std::cmp::Ordering::Equal)
                         }
-                        None => {
-                            EvaluationResult::boolean(false)
-                        }
+                        None => EvaluationResult::boolean(false),
                     }
                 }
                 // Quantity equality (requires same units and equal values)
@@ -5522,9 +5552,10 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_str);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_prim);
-                        
-                        
-                        EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l == val_r_prim)
+
+                        EvaluationResult::boolean(
+                            normalized_unit_l == normalized_unit_r && val_l == val_r_prim,
+                        )
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
                         EvaluationResult::boolean(false)
@@ -5537,7 +5568,9 @@ fn compare_equality(
                         type_info: Some(type_info),
                     },
                     EvaluationResult::Quantity(val_r_prim, unit_r_prim, _),
-                ) if type_info.namespace == "FHIR" && (type_info.name == "Quantity" || type_info.name == "quantity") => {
+                ) if type_info.namespace == "FHIR"
+                    && (type_info.name == "Quantity" || type_info.name == "quantity") =>
+                {
                     let val_l_obj = obj_l.get("value");
                     let unit_l_obj_field = obj_l.get("code").or_else(|| obj_l.get("unit"));
 
@@ -5549,7 +5582,9 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_str);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_prim);
-                        EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l == val_r_prim)
+                        EvaluationResult::boolean(
+                            normalized_unit_l == normalized_unit_r && val_l == val_r_prim,
+                        )
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
                         EvaluationResult::boolean(false)
@@ -5574,9 +5609,10 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_prim);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_str);
-                        
-                        
-                        EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l_prim == val_r)
+
+                        EvaluationResult::boolean(
+                            normalized_unit_l == normalized_unit_r && val_l_prim == val_r,
+                        )
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
                         EvaluationResult::boolean(false)
@@ -5601,7 +5637,9 @@ fn compare_equality(
                         // Normalize units for comparison
                         let normalized_unit_l = normalize_unit_for_equality(unit_l_prim);
                         let normalized_unit_r = normalize_unit_for_equality(unit_r_str);
-                        EvaluationResult::boolean(normalized_unit_l == normalized_unit_r && val_l_prim == val_r)
+                        EvaluationResult::boolean(
+                            normalized_unit_l == normalized_unit_r && val_l_prim == val_r,
+                        )
                     } else {
                         // Object is not a valid Quantity representation or fields are missing/wrong type
                         EvaluationResult::boolean(false)
@@ -5764,8 +5802,7 @@ fn compare_equality(
                         let all_equivalent =
                             l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
                                 // Recursive call should use original left/right if they were collections
-                                compare_equality(li, "~", ri, context)
-                                    .is_ok_and(|r| r.to_boolean())
+                                compare_equality(li, "~", ri, context).is_ok_and(|r| r.to_boolean())
                             });
                         EvaluationResult::boolean(all_equivalent)
                     }
@@ -5825,7 +5862,7 @@ fn compare_equality(
                 (EvaluationResult::Decimal(l, _), EvaluationResult::Decimal(r, _)) => {
                     // For FHIRPath equivalence, decimals should be considered equivalent if they are
                     // sufficiently close to account for rounding/precision differences.
-                    // The test expects 1.2/1.8 ~ 0.67 to be true. Since 1.2/1.8 = 0.666..., 
+                    // The test expects 1.2/1.8 ~ 0.67 to be true. Since 1.2/1.8 = 0.666...,
                     // and 0.67 differs by ~0.003, we need a tolerance that handles this case.
                     use rust_decimal::prelude::*;
                     let tolerance = Decimal::new(1, 2); // 0.01 - reasonable tolerance for decimal equivalence
@@ -5910,8 +5947,9 @@ fn check_membership(
                     .any(|item| {
                         compare_equality(left, "=", item, context).is_ok_and(|r| r.to_boolean())
                     }),
-                single_item => compare_equality(left, "=", single_item, context)
-                    .is_ok_and(|r| r.to_boolean()),
+                single_item => {
+                    compare_equality(left, "=", single_item, context).is_ok_and(|r| r.to_boolean())
+                }
             };
 
             Ok(EvaluationResult::boolean(is_in))
@@ -5939,8 +5977,7 @@ fn check_membership(
                     // Use map_or to handle potential error from compare_equality
                     // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
-                        compare_equality(item, "=", right, context)
-                            .is_ok_and(|r| r.to_boolean()) // context is captured here
+                        compare_equality(item, "=", right, context).is_ok_and(|r| r.to_boolean()) // context is captured here
                     });
                     EvaluationResult::boolean(contains)
                 }
@@ -5975,7 +6012,10 @@ fn check_membership(
 
 /// Helper function to determine if an expression starts with a resource identifier
 /// This is used to decide whether to use global or current context in iif() evaluation
-fn expression_starts_with_resource_identifier(expr: &Expression, context: &EvaluationContext) -> bool {
+fn expression_starts_with_resource_identifier(
+    expr: &Expression,
+    context: &EvaluationContext,
+) -> bool {
     match expr {
         Expression::Invocation(base, _) => {
             // Check if the base expression starts with a resource identifier

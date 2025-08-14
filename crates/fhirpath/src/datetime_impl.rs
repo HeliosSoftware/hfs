@@ -198,7 +198,6 @@ pub fn compare_date_time_values(
     }
 }
 
-
 /// Converts a value to a date representation if possible
 pub fn to_date(value: &EvaluationResult) -> Option<String> {
     match value {
@@ -259,7 +258,6 @@ pub fn to_datetime(value: &EvaluationResult) -> Option<String> {
         _ => None,
     }
 }
-
 
 #[cfg(test)]
 mod tests {

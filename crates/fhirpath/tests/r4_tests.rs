@@ -1,9 +1,9 @@
+use chumsky::Parser;
 use helios_fhir::r4;
-use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use helios_fhirpath::evaluator::evaluate;
 use helios_fhirpath::parser::parser;
+use helios_fhirpath::{EvaluationContext, evaluate_expression};
 use helios_fhirpath_support::EvaluationResult;
-use chumsky::Parser;
 use roxmltree::{Document, Node};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -222,7 +222,8 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
         serde_json::from_str(&contents).map_err(|e| format!("Failed to parse JSON: {:?}", e))?;
 
     // Create an evaluation context with the resource
-    let mut context = EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
+    let mut context =
+        EvaluationContext::new(vec![helios_fhir::FhirResource::R4(Box::new(resource))]);
 
     // Enhanced context setup for tests: For patient example, we'll add a direct birth date access path
     if json_filename == "patient-example.json" {
@@ -314,7 +315,8 @@ fn load_test_resource(json_filename: &str) -> Result<EvaluationContext, String> 
                     }
 
                     // Extract the unit from valueQuantity for easy testing
-                    if let Some(EvaluationResult::Object { map: _vq, .. }) = obj.get("valueQuantity")
+                    if let Some(EvaluationResult::Object { map: _vq, .. }) =
+                        obj.get("valueQuantity")
                     {
                         // Note: unit information available for debugging if needed
                     }
@@ -505,41 +507,45 @@ fn test_basic_fhirpath_expressions() {
 #[test]
 fn test_real_fhir_patient_type() {
     println!("Testing real FHIR Patient from JSON parsing");
-    
+
     // Create a real Patient from JSON
     let patient_json = r#"{
         "resourceType": "Patient",
         "id": "example",
         "active": true
     }"#;
-    
+
     let patient: r4::Patient = serde_json::from_str(patient_json).unwrap();
-    let fhir_resource = helios_fhir::FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
+    let fhir_resource =
+        helios_fhir::FhirResource::R4(Box::new(helios_fhir::r4::Resource::Patient(patient)));
     let context = EvaluationContext::new(vec![fhir_resource]);
-    
+
     // First, let's see what the context contains
     println!("Context resources: {:?}", context.resources.len());
     if let Some(resource) = context.resources.first() {
         println!("First resource: {:?}", resource);
     }
-    
+
     // Test accessing the Patient resource via 'this' context
     let result = evaluate_expression("$this", &context).unwrap();
     println!("$this (Patient resource): {:?}", result);
-    
+
     // Test direct property access (Patient is already the context)
     let result = evaluate_expression("active", &context).unwrap();
     println!("Real active: {:?}", result);
-    
+
     // Test active.type().namespace - should be FHIR
     let result = evaluate_expression("active.type().namespace", &context).unwrap();
     println!("Real active.type().namespace: {:?}", result);
     assert_eq!(result, EvaluationResult::String("FHIR".to_string(), None));
-    
+
     // Test active.type().name - should be boolean
     let result = evaluate_expression("active.type().name", &context).unwrap();
     println!("Real active.type().name: {:?}", result);
-    assert_eq!(result, EvaluationResult::String("boolean".to_string(), None));
+    assert_eq!(
+        result,
+        EvaluationResult::String("boolean".to_string(), None)
+    );
 }
 
 #[test]
@@ -707,7 +713,6 @@ fn test_patient_active_type() {
         "but due to test structure limitations, we're reporting diagnostics instead of strict assertions."
     );
 }
-
 
 #[test]
 fn test_r4_test_suite() {
@@ -1070,21 +1075,25 @@ fn test_r4_test_suite() {
                 continue;
             }
 
-
             // Skip specific UCUM quantity tests that we're not implementing yet
-            let quantity_tests_to_ignore = ["testQuantity1",
-                "testQuantity2", 
+            let quantity_tests_to_ignore = [
+                "testQuantity1",
+                "testQuantity2",
                 "testQuantity4",
                 "testQuantity5",
-                "testQuantity6", 
+                "testQuantity6",
                 "testQuantity7",
                 "testQuantity8",
                 "testQuantity9",
                 "testQuantity10",
-                "testQuantity11"];
-            
+                "testQuantity11",
+            ];
+
             if quantity_tests_to_ignore.contains(&test.name.as_str()) {
-                println!("  SKIP (UCUM not implemented): {} - '{}'", test.name, test.expression);
+                println!(
+                    "  SKIP (UCUM not implemented): {} - '{}'",
+                    test.name, test.expression
+                );
                 skipped_tests += 1;
                 continue;
             }

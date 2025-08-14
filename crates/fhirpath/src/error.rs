@@ -14,28 +14,28 @@ pub type FhirPathResult<T> = Result<T, FhirPathError>;
 pub enum FhirPathError {
     /// Parse error with message
     ParseError(String),
-    
+
     /// Evaluation error with message
     EvaluationError(String),
-    
+
     /// IO error (file operations, etc.)
     IoError(std::io::Error),
-    
+
     /// JSON serialization/deserialization error
     JsonError(serde_json::Error),
-    
+
     /// Invalid input parameters
     InvalidInput(String),
-    
+
     /// Resource not found
     NotFound(String),
-    
+
     /// Feature not implemented
     NotImplemented(String),
-    
+
     /// Server configuration error
     ConfigError(String),
-    
+
     /// HTTP-specific error with status code
     HttpError(u16, String),
 }
@@ -84,10 +84,10 @@ impl axum::response::IntoResponse for FhirPathError {
 
 impl From<FhirPathError> for axum::response::Response {
     fn from(err: FhirPathError) -> Self {
+        use axum::Json;
         use axum::http::StatusCode;
         use axum::response::IntoResponse;
-        use axum::Json;
-        
+
         let (status, message) = match err {
             FhirPathError::ParseError(msg) => (StatusCode::BAD_REQUEST, msg),
             FhirPathError::EvaluationError(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg),
@@ -101,7 +101,7 @@ impl From<FhirPathError> for axum::response::Response {
             ),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
-        
+
         // Create FHIR OperationOutcome
         let operation_outcome = serde_json::json!({
             "resourceType": "OperationOutcome",
@@ -117,7 +117,7 @@ impl From<FhirPathError> for axum::response::Response {
                 "diagnostics": message
             }]
         });
-        
+
         (status, Json(operation_outcome)).into_response()
     }
 }

@@ -139,11 +139,14 @@ pub fn exclude_function(
     }
 
     // exclude() preserves order of the left operand.
-    let input_was_unordered = matches!(invocation_base, EvaluationResult::Collection {
-        has_undefined_order: true,
-        type_info: None,
-        ..
-    });
+    let input_was_unordered = matches!(
+        invocation_base,
+        EvaluationResult::Collection {
+            has_undefined_order: true,
+            type_info: None,
+            ..
+        }
+    );
 
     Ok(normalize_collection_result(
         result_items,
@@ -350,11 +353,11 @@ fn units_are_equivalent(unit1: &str, unit2: &str) -> bool {
     if unit1 == unit2 {
         return true;
     }
-    
+
     // Handle common UCUM equivalences
     let normalized_unit1 = normalize_ucum_unit(unit1);
     let normalized_unit2 = normalize_ucum_unit(unit2);
-    
+
     normalized_unit1 == normalized_unit2
 }
 

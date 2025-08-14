@@ -193,12 +193,16 @@ mod tests {
     #[test]
     fn test_oftype_method_form() {
         // Create a collection with mixed types
-        let collection = EvaluationResult::Collection { items: vec![
-            EvaluationResult::boolean(true),
-            EvaluationResult::integer(42),
-            EvaluationResult::boolean(false),
-            EvaluationResult::string("test".to_string()),
-        ], has_undefined_order: false, type_info: None };
+        let collection = EvaluationResult::Collection {
+            items: vec![
+                EvaluationResult::boolean(true),
+                EvaluationResult::integer(42),
+                EvaluationResult::boolean(false),
+                EvaluationResult::string("test".to_string()),
+            ],
+            has_undefined_order: false,
+            type_info: None,
+        };
 
         // Create a context with the collection
         let mut context = EvaluationContext::new_empty_with_default_version();
@@ -209,10 +213,14 @@ mod tests {
             // Filter for Boolean values
             (
                 "$this.ofType('Boolean')",
-                EvaluationResult::Collection { items: vec![
-                    EvaluationResult::boolean(true),
-                    EvaluationResult::boolean(false),
-                ], has_undefined_order: false, type_info: None },
+                EvaluationResult::Collection {
+                    items: vec![
+                        EvaluationResult::boolean(true),
+                        EvaluationResult::boolean(false),
+                    ],
+                    has_undefined_order: false,
+                    type_info: None,
+                },
             ),
             // Filter for String values
             (
@@ -224,10 +232,14 @@ mod tests {
             // Filter with System namespace
             (
                 "$this.ofType('System.Boolean')",
-                EvaluationResult::Collection { items: vec![
-                    EvaluationResult::boolean(true),
-                    EvaluationResult::boolean(false),
-                ], has_undefined_order: false, type_info: None },
+                EvaluationResult::Collection {
+                    items: vec![
+                        EvaluationResult::boolean(true),
+                        EvaluationResult::boolean(false),
+                    ],
+                    has_undefined_order: false,
+                    type_info: None,
+                },
             ),
             // Filter with no matches
             ("$this.ofType('Decimal')", EvaluationResult::Empty),

@@ -1,4 +1,6 @@
-use helios_fhir::r4::{Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn};
+use helios_fhir::r4::{
+    Bundle, Patient, ViewDefinition, ViewDefinitionSelect, ViewDefinitionSelectColumn,
+};
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]

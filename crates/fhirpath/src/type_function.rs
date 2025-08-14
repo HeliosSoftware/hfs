@@ -2,7 +2,7 @@ use helios_fhirpath_support::{EvaluationError, EvaluationResult, TypeInfoResult}
 use std::collections::HashMap;
 
 /// FHIRPath type() function implementation
-/// 
+///
 /// Returns a Object with namespace and name properties representing the type of each item
 /// in the input collection.
 pub fn type_function(
@@ -12,11 +12,9 @@ pub fn type_function(
     match invocation_base {
         EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         EvaluationResult::Collection { items, .. } => {
-            let type_objects: Vec<EvaluationResult> = items
-                .iter()
-                .map(create_type_object)
-                .collect();
-            
+            let type_objects: Vec<EvaluationResult> =
+                items.iter().map(create_type_object).collect();
+
             Ok(EvaluationResult::Collection {
                 items: type_objects,
                 has_undefined_order: false,
@@ -38,14 +36,14 @@ pub fn type_function(
 /// Creates a type object with namespace and name properties
 fn create_type_object(value: &EvaluationResult) -> EvaluationResult {
     let (namespace, name) = get_type_info(value);
-    
+
     let mut map = HashMap::new();
     map.insert(
         "namespace".to_string(),
         EvaluationResult::String(namespace, None),
     );
     map.insert("name".to_string(), EvaluationResult::String(name, None));
-    
+
     EvaluationResult::Object {
         map,
         type_info: Some(TypeInfoResult {

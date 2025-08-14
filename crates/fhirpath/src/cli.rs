@@ -68,24 +68,26 @@
 //! cat patient.json | fhirpath-cli -e "Patient.name.family" -r -
 //! ```
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::collections::HashMap;
 
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::{FhirPathError, FhirPathResult};
 use crate::evaluator::EvaluationContext;
 use crate::parse_debug::{expression_to_debug_tree, generate_parse_debug};
-use crate::{evaluate_expression, EvaluationResult};
+use crate::{EvaluationResult, evaluate_expression};
 use helios_fhir::{FhirResource, FhirVersion};
 
 #[derive(Parser, Debug)]
 #[command(name = "fhirpath-cli")]
 #[command(about = "FHIRPath CLI tool for evaluating expressions against FHIR resources")]
-#[command(long_about = "Evaluate FHIRPath expressions against FHIR resources with support for context expressions, variables, and debug output")]
+#[command(
+    long_about = "Evaluate FHIRPath expressions against FHIR resources with support for context expressions, variables, and debug output"
+)]
 pub struct Args {
     /// FHIRPath expression to evaluate
     #[arg(short, long)]
@@ -191,8 +193,8 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
     // Evaluate context expression if provided
     let result = if let Some(context_expr) = &args.context {
         // First evaluate the context expression
-        let context_result = evaluate_expression(context_expr, &context)
-            .map_err(FhirPathError::EvaluationError)?;
+        let context_result =
+            evaluate_expression(context_expr, &context).map_err(FhirPathError::EvaluationError)?;
 
         // Create a new context with the context result
         let mut scoped_context = EvaluationContext::new(vec![]);
@@ -201,7 +203,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
             EvaluationResult::Collection { items, .. } => items,
             single_value => vec![single_value],
         };
-        
+
         for value in context_items {
             // Note: This is a simplified approach. In a full implementation,
             // we'd need to properly handle setting the context
@@ -213,8 +215,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
             .map_err(FhirPathError::EvaluationError)?
     } else {
         // Evaluate the expression directly
-        evaluate_expression(&args.expression, &context)
-            .map_err(FhirPathError::EvaluationError)?
+        evaluate_expression(&args.expression, &context).map_err(FhirPathError::EvaluationError)?
     };
 
     // Convert result to JSON
@@ -309,10 +310,7 @@ fn parse_fhir_resource(json: Value, version: FhirVersion) -> FhirPathResult<Fhir
 }
 
 /// Load variables from JSON file
-fn load_variables_from_file(
-    context: &mut EvaluationContext,
-    path: &PathBuf,
-) -> FhirPathResult<()> {
+fn load_variables_from_file(context: &mut EvaluationContext, path: &PathBuf) -> FhirPathResult<()> {
     let content = fs::read_to_string(path)?;
     let variables: HashMap<String, Value> = serde_json::from_str(&content)?;
 
@@ -409,16 +407,14 @@ fn json_value_to_result(value: &Value) -> FhirPathResult<EvaluationResult> {
 fn result_to_json(result: &EvaluationResult) -> FhirPathResult<String> {
     let output = match result {
         EvaluationResult::Collection { items, .. } => {
-            let values: Vec<Value> = items.iter()
-                .map(evaluation_result_to_json_value)
-                .collect();
-            
+            let values: Vec<Value> = items.iter().map(evaluation_result_to_json_value).collect();
+
             if values.len() == 1 {
                 values[0].clone()
             } else {
                 json!(values)
             }
-        },
+        }
         single_value => evaluation_result_to_json_value(single_value),
     };
 
@@ -442,11 +438,9 @@ fn evaluation_result_to_json_value(result: &EvaluationResult) -> Value {
             "unit": unit
         }),
         EvaluationResult::Collection { items, .. } => {
-            let values: Vec<Value> = items.iter()
-                .map(evaluation_result_to_json_value)
-                .collect();
+            let values: Vec<Value> = items.iter().map(evaluation_result_to_json_value).collect();
             json!(values)
-        },
+        }
         _ => {
             // For other complex types, use debug representation
             json!(format!("{:?}", result))
@@ -492,8 +486,14 @@ mod tests {
 
     #[test]
     fn test_parse_var() {
-        assert_eq!(parse_var("key=value").unwrap(), ("key".to_string(), "value".to_string()));
-        assert_eq!(parse_var("complex=value=with=equals").unwrap(), ("complex".to_string(), "value=with=equals".to_string()));
+        assert_eq!(
+            parse_var("key=value").unwrap(),
+            ("key".to_string(), "value".to_string())
+        );
+        assert_eq!(
+            parse_var("complex=value=with=equals").unwrap(),
+            ("complex".to_string(), "value=with=equals".to_string())
+        );
         assert!(parse_var("invalid").is_err());
     }
 
@@ -516,7 +516,7 @@ mod tests {
 
         let mut args = create_test_args("family", resource_path);
         args.context = Some("Patient.name".to_string());
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -526,16 +526,21 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let resource_path = temp_dir.path().join("patient.json");
         let vars_path = temp_dir.path().join("vars.json");
-        
+
         fs::write(&resource_path, create_test_resource().to_string()).unwrap();
-        fs::write(&vars_path, json!({
-            "threshold": 5,
-            "testString": "hello"
-        }).to_string()).unwrap();
+        fs::write(
+            &vars_path,
+            json!({
+                "threshold": 5,
+                "testString": "hello"
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         let mut args = create_test_args("%testString", resource_path);
         args.variables = Some(vars_path);
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -548,7 +553,7 @@ mod tests {
 
         let mut args = create_test_args("%myVar", resource_path);
         args.var = vec![("myVar".to_string(), "test-value".to_string())];
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -558,16 +563,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let resource_path = temp_dir.path().join("patient.json");
         let output_path = temp_dir.path().join("output.json");
-        
+
         fs::write(&resource_path, create_test_resource().to_string()).unwrap();
 
         let mut args = create_test_args("Patient.name.family", resource_path);
         args.output = Some(output_path.clone());
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
         assert!(output_path.exists());
-        
+
         let output_content = fs::read_to_string(output_path).unwrap();
         assert!(output_content.contains("\"Doe\""));
     }
@@ -580,7 +585,7 @@ mod tests {
 
         let mut args = create_test_args("Patient.name.family", resource_path);
         args.parse_debug_tree = true;
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -593,7 +598,7 @@ mod tests {
 
         let mut args = create_test_args("Patient.name.family", resource_path);
         args.parse_debug = true;
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -612,7 +617,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.json");
         fs::write(&file_path, "test content").unwrap();
-        
+
         let result = read_input(&file_path);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test content");
@@ -666,13 +671,13 @@ mod tests {
     #[test]
     fn test_set_variable_json_types() {
         let mut context = EvaluationContext::new(vec![]);
-        
+
         // Test setting different JSON types
         set_variable(&mut context, "str", "\"hello\"").unwrap();
         set_variable(&mut context, "num", "42").unwrap();
         set_variable(&mut context, "bool", "true").unwrap();
         set_variable(&mut context, "plain", "plain text").unwrap();
-        
+
         // Verify variables were set (would need getter methods to fully test)
         assert!(set_variable(&mut context, "test", "value").is_ok());
     }
@@ -696,7 +701,7 @@ mod tests {
 
         let mut args = create_test_args("Patient.name", resource_path);
         args.terminology_server = Some("http://terminology.example.com".to_string());
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }
@@ -709,7 +714,7 @@ mod tests {
 
         let mut args = create_test_args("Patient.name", resource_path);
         args.trace = true;
-        
+
         let result = run_cli(args);
         assert!(result.is_ok());
     }

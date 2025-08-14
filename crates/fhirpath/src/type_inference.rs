@@ -3,7 +3,7 @@
 //! This module provides static type inference for FHIRPath expressions,
 //! determining the return type of expressions without evaluating them.
 
-use crate::parser::{Expression, Term, Invocation, Literal, TypeSpecifier};
+use crate::parser::{Expression, Invocation, Literal, Term, TypeSpecifier};
 use std::collections::HashMap;
 
 /// Represents a type in the FHIRPath type system
@@ -89,12 +89,12 @@ impl TypeContext {
 pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option<InferredType> {
     match expr {
         Expression::Term(term) => infer_term_type(term, context),
-        
+
         Expression::Invocation(base_expr, invocation) => {
             let base_type = infer_expression_type(base_expr, context)?;
             infer_invocation_type(invocation, &base_type, context)
         }
-        
+
         Expression::Indexer(expr, _index) => {
             let base_type = infer_expression_type(expr, context)?;
             // Indexing a collection returns the element type
@@ -108,7 +108,7 @@ pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option
                 None // Can't index non-collections
             }
         }
-        
+
         Expression::Polarity(op, expr) => {
             let _inner_type = infer_expression_type(expr, context)?;
             match op {
@@ -116,31 +116,27 @@ pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option
                 _ => None,
             }
         }
-        
-        Expression::Multiplicative(left, op, right) |
-        Expression::Additive(left, op, right) => {
+
+        Expression::Multiplicative(left, op, right) | Expression::Additive(left, op, right) => {
             let left_type = infer_expression_type(left, context)?;
             let _right_type = infer_expression_type(right, context)?;
-            
+
             match op.as_str() {
                 "*" | "/" | "mod" | "div" => Some(left_type), // Preserve numeric type
-                "+" | "-" => Some(left_type), // Preserve numeric type
+                "+" | "-" => Some(left_type),                 // Preserve numeric type
                 _ => None,
             }
         }
-        
-        Expression::Inequality(_left, _op, _right) |
-        Expression::Equality(_left, _op, _right) => {
+
+        Expression::Inequality(_left, _op, _right) | Expression::Equality(_left, _op, _right) => {
             Some(InferredType::system("Boolean"))
         }
-        
-        Expression::Membership(expr, op, _type_or_expr) => {
-            match op.as_str() {
-                "in" | "contains" => Some(InferredType::system("Boolean")),
-                _ => infer_expression_type(expr, context),
-            }
-        }
-        
+
+        Expression::Membership(expr, op, _type_or_expr) => match op.as_str() {
+            "in" | "contains" => Some(InferredType::system("Boolean")),
+            _ => infer_expression_type(expr, context),
+        },
+
         Expression::Type(expr, op, type_spec) => {
             match op.as_str() {
                 "is" => Some(InferredType::system("Boolean")),
@@ -159,11 +155,11 @@ pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option
                 _ => infer_expression_type(expr, context),
             }
         }
-        
+
         Expression::Union(left, right) => {
             let left_type = infer_expression_type(left, context);
             let right_type = infer_expression_type(right, context);
-            
+
             // Union combines collections
             match (left_type, right_type) {
                 (Some(lt), Some(rt)) if lt == rt => Some(lt.collection()),
@@ -172,16 +168,13 @@ pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option
                 _ => None,
             }
         }
-        
-        Expression::And(_left, _right) |
-        Expression::Implies(_left, _right) => {
+
+        Expression::And(_left, _right) | Expression::Implies(_left, _right) => {
             Some(InferredType::system("Boolean"))
         }
-        
-        Expression::Or(_left, _op, _right) => {
-            Some(InferredType::system("Boolean"))
-        }
-        
+
+        Expression::Or(_left, _op, _right) => Some(InferredType::system("Boolean")),
+
         Expression::Lambda(_param, expr) => {
             // Lambda returns the type of its body expression
             infer_expression_type(expr, context)
@@ -192,7 +185,9 @@ pub fn infer_expression_type(expr: &Expression, context: &TypeContext) -> Option
 fn infer_term_type(term: &Term, context: &TypeContext) -> Option<InferredType> {
     match term {
         Term::Literal(lit) => infer_literal_type(lit),
-        Term::Invocation(inv) => infer_invocation_type(inv, &context.current_type.clone()?, context),
+        Term::Invocation(inv) => {
+            infer_invocation_type(inv, &context.current_type.clone()?, context)
+        }
         Term::ExternalConstant(name) => {
             // Look up variable type
             context.variables.get(name).cloned()
@@ -270,18 +265,20 @@ fn infer_function_return_type(
         "toChars" => Some(InferredType::system("String").collection()),
         "substring" => Some(InferredType::system("String")),
         "startsWith" | "endsWith" | "contains" | "matches" => Some(InferredType::system("Boolean")),
-        "replace" | "replaceMatches" | "trim" | "upper" | "lower" => Some(InferredType::system("String")),
+        "replace" | "replaceMatches" | "trim" | "upper" | "lower" => {
+            Some(InferredType::system("String"))
+        }
         "split" => Some(InferredType::system("String").collection()),
         "join" => Some(InferredType::system("String")),
         "encode" | "decode" => Some(InferredType::system("String")),
-        
+
         // Numeric functions
         "toInteger" => Some(InferredType::system("Integer")),
         "toDecimal" => Some(InferredType::system("Decimal")),
         "toQuantity" => Some(InferredType::system("Quantity")),
         "abs" | "ceiling" | "floor" | "round" | "truncate" => Some(input_type.clone()),
         "sqrt" | "exp" | "ln" | "log" | "power" => Some(InferredType::system("Decimal")),
-        
+
         // Date/Time functions
         "toDate" => Some(InferredType::system("Date")),
         "toDateTime" => Some(InferredType::system("DateTime")),
@@ -289,15 +286,17 @@ fn infer_function_return_type(
         "today" => Some(InferredType::system("Date")),
         "now" => Some(InferredType::system("DateTime")),
         "timeOfDay" => Some(InferredType::system("Time")),
-        
+
         // Boolean functions
         "toBoolean" => Some(InferredType::system("Boolean")),
         "not" => Some(InferredType::system("Boolean")),
         "allTrue" | "anyTrue" | "allFalse" | "anyFalse" => Some(InferredType::system("Boolean")),
-        
+
         // Collection functions
         "count" => Some(InferredType::system("Integer")),
-        "empty" | "exists" | "all" | "subsetOf" | "supersetOf" => Some(InferredType::system("Boolean")),
+        "empty" | "exists" | "all" | "subsetOf" | "supersetOf" => {
+            Some(InferredType::system("Boolean"))
+        }
         "first" | "last" | "single" => {
             if input_type.is_collection {
                 Some(InferredType {
@@ -313,12 +312,12 @@ fn infer_function_return_type(
         "where" | "select" => Some(input_type.clone()),
         "repeat" => Some(input_type.clone()),
         "aggregate" => Some(InferredType::system("Any")), // Type depends on aggregator
-        
+
         // Type functions
         "ofType" => Some(input_type.clone()),
         "is" => Some(InferredType::system("Boolean")),
         "as" => Some(input_type.clone()),
-        
+
         // Utility functions
         "trace" => Some(input_type.clone()),
         "combine" => {
@@ -329,11 +328,11 @@ fn infer_function_return_type(
                 Some(input_type.clone().collection())
             }
         }
-        
+
         // Math aggregates
         "sum" => Some(input_type.clone()),
         "min" | "max" | "avg" | "mean" => Some(input_type.clone()),
-        
+
         _ => None, // Unknown function
     }
 }

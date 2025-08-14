@@ -1,5 +1,5 @@
-use crate::evaluator::evaluate;
 use crate::evaluator::EvaluationContext;
+use crate::evaluator::evaluate;
 use crate::parser::Expression;
 use helios_fhirpath_support::EvaluationError;
 use helios_fhirpath_support::EvaluationResult;

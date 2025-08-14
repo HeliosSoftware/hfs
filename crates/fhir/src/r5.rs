@@ -1,7 +1,7 @@
-use helios_fhir_macro::{FhirSerde, FhirPath};
-use serde::{Serialize, Deserialize};
+use helios_fhir_macro::{FhirPath, FhirSerde};
+use serde::{Deserialize, Serialize};
 
-use crate::{Element, DecimalElement};
+use crate::{DecimalElement, Element};
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct AccountRelatedAccount {
@@ -117,7 +117,6 @@ pub struct AccountProcedure {
     pub package_code: Option<Vec<CodeableConcept>>,
     pub device: Option<Vec<Reference>>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in ActivityDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -289,7 +288,6 @@ pub struct ActivityDefinitionDynamicValue {
     pub expression: Expression,
 }
 
-
 /// Choice of types for the versionAlgorithm\[x\] field in ActorDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum ActorDefinitionVersionAlgorithm {
@@ -342,7 +340,6 @@ pub struct ActorDefinition {
     pub derived_from: Option<Vec<Canonical>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct AdministrableProductDefinition {
     pub id: Option<String>,
@@ -391,7 +388,8 @@ pub struct AdministrableProductDefinitionRouteOfAdministration {
     #[fhir_serde(rename = "maxTreatmentPeriod")]
     pub max_treatment_period: Option<Duration>,
     #[fhir_serde(rename = "targetSpecies")]
-    pub target_species: Option<Vec<AdministrableProductDefinitionRouteOfAdministrationTargetSpecies>>,
+    pub target_species:
+        Option<Vec<AdministrableProductDefinitionRouteOfAdministrationTargetSpecies>>,
 }
 
 /// Choice of types for the value\[x\] field in AdministrableProductDefinitionProperty
@@ -441,7 +439,9 @@ pub struct AdministrableProductDefinitionRouteOfAdministrationTargetSpecies {
     pub modifier_extension: Option<Vec<Extension>>,
     pub code: CodeableConcept,
     #[fhir_serde(rename = "withdrawalPeriod")]
-    pub withdrawal_period: Option<Vec<AdministrableProductDefinitionRouteOfAdministrationTargetSpeciesWithdrawalPeriod>>,
+    pub withdrawal_period: Option<
+        Vec<AdministrableProductDefinitionRouteOfAdministrationTargetSpeciesWithdrawalPeriod>,
+    >,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
@@ -455,7 +455,6 @@ pub struct AdministrableProductDefinitionRouteOfAdministrationTargetSpeciesWithd
     #[fhir_serde(rename = "supportingInformation")]
     pub supporting_information: Option<String>,
 }
-
 
 /// Choice of types for the item\[x\] field in AdverseEventSupportingInfo
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -647,7 +646,6 @@ pub struct AdverseEventParticipant {
     pub actor: Reference,
 }
 
-
 /// Choice of types for the onset\[x\] field in AllergyIntolerance
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum AllergyIntoleranceOnset {
@@ -728,7 +726,6 @@ pub struct AllergyIntoleranceReaction {
     pub exposure_route: Option<CodeableConcept>,
     pub note: Option<Vec<Annotation>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct AppointmentRecurrenceTemplate {
@@ -876,7 +873,6 @@ pub struct AppointmentRecurrenceTemplateMonthlyTemplate {
     pub month_interval: PositiveInt,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct AppointmentResponse {
     pub id: Option<String>,
@@ -907,7 +903,6 @@ pub struct AppointmentResponse {
     #[fhir_serde(rename = "recurrenceId")]
     pub recurrence_id: Option<PositiveInt>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ArtifactAssessmentContent {
@@ -985,7 +980,6 @@ pub struct ArtifactAssessment {
     pub workflow_status: Option<Code>,
     pub disposition: Option<Code>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct AuditEventSource {
@@ -1147,7 +1141,6 @@ pub struct AuditEventEntityDetail {
     pub value: Option<AuditEventEntityDetailValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Basic {
     pub id: Option<String>,
@@ -1167,7 +1160,6 @@ pub struct Basic {
     pub author: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Binary {
     pub id: Option<String>,
@@ -1181,7 +1173,6 @@ pub struct Binary {
     pub security_context: Option<Reference>,
     pub data: Option<Base64Binary>,
 }
-
 
 /// Choice of types for the value\[x\] field in BiologicallyDerivedProductProperty
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -1284,7 +1275,6 @@ pub struct BiologicallyDerivedProductCollection {
     pub collected: Option<BiologicallyDerivedProductCollectionCollected>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct BiologicallyDerivedProductDispense {
     pub id: Option<String>,
@@ -1332,7 +1322,6 @@ pub struct BiologicallyDerivedProductDispensePerformer {
     pub actor: Reference,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct BodyStructureIncludedStructureBodyLandmarkOrientationDistanceFromLandmark {
     pub id: Option<String>,
@@ -1354,7 +1343,8 @@ pub struct BodyStructureIncludedStructureBodyLandmarkOrientation {
     #[fhir_serde(rename = "clockFacePosition")]
     pub clock_face_position: Option<Vec<CodeableConcept>>,
     #[fhir_serde(rename = "distanceFromLandmark")]
-    pub distance_from_landmark: Option<Vec<BodyStructureIncludedStructureBodyLandmarkOrientationDistanceFromLandmark>>,
+    pub distance_from_landmark:
+        Option<Vec<BodyStructureIncludedStructureBodyLandmarkOrientationDistanceFromLandmark>>,
     #[fhir_serde(rename = "surfaceOrientation")]
     pub surface_orientation: Option<Vec<CodeableConcept>>,
 }
@@ -1368,7 +1358,8 @@ pub struct BodyStructureIncludedStructure {
     pub structure: CodeableConcept,
     pub laterality: Option<CodeableConcept>,
     #[fhir_serde(rename = "bodyLandmarkOrientation")]
-    pub body_landmark_orientation: Option<Vec<BodyStructureIncludedStructureBodyLandmarkOrientation>>,
+    pub body_landmark_orientation:
+        Option<Vec<BodyStructureIncludedStructureBodyLandmarkOrientation>>,
     #[fhir_serde(rename = "spatialReference")]
     pub spatial_reference: Option<Vec<Reference>>,
     pub qualifier: Option<Vec<CodeableConcept>>,
@@ -1397,7 +1388,6 @@ pub struct BodyStructure {
     pub image: Option<Vec<Attachment>>,
     pub patient: Reference,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct BundleLink {
@@ -1483,7 +1473,6 @@ pub struct BundleEntrySearch {
     pub mode: Option<Code>,
     pub score: Option<Decimal>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CapabilityStatementMessagingSupportedMessage {
@@ -1726,7 +1715,6 @@ pub struct CapabilityStatementRestInteraction {
     pub documentation: Option<Markdown>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CarePlanActivity {
     pub id: Option<String>,
@@ -1783,7 +1771,6 @@ pub struct CarePlan {
     pub note: Option<Vec<Annotation>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CareTeam {
     pub id: Option<String>,
@@ -1834,7 +1821,6 @@ pub struct CareTeamParticipant {
     #[fhir_serde(flatten)]
     pub coverage: Option<CareTeamParticipantCoverage>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ChargeItemPerformer {
@@ -1911,7 +1897,6 @@ pub struct ChargeItem {
     #[fhir_serde(rename = "supportingInformation")]
     pub supporting_information: Option<Vec<Reference>>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in ChargeItemDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -1995,7 +1980,6 @@ pub struct ChargeItemDefinitionPropertyGroup {
     #[fhir_serde(rename = "priceComponent")]
     pub price_component: Option<Vec<MonetaryComponent>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CitationCitedArtifactStatusDate {
@@ -2179,7 +2163,8 @@ pub struct CitationCitedArtifactContributorshipEntry {
     pub contribution_type: Option<Vec<CodeableConcept>>,
     pub role: Option<CodeableConcept>,
     #[fhir_serde(rename = "contributionInstance")]
-    pub contribution_instance: Option<Vec<CitationCitedArtifactContributorshipEntryContributionInstance>>,
+    pub contribution_instance:
+        Option<Vec<CitationCitedArtifactContributorshipEntryContributionInstance>>,
     #[fhir_serde(rename = "correspondingContact")]
     pub corresponding_contact: Option<Boolean>,
     #[fhir_serde(rename = "rankingOrder")]
@@ -2331,7 +2316,6 @@ pub struct CitationCitedArtifactAbstract {
     pub text: Markdown,
     pub copyright: Option<Markdown>,
 }
-
 
 /// Choice of types for the when\[x\] field in ClaimEvent
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -2734,7 +2718,6 @@ pub struct ClaimRelated {
     pub reference: Option<Identifier>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ClaimResponseAddItemDetail {
     pub id: Option<String>,
@@ -3103,7 +3086,6 @@ pub struct ClaimResponseItemDetail {
     pub sub_detail: Option<Vec<ClaimResponseItemDetailSubDetail>>,
 }
 
-
 /// Choice of types for the effective\[x\] field in ClinicalImpression
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum ClinicalImpressionEffective {
@@ -3163,7 +3145,6 @@ pub struct ClinicalImpressionFinding {
     pub item: Option<CodeableReference>,
     pub basis: Option<String>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ClinicalUseDefinitionUndesirableEffect {
@@ -3311,7 +3292,6 @@ pub struct ClinicalUseDefinitionWarning {
     pub description: Option<Markdown>,
     pub code: Option<CodeableConcept>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CodeSystemConceptDesignation {
@@ -3476,7 +3456,6 @@ pub struct CodeSystemConceptProperty {
     pub value: Option<CodeSystemConceptPropertyValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Communication {
     pub id: Option<String>,
@@ -3542,7 +3521,6 @@ pub struct CommunicationPayload {
     #[fhir_serde(flatten)]
     pub content: Option<CommunicationPayloadContent>,
 }
-
 
 /// Choice of types for the occurrence\[x\] field in CommunicationRequest
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -3622,7 +3600,6 @@ pub struct CommunicationRequestPayload {
     pub content: Option<CommunicationRequestPayloadContent>,
 }
 
-
 /// Choice of types for the versionAlgorithm\[x\] field in CompartmentDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum CompartmentDefinitionVersionAlgorithm {
@@ -3680,7 +3657,6 @@ pub struct CompartmentDefinitionResource {
     #[fhir_serde(rename = "endParam")]
     pub end_param: Option<Uri>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Composition {
@@ -3757,7 +3733,6 @@ pub struct CompositionEvent {
     pub period: Option<Period>,
     pub detail: Option<Vec<CodeableReference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ConceptMapGroupElementTarget {
@@ -4005,7 +3980,6 @@ pub struct ConceptMapProperty {
     pub system: Option<Canonical>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ConditionStage {
     pub id: Option<String>,
@@ -4103,7 +4077,6 @@ pub struct Condition {
     pub evidence: Option<Vec<CodeableReference>>,
     pub note: Option<Vec<Annotation>>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in ConditionDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -4229,7 +4202,6 @@ pub struct ConditionDefinitionObservation {
     pub code: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ConsentProvisionData {
     pub id: Option<String>,
@@ -4337,7 +4309,6 @@ pub struct ConsentProvision {
     pub expression: Option<Expression>,
     pub provision: Option<Vec<ConsentProvision>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ContractContentDefinition {
@@ -4785,7 +4756,6 @@ pub struct ContractRule {
     pub content: Option<ContractRuleContent>,
 }
 
-
 /// Choice of types for the value\[x\] field in CoverageCostToBeneficiary
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum CoverageCostToBeneficiaryValue {
@@ -4886,7 +4856,6 @@ pub struct Coverage {
     #[fhir_serde(rename = "insurancePlan")]
     pub insurance_plan: Option<Reference>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CoverageEligibilityRequestItem {
@@ -5018,7 +4987,6 @@ pub struct CoverageEligibilityRequestInsurance {
     #[fhir_serde(rename = "businessArrangement")]
     pub business_arrangement: Option<String>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CoverageEligibilityResponseError {
@@ -5177,7 +5145,6 @@ pub struct CoverageEligibilityResponseInsuranceItem {
     pub authorization_url: Option<Uri>,
 }
 
-
 /// Choice of types for the identified\[x\] field in DetectedIssue
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum DetectedIssueIdentified {
@@ -5239,7 +5206,6 @@ pub struct DetectedIssueMitigation {
     pub author: Option<Reference>,
     pub note: Option<Vec<Annotation>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DeviceName {
@@ -5392,7 +5358,6 @@ pub struct DeviceProperty {
     pub value: Option<DevicePropertyValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DeviceAssociationOperation {
     pub id: Option<String>,
@@ -5428,7 +5393,6 @@ pub struct DeviceAssociation {
     pub period: Option<Period>,
     pub operation: Option<Vec<DeviceAssociationOperation>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DeviceDefinitionGuideline {
@@ -5711,7 +5675,6 @@ pub struct DeviceDefinitionProperty {
     pub value: Option<DeviceDefinitionPropertyValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DeviceDispensePerformer {
     pub id: Option<String>,
@@ -5766,7 +5729,6 @@ pub struct DeviceDispense {
     pub event_history: Option<Vec<Reference>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DeviceMetric {
     pub id: Option<String>,
@@ -5804,7 +5766,6 @@ pub struct DeviceMetricCalibration {
     pub state: Option<Code>,
     pub time: Option<Instant>,
 }
-
 
 /// Choice of types for the occurrence\[x\] field in DeviceRequest
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -5899,7 +5860,6 @@ pub struct DeviceRequestParameter {
     pub value: Option<DeviceRequestParameterValue>,
 }
 
-
 /// Choice of types for the timing\[x\] field in DeviceUsage
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum DeviceUsageTiming {
@@ -5962,7 +5922,6 @@ pub struct DeviceUsageAdherence {
     pub code: CodeableConcept,
     pub reason: Option<Vec<CodeableConcept>>,
 }
-
 
 /// Choice of types for the effective\[x\] field in DiagnosticReport
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -6036,7 +5995,6 @@ pub struct DiagnosticReportSupportingInfo {
     pub r#type: CodeableConcept,
     pub reference: Reference,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct DocumentReferenceAttester {
@@ -6137,7 +6095,6 @@ pub struct DocumentReferenceContent {
     pub attachment: Attachment,
     pub profile: Option<Vec<DocumentReferenceContentProfile>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EncounterLocation {
@@ -6260,7 +6217,6 @@ pub struct EncounterParticipant {
     pub actor: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EncounterHistoryLocation {
     pub id: Option<String>,
@@ -6304,7 +6260,6 @@ pub struct EncounterHistory {
     pub location: Option<Vec<EncounterHistoryLocation>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Endpoint {
     pub id: Option<String>,
@@ -6346,7 +6301,6 @@ pub struct EndpointPayload {
     pub mime_type: Option<Vec<Code>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EnrollmentRequest {
     pub id: Option<String>,
@@ -6367,7 +6321,6 @@ pub struct EnrollmentRequest {
     pub candidate: Option<Reference>,
     pub coverage: Option<Reference>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EnrollmentResponse {
@@ -6391,7 +6344,6 @@ pub struct EnrollmentResponse {
     #[fhir_serde(rename = "requestProvider")]
     pub request_provider: Option<Reference>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EpisodeOfCareDiagnosis {
@@ -6457,7 +6409,6 @@ pub struct EpisodeOfCareStatusHistory {
     pub status: Code,
     pub period: Period,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in EventDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -6532,7 +6483,6 @@ pub struct EventDefinition {
     pub related_artifact: Option<Vec<RelatedArtifact>>,
     pub trigger: Option<Vec<TriggerDefinition>>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in Evidence
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -6729,7 +6679,6 @@ pub struct EvidenceCertainty {
     pub subcomponent: Option<Vec<EvidenceCertainty>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct EvidenceReportRelatesTo {
     pub id: Option<String>,
@@ -6869,7 +6818,6 @@ pub struct EvidenceReportRelatesToTarget {
     pub display: Option<Markdown>,
     pub resource: Option<Reference>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in EvidenceVariable
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -7045,7 +6993,8 @@ pub struct EvidenceVariableCharacteristic {
     #[fhir_serde(rename = "definitionId")]
     pub definition_id: Option<Id>,
     #[fhir_serde(rename = "definitionByTypeAndValue")]
-    pub definition_by_type_and_value: Option<EvidenceVariableCharacteristicDefinitionByTypeAndValue>,
+    pub definition_by_type_and_value:
+        Option<EvidenceVariableCharacteristicDefinitionByTypeAndValue>,
     #[fhir_serde(rename = "definitionByCombination")]
     pub definition_by_combination: Option<EvidenceVariableCharacteristicDefinitionByCombination>,
     #[fhir_serde(flatten)]
@@ -7093,7 +7042,6 @@ pub struct EvidenceVariableCharacteristicDefinitionByTypeAndValue {
     pub value: Option<EvidenceVariableCharacteristicDefinitionByTypeAndValueValue>,
     pub offset: Option<CodeableConcept>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ExampleScenarioProcess {
@@ -7271,7 +7219,6 @@ pub struct ExampleScenarioProcessStepAlternative {
     pub description: Option<Markdown>,
     pub step: Option<Vec<ExampleScenarioProcessStep>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ExplanationOfBenefitItemAdjudication {
@@ -7971,7 +7918,6 @@ pub struct ExplanationOfBenefitCareTeam {
     pub specialty: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct FamilyMemberHistoryParticipant {
     pub id: Option<String>,
@@ -8137,7 +8083,6 @@ pub struct FamilyMemberHistoryProcedure {
     pub note: Option<Vec<Annotation>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Flag {
     pub id: Option<String>,
@@ -8160,7 +8105,6 @@ pub struct Flag {
     pub author: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct FormularyItem {
     pub id: Option<String>,
@@ -8177,7 +8121,6 @@ pub struct FormularyItem {
     pub code: Option<CodeableConcept>,
     pub status: Option<Code>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct GenomicStudyAnalysis {
@@ -8302,7 +8245,6 @@ pub struct GenomicStudyAnalysisDevice {
     pub function: Option<CodeableConcept>,
 }
 
-
 /// Choice of types for the detail\[x\] field in GoalTarget
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum GoalTargetDetail {
@@ -8398,7 +8340,6 @@ pub struct Goal {
     pub note: Option<Vec<Annotation>>,
     pub outcome: Option<Vec<CodeableReference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct GraphDefinitionLink {
@@ -8496,7 +8437,6 @@ pub struct GraphDefinition {
     pub link: Option<Vec<GraphDefinitionLink>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Group {
     pub id: Option<String>,
@@ -8568,7 +8508,6 @@ pub struct GroupMember {
     pub inactive: Option<Boolean>,
 }
 
-
 /// Choice of types for the module\[x\] field in GuidanceResponse
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum GuidanceResponseModule {
@@ -8616,7 +8555,6 @@ pub struct GuidanceResponse {
     #[fhir_serde(rename = "dataRequirement")]
     pub data_requirement: Option<Vec<DataRequirement>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct HealthcareService {
@@ -8672,7 +8610,6 @@ pub struct HealthcareServiceEligibility {
     pub code: Option<CodeableConcept>,
     pub comment: Option<Markdown>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImagingSelectionInstanceImageRegion2D {
@@ -8761,7 +8698,6 @@ pub struct ImagingSelectionInstanceImageRegion3D {
     pub coordinate: Option<Vec<Decimal>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImagingStudySeries {
     pub id: Option<String>,
@@ -8842,7 +8778,6 @@ pub struct ImagingStudySeriesPerformer {
     pub function: Option<CodeableConcept>,
     pub actor: Reference,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImmunizationReaction {
@@ -8961,7 +8896,6 @@ pub struct Immunization {
     pub protocol_applied: Option<Vec<ImmunizationProtocolApplied>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImmunizationEvaluation {
     pub id: Option<String>,
@@ -8994,7 +8928,6 @@ pub struct ImmunizationEvaluation {
     #[fhir_serde(rename = "seriesDoses")]
     pub series_doses: Option<String>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImmunizationRecommendationRecommendationDateCriterion {
@@ -9054,7 +8987,6 @@ pub struct ImmunizationRecommendation {
     pub authority: Option<Reference>,
     pub recommendation: Option<Vec<ImmunizationRecommendationRecommendation>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ImplementationGuideManifestPage {
@@ -9263,7 +9195,6 @@ pub struct ImplementationGuideDefinition {
     pub template: Option<Vec<ImplementationGuideDefinitionTemplate>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct IngredientSubstance {
     pub id: Option<String>,
@@ -9393,7 +9324,6 @@ pub struct IngredientSubstanceStrengthReferenceStrength {
     pub measurement_point: Option<String>,
     pub country: Option<Vec<CodeableConcept>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct InsurancePlanCoverage {
@@ -9526,7 +9456,6 @@ pub struct InsurancePlanCoverageBenefit {
     pub requirement: Option<String>,
     pub limit: Option<Vec<InsurancePlanCoverageBenefitLimit>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct InventoryItemDescription {
@@ -9676,7 +9605,6 @@ pub struct InventoryItemName {
     pub name: String,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct InventoryReportInventoryListing {
     pub id: Option<String>,
@@ -9731,7 +9659,6 @@ pub struct InventoryReportInventoryListingItem {
     pub quantity: Quantity,
     pub item: CodeableReference,
 }
-
 
 /// Choice of types for the serviced\[x\] field in InvoiceLineItem
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -9831,7 +9758,6 @@ pub struct InvoiceParticipant {
     pub actor: Reference,
 }
 
-
 /// Choice of types for the versionAlgorithm\[x\] field in Library
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum LibraryVersionAlgorithm {
@@ -9911,7 +9837,6 @@ pub struct Library {
     pub content: Option<Vec<Attachment>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Linkage {
     pub id: Option<String>,
@@ -9939,7 +9864,6 @@ pub struct LinkageItem {
     pub r#type: Code,
     pub resource: Reference,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct List {
@@ -9981,7 +9905,6 @@ pub struct ListEntry {
     pub date: Option<DateTime>,
     pub item: Reference,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct LocationPosition {
@@ -10031,7 +9954,6 @@ pub struct Location {
     pub virtual_service: Option<Vec<VirtualServiceDetail>>,
     pub endpoint: Option<Vec<Reference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ManufacturedItemDefinitionComponent {
@@ -10125,7 +10047,6 @@ pub struct ManufacturedItemDefinition {
     pub property: Option<Vec<ManufacturedItemDefinitionProperty>>,
     pub component: Option<Vec<ManufacturedItemDefinitionComponent>>,
 }
-
 
 /// Choice of types for the subject\[x\] field in MeasureGroup
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -10335,7 +10256,6 @@ pub struct MeasureSupplementalData {
     pub description: Option<Markdown>,
     pub criteria: Expression,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MeasureReportGroupStratifierStratumPopulation {
@@ -10550,7 +10470,6 @@ pub struct MeasureReportGroupStratifierStratum {
     pub measure_score: Option<MeasureReportGroupStratifierStratumMeasureScore>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Medication {
     pub id: Option<String>,
@@ -10615,7 +10534,6 @@ pub struct MedicationBatch {
     #[fhir_serde(rename = "expirationDate")]
     pub expiration_date: Option<DateTime>,
 }
-
 
 /// Choice of types for the rate\[x\] field in MedicationAdministrationDosage
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -10710,7 +10628,6 @@ pub struct MedicationAdministrationPerformer {
     pub actor: CodeableReference,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MedicationDispensePerformer {
     pub id: Option<String>,
@@ -10790,7 +10707,6 @@ pub struct MedicationDispense {
     pub event_history: Option<Vec<Reference>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MedicationKnowledgeRegulatoryMaxDispense {
     pub id: Option<String>,
@@ -10824,7 +10740,8 @@ pub struct MedicationKnowledgeIndicationGuidelineDosingGuidelinePatientCharacter
     #[fhir_serde(rename = "type")]
     pub r#type: CodeableConcept,
     #[fhir_serde(flatten)]
-    pub value: Option<MedicationKnowledgeIndicationGuidelineDosingGuidelinePatientCharacteristicValue>,
+    pub value:
+        Option<MedicationKnowledgeIndicationGuidelineDosingGuidelinePatientCharacteristicValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
@@ -10885,7 +10802,8 @@ pub struct MedicationKnowledgeIndicationGuidelineDosingGuideline {
     #[fhir_serde(rename = "administrationTreatment")]
     pub administration_treatment: Option<CodeableConcept>,
     #[fhir_serde(rename = "patientCharacteristic")]
-    pub patient_characteristic: Option<Vec<MedicationKnowledgeIndicationGuidelineDosingGuidelinePatientCharacteristic>>,
+    pub patient_characteristic:
+        Option<Vec<MedicationKnowledgeIndicationGuidelineDosingGuidelinePatientCharacteristic>>,
 }
 
 /// Choice of types for the strength\[x\] field in MedicationKnowledgeDefinitionalIngredient
@@ -11142,7 +11060,6 @@ pub struct MedicationKnowledgeCost {
     pub cost: Option<MedicationKnowledgeCostCost>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MedicationRequest {
     pub id: Option<String>,
@@ -11262,7 +11179,6 @@ pub struct MedicationRequestSubstitution {
     pub reason: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MedicationStatementAdherence {
     pub id: Option<String>,
@@ -11324,7 +11240,6 @@ pub struct MedicationStatement {
     pub dosage: Option<Vec<Dosage>>,
     pub adherence: Option<MedicationStatementAdherence>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MedicinalProductDefinitionContact {
@@ -11494,7 +11409,6 @@ pub struct MedicinalProductDefinitionName {
     pub usage: Option<Vec<MedicinalProductDefinitionNameUsage>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MessageDefinitionAllowedResponse {
     pub id: Option<String>,
@@ -11584,7 +11498,6 @@ pub struct MessageDefinition {
     pub allowed_response: Option<Vec<MessageDefinitionAllowedResponse>>,
     pub graph: Option<Canonical>,
 }
-
 
 /// Choice of types for the event\[x\] field in MessageHeader
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -11682,7 +11595,6 @@ pub struct MessageHeaderSource {
     pub contact: Option<ContactPoint>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MolecularSequence {
     pub id: Option<String>,
@@ -11772,7 +11684,6 @@ pub struct MolecularSequenceRelativeStartingSequence {
     pub strand: Option<Code>,
 }
 
-
 /// Choice of types for the versionAlgorithm\[x\] field in NamingSystem
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum NamingSystemVersionAlgorithm {
@@ -11852,7 +11763,6 @@ pub struct NamingSystemUniqueId {
     pub period: Option<Period>,
     pub authoritative: Option<Boolean>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct NutritionIntakePerformer {
@@ -11958,7 +11868,6 @@ pub struct NutritionIntakeIngredientLabel {
     pub nutrient: CodeableReference,
     pub amount: Quantity,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct NutritionOrderOralDietSchedule {
@@ -12160,7 +12069,6 @@ pub struct NutritionOrderSupplementSchedule {
     pub as_needed_for: Option<CodeableConcept>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct NutritionProduct {
     pub id: Option<String>,
@@ -12258,7 +12166,6 @@ pub struct NutritionProductInstance {
     #[fhir_serde(rename = "biologicalSourceEvent")]
     pub biological_source_event: Option<Identifier>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ObservationTriggeredBy {
@@ -12475,7 +12382,6 @@ pub struct ObservationComponent {
     pub reference_range: Option<Vec<ObservationReferenceRange>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ObservationDefinitionQualifiedValue {
     pub id: Option<String>,
@@ -12595,7 +12501,6 @@ pub struct ObservationDefinition {
     pub has_member: Option<Vec<Reference>>,
     pub component: Option<Vec<ObservationDefinitionComponent>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct OperationDefinitionOverload {
@@ -12719,7 +12624,6 @@ pub struct OperationDefinitionParameterReferencedFrom {
     pub source_id: Option<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct OperationOutcome {
     pub id: Option<String>,
@@ -12748,7 +12652,6 @@ pub struct OperationOutcomeIssue {
     pub location: Option<Vec<String>>,
     pub expression: Option<Vec<String>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Organization {
@@ -12788,7 +12691,6 @@ pub struct OrganizationQualification {
     pub issuer: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct OrganizationAffiliation {
     pub id: Option<String>,
@@ -12816,7 +12718,6 @@ pub struct OrganizationAffiliation {
     pub contact: Option<Vec<ExtendedContactDetail>>,
     pub endpoint: Option<Vec<Reference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PackagedProductDefinitionLegalStatusOfSupply {
@@ -12930,7 +12831,6 @@ pub struct PackagedProductDefinitionPackagingContainedItem {
     pub item: CodeableReference,
     pub amount: Option<Quantity>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Parameters {
@@ -13122,7 +13022,6 @@ pub struct ParametersParameter {
     pub part: Option<Vec<ParametersParameter>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PatientContact {
     pub id: Option<String>,
@@ -13217,7 +13116,6 @@ pub struct PatientCommunication {
     pub preferred: Option<Boolean>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PaymentNotice {
     pub id: Option<String>,
@@ -13245,7 +13143,6 @@ pub struct PaymentNotice {
     #[fhir_serde(rename = "paymentStatus")]
     pub payment_status: Option<CodeableConcept>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PaymentReconciliationProcessNote {
@@ -13350,7 +13247,6 @@ pub struct PaymentReconciliationAllocation {
     pub amount: Option<Money>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PermissionJustification {
     pub id: Option<String>,
@@ -13428,7 +13324,6 @@ pub struct PermissionRule {
     pub limit: Option<Vec<CodeableConcept>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PersonCommunication {
     pub id: Option<String>,
@@ -13490,7 +13385,6 @@ pub struct PersonLink {
     pub target: Reference,
     pub assurance: Option<Code>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PlanDefinitionGoal {
@@ -13847,7 +13741,6 @@ pub struct PlanDefinitionAction {
     pub action: Option<Vec<PlanDefinitionAction>>,
 }
 
-
 /// Choice of types for the deceased\[x\] field in Practitioner
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum PractitionerDeceased {
@@ -13908,7 +13801,6 @@ pub struct PractitionerQualification {
     pub issuer: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct PractitionerRole {
     pub id: Option<String>,
@@ -13937,7 +13829,6 @@ pub struct PractitionerRole {
     pub availability: Option<Vec<Availability>>,
     pub endpoint: Option<Vec<Reference>>,
 }
-
 
 /// Choice of types for the occurrence\[x\] field in Procedure
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -14049,7 +13940,6 @@ pub struct ProcedureFocalDevice {
     pub manipulated: Reference,
 }
 
-
 /// Choice of types for the occurred\[x\] field in Provenance
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum ProvenanceOccurred {
@@ -14114,7 +14004,6 @@ pub struct ProvenanceEntity {
     pub what: Reference,
     pub agent: Option<Vec<ProvenanceAgent>>,
 }
-
 
 /// Choice of types for the value\[x\] field in QuestionnaireItemInitial
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -14342,7 +14231,6 @@ pub struct QuestionnaireItem {
     pub item: Option<Vec<QuestionnaireItem>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct QuestionnaireResponseItem {
     pub id: Option<String>,
@@ -14436,7 +14324,6 @@ pub struct QuestionnaireResponse {
     pub item: Option<Vec<QuestionnaireResponseItem>>,
 }
 
-
 /// Choice of types for the date\[x\] field in RegulatedAuthorizationCase
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum RegulatedAuthorizationCaseDate {
@@ -14497,7 +14384,6 @@ pub struct RegulatedAuthorization {
     pub case: Option<RegulatedAuthorizationCase>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct RelatedPersonCommunication {
     pub id: Option<String>,
@@ -14534,7 +14420,6 @@ pub struct RelatedPerson {
     pub period: Option<Period>,
     pub communication: Option<Vec<RelatedPersonCommunication>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct RequestOrchestration {
@@ -14753,7 +14638,6 @@ pub struct RequestOrchestrationActionRelatedAction {
     pub offset: Option<RequestOrchestrationActionRelatedActionOffset>,
 }
 
-
 /// Choice of types for the versionAlgorithm\[x\] field in Requirements
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum RequirementsVersionAlgorithm {
@@ -14823,7 +14707,6 @@ pub struct RequirementsStatement {
     pub reference: Option<Vec<Url>>,
     pub source: Option<Vec<Reference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ResearchStudyObjective {
@@ -14974,7 +14857,6 @@ pub struct ResearchStudyAssociatedParty {
     pub party: Option<Reference>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ResearchSubjectProgress {
     pub id: Option<String>,
@@ -15017,7 +14899,6 @@ pub struct ResearchSubject {
     pub actual_comparison_group: Option<Id>,
     pub consent: Option<Vec<Reference>>,
 }
-
 
 /// Choice of types for the occurrence\[x\] field in RiskAssessment
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -15102,7 +14983,6 @@ pub struct RiskAssessmentPrediction {
     pub rationale: Option<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Schedule {
     pub id: Option<String>,
@@ -15128,7 +15008,6 @@ pub struct Schedule {
     pub planning_horizon: Option<Period>,
     pub comment: Option<Markdown>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SearchParameterComponent {
@@ -15203,7 +15082,6 @@ pub struct SearchParameter {
     pub chain: Option<Vec<String>>,
     pub component: Option<Vec<SearchParameterComponent>>,
 }
-
 
 /// Choice of types for the value\[x\] field in ServiceRequestOrderDetailParameter
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -15375,7 +15253,6 @@ pub struct ServiceRequestOrderDetail {
     pub parameter: Option<Vec<ServiceRequestOrderDetailParameter>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Slot {
     pub id: Option<String>,
@@ -15403,7 +15280,6 @@ pub struct Slot {
     pub overbooked: Option<Boolean>,
     pub comment: Option<String>,
 }
-
 
 /// Choice of types for the collected\[x\] field in SpecimenCollection
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -15526,7 +15402,6 @@ pub struct SpecimenProcessing {
     #[fhir_serde(flatten)]
     pub time: Option<SpecimenProcessingTime>,
 }
-
 
 /// Choice of types for the additive\[x\] field in SpecimenDefinitionTypeTestedContainerAdditive
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -15694,7 +15569,6 @@ pub struct SpecimenDefinitionTypeTested {
     pub testing_destination: Option<Vec<CodeableConcept>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct StructureDefinitionDifferential {
     pub id: Option<String>,
@@ -15797,7 +15671,6 @@ pub struct StructureDefinitionSnapshot {
     pub modifier_extension: Option<Vec<Extension>>,
     pub element: Option<Vec<ElementDefinition>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct StructureMapGroupRuleSource {
@@ -16002,7 +15875,6 @@ pub struct StructureMapGroupRuleDependent {
     pub parameter: Option<Vec<StructureMapGroupRuleTargetParameter>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubscriptionParameter {
     pub id: Option<String>,
@@ -16065,7 +15937,6 @@ pub struct SubscriptionFilterBy {
     pub value: String,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubscriptionStatus {
     pub id: Option<String>,
@@ -16103,7 +15974,6 @@ pub struct SubscriptionStatusNotificationEvent {
     #[fhir_serde(rename = "additionalContext")]
     pub additional_context: Option<Vec<Reference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubscriptionTopicResourceTriggerQueryCriteria {
@@ -16237,7 +16107,6 @@ pub struct SubscriptionTopicNotificationShape {
     pub rev_include: Option<Vec<String>>,
 }
 
-
 /// Choice of types for the substance\[x\] field in SubstanceIngredient
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum SubstanceIngredientSubstance {
@@ -16282,7 +16151,6 @@ pub struct Substance {
     pub quantity: Option<Quantity>,
     pub ingredient: Option<Vec<SubstanceIngredient>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstanceDefinition {
@@ -16553,7 +16421,6 @@ pub struct SubstanceDefinitionCharacterization {
     pub file: Option<Vec<Attachment>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstanceNucleicAcidSubunitLinkage {
     pub id: Option<String>,
@@ -16621,7 +16488,6 @@ pub struct SubstanceNucleicAcidSubunitSugar {
     pub residue_site: Option<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstancePolymerRepeatRepeatUnitStructuralRepresentation {
     pub id: Option<String>,
@@ -16657,9 +16523,11 @@ pub struct SubstancePolymerRepeatRepeatUnit {
     pub orientation: Option<CodeableConcept>,
     pub amount: Option<Integer>,
     #[fhir_serde(rename = "degreeOfPolymerisation")]
-    pub degree_of_polymerisation: Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
+    pub degree_of_polymerisation:
+        Option<Vec<SubstancePolymerRepeatRepeatUnitDegreeOfPolymerisation>>,
     #[fhir_serde(rename = "structuralRepresentation")]
-    pub structural_representation: Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
+    pub structural_representation:
+        Option<Vec<SubstancePolymerRepeatRepeatUnitStructuralRepresentation>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
@@ -16725,7 +16593,6 @@ pub struct SubstancePolymerMonomerSetStartingMaterial {
     pub amount: Option<Quantity>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstanceProtein {
     pub id: Option<String>,
@@ -16767,7 +16634,6 @@ pub struct SubstanceProteinSubunit {
     #[fhir_serde(rename = "cTerminalModification")]
     pub c_terminal_modification: Option<String>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstanceReferenceInformationGeneElement {
@@ -16845,7 +16711,6 @@ pub struct SubstanceReferenceInformation {
     pub gene_element: Option<Vec<SubstanceReferenceInformationGeneElement>>,
     pub target: Option<Vec<SubstanceReferenceInformationTarget>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SubstanceSourceMaterialOrganismAuthor {
@@ -16969,7 +16834,6 @@ pub struct SubstanceSourceMaterialOrganism {
     pub organism_general: Option<SubstanceSourceMaterialOrganismOrganismGeneral>,
 }
 
-
 /// Choice of types for the item\[x\] field in SupplyDeliverySuppliedItem
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum SupplyDeliverySuppliedItemItem {
@@ -17035,7 +16899,6 @@ pub struct SupplyDelivery {
     pub destination: Option<Reference>,
     pub receiver: Option<Vec<Reference>>,
 }
-
 
 /// Choice of types for the occurrence\[x\] field in SupplyRequest
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -17114,7 +16977,6 @@ pub struct SupplyRequestParameter {
     #[fhir_serde(flatten)]
     pub value: Option<SupplyRequestParameterValue>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct TaskPerformer {
@@ -17557,7 +17419,6 @@ pub struct TaskInput {
     pub value: Option<TaskInputValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct TerminologyCapabilitiesImplementation {
     pub id: Option<String>,
@@ -17726,7 +17587,6 @@ pub struct TerminologyCapabilitiesClosure {
     pub translation: Option<Boolean>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct TestPlanTestCaseTestRun {
     pub id: Option<String>,
@@ -17885,7 +17745,6 @@ pub struct TestPlanTestCaseAssertion {
     pub result: Option<Vec<CodeableReference>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct TestReportParticipant {
     pub id: Option<String>,
@@ -18026,7 +17885,6 @@ pub struct TestReportSetupAction {
     pub operation: Option<TestReportSetupActionOperation>,
     pub assert: Option<TestReportSetupActionAssert>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct TestScriptSetupActionOperationRequestHeader {
@@ -18350,7 +18208,6 @@ pub struct TestScriptMetadataCapability {
     pub link: Option<Vec<Uri>>,
     pub capabilities: Canonical,
 }
-
 
 /// Choice of types for the value\[x\] field in TransportOutput
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -18781,7 +18638,6 @@ pub struct TransportRestriction {
     pub recipient: Option<Vec<Reference>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ValueSetCompose {
     pub id: Option<String>,
@@ -19078,7 +18934,6 @@ pub struct ValueSetComposeIncludeConcept {
     pub designation: Option<Vec<ValueSetComposeIncludeConceptDesignation>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct VerificationResultValidator {
     pub id: Option<String>,
@@ -19171,7 +19026,6 @@ pub struct VerificationResult {
     pub validator: Option<Vec<VerificationResultValidator>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct VisionPrescription {
     pub id: Option<String>,
@@ -19228,7 +19082,6 @@ pub struct VisionPrescriptionLensSpecification {
     pub brand: Option<String>,
     pub note: Option<Vec<Annotation>>,
 }
-
 
 /// Choice of types for the versionAlgorithm\[x\] field in ViewDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -19407,7 +19260,6 @@ pub struct ViewDefinitionSelect {
     pub union_all: Option<Vec<ViewDefinitionSelect>>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, FhirPath)]
 #[serde(tag = "resourceType")]
 pub enum Resource {
@@ -19572,21 +19424,29 @@ pub enum Resource {
     ViewDefinition(ViewDefinition),
 }
 
-
 // --- From<T> Implementations for Element<T, Extension> ---
 impl From<bool> for Element<bool, Extension> {
     fn from(value: bool) -> Self {
-        Self { value: Some(value), ..Default::default() }
+        Self {
+            value: Some(value),
+            ..Default::default()
+        }
     }
 }
 impl From<std::primitive::i32> for Element<std::primitive::i32, Extension> {
     fn from(value: std::primitive::i32) -> Self {
-        Self { value: Some(value), ..Default::default() }
+        Self {
+            value: Some(value),
+            ..Default::default()
+        }
     }
 }
 impl From<std::string::String> for Element<std::string::String, Extension> {
     fn from(value: std::string::String) -> Self {
-        Self { value: Some(value), ..Default::default() }
+        Self {
+            value: Some(value),
+            ..Default::default()
+        }
     }
 }
 // --- End From<T> Implementations ---
@@ -19651,7 +19511,6 @@ pub struct Address {
     pub period: Option<Period>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Age {
     pub id: Option<String>,
@@ -19662,7 +19521,6 @@ pub struct Age {
     pub system: Option<Uri>,
     pub code: Option<Code>,
 }
-
 
 /// Choice of types for the author\[x\] field in Annotation
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -19685,7 +19543,6 @@ pub struct Annotation {
     pub text: Markdown,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Attachment {
     pub id: Option<String>,
@@ -19705,7 +19562,6 @@ pub struct Attachment {
     pub duration: Option<Decimal>,
     pub pages: Option<PositiveInt>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Availability {
@@ -19739,7 +19595,6 @@ pub struct AvailabilityAvailableTime {
     pub available_end_time: Option<Time>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CodeableConcept {
     pub id: Option<String>,
@@ -19748,7 +19603,6 @@ pub struct CodeableConcept {
     pub text: Option<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct CodeableReference {
     pub id: Option<String>,
@@ -19756,7 +19610,6 @@ pub struct CodeableReference {
     pub concept: Option<CodeableConcept>,
     pub reference: Option<Reference>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Coding {
@@ -19770,7 +19623,6 @@ pub struct Coding {
     pub user_selected: Option<Boolean>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ContactDetail {
     pub id: Option<String>,
@@ -19778,7 +19630,6 @@ pub struct ContactDetail {
     pub name: Option<String>,
     pub telecom: Option<Vec<ContactPoint>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ContactPoint {
@@ -19792,7 +19643,6 @@ pub struct ContactPoint {
     pub period: Option<Period>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Contributor {
     pub id: Option<String>,
@@ -19802,7 +19652,6 @@ pub struct Contributor {
     pub name: String,
     pub contact: Option<Vec<ContactDetail>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Count {
@@ -19814,7 +19663,6 @@ pub struct Count {
     pub system: Option<Uri>,
     pub code: Option<Code>,
 }
-
 
 /// Choice of types for the value\[x\] field in DataRequirementDateFilter
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -19919,7 +19767,6 @@ pub struct DataRequirementSort {
     pub direction: Code,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Distance {
     pub id: Option<String>,
@@ -19930,7 +19777,6 @@ pub struct Distance {
     pub system: Option<Uri>,
     pub code: Option<Code>,
 }
-
 
 /// Choice of types for the dose\[x\] field in DosageDoseAndRate
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -19999,7 +19845,6 @@ pub struct Dosage {
     pub max_dose_per_lifetime: Option<Quantity>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Duration {
     pub id: Option<String>,
@@ -20010,7 +19855,6 @@ pub struct Duration {
     pub system: Option<Uri>,
     pub code: Option<Code>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ElementDefinitionSlicing {
@@ -20909,7 +20753,6 @@ pub struct ElementDefinition {
     pub mapping: Option<Vec<ElementDefinitionMapping>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Expression {
     pub id: Option<String>,
@@ -20920,7 +20763,6 @@ pub struct Expression {
     pub expression: Option<String>,
     pub reference: Option<Uri>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ExtendedContactDetail {
@@ -20933,7 +20775,6 @@ pub struct ExtendedContactDetail {
     pub organization: Option<Reference>,
     pub period: Option<Period>,
 }
-
 
 /// Choice of types for the value\[x\] field in Extension
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -21111,7 +20952,6 @@ pub struct Extension {
     pub value: Option<ExtensionValue>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct HumanName {
     pub id: Option<String>,
@@ -21126,7 +20966,6 @@ pub struct HumanName {
     pub period: Option<Period>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Identifier {
     pub id: Option<String>,
@@ -21140,7 +20979,6 @@ pub struct Identifier {
     pub period: Option<Period>,
     pub assigner: Option<Box<Reference>>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MarketingStatus {
@@ -21157,7 +20995,6 @@ pub struct MarketingStatus {
     pub restore_date: Option<DateTime>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Meta {
     pub id: Option<String>,
@@ -21172,7 +21009,6 @@ pub struct Meta {
     pub tag: Option<Vec<Coding>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct MonetaryComponent {
     pub id: Option<String>,
@@ -21184,7 +21020,6 @@ pub struct MonetaryComponent {
     pub amount: Option<Money>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Money {
     pub id: Option<String>,
@@ -21193,7 +21028,6 @@ pub struct Money {
     pub currency: Option<Code>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Narrative {
     pub id: Option<String>,
@@ -21201,7 +21035,6 @@ pub struct Narrative {
     pub status: Code,
     pub div: Xhtml,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct ParameterDefinition {
@@ -21218,7 +21051,6 @@ pub struct ParameterDefinition {
     pub profile: Option<Canonical>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Period {
     pub id: Option<String>,
@@ -21226,7 +21058,6 @@ pub struct Period {
     pub start: Option<DateTime>,
     pub end: Option<DateTime>,
 }
-
 
 /// Choice of types for the period\[x\] field in ProductShelfLife
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -21253,7 +21084,6 @@ pub struct ProductShelfLife {
     pub special_precautions_for_storage: Option<Vec<CodeableConcept>>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Quantity {
     pub id: Option<String>,
@@ -21265,7 +21095,6 @@ pub struct Quantity {
     pub code: Option<Code>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Range {
     pub id: Option<String>,
@@ -21274,7 +21103,6 @@ pub struct Range {
     pub high: Option<Quantity>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Ratio {
     pub id: Option<String>,
@@ -21282,7 +21110,6 @@ pub struct Ratio {
     pub numerator: Option<Quantity>,
     pub denominator: Option<Quantity>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct RatioRange {
@@ -21295,7 +21122,6 @@ pub struct RatioRange {
     pub denominator: Option<Quantity>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Reference {
     pub id: Option<String>,
@@ -21306,7 +21132,6 @@ pub struct Reference {
     pub identifier: Option<Box<Identifier>>,
     pub display: Option<String>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct RelatedArtifact {
@@ -21328,7 +21153,6 @@ pub struct RelatedArtifact {
     pub publication_date: Option<Date>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct SampledData {
     pub id: Option<String>,
@@ -21349,7 +21173,6 @@ pub struct SampledData {
     pub data: Option<String>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Signature {
     pub id: Option<String>,
@@ -21366,7 +21189,6 @@ pub struct Signature {
     pub sig_format: Option<Code>,
     pub data: Option<Base64Binary>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath, Default)]
 pub struct Timing {
@@ -21423,7 +21245,6 @@ pub struct TimingRepeat {
     pub offset: Option<UnsignedInt>,
 }
 
-
 /// Choice of types for the timing\[x\] field in TriggerDefinition
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum TriggerDefinitionTiming {
@@ -21457,7 +21278,6 @@ pub struct TriggerDefinition {
     pub condition: Option<Expression>,
 }
 
-
 /// Choice of types for the value\[x\] field in UsageContext
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
 pub enum UsageContextValue {
@@ -21483,7 +21303,6 @@ pub struct UsageContext {
     #[fhir_serde(flatten)]
     pub value: Option<UsageContextValue>,
 }
-
 
 /// Choice of types for the address\[x\] field in VirtualServiceDetail
 #[derive(Debug, Clone, PartialEq, Eq, FhirSerde, FhirPath)]
@@ -21517,5 +21336,3 @@ pub struct VirtualServiceDetail {
     #[fhir_serde(rename = "sessionKey")]
     pub session_key: Option<String>,
 }
-
-

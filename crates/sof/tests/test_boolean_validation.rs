@@ -68,7 +68,8 @@ fn test_boolean_validation_improvements() {
 
     // Parse as FHIR resources directly to test validation
     println!("Testing comparison operation (should pass):");
-    let view_def1: Result<helios_fhir::r4::ViewDefinition, _> = serde_json::from_str(view_with_comparison);
+    let view_def1: Result<helios_fhir::r4::ViewDefinition, _> =
+        serde_json::from_str(view_with_comparison);
     assert!(
         view_def1.is_ok(),
         "Should parse ViewDefinition successfully"
