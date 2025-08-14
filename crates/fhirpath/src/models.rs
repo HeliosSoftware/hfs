@@ -216,7 +216,7 @@ fn process_parameter_r4(
     param: &helios_fhir::r4::ParametersParameter,
     extracted: &mut ExtractedParameters,
 ) -> Result<(), String> {
-    let name = param.name.value.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let name = param.name.value.as_deref().unwrap_or("");
     
     match name {
         "context" => {
@@ -302,7 +302,7 @@ fn extract_parameters_from_r4b(
     // Similar implementation for R4B
     // For brevity, this follows the same pattern as R4
     for param in parameters.parameter.unwrap_or_default() {
-        let name = param.name.value.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let name = param.name.value.as_deref().unwrap_or("");
         
         match name {
             "context" => {
@@ -343,7 +343,7 @@ fn extract_parameters_from_r5(
 ) -> Result<(), String> {
     // Similar implementation for R5
     for param in parameters.parameter.unwrap_or_default() {
-        let name = param.name.value.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let name = param.name.value.as_deref().unwrap_or("");
         
         match name {
             "context" => {
@@ -359,7 +359,6 @@ fn extract_parameters_from_r5(
             "validate" => {
                 extracted.validate = param.value.as_ref()
                     .and_then(|v| v.as_boolean())
-                    .copied()
                     .unwrap_or(false);
             }
             "resource" => {
@@ -385,7 +384,7 @@ fn extract_parameters_from_r6(
 ) -> Result<(), String> {
     // Similar implementation for R6
     for param in parameters.parameter.unwrap_or_default() {
-        let name = param.name.value.as_ref().map(|s| s.as_str()).unwrap_or("");
+        let name = param.name.value.as_deref().unwrap_or("");
         
         match name {
             "context" => {
@@ -401,7 +400,6 @@ fn extract_parameters_from_r6(
             "validate" => {
                 extracted.validate = param.value.as_ref()
                     .and_then(|v| v.as_boolean())
-                    .copied()
                     .unwrap_or(false);
             }
             "resource" => {

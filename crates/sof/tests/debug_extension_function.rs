@@ -1,5 +1,4 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
-use serde_json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 fn create_test_bundle() -> SofBundle {

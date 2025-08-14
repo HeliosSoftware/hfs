@@ -8,7 +8,7 @@ use helios_fhir::{FhirVersion, FhirResourceTypeProvider};
 /// This module provides enhanced support for handling FHIR resource types
 /// in FHIRPath expressions, allowing for proper type checking and filtering
 /// based on resource types.
-
+///
 /// Checks if a type name is a resource type for the given FHIR version
 /// 
 /// # Arguments
@@ -578,7 +578,7 @@ pub fn extract_namespace_and_type_with_context(type_spec: &TypeSpecifier, contex
                     capitalize_first_letter(&clean_name)
                 };
                 
-                return Ok((Some("System".to_string()), normalized_type));
+                Ok((Some("System".to_string()), normalized_type))
             }
             
             else if fhir_primitives.iter().any(|&t| t.eq_ignore_ascii_case(&clean_name)) {
@@ -723,7 +723,7 @@ pub fn extract_namespace_and_type(type_spec: &TypeSpecifier) -> Result<(Option<S
                     capitalize_first_letter(&clean_name)
                 };
                 
-                return Ok((Some("System".to_string()), normalized_type));
+                Ok((Some("System".to_string()), normalized_type))
             }
             
             // Check if the clean_name is a known FHIR primitive type
@@ -999,7 +999,7 @@ pub fn of_type(collection: &EvaluationResult, type_spec: &TypeSpecifier) -> Resu
             Ok(result[0].clone())
         } else {
             // ofType preserves the order of the input collection
-            let input_was_unordered = if let EvaluationResult::Collection { has_undefined_order: true, .. } = collection { true } else { false };
+            let input_was_unordered = matches!(collection, EvaluationResult::Collection { has_undefined_order: true, .. });
             Ok(EvaluationResult::Collection { items: result, has_undefined_order: input_was_unordered, type_info: None })
         }
     };

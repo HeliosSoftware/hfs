@@ -132,13 +132,12 @@ pub async fn evaluate_fhirpath(
         };
 
         // For each context result, evaluate the main expression
-        let mut context_index = 0;
         let context_items = match context_results {
             EvaluationResult::Collection { items, .. } => items,
             single_value => vec![single_value],
         };
 
-        for context_value in context_items {
+        for (context_index, context_value) in context_items.into_iter().enumerate() {
             // Clear trace outputs before each evaluation
             context.clear_trace_outputs();
             
@@ -154,7 +153,6 @@ pub async fn evaluate_fhirpath(
                     warn!("Evaluation error for context {}: {}", context_index, e);
                 }
             }
-            context_index += 1;
         }
     } else {
         // Evaluate without context

@@ -173,7 +173,7 @@ mod tests {
     fn test_aggregate_sum() {
         // Create a collection of integers 1 through 9
         let collection = EvaluationResult::Collection {
-            items: (1..=9).map(|i| EvaluationResult::integer(i)).collect(),
+            items: (1..=9).map(EvaluationResult::integer).collect(),
             has_undefined_order: false, // Assuming ordered for this literal collection
             type_info: None,
         };

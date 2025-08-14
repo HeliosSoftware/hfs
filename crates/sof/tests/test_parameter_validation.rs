@@ -154,7 +154,7 @@ fn apply_json_filtering(
 
             let filtered_ndjson = records
                 .iter()
-                .map(|r| serde_json::to_string(r))
+                .map(serde_json::to_string)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to serialize filtered NDJSON: {}", e))?
                 .join("\n");

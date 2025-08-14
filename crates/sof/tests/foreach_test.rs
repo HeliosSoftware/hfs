@@ -1,4 +1,3 @@
-use serde_json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 fn create_test_bundle(
@@ -115,12 +114,10 @@ fn test_simple_foreach() {
     println!("Actual result: {:#?}", actual_rows);
 
     // Expected: 4 rows (2 per patient, one for each name)
-    let expected = vec![
-        serde_json::json!({"id": "pt1", "family": "F1.1"}),
+    let expected = [serde_json::json!({"id": "pt1", "family": "F1.1"}),
         serde_json::json!({"id": "pt1", "family": "F1.2"}),
         serde_json::json!({"id": "pt2", "family": "F2.1"}),
-        serde_json::json!({"id": "pt2", "family": "F2.2"}),
-    ];
+        serde_json::json!({"id": "pt2", "family": "F2.2"})];
 
     assert_eq!(
         actual_rows.len(),

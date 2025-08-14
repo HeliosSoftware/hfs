@@ -107,7 +107,7 @@ impl EvaluationContext {
             });
 
         // Set 'this' to the first resource if available
-        let this = resources.first().map(|resource| convert_resource_to_result(resource));
+        let this = resources.first().map(convert_resource_to_result);
 
         Self {
             resources,
@@ -136,7 +136,7 @@ impl EvaluationContext {
     /// A new `EvaluationContext` instance with the provided resources and version
     pub fn new_with_version(resources: Vec<FhirResource>, fhir_version: FhirVersion) -> Self {
         // Set 'this' to the first resource if available
-        let this = resources.first().map(|resource| convert_resource_to_result(resource));
+        let this = resources.first().map(convert_resource_to_result);
 
         Self {
             resources,
@@ -401,7 +401,7 @@ fn apply_decimal_multiplicative(
                 .to_i64() // Convert to i64
                 .map(EvaluationResult::integer)
                 // Return error if conversion fails (e.g., overflow)
-                .ok_or_else(|| EvaluationError::ArithmeticOverflow)
+                .ok_or(EvaluationError::ArithmeticOverflow)
         }
         "mod" => {
             // Decimal mod Decimal -> Decimal
@@ -1024,8 +1024,7 @@ fn evaluate_term(
 
             // Handle variables (%var, %context) next and return
             if let Invocation::Member(name) = invocation {
-                if name.starts_with('%') {
-                    let var_name = &name[1..]; // Remove the % prefix
+                if let Some(var_name) = name.strip_prefix('%') {
                     if var_name == "context" {
                         // Return %context value
                         // Correctly wrap the entire conditional result in Ok()
@@ -2555,7 +2554,7 @@ fn call_function(
                                 && parts[2]
                                     .split('.')
                                     .next()
-                                    .map_or(false, |sec| sec.len() == 2)
+                                    .is_some_and(|sec| sec.len() == 2)
                                 && parts
                                     .iter()
                                     .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
@@ -2612,7 +2611,7 @@ fn call_function(
                                 && parts[2]
                                     .split('.')
                                     .next()
-                                    .map_or(false, |sec| sec.len() == 2)
+                                    .is_some_and(|sec| sec.len() == 2)
                                 && parts
                                     .iter()
                                     .all(|p| p.chars().all(|c| c.is_ascii_digit() || c == '.'))
@@ -2857,7 +2856,7 @@ fn call_function(
                 ));
             }
             // Check for singleton arguments
-            if args[0].count() > 1 || args.get(1).map_or(false, |a| a.count() > 1) {
+            if args[0].count() > 1 || args.get(1).is_some_and(|a| a.count() > 1) {
                 return Err(EvaluationError::SingletonEvaluationError(
                     "substring requires singleton arguments".to_string(),
                 ));
@@ -4470,7 +4469,7 @@ fn sqrt_decimal(value: Decimal) -> Result<Decimal, &'static str> {
 
     // Use Newton-Raphson method for square root approximation
     // x(n+1) = 0.5 * (x(n) + value / x(n))
-    let mut x = value.clone();
+    let mut x = value;
     let half = Decimal::from_str_exact("0.5").unwrap();
 
     // Run iterations until we reach desired precision
@@ -5375,6 +5374,7 @@ fn compare_inequality(
 }
 
 /// Compares two values for equality - Returns Result now
+#[allow(clippy::only_used_in_recursion)]
 fn compare_equality(
     left: &EvaluationResult,
     op: &str,
@@ -5444,7 +5444,7 @@ fn compare_equality(
                             // Recursive call should use original left/right if they were collections,
                             // or the potentially unwrapped l_cmp/r_cmp if they were scalars.
                             // However, for Collection = Collection, items are always elements.
-                            compare_equality(li, "=", ri, context).map_or(false, |r| r.to_boolean())
+                            compare_equality(li, "=", ri, context).is_ok_and(|r| r.to_boolean())
                         });
                         EvaluationResult::boolean(all_equal)
                     }
@@ -5493,11 +5493,7 @@ fn compare_equality(
                             EvaluationResult::boolean(ordering == std::cmp::Ordering::Equal)
                         }
                         None => {
-                            if l_cmp.type_name() == r_cmp.type_name() {
-                                EvaluationResult::boolean(false)
-                            } else {
-                                EvaluationResult::boolean(false)
-                            }
+                            EvaluationResult::boolean(false)
                         }
                     }
                 }
@@ -5769,7 +5765,7 @@ fn compare_equality(
                             l_sorted.iter().zip(r_sorted.iter()).all(|(li, ri)| {
                                 // Recursive call should use original left/right if they were collections
                                 compare_equality(li, "~", ri, context)
-                                    .map_or(false, |r| r.to_boolean())
+                                    .is_ok_and(|r| r.to_boolean())
                             });
                         EvaluationResult::boolean(all_equivalent)
                     }
@@ -5912,10 +5908,10 @@ fn check_membership(
                 EvaluationResult::Collection { items, .. } => items // Destructure
                     .iter()
                     .any(|item| {
-                        compare_equality(left, "=", item, context).map_or(false, |r| r.to_boolean())
+                        compare_equality(left, "=", item, context).is_ok_and(|r| r.to_boolean())
                     }),
                 single_item => compare_equality(left, "=", single_item, context)
-                    .map_or(false, |r| r.to_boolean()),
+                    .is_ok_and(|r| r.to_boolean()),
             };
 
             Ok(EvaluationResult::boolean(is_in))
@@ -5944,7 +5940,7 @@ fn check_membership(
                     // Pass context to compare_equality
                     let contains = items.iter().any(|item| {
                         compare_equality(item, "=", right, context)
-                            .map_or(false, |r| r.to_boolean()) // context is captured here
+                            .is_ok_and(|r| r.to_boolean()) // context is captured here
                     });
                     EvaluationResult::boolean(contains)
                 }
@@ -5966,7 +5962,7 @@ fn check_membership(
                 // Pass context to compare_equality
                 single_item => EvaluationResult::boolean(
                     compare_equality(single_item, "=", right, context)
-                        .map_or(false, |r| r.to_boolean()), // context is available here
+                        .is_ok_and(|r| r.to_boolean()), // context is available here
                 ),
             })
         }

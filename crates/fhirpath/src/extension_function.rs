@@ -171,7 +171,6 @@ fn find_extension_by_url(
 ///
 /// * If the extension is found, returns the extension element
 /// * If no extension is found with the given URL, returns Empty
-
 #[cfg(test)]
 mod tests {
     use super::*;

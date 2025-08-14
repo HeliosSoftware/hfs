@@ -144,10 +144,8 @@ pub fn tail_function(
             } else {
                 EvaluationResult::Empty // Empty if 0 or 1 item
             }
-        } else if invocation_base == &EvaluationResult::Empty {
-            EvaluationResult::Empty // Empty input
         } else {
-            EvaluationResult::Empty // Single item (not in collection form)
+            EvaluationResult::Empty // Empty input or single item
         },
     )
 }

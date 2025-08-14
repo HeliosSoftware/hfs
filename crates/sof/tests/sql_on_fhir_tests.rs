@@ -251,11 +251,9 @@ fn test_basic_view_definition() {
     let actual_rows: Vec<serde_json::Value> =
         serde_json::from_slice(&result).expect("Failed to parse result as JSON");
 
-    let expected = vec![
-        serde_json::json!({"id": "pt1"}),
+    let expected = [serde_json::json!({"id": "pt1"}),
         serde_json::json!({"id": "pt2"}),
-        serde_json::json!({"id": "pt3"}),
-    ];
+        serde_json::json!({"id": "pt3"})];
 
     assert_eq!(actual_rows.len(), expected.len(), "Row count mismatch");
     for (actual, expected) in actual_rows.iter().zip(expected.iter()) {
@@ -319,11 +317,9 @@ fn test_basic_boolean_attribute() {
     let actual_rows: Vec<serde_json::Value> =
         serde_json::from_slice(&result).expect("Failed to parse result as JSON");
 
-    let expected = vec![
-        serde_json::json!({"id": "pt1", "active": true}),
+    let expected = [serde_json::json!({"id": "pt1", "active": true}),
         serde_json::json!({"id": "pt2", "active": false}),
-        serde_json::json!({"id": "pt3", "active": null}),
-    ];
+        serde_json::json!({"id": "pt3", "active": null})];
 
     assert_eq!(actual_rows.len(), expected.len(), "Row count mismatch");
     for (actual, expected) in actual_rows.iter().zip(expected.iter()) {

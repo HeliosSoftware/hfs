@@ -1,5 +1,4 @@
 use helios_fhirpath_support::IntoEvaluationResult;
-use serde_json;
 
 #[test]
 fn test_evaluation_result_conversion() {

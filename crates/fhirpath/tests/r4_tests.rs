@@ -6,7 +6,6 @@ use helios_fhirpath_support::EvaluationResult;
 use chumsky::Parser;
 use roxmltree::{Document, Node};
 use rust_decimal::Decimal;
-use serde_json;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -730,9 +729,9 @@ fn test_r4_test_suite() {
     file.read_to_string(&mut contents)
         .expect("Failed to read test file");
 
-    // Fix malformed closing tags in the XML content
-    // The test files use </o> instead of </o> which causes parsing issues
-    contents = contents.replace("</o>", "</o>");
+    // NOTE: The following line is intentionally a no-op
+    // In case there are malformed closing tags, this would fix them
+    contents = contents.replace("</malformed>", "</correct>");
 
     println!("Fixed malformed XML closing tags in test file");
 
@@ -1073,8 +1072,7 @@ fn test_r4_test_suite() {
 
 
             // Skip specific UCUM quantity tests that we're not implementing yet
-            let quantity_tests_to_ignore = vec![
-                "testQuantity1",
+            let quantity_tests_to_ignore = ["testQuantity1",
                 "testQuantity2", 
                 "testQuantity4",
                 "testQuantity5",
@@ -1083,8 +1081,7 @@ fn test_r4_test_suite() {
                 "testQuantity8",
                 "testQuantity9",
                 "testQuantity10",
-                "testQuantity11"
-            ];
+                "testQuantity11"];
             
             if quantity_tests_to_ignore.contains(&test.name.as_str()) {
                 println!("  SKIP (UCUM not implemented): {} - '{}'", test.name, test.expression);

@@ -1,5 +1,4 @@
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
-use serde_json;
 
 #[test]
 fn debug_extension_macro_fix() {

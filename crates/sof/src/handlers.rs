@@ -82,14 +82,14 @@ pub async fn run_view_definition_handler(
     // Validate and parse query parameters
     let accept_header = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
     let validated_params =
-        validate_query_params(&params, accept_header).map_err(|e| ServerError::BadRequest(e))?;
+        validate_query_params(&params, accept_header).map_err(ServerError::BadRequest)?;
 
     // Parse the Parameters resource using version detection
     let parameters = parse_parameters(body)?;
 
     // Extract all parameters including filters
     let extracted_params =
-        extract_all_parameters(parameters).map_err(|e| ServerError::BadRequest(e))?;
+        extract_all_parameters(parameters).map_err(ServerError::BadRequest)?;
 
     // Check for not-yet-implemented parameters
     if extracted_params.view_reference.is_some() {
@@ -487,9 +487,7 @@ fn filter_resources_by_patient_and_group(
             patient_ref, normalized_patient_ref
         );
         let patient_ref_to_match = normalized_patient_ref.as_str();
-        filtered = filtered
-            .into_iter()
-            .filter(|resource| {
+        filtered.retain(|resource| {
                 // Check if resource belongs to patient compartment
                 // This is a simplified implementation - in production, this would
                 // need to check all patient compartment definitions
@@ -534,8 +532,7 @@ fn filter_resources_by_patient_and_group(
                     }
                 }
                 false
-            })
-            .collect();
+            });
     }
 
     // Apply group filter if provided

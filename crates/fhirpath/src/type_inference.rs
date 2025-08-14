@@ -63,6 +63,7 @@ fn capitalize_first(s: &str) -> String {
 }
 
 /// Context for type inference
+#[derive(Default)]
 pub struct TypeContext {
     /// The type of the root resource
     pub root_type: Option<InferredType>,
@@ -74,11 +75,7 @@ pub struct TypeContext {
 
 impl TypeContext {
     pub fn new() -> Self {
-        Self {
-            root_type: None,
-            current_type: None,
-            variables: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn with_root_type(mut self, root_type: InferredType) -> Self {

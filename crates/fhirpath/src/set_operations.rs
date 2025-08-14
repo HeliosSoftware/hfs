@@ -139,16 +139,11 @@ pub fn exclude_function(
     }
 
     // exclude() preserves order of the left operand.
-    let input_was_unordered = if let EvaluationResult::Collection {
+    let input_was_unordered = matches!(invocation_base, EvaluationResult::Collection {
         has_undefined_order: true,
         type_info: None,
         ..
-    } = invocation_base
-    {
-        true
-    } else {
-        false
-    };
+    });
 
     Ok(normalize_collection_result(
         result_items,
@@ -215,7 +210,7 @@ pub fn union_function(
     for item in right_items {
         if !union_items
             .iter()
-            .any(|existing| equal_helper(&existing, &item, context))
+            .any(|existing| equal_helper(existing, &item, context))
         {
             union_items.push(item);
         }

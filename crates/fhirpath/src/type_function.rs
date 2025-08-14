@@ -14,7 +14,7 @@ pub fn type_function(
         EvaluationResult::Collection { items, .. } => {
             let type_objects: Vec<EvaluationResult> = items
                 .iter()
-                .map(|item| create_type_object(item))
+                .map(create_type_object)
                 .collect();
             
             Ok(EvaluationResult::Collection {

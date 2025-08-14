@@ -253,11 +253,7 @@ mod tests {
                 
                 // Check that we get the nested object
                 assert!(items.iter().any(|item| {
-                    if let EvaluationResult::Object { map: _, .. } = item {
-                        true
-                    } else {
-                        false
-                    }
+                    matches!(item, EvaluationResult::Object { map: _, .. })
                 }));
             }
             _ => panic!("Expected Collection, got {:?}", result),

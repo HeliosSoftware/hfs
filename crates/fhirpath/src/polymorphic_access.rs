@@ -21,7 +21,7 @@ use std::collections::HashMap;
 /// - Identifying choice elements in FHIR resources
 /// - Accessing choice elements by their base name
 /// - Filtering choice elements by type (using is/as operators)
-
+///
 /// Handles polymorphic access to FHIR resource choice elements.
 ///
 /// This function resolves a field name in a FHIR resource object, handling choice elements
@@ -434,7 +434,7 @@ pub fn apply_polymorphic_type_operation(
     value: &EvaluationResult,
     op: &str,
     type_name: &str,
-    namespace: Option<&str>,
+    _namespace: Option<&str>,
 ) -> Result<EvaluationResult, EvaluationError> {
     // Handle empty values first
     if let EvaluationResult::Empty = value {
@@ -456,7 +456,7 @@ pub fn apply_polymorphic_type_operation(
         if items.len() != 1 {
             return Ok(EvaluationResult::Empty);
         }
-        return apply_polymorphic_type_operation(&items[0], op, type_name, namespace);
+        return apply_polymorphic_type_operation(&items[0], op, type_name, _namespace);
     }
 
     // Since we need to determine if the original path is a choice element
@@ -803,7 +803,7 @@ pub fn apply_polymorphic_type_operation(
                 // The 'as' operator returns the input value if it 'is' of the specified type,
                 // otherwise it returns Empty.
                 let is_type_result =
-                    apply_polymorphic_type_operation(value, "is", type_name, namespace)?;
+                    apply_polymorphic_type_operation(value, "is", type_name, _namespace)?;
                 match is_type_result {
                     EvaluationResult::Boolean(true, _) => Ok(value.clone()),
                     EvaluationResult::Boolean(false, _) => Ok(EvaluationResult::Empty),

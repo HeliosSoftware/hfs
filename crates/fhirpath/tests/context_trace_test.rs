@@ -125,11 +125,9 @@ fn test_trace_with_context_full_expression() {
     };
     
     // Expected results
-    let expected_results = vec![
-        "Peter James, Chalmers",
+    let expected_results = ["Peter James, Chalmers",
         "Jim",
-        "Peter James, Windsor"
-    ];
+        "Peter James, Windsor"];
     
     for (i, name_item) in name_items.iter().enumerate() {
         println!("Processing name[{}]", i);

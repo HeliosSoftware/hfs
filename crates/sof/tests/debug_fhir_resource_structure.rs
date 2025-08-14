@@ -1,6 +1,5 @@
 use helios_fhir::FhirResource;
 use helios_fhirpath::{EvaluationContext, evaluate_expression};
-use serde_json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 fn create_test_patient_with_extension() -> helios_fhir::r4::Patient {

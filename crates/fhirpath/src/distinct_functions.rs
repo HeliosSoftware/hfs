@@ -68,7 +68,7 @@ pub fn distinct_function(
 ) -> Result<EvaluationResult, EvaluationError> {
     // Handle special cases
     match invocation_base {
-        EvaluationResult::Empty => return Ok(EvaluationResult::Empty),
+        EvaluationResult::Empty => Ok(EvaluationResult::Empty),
         EvaluationResult::Collection { items, .. } => {
             // If collection is empty, return empty
             if items.is_empty() {

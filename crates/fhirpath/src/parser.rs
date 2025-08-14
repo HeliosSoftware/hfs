@@ -314,7 +314,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let string = just('\'')
         .ignore_then(
             none_of("\\\'") // Any character except \ or '
-                .or(esc.clone()) // Or an escape sequence
+                .or(esc) // Or an escape sequence
                 .repeated()
                 .collect::<String>(),
         )
@@ -569,7 +569,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let unit_string_literal = just('\'')
         .ignore_then(
             none_of("\\\'") // Any character except \ or '
-                .or(esc.clone()) // Or an escape sequence
+                .or(esc) // Or an escape sequence
                 .repeated()
                 .collect::<String>(),
         )
@@ -639,7 +639,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let datetime_literal = just('@')
         .ignore_then(date_format_str.clone())
         .then_ignore(just('T'))
-        .then(time_format.clone())
+        .then(time_format)
         .then(timezone_format.clone().or_not())
         .map(|((date_str, time_str), tz_opt)| {
             Literal::DateTime(date_str, Some((time_str, tz_opt)))
@@ -658,8 +658,8 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let time_literal = just('@')
         .ignore_then(
             just('T')
-                .ignore_then(time_format.clone())
-                .then(timezone_format.clone().or_not()), // Parse time and optional timezone
+                .ignore_then(time_format)
+                .then(timezone_format.or_not()), // Parse time and optional timezone
         )
         .try_map(|(time_str, tz_opt), span| {
             // Validate that timezone is not present
@@ -707,7 +707,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
 
     // DELIMITEDIDENTIFIER: '`' (ESC | .)*? '`'
     let delimited_identifier = just('`')
-        .ignore_then(none_of("`").or(esc.clone()).repeated().collect::<String>())
+        .ignore_then(none_of("`").or(esc).repeated().collect::<String>())
         .then_ignore(just('`'))
         .padded();
 
@@ -716,7 +716,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     // when they appear where an identifier is expected (e.g., in function calls or member access).
     // The context of the grammar will differentiate their use.
     let identifier = choice((
-        standard_identifier.clone(),
+        standard_identifier,
         delimited_identifier,
         // Allow keywords to be parsed as identifiers if they appear in identifier positions
         text::keyword("as").to(String::from("as")),
@@ -786,7 +786,7 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
     let string_for_external = just('\'')
         .ignore_then(
             none_of("\'\\")
-                .or(esc.clone())
+                .or(esc)
                 .repeated()
                 .collect::<String>(),
         )
@@ -999,13 +999,11 @@ pub fn parser() -> impl Parser<char, Expression, Error = Simple<char>> + Clone {
         // Let's treat it as left-associative for simplicity, though the spec implies right-to-left evaluation.
         // A proper right-associative fold might be needed if complex implies chains are common.
         let op_implies = text::keyword("implies").padded();
-        let implies = logical_or
+        // The final expression parser is the one with the lowest precedence
+        logical_or
             .clone()
             .then(op_implies.then(logical_or).repeated())
-            .foldl(|left, (_, right)| Expression::Implies(Box::new(left), Box::new(right)));
-
-        // The final expression parser is the one with the lowest precedence
-        implies // This is now the return value of the closure
+            .foldl(|left, (_, right)| Expression::Implies(Box::new(left), Box::new(right)))
     }) // Close the recursive closure here
     .then_ignore(end()) // Ensure the entire input is consumed after the expression
 }

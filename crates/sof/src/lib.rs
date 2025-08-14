@@ -8,10 +8,10 @@
 //!
 //! There are three consumers of this crate:
 //! - [sof_cli](../sof_cli/index.html) - A command-line interface for the SQL-on-FHIR implementation,
-//! allowing users to execute ViewDefinition transformations on FHIR Bundle resources
-//! and output the results in various formats.
+//!   allowing users to execute ViewDefinition transformations on FHIR Bundle resources
+//!   and output the results in various formats.
 //! - [sof_server](../sof_server/index.html) - A stateless HTTP server implementation for the SQL-on-FHIR specification,
-//! enabling HTTP-based access to ViewDefinition transformation capabilities.
+//!   enabling HTTP-based access to ViewDefinition transformation capabilities.
 //! - [hfs](../hfs/index.html) - The full featured Helios FHIR Server.
 //!
 //! ## Architecture
@@ -1053,13 +1053,13 @@ where
 // Generic version-agnostic validation
 fn validate_view_definition<VD: ViewDefinitionTrait>(view_def: &VD) -> Result<(), SofError> {
     // Basic validation
-    if view_def.resource().map_or(true, |s| s.is_empty()) {
+    if view_def.resource().is_none_or(|s| s.is_empty()) {
         return Err(SofError::InvalidViewDefinition(
             "ViewDefinition must specify a resource type".to_string(),
         ));
     }
 
-    if view_def.select().map_or(true, |s| s.is_empty()) {
+    if view_def.select().is_none_or(|s| s.is_empty()) {
         return Err(SofError::InvalidViewDefinition(
             "ViewDefinition must have at least one select".to_string(),
         ));

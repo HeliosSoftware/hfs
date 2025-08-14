@@ -7,7 +7,7 @@ pub fn apply_date_type_operation(
     value: &EvaluationResult,
     op: &str,
     type_name: &str,
-    namespace: Option<&str>,
+    _namespace: Option<&str>,
 ) -> Result<EvaluationResult, EvaluationError> {
     match op {
         "is" => {
@@ -61,7 +61,7 @@ pub fn apply_date_type_operation(
         }
         "as" => {
             // Check if the value is of the target type
-            let is_result = apply_date_type_operation(value, "is", type_name, namespace)?;
+            let is_result = apply_date_type_operation(value, "is", type_name, _namespace)?;
             match is_result {
                 EvaluationResult::Boolean(true, _) => {
                     // Value is already of the target type, return as is

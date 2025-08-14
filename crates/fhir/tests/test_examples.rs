@@ -157,7 +157,7 @@ fn compare_json_values(
 fn find_missing_linkid(json: &serde_json::Value) {
     if let Some(items) = json.get("item").and_then(|i| i.as_array()) {
         for (index, item) in items.iter().enumerate() {
-            if !item.get("linkId").is_some() {
+            if item.get("linkId").is_none() {
                 println!("Item at index {} is missing linkId", index);
                 println!(
                     "Item content: {}",
@@ -193,7 +193,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
         let entry = entry.unwrap();
         let path = entry.path();
 
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
             let filename = path.file_name().unwrap().to_string_lossy();
             
             // Check if this file should be skipped
@@ -268,8 +268,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
 
                                                         // Only fail the test if there are actual significant differences
                                                         // (not just valid string-to-integer conversions)
-                                                        assert!(
-                                                            false,
+                                                        panic!(
                                                             "Found {} significant differences in JSON values.\nSee above for specific differences.",
                                                             diff_paths.len()
                                                         );
@@ -278,8 +277,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                                     println!("Resource JSON matches original JSON");
                                                 }
                                                 Err(e) => {
-                                                    assert!(
-                                                        false,
+                                                    panic!(
                                                         "Error serializing Resource to JSON: {}",
                                                         e
                                                     );
@@ -312,7 +310,7 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                                 }
                                             }
 
-                                            assert!(false, "{}", error_message);
+                                            panic!("{}", error_message);
                                         }
                                     }
                                 } else {

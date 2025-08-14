@@ -1,4 +1,3 @@
-use serde_json;
 use helios_sof::{ContentType, SofBundle, SofViewDefinition, run_view_definition};
 
 #[test]

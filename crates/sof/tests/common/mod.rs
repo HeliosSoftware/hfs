@@ -233,8 +233,7 @@ async fn run_view_definition_handler(
                 Some("_since") => {
                     // Check if any value[X] field exists
                     let has_value_field = param
-                        .as_object()
-                        .map_or(false, |obj| obj.keys().any(|k| k.starts_with("value")));
+                        .as_object().is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")));
 
                     // Extract and validate _since from valueInstant or valueDateTime
                     if let Some(value_instant) = param.get("valueInstant").and_then(|v| v.as_str())
@@ -291,9 +290,7 @@ async fn run_view_definition_handler(
             format!("Patient/{}", patient_ref)
         };
 
-        resources = resources
-            .into_iter()
-            .filter(|resource| {
+        resources.retain(|resource| {
                 if let Some(resource_type) = resource.get("resourceType").and_then(|r| r.as_str()) {
                     match resource_type {
                         "Patient" => {
@@ -314,8 +311,7 @@ async fn run_view_definition_handler(
                     }
                 }
                 false
-            })
-            .collect();
+            });
     }
 
     // Apply _since filter if provided
@@ -342,9 +338,7 @@ async fn run_view_definition_handler(
         if let Ok(since_dt) = chrono::DateTime::parse_from_rfc3339(since_str) {
             let since_utc = since_dt.with_timezone(&chrono::Utc);
 
-            resources = resources
-                .into_iter()
-                .filter(|resource| {
+            resources.retain(|resource| {
                     // Check if resource has meta.lastUpdated field
                     if let Some(meta) = resource.get("meta") {
                         if let Some(last_updated) =
@@ -361,15 +355,12 @@ async fn run_view_definition_handler(
                     }
                     // If no meta.lastUpdated field, exclude the resource
                     false
-                })
-                .collect();
+                });
         }
     }
 
     // Parse content type - body format takes precedence
-    let format = format_from_body
-        .as_ref()
-        .map(|s| s.as_str())
+    let format = format_from_body.as_deref()
         .or_else(|| params.get("_format").map(|s| s.as_str()));
     let accept = if format_from_body.is_some() {
         None // Ignore Accept header when body param is present

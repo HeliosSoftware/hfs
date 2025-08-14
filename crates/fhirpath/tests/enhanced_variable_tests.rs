@@ -21,7 +21,7 @@ fn test_enhanced_variable_handling() {
     
     // Set variables with different types using the new API
     context.set_variable_result("intVar", EvaluationResult::integer(42));
-    context.set_variable_result("decimalVar", EvaluationResult::decimal(Decimal::from_f32(3.14).unwrap()));
+    context.set_variable_result("decimalVar", EvaluationResult::decimal(Decimal::from_f32(3.25).unwrap()));
     context.set_variable_result("boolVar", EvaluationResult::boolean(true));
     context.set_variable_result("stringVar", EvaluationResult::string("Hello".to_string()));
     
@@ -47,7 +47,7 @@ fn test_enhanced_variable_handling() {
     
     assert_eq!(
         eval("%decimalVar", &context).unwrap(),
-        EvaluationResult::decimal(Decimal::from_f32(3.14).unwrap())
+        EvaluationResult::decimal(Decimal::from_f32(3.25).unwrap())
     );
     
     assert_eq!(
@@ -116,7 +116,7 @@ fn test_variable_coercion() {
     
     // Set variables with different types 
     context.set_variable_result("intVar", EvaluationResult::integer(42));
-    context.set_variable_result("decimalVar", EvaluationResult::decimal(Decimal::from_f32(3.14).unwrap()));
+    context.set_variable_result("decimalVar", EvaluationResult::decimal(Decimal::from_f32(3.25).unwrap()));
     context.set_variable_result("boolVar", EvaluationResult::boolean(true));
     
     // Test type conversion functions on variables

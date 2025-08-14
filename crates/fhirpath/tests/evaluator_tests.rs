@@ -3675,7 +3675,7 @@ fn patient_context() -> EvaluationContext {
         active: Some(Boolean {
             // Use imported Boolean
             // Element with value
-            id: Some("active-id".to_string().into()), // Element ID - Use .to_string().into()
+            id: Some("active-id".to_string()), // Element ID
             value: Some(true),
             ..Default::default()
         }),
@@ -3699,7 +3699,7 @@ fn patient_context() -> EvaluationContext {
                     }, // Element<String>
                     FhirString {
                         // Use imported FhirString
-                        id: Some("given2-id".to_string().into()), // Use .to_string().into()
+                        id: Some("given2-id".to_string()), // Element ID
                         value: Some("Middle".to_string()),
                         ..Default::default()
                     }, // Element with ID
@@ -3748,15 +3748,14 @@ fn patient_context() -> EvaluationContext {
         birth_date: Some(Date {
             // Use imported Date
             // Element with value and extension
-            id: Some("birthdate-id".to_string().into()), // Use .to_string().into()
+            id: Some("birthdate-id".to_string()), // Element ID
             value: Some("1980-05-15".to_string()),
             extension: Some(vec![Extension {
                 // Use imported Extension, wrap in Some()
                 url: "http://example.com/precision".to_string().into(), // Remove Some(), url is not Option
                 value: Some(ExtensionValue::String("day".to_string().into())), // Use imported ExtensionValue, .to_string().into()
                 ..Default::default()
-            }]),
-            ..Default::default()
+            }])
         }),
         deceased: Some(r4::PatientDeceased::Boolean(Boolean {
             // Use imported Boolean

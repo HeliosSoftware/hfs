@@ -352,8 +352,8 @@ fn calculate_datetime_high_boundary(datetime_str: &str) -> EvaluationResult {
 /// Extracts timezone information from a time string
 fn extract_timezone(time_str: &str) -> (&str, &str) {
     // Look for timezone indicators: Z, +HH:MM, -HH:MM
-    if time_str.ends_with('Z') {
-        (&time_str[..time_str.len()-1], "Z")
+    if let Some(stripped) = time_str.strip_suffix('Z') {
+        (stripped, "Z")
     } else if let Some(plus_pos) = time_str.rfind('+') {
         (&time_str[..plus_pos], &time_str[plus_pos..])
     } else if let Some(minus_pos) = time_str.rfind('-') {

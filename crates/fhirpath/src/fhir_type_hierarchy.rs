@@ -6,8 +6,7 @@ use std::collections::HashSet;
 ///
 /// This module provides utility functions for FHIR type checking and string manipulation.
 /// It includes primitive type checking and string capitalization utilities.
-
-
+///
 /// Set of FHIR primitive types
 static FHIR_PRIMITIVE_TYPES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     let mut s = HashSet::new();

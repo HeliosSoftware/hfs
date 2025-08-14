@@ -1,4 +1,3 @@
-use serde_json;
 
 #[test]
 fn test_raw_fhir_parsing() {
@@ -29,7 +28,7 @@ fn test_raw_fhir_parsing() {
 
     // Check the extension structure specifically
     if let Some(extensions) = serialized.get("extension") {
-        if let Some(first_ext) = extensions.as_array().and_then(|arr| arr.get(0)) {
+        if let Some(first_ext) = extensions.as_array().and_then(|arr| arr.first()) {
             println!("\nFirst extension structure:");
             println!("{}", serde_json::to_string_pretty(first_ext).unwrap());
 

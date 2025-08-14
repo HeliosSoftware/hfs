@@ -56,7 +56,7 @@ mod tests {
         let args = debug_tree.get("Arguments").and_then(|a| a.as_array());
         assert!(args.is_some());
         let args = args.unwrap();
-        assert!(args.len() > 0);
+        assert!(!args.is_empty());
         assert_eq!(args[0].get("Name").and_then(|n| n.as_str()), Some("builtin.that"));
     }
 }

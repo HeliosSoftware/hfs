@@ -202,8 +202,7 @@ fn process_parameter(
     // Helper function to check if any value[X] field exists
     let has_any_value_field = |param: &serde_json::Value| -> bool {
         param
-            .as_object()
-            .map_or(false, |obj| obj.keys().any(|k| k.starts_with("value")))
+            .as_object().is_some_and(|obj| obj.keys().any(|k| k.starts_with("value")))
     };
 
     match name {
@@ -528,7 +527,7 @@ fn apply_json_filtering(
 
             let filtered_ndjson = records
                 .iter()
-                .map(|r| serde_json::to_string(r))
+                .map(serde_json::to_string)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("Failed to serialize filtered NDJSON: {}", e))?
                 .join("\n");

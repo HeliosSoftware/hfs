@@ -675,7 +675,7 @@ fn detect_struct_cycles(
             let path_parts: Vec<&str> = element.path.split('.').collect();
             if path_parts.len() > 1 {
                 let from_type = path_parts[0].to_string();
-                if !from_type.is_empty() && element.max.as_ref().map(|m| m.as_str()) == Some("1") {
+                if !from_type.is_empty() && element.max.as_deref() == Some("1") {
                     for ty in types {
                         if !ty.code.contains('.') && from_type != ty.code {
                             graph
@@ -704,7 +704,7 @@ fn detect_struct_cycles(
     // Add cycle from Bundle to Resource since Bundle.issues contains Resources (an specially generated enum) beginning in R5
     if elements
         .iter()
-        .any(|e| e.id.as_ref().map_or(false, |id| id == "Bundle.issues"))
+        .any(|e| e.id.as_ref().is_some_and(|id| id == "Bundle.issues"))
     {
         cycles.insert(("Bundle".to_string(), "Resource".to_string()));
     }
@@ -797,7 +797,7 @@ fn process_elements(
             ));
 
             // Generate enum derives - Add Clone, PartialEq, Eq to all enums
-            let enum_derives = vec!["Debug", "Clone", "PartialEq", "Eq", "FhirSerde", "FhirPath"];
+            let enum_derives = ["Debug", "Clone", "PartialEq", "Eq", "FhirSerde", "FhirPath"];
             output.push_str(&format!("#[derive({})]\n", enum_derives.join(", ")));
 
             // Add other serde attributes and enum definition
@@ -824,7 +824,7 @@ fn process_elements(
         }
 
         // Generate struct derives - Add Clone, PartialEq, Eq to all structs
-        let derives = vec![
+        let derives = [
             "Debug",
             "Clone",
             "PartialEq",
@@ -879,7 +879,7 @@ fn process_elements(
 /// - **Content References**: Resolves `#id` references to other elements
 fn generate_element_definition(
     element: &ElementDefinition,
-    type_name: &String,
+    type_name: &str,
     output: &mut String,
     cycles: &std::collections::HashSet<(String, String)>,
     elements: &[ElementDefinition],
@@ -908,7 +908,7 @@ fn generate_element_definition(
                     let ref_id = extract_content_reference_id(content_ref);
                     if let Some(referenced_element) = elements
                         .iter()
-                        .find(|e| e.id.as_ref().map_or(false, |id| id == ref_id))
+                        .find(|e| e.id.as_ref().is_some_and(|id| id == ref_id))
                     {
                         if let Some(ref_ty) =
                             referenced_element.r#type.as_ref().and_then(|t| t.first())
@@ -1076,8 +1076,7 @@ fn generate_type_name(path: &str) -> String {
         }
         result
     } else {
-        let result = String::from("Empty path provided to generate_type_name");
-        result
+        String::from("Empty path provided to generate_type_name")
     }
 }
 

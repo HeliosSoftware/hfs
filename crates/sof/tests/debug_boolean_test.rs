@@ -2,7 +2,6 @@
 mod tests {
     use helios_fhir::{FhirResource, r4::Patient};
     use helios_fhirpath::{EvaluationContext, evaluate_expression};
-    use serde_json;
 
     #[test]
     fn debug_boolean_constant_test() {
@@ -83,6 +82,5 @@ mod tests {
         }
 
         // This test always passes - we just want to see the debug output
-        assert!(true);
     }
 }

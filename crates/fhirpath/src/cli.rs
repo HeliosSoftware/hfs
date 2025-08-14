@@ -192,7 +192,7 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
     let result = if let Some(context_expr) = &args.context {
         // First evaluate the context expression
         let context_result = evaluate_expression(context_expr, &context)
-            .map_err(|e| FhirPathError::EvaluationError(e))?;
+            .map_err(FhirPathError::EvaluationError)?;
 
         // Create a new context with the context result
         let mut scoped_context = EvaluationContext::new(vec![]);
@@ -210,11 +210,11 @@ pub fn run_cli(args: Args) -> FhirPathResult<()> {
 
         // Evaluate the main expression in the scoped context
         evaluate_expression(&args.expression, &scoped_context)
-            .map_err(|e| FhirPathError::EvaluationError(e))?
+            .map_err(FhirPathError::EvaluationError)?
     } else {
         // Evaluate the expression directly
         evaluate_expression(&args.expression, &context)
-            .map_err(|e| FhirPathError::EvaluationError(e))?
+            .map_err(FhirPathError::EvaluationError)?
     };
 
     // Convert result to JSON

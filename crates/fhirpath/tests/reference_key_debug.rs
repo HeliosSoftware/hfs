@@ -1,5 +1,4 @@
 use helios_fhirpath::{evaluate_expression, EvaluationContext};
-use serde_json;
 
 #[test]
 fn debug_reference_key_functions() {
