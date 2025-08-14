@@ -1012,14 +1012,12 @@ pub fn extract_namespace_and_type_with_context(
                 ));
             }
             // For complex types and unknown types, make an educated guess based on capitalization
-            else {
-                if is_likely_system_type {
-                    // Capitalized types are likely System types
-                    return Ok((Some("System".to_string()), clean_name));
-                } else {
-                    // Lowercase types are likely FHIR types
-                    return Ok((Some("FHIR".to_string()), clean_name));
-                }
+            else if is_likely_system_type {
+                // Capitalized types are likely System types
+                return Ok((Some("System".to_string()), clean_name));
+            } else {
+                // Lowercase types are likely FHIR types
+                return Ok((Some("FHIR".to_string()), clean_name));
             }
         }
     }
@@ -1216,14 +1214,12 @@ pub fn extract_namespace_and_type(
                 ));
             }
             // For types we're not confident about, make an educated guess based on capitalization
-            else {
-                if is_likely_system_type {
-                    // Capitalized types are likely System types
-                    return Ok((Some("System".to_string()), clean_name));
-                } else {
-                    // Lowercase types are likely FHIR types
-                    return Ok((Some("FHIR".to_string()), clean_name));
-                }
+            else if is_likely_system_type {
+                // Capitalized types are likely System types
+                return Ok((Some("System".to_string()), clean_name));
+            } else {
+                // Lowercase types are likely FHIR types
+                return Ok((Some("FHIR".to_string()), clean_name));
             }
         }
     }

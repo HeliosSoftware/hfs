@@ -886,37 +886,28 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             }
-                        } else {
-                            if field_is_flattened {
-                                // For flattened fields, we don't increment the count
-                                quote! {
-                                    // No count increment for flattened fields
-                                    #[allow(unused_variables)]
-                                    let mut #extension_field_ident = false;
+                        } else if !is_vec && is_fhir_element {
+                            quote! {
+                                let mut #extension_field_ident = false;
+                                if #field_access.value.is_some() {
+                                    count += 1;
                                 }
-                            } else if !is_vec && is_fhir_element {
+                                if #field_access.id.is_some() || #field_access.extension.is_some() {
+                                    count += 1;
+                                    #extension_field_ident = true;
+                                }
+                            }
+                        } else {
+                            // Only count non-Option fields or Some Option fields
+                            if is_option {
                                 quote! {
-                                    let mut #extension_field_ident = false;
-                                    if #field_access.value.is_some() {
+                                    if #field_access.is_some() {
                                         count += 1;
-                                    }
-                                    if #field_access.id.is_some() || #field_access.extension.is_some() {
-                                        count += 1;
-                                        #extension_field_ident = true;
                                     }
                                 }
                             } else {
-                                // Only count non-Option fields or Some Option fields
-                                if is_option {
-                                    quote! {
-                                        if #field_access.is_some() {
-                                            count += 1;
-                                        }
-                                    }
-                                } else {
-                                    quote! {
-                                        count += 1;
-                                    }
+                                quote! {
+                                    count += 1;
                                 }
                             }
                         };
@@ -1071,17 +1062,7 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                     }
                                 }
                             }
-                        } else {
-                            if field_is_flattened {
-                                // For flattened fields, use FlatMapSerializer
-                                quote! {
-                                    // Use serde::Serialize::serialize with FlatMapSerializer
-                                    serde::Serialize::serialize(
-                                        &#field_access,
-                                        serde::__private::ser::FlatMapSerializer(&mut state)
-                                    )?;
-                                }
-                            } else if !is_vec && is_fhir_element {
+                        } else if !is_vec && is_fhir_element {
                                 if has_flattened_fields {
                                     // For SerializeMap
                                     quote! {
@@ -1172,27 +1153,26 @@ fn generate_serialize_impl(data: &Data, name: &Ident) -> proc_macro2::TokenStrea
                                         }
                                     }
                                 }
-                            } else {
-                                // For non-Option types, check if it's a struct with all None/null fields
-                                if has_flattened_fields {
-                                    // For SerializeMap
-                                    quote! {
-                                        // Use serde_json to check if the field serializes to null or empty object
-                                        let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                        if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                            // Use serialize_entry for SerializeMap
-                                            state.serialize_entry(&#effective_field_name_str, &#field_access)?;
-                                        }
+                        } else {
+                            // For non-Option types, check if it's a struct with all None/null fields
+                            if has_flattened_fields {
+                                // For SerializeMap
+                                quote! {
+                                    // Use serde_json to check if the field serializes to null or empty object
+                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                        // Use serialize_entry for SerializeMap
+                                        state.serialize_entry(&#effective_field_name_str, &#field_access)?;
                                     }
-                                } else {
-                                    // For SerializeStruct
-                                    quote! {
-                                        // Use serde_json to check if the field serializes to null or empty object
-                                        let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
-                                        if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
-                                            // Use serialize_field for SerializeStruct
-                                            state.serialize_field(&#effective_field_name_str, &#field_access)?;
-                                        }
+                                }
+                            } else {
+                                // For SerializeStruct
+                                quote! {
+                                    // Use serde_json to check if the field serializes to null or empty object
+                                    let json_value = serde_json::to_value(&#field_access).map_err(|_| serde::ser::Error::custom("serialization failed"))?;
+                                    if !json_value.is_null() && !(json_value.is_object() && json_value.as_object().unwrap().is_empty()) {
+                                        // Use serialize_field for SerializeStruct
+                                        state.serialize_field(&#effective_field_name_str, &#field_access)?;
                                     }
                                 }
                             }
