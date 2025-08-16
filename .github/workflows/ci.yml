@@ -14,7 +14,7 @@ env:
 jobs:
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
+    runs-on: self-hosted 
     strategy:
       matrix:
         rust: [stable]
@@ -73,7 +73,7 @@ jobs:
  
   lint:
     name: Linting
-    runs-on: ubuntu-latest
+    runs-on: self-hosted 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -103,7 +103,7 @@ jobs:
 
   security:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: self-hosted 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
