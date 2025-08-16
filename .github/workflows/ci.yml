@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_MIN_STACK: 8388608
-  CARGO_BUILD_JOBS: 1
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   test:
