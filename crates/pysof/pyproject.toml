@@ -42,7 +42,7 @@ lint = "ruff check src tests"
 lint-fix = "ruff check --fix src tests"
 typecheck = "mypy src"
 test = "pytest tests/ -v"
-test-cov = "pytest tests/ -v --cov=pysof --cov-report=term-missing"
+test-cov = "pytest tests/ -v --cov=pysof --cov-report=term-missing --cov-report=xml"
 check-all = ["lint", "typecheck", "test"]
 
 [tool.hatch.build.targets.wheel]
@@ -108,5 +108,34 @@ show_error_codes = true
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--disable-warnings",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
 
 

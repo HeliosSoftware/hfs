@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/pysof/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/pysof/**'
+      - '.github/workflows/ci.yml'
+
+defaults:
+  run:
+    working-directory: crates/pysof
+
+jobs:
+  lint-and-test:
+    name: Lint and Test (Python 3.11)
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+        
+    - name: Set up Python 3.11
+      run: uv python install 3.11
+      
+    - name: Create virtual environment
+      run: uv venv --python 3.11
+      
+    - name: Install dependencies
+      run: uv sync --group dev
+      
+    - name: Format check
+      run: uv run ruff format --check src tests
+      
+    - name: Lint check
+      run: uv run lint
+      
+    - name: Type check
+      run: uv run typecheck
+      
+    - name: Run tests
+      run: uv run test-cov
+      
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./crates/pysof/coverage.xml
+        flags: pysof
+        name: pysof-coverage
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # Test on multiple platforms to ensure compatibility
+  test-platforms:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+        
+    - name: Set up Python 3.11
+      run: uv python install 3.11
+      
+    - name: Create virtual environment
+      run: uv venv --python 3.11
+      working-directory: crates/pysof
+      
+    - name: Install dependencies
+      run: uv sync --group dev
+      working-directory: crates/pysof
+      
+    - name: Run tests
+      run: uv run test
+      working-directory: crates/pysof
