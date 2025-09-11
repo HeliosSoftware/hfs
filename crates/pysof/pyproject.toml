@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.25"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "pysof"
@@ -25,28 +25,13 @@ dev = [
     "pytest-cov>=4.1.0",
 ]
 
-[tool.uv]
-dev-dependencies = [
-    "ruff>=0.1.0",
-    "mypy>=1.5.0", 
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-]
-
 [project.scripts]
 # No CLI scripts yet
 
-[tool.uv.scripts]
-fmt = "ruff format src tests"
-lint = "ruff check src tests"
-lint-fix = "ruff check --fix src tests"
-typecheck = "mypy src"
-test = "pytest tests/ -v"
-test-cov = "pytest tests/ -v --cov=pysof --cov-report=term-missing --cov-report=xml"
-check-all = ["lint", "typecheck", "test"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/pysof"]
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "pysof._pysof"
+python-source = "src"
 
 [tool.ruff]
 target-version = "py311"
@@ -137,5 +122,3 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
 ]
-
-

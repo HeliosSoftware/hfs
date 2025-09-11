@@ -53,7 +53,7 @@ crates/pysof/
 
 - v1 (Rust bindings and wheels)
 
-  - [ ] Introduce PyO3 bindings to call Rust `sof` library
+  - [ ] Introduce PyO3 bindings to call Rust `helios-sof` library
   - [ ] Switch build backend to `maturin` (PEP 621) for extension builds
   - [ ] **Core API Functions:**
     - [ ] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
