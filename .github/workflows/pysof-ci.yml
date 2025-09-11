@@ -1,119 +1,119 @@
-name: pysof CI
+# name: pysof CI
 
-on:
-  push:
-    branches: [main, epic/pysof]
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-ci.yml'
-  pull_request:
-    branches: [main, epic/pysof]
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-ci.yml'
+# on:
+#   push:
+#     branches: [main, epic/pysof]
+#     paths:
+#       - 'crates/pysof/**'
+#       - '.github/workflows/pysof-ci.yml'
+#   pull_request:
+#     branches: [main, epic/pysof]
+#     paths:
+#       - 'crates/pysof/**'
+#       - '.github/workflows/pysof-ci.yml'
 
-defaults:
-  run:
-    working-directory: crates/pysof
+# defaults:
+#   run:
+#     working-directory: crates/pysof
 
-jobs:
-  lint-and-test:
-    name: pysof Lint and Test (Python 3.11)
-    runs-on: [self-hosted, Linux]
+# jobs:
+#   lint-and-test:
+#     name: pysof Lint and Test (Python 3.11)
+#     runs-on: [self-hosted, Linux]
     
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+#     steps:
+#     - name: Checkout code
+#       uses: actions/checkout@v4
       
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        version: "latest"
+#     - name: Install uv
+#       uses: astral-sh/setup-uv@v3
+#       with:
+#         version: "latest"
         
-    - name: Set up Python 3.11
-      run: uv python install 3.11
+#     - name: Set up Python 3.11
+#       run: uv python install 3.11
       
-    - name: Create virtual environment
-      run: uv venv --python 3.11
+#     - name: Create virtual environment
+#       run: uv venv --python 3.11
       
-    - name: Install dependencies
-      run: uv sync --group dev
+#     - name: Install dependencies
+#       run: uv sync --group dev
       
-    - name: Format check
-      run: uv run ruff format --check src tests
+#     - name: Format check
+#       run: uv run ruff format --check src tests
       
-    - name: Lint check
-      run: uv run lint
+#     - name: Lint check
+#       run: uv run lint
       
-    - name: Type check
-      run: uv run typecheck
+#     - name: Type check
+#       run: uv run typecheck
       
-    - name: Run tests
-      run: uv run test-cov
+#     - name: Run tests
+#       run: uv run test-cov
       
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./crates/pysof/coverage.xml
-        flags: pysof
-        name: pysof-coverage
-        fail_ci_if_error: false
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+#     - name: Upload coverage to Codecov
+#       uses: codecov/codecov-action@v4
+#       with:
+#         file: ./crates/pysof/coverage.xml
+#         flags: pysof
+#         name: pysof-coverage
+#         fail_ci_if_error: false
+#       env:
+#         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  # Test on multiple platforms to ensure compatibility
-  test-platforms:
-    name: pysof Test on ${{ matrix.os }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - os: Linux
-            runner: [self-hosted, Linux]
-          - os: Windows
-            runner: [self-hosted, Windows]
+#   # Test on multiple platforms to ensure compatibility
+#   test-platforms:
+#     name: pysof Test on ${{ matrix.os }}
+#     runs-on: ${{ matrix.runner }}
+#     strategy:
+#       matrix:
+#         include:
+#           - os: Linux
+#             runner: [self-hosted, Linux]
+#           - os: Windows
+#             runner: [self-hosted, Windows]
         
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+#     steps:
+#     - name: Checkout code
+#       uses: actions/checkout@v4
       
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        version: "latest"
+#     - name: Install uv
+#       uses: astral-sh/setup-uv@v3
+#       with:
+#         version: "latest"
         
-    - name: Set up Python 3.11
-      run: uv python install 3.11
+#     - name: Set up Python 3.11
+#       run: uv python install 3.11
       
-    - name: Create virtual environment (Linux)
-      if: runner.os != 'Windows'
-      run: uv venv --python 3.11
-      working-directory: crates/pysof
+#     - name: Create virtual environment (Linux)
+#       if: runner.os != 'Windows'
+#       run: uv venv --python 3.11
+#       working-directory: crates/pysof
       
-    - name: Create virtual environment (Windows)
-      if: runner.os == 'Windows'
-      shell: cmd
-      run: uv venv --python 3.11
-      working-directory: crates/pysof
+#     - name: Create virtual environment (Windows)
+#       if: runner.os == 'Windows'
+#       shell: cmd
+#       run: uv venv --python 3.11
+#       working-directory: crates/pysof
       
-    - name: Install dependencies (Linux)
-      if: runner.os != 'Windows'
-      run: uv sync --group dev
-      working-directory: crates/pysof
+#     - name: Install dependencies (Linux)
+#       if: runner.os != 'Windows'
+#       run: uv sync --group dev
+#       working-directory: crates/pysof
       
-    - name: Install dependencies (Windows)
-      if: runner.os == 'Windows'
-      shell: cmd
-      run: uv sync --group dev
-      working-directory: crates/pysof
+#     - name: Install dependencies (Windows)
+#       if: runner.os == 'Windows'
+#       shell: cmd
+#       run: uv sync --group dev
+#       working-directory: crates/pysof
       
-    - name: Run tests (Linux)
-      if: runner.os != 'Windows'
-      run: uv run test
-      working-directory: crates/pysof
+#     - name: Run tests (Linux)
+#       if: runner.os != 'Windows'
+#       run: uv run test
+#       working-directory: crates/pysof
       
-    - name: Run tests (Windows)
-      if: runner.os == 'Windows'
-      shell: cmd
-      run: uv run test
-      working-directory: crates/pysof
+#     - name: Run tests (Windows)
+#       if: runner.os == 'Windows'
+#       shell: cmd
+#       run: uv run test
+#       working-directory: crates/pysof

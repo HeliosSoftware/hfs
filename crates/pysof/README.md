@@ -48,6 +48,7 @@ crates/pysof/
   - [x] Add `uv` scripts for fmt, lint, test
   - [x] Add minimal tests: import/package metadata/version
   - [x] Add CI workflow for Python 3.11: lint + tests (Linux/Windows self-hosted)
+  - [ ] Install uv on self-hosted runners to enable CI execution
   - [ ] Add macOS self-hosted runner support to CI
 
 - v1 (Rust bindings and wheels)
@@ -96,6 +97,11 @@ crates/pysof/
     - [ ] Schema validation against FHIR specification
     - [ ] FHIRPath expression syntax validation
     - [ ] ViewDefinition linting and optimization suggestions
+
+- Infrastructure/DevOps
+  - [ ] Install uv package manager on self-hosted CI runners
+  - [ ] Set up macOS self-hosted runner (when needed for wheel distribution)
+  - [ ] Configure Python 3.11+ on all CI environments
 
 - Future (Server integration and ecosystem)
   - [ ] **HTTP Client Integration:**
