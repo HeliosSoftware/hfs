@@ -43,10 +43,10 @@ crates/pysof/
   - [x] Package skeleton with src layout
   - [x] `pyproject.toml` targeting Python 3.11
   - [x] README with quickstart, layout, roadmap
-  - [ ] Define Python public API surface in `pysof/__init__.py`
-  - [ ] Add `ruff` (lint) and `mypy` (types) configs
-  - [ ] Add `uv` scripts for fmt, lint, test
-  - [ ] Add minimal tests: import/package metadata/version
+  - [x] Define Python public API surface in `pysof/__init__.py`
+  - [x] Add `ruff` (lint) and `mypy` (types) configs
+  - [x] Add `uv` scripts for fmt, lint, test
+  - [x] Add minimal tests: import/package metadata/version
   - [ ] Add CI workflow for Python 3.11: lint + tests
 
 - v1 (Rust bindings and wheels)
