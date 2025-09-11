@@ -1,16 +1,16 @@
-name: CI
+name: pysof CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, epic/pysof]
     paths:
       - 'crates/pysof/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/pysof-ci.yml'
   pull_request:
-    branches: [main]
+    branches: [main, epic/pysof]
     paths:
       - 'crates/pysof/**'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/pysof-ci.yml'
 
 defaults:
   run:
@@ -18,7 +18,7 @@ defaults:
 
 jobs:
   lint-and-test:
-    name: Lint and Test (Python 3.11)
+    name: pysof Lint and Test (Python 3.11)
     runs-on: ubuntu-latest
     
     steps:
@@ -63,7 +63,7 @@ jobs:
 
   # Test on multiple platforms to ensure compatibility
   test-platforms:
-    name: Test on ${{ matrix.os }}
+    name: pysof Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
