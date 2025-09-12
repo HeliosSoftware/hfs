@@ -21,31 +21,31 @@ Exception hierarchy:
     IoError: File/IO related errors
 """
 
-from typing import List, Dict, Any, Optional, Union
+from typing import Any
 
 try:
     # Import the Rust extension module
     from pysof._pysof import (
-        py_run_view_definition,
-        py_run_view_definition_with_options,
-        py_validate_view_definition,
-        py_validate_bundle,
-        py_parse_content_type,
-        py_get_supported_fhir_versions,
+        CsvError,
+        FhirPathError,
+        InvalidViewDefinitionError,
+        IoError,
+        SerializationError,
         # Exception classes
         SofError,
-        InvalidViewDefinitionError,
-        FhirPathError,
-        SerializationError,
         UnsupportedContentTypeError,
-        CsvError,
-        IoError,
+        py_get_supported_fhir_versions,
+        py_parse_content_type,
+        py_run_view_definition,
+        py_run_view_definition_with_options,
+        py_validate_bundle,
+        py_validate_view_definition,
     )
 
     # Create Python-friendly wrapper functions
     def run_view_definition(
-        view: Dict[str, Any],
-        bundle: Dict[str, Any],
+        view: dict[str, Any],
+        bundle: dict[str, Any],
         format: str,
         *,
         fhir_version: str = "R4",
@@ -72,13 +72,13 @@ try:
         return py_run_view_definition(view, bundle, format, fhir_version)
 
     def run_view_definition_with_options(
-        view: Dict[str, Any],
-        bundle: Dict[str, Any],
+        view: dict[str, Any],
+        bundle: dict[str, Any],
         format: str,
         *,
-        since: Optional[str] = None,
-        limit: Optional[int] = None,
-        page: Optional[int] = None,
+        since: str | None = None,
+        limit: int | None = None,
+        page: int | None = None,
         fhir_version: str = "R4",
     ) -> bytes:
         """Transform FHIR Bundle data using a ViewDefinition with additional options.
@@ -114,7 +114,7 @@ try:
         )
 
     def validate_view_definition(
-        view: Dict[str, Any], *, fhir_version: str = "R4"
+        view: dict[str, Any], *, fhir_version: str = "R4"
     ) -> bool:
         """Validate a ViewDefinition structure without executing it.
 
@@ -131,7 +131,7 @@ try:
         """
         return py_validate_view_definition(view, fhir_version)
 
-    def validate_bundle(bundle: Dict[str, Any], *, fhir_version: str = "R4") -> bool:
+    def validate_bundle(bundle: dict[str, Any], *, fhir_version: str = "R4") -> bool:
         """Validate a Bundle structure without executing transformations.
 
         Args:
@@ -160,7 +160,7 @@ try:
         """
         return py_parse_content_type(mime_type)
 
-    def get_supported_fhir_versions() -> List[str]:
+    def get_supported_fhir_versions() -> list[str]:
         """Get list of supported FHIR versions compiled into this build.
 
         Returns:
@@ -175,6 +175,7 @@ except ImportError as e:
     warnings.warn(
         f"Rust extension module not available: {e}. Using placeholder functions.",
         ImportWarning,
+        stacklevel=2,
     )
 
     # Define placeholder exception classes
@@ -215,8 +216,8 @@ except ImportError as e:
 
     # Define placeholder functions
     def run_view_definition(
-        view: Dict[str, Any],
-        bundle: Dict[str, Any],
+        view: dict[str, Any],
+        bundle: dict[str, Any],
         format: str,
         *,
         fhir_version: str = "R4",
@@ -224,33 +225,33 @@ except ImportError as e:
         raise NotImplementedError("Rust extension module not available")
 
     def run_view_definition_with_options(
-        view: Dict[str, Any],
-        bundle: Dict[str, Any],
+        view: dict[str, Any],
+        bundle: dict[str, Any],
         format: str,
         *,
-        since: Optional[str] = None,
-        limit: Optional[int] = None,
-        page: Optional[int] = None,
+        since: str | None = None,
+        limit: int | None = None,
+        page: int | None = None,
         fhir_version: str = "R4",
     ) -> bytes:
         raise NotImplementedError("Rust extension module not available")
 
     def validate_view_definition(
-        view: Dict[str, Any], *, fhir_version: str = "R4"
+        view: dict[str, Any], *, fhir_version: str = "R4"
     ) -> bool:
         raise NotImplementedError("Rust extension module not available")
 
-    def validate_bundle(bundle: Dict[str, Any], *, fhir_version: str = "R4") -> bool:
+    def validate_bundle(bundle: dict[str, Any], *, fhir_version: str = "R4") -> bool:
         raise NotImplementedError("Rust extension module not available")
 
     def parse_content_type(mime_type: str) -> str:
         raise NotImplementedError("Rust extension module not available")
 
-    def get_supported_fhir_versions() -> List[str]:
+    def get_supported_fhir_versions() -> list[str]:
         raise NotImplementedError("Rust extension module not available")
 
 
-__all__: List[str] = [
+__all__: list[str] = [
     # Core functions
     "run_view_definition",
     "run_view_definition_with_options",
