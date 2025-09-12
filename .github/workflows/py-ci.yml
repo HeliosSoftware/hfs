@@ -68,10 +68,10 @@ jobs:
         run: uv run ruff format --check src tests
 
       - name: Lint check
-        run: uv run lint
+        run: uv run ruff check crates/pysof/src tests
 
       - name: Type check
-        run: uv run typecheck
+        run: uv run mypy crates/pysof/src
 
   test:
     name: Tests (Linux)
