@@ -84,6 +84,9 @@ jobs:
           path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
+      - name: Install maturin
+        run: uv pip install -q maturin
+
       - name: Build extension (dev)
         run: uv run maturin develop
 
