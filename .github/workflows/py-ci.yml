@@ -85,7 +85,7 @@ jobs:
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
       - name: Run tests with coverage
-        run: uv run test-cov
+        run: uv run python -m pytest -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
 
       # - name: Upload coverage to Codecov
       #   uses: codecov/codecov-action@v4
