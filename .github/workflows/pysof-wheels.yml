@@ -103,40 +103,11 @@ jobs:
           path: crates/pysof/dist/*.whl
           retention-days: 30
 
-  # Detect if the triggering commit is tagged with a pysof release tag
-  detect-tag:
-    name: Detect tag for release
-    runs-on: [self-hosted, Linux]
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    outputs:
-      tag_name: ${{ steps.find-tag.outputs.tag_name }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
-      - name: Fetch tags
-        run: git fetch --tags --force
-      - id: find-tag
-        name: Find matching tag
-        shell: bash
-        run: |
-          TAG=$(git tag --points-at HEAD | grep '^pysof-v' || true)
-          if [ -n "$TAG" ]; then
-            echo "Found tag: $TAG"
-            echo "tag_name=$TAG" >> $GITHUB_OUTPUT
-          else
-            echo "No matching tag found"
-            echo "tag_name=" >> $GITHUB_OUTPUT
-          fi
-
-  # Job to collect all wheels and create a release
   create-release:
     name: Create Release
     runs-on: [self-hosted, Linux]
-    needs: [build-wheels, detect-tag]
-    if: ${{ github.event.workflow_run.conclusion == 'success' && needs.detect-tag.outputs.tag_name != '' }}
+    needs: build-wheels
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - name: Checkout code
@@ -158,85 +129,15 @@ jobs:
           cd ..
           ls -la release/
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+      - name: Upload consolidated wheels artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ needs.detect-tag.outputs.tag_name }}
-          name: pysof ${{ needs.detect-tag.outputs.tag_name }}
-          body: |
-            Python wheels for pysof ${{ github.ref_name }}
-
-            ## Installation
-
-            Download the appropriate wheel for your platform and install with:
-            ```bash
-            pip install pysof-*.whl
-            ```
-
-            ## Supported Platforms
-            - Linux x86_64 (glibc and musl)
-            - Windows x86_64
-            - macOS x86_64 and ARM64
-
-            ## Python Version
-            - Python 3.11 only
-          files: |
+          name: pysof-wheels
+          path: |
             release/*.whl
             pysof-wheels.tar.gz
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          retention-days: 30
 
-  # Job to publish to PyPI (only on tags and when explicitly requested)
-  publish-pypi:
-    name: Publish to PyPI
-    runs-on: [self-hosted, Linux]
-    needs: [build-wheels, detect-tag]
-    if: |
-      github.event.workflow_run.conclusion == 'success' &&
-      needs.detect-tag.outputs.tag_name != '' &&
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: 'latest'
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Create virtual environment
-        run: uv venv --python 3.11
-
-      - name: Install build tools
-        run: |
-          uv add maturin
-          uv add twine
-
-      - name: Build source distribution
-        run: uv run maturin sdist --out dist
-
-      - name: Publish to PyPI
-        run: |
-          # Upload wheels and source distribution
-          uv run twine upload dist/*.whl dist/*.tar.gz
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-
-  # Job to test wheel builds on different Python versions (when available)
   test-wheels:
     name: Test wheels on ${{ matrix.python-version }}
     runs-on: [self-hosted, Linux]
