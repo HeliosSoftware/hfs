@@ -1,20 +1,11 @@
 name: Build and Publish pysof Wheels
 
 on:
-  push:
-    tags:
-      - 'pysof-v*' # Trigger on pysof-specific tags
-    branches:
-      - main
-      - epic/pysof
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-wheels.yml'
-  pull_request:
+  workflow_run:
+    workflows: ['pysof CI']
     branches: [main, epic/pysof]
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-wheels.yml'
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       publish:
@@ -35,6 +26,7 @@ jobs:
   build-wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     strategy:
       matrix:
         include:
@@ -65,6 +57,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
@@ -109,16 +103,46 @@ jobs:
           path: crates/pysof/dist/*.whl
           retention-days: 30
 
+  # Detect if the triggering commit is tagged with a pysof release tag
+  detect-tag:
+    name: Detect tag for release
+    runs-on: [self-hosted, Linux]
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      tag_name: ${{ steps.find-tag.outputs.tag_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --tags --force
+      - id: find-tag
+        name: Find matching tag
+        shell: bash
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^pysof-v' || true)
+          if [ -n "$TAG" ]; then
+            echo "Found tag: $TAG"
+            echo "tag_name=$TAG" >> $GITHUB_OUTPUT
+          else
+            echo "No matching tag found"
+            echo "tag_name=" >> $GITHUB_OUTPUT
+          fi
+
   # Job to collect all wheels and create a release
   create-release:
     name: Create Release
     runs-on: [self-hosted, Linux]
-    needs: build-wheels
-    if: startsWith(github.ref, 'refs/tags/pysof-v')
+    needs: [build-wheels, detect-tag]
+    if: ${{ github.event.workflow_run.conclusion == 'success' && needs.detect-tag.outputs.tag_name != '' }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -137,8 +161,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: pysof ${{ github.ref_name }}
+          tag_name: ${{ needs.detect-tag.outputs.tag_name }}
+          name: pysof ${{ needs.detect-tag.outputs.tag_name }}
           body: |
             Python wheels for pysof ${{ github.ref_name }}
 
@@ -168,15 +192,17 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     runs-on: [self-hosted, Linux]
-    needs: build-wheels
+    needs: [build-wheels, detect-tag]
     if: |
-      startsWith(github.ref, 'refs/tags/pysof-v') && 
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' || 
-       github.event_name == 'push')
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.detect-tag.outputs.tag_name != '' &&
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -215,7 +241,7 @@ jobs:
     name: Test wheels on ${{ matrix.python-version }}
     runs-on: [self-hosted, Linux]
     needs: build-wheels
-    if: github.event_name == 'pull_request'
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
 
     strategy:
       matrix:
