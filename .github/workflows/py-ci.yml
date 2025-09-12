@@ -84,6 +84,12 @@ jobs:
           path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
       - name: Install maturin
         run: uv pip install -q maturin
 
