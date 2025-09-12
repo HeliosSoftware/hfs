@@ -58,9 +58,9 @@ crates/pysof/
 
   - [x] Introduce PyO3 bindings to call Rust `helios-sof` library
   - [x] Switch build backend to `maturin` (PEP 621) for extension builds
-  - [ ] **Core API Functions:**
-    - [ ] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
-    - [ ] Expose `run_view_definition_with_options(view: dict, bundle: dict, format: str, *, since: str = None, limit: int = None, page: int = None) -> bytes`
+  - [x] **Core API Functions:**
+    - [x] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
+    - [x] Expose `run_view_definition_with_options(view: dict, bundle: dict, format: str, *, since: str = None, limit: int = None, page: int = None) -> bytes`
   - [ ] **Content Type Support:** Map content types: `csv`, `csv_with_header`, `json`, `ndjson`
   - [ ] **FHIR Version Support:**
     - [ ] Add optional `fhir_version` parameter (default: "R4")

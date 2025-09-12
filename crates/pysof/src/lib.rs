@@ -10,6 +10,7 @@ use helios_sof::{
 };
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::types::PyBytes;
 use serde_json;
 
 // Custom Python exception types - using different names to avoid conflicts
@@ -60,11 +61,12 @@ fn json_error_to_py_err(err: serde_json::Error) -> PyErr {
 #[pyfunction]
 #[pyo3(signature = (view_definition, bundle, format, fhir_version = "R4"))]
 fn py_run_view_definition(
+    py: Python<'_>,
     view_definition: &Bound<'_, PyAny>,
     bundle: &Bound<'_, PyAny>,
     format: &str,
     fhir_version: &str,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<Py<PyBytes>> {
     // Parse content type
     let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
     
@@ -112,7 +114,7 @@ fn py_run_view_definition(
     let result = run_view_definition(sof_view_def, sof_bundle, content_type)
         .map_err(rust_sof_error_to_py_err)?;
     
-    Ok(result)
+    Ok(PyBytes::new_bound(py, &result).into())
 }
 
 /// Transform FHIR Bundle data using a ViewDefinition with additional options.
@@ -139,6 +141,7 @@ fn py_run_view_definition(
 #[pyfunction]
 #[pyo3(signature = (view_definition, bundle, format, *, since = None, limit = None, page = None, fhir_version = "R4"))]
 fn py_run_view_definition_with_options(
+    py: Python<'_>,
     view_definition: &Bound<'_, PyAny>,
     bundle: &Bound<'_, PyAny>,
     format: &str,
@@ -146,7 +149,7 @@ fn py_run_view_definition_with_options(
     limit: Option<usize>,
     page: Option<usize>,
     fhir_version: &str,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<Py<PyBytes>> {
     // Parse content type
     let content_type = ContentType::from_string(format).map_err(rust_sof_error_to_py_err)?;
     
@@ -205,7 +208,7 @@ fn py_run_view_definition_with_options(
     let result = run_view_definition_with_options(sof_view_def, sof_bundle, content_type, options)
         .map_err(rust_sof_error_to_py_err)?;
     
-    Ok(result)
+    Ok(PyBytes::new_bound(py, &result).into())
 }
 
 /// Validate a ViewDefinition structure without executing it.
