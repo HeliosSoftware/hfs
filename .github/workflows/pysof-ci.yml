@@ -1,25 +1,26 @@
 name: pysof CI
 
 on:
-  push:
-    branches: [main, epic/pysof]
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-ci.yml'
-  pull_request:
-    branches: [main, epic/pysof]
-    paths:
-      - 'crates/pysof/**'
-      - '.github/workflows/pysof-ci.yml'
+  workflow_dispatch:
 
 defaults:
   run:
     working-directory: crates/pysof
 
 jobs:
+  deprecated:
+    name: DEPRECATED workflow
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Notice
+        run: |
+          echo 'This workflow is deprecated. Use the new workflows instead:'
+          echo '  - .github/workflows/py-ci.yml (CI)'
+          echo '  - .github/workflows/py-cd.yml (CD)'
   setup:
     name: Setup Python Environment
     runs-on: [self-hosted, Linux]
+    if: false
     outputs:
       cache-key: ${{ steps.cache-key.outputs.key }}
 
@@ -48,6 +49,7 @@ jobs:
   lint:
     name: pysof Lint (Format, Lint, Type Check)
     runs-on: [self-hosted, Linux]
+    if: false
     needs: setup
 
     steps:
@@ -80,6 +82,7 @@ jobs:
   test:
     name: pysof Test on ${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
+    if: false
     needs: setup
     strategy:
       matrix:

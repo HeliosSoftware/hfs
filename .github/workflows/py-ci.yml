@@ -1,0 +1,85 @@
+name: py CI
+
+on:
+  push:
+    branches: [main, epic/pysof]
+    paths:
+      - 'crates/pysof/**'
+      - '.github/workflows/py-ci.yml'
+  pull_request:
+    branches: [main, epic/pysof]
+    paths:
+      - 'crates/pysof/**'
+      - '.github/workflows/py-ci.yml'
+
+defaults:
+  run:
+    working-directory: crates/pysof
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (format, lint, typecheck)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Create virtual environment
+        run: uv venv --python 3.11
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Format check
+        run: uv run ruff format --check src tests
+
+      - name: Lint check
+        run: uv run lint
+
+      - name: Type check
+        run: uv run typecheck
+
+  test:
+    name: Tests (Linux)
+    runs-on: [self-hosted, Linux]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Create virtual environment
+        run: uv venv --python 3.11
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests with coverage
+        run: uv run test-cov
+
+      # - name: Upload coverage to Codecov
+      #   uses: codecov/codecov-action@v4
+      #   with:
+      #     file: ./crates/pysof/coverage.xml
+      #     flags: pysof
+      #     name: pysof-coverage
+      #     fail_ci_if_error: false
+      #   env:
+      #     CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
