@@ -17,9 +17,38 @@ defaults:
     working-directory: crates/pysof
 
 jobs:
+  setup:
+    name: Setup Python Environment
+    runs-on: [self-hosted, Linux]
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Create virtual environment
+        run: uv venv --python 3.11
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Generate cache key
+        id: cache-key
+        run: echo "key=pysof-env-$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+
   lint:
     name: pysof Lint (Format, Lint, Type Check)
     runs-on: [self-hosted, Linux]
+    needs: setup
 
     steps:
       - name: Checkout code
@@ -51,6 +80,7 @@ jobs:
   test:
     name: pysof Test on ${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
+    needs: setup
     strategy:
       matrix:
         include:
@@ -75,31 +105,13 @@ jobs:
         run: uv venv --python 3.11
         working-directory: crates/pysof
 
-      # - name: Create virtual environment (Windows)
-      #   if: runner.os == 'Windows'
-      #   shell: cmd
-      #   run: uv venv --python 3.11
-      #   working-directory: crates/pysof
-
       - name: Install dependencies
         run: uv sync --group dev
         working-directory: crates/pysof
 
-      # - name: Install dependencies (Windows)
-      #   if: runner.os == 'Windows'
-      #   shell: cmd
-      #   run: uv sync --group dev
-      #   working-directory: crates/pysof
-
       - name: Run tests with coverage
         run: uv run test-cov
         working-directory: crates/pysof
-
-      # - name: Run tests (Windows)
-      #   if: runner.os == 'Windows'
-      #   shell: cmd
-      #   run: uv run test
-      #   working-directory: crates/pysof
 
     #   - name: Upload coverage to Codecov
     #     if: runner.os != 'Windows'

@@ -23,9 +23,41 @@ defaults:
     working-directory: crates/pysof
 
 jobs:
+  setup:
+    name: Setup Python Environment
+    runs-on: [self-hosted, Linux]
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Create virtual environment
+        run: uv venv --python 3.11
+
+      - name: Install maturin
+        run: uv add maturin
+
+      - name: Generate cache key
+        id: cache-key
+        run: echo "key=pysof-wheels-env-$(date +%Y%m%d-%H%M)" >> $GITHUB_OUTPUT
+
   build-wheels:
     name: Build wheels on ${{ matrix.os }}
     runs-on: ${{ matrix.runner }}
+    needs: setup
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     strategy:
       matrix:
@@ -106,7 +138,7 @@ jobs:
   create-release:
     name: Create Release
     runs-on: [self-hosted, Linux]
-    needs: build-wheels
+    needs: [setup, build-wheels]
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
@@ -141,7 +173,7 @@ jobs:
   test-wheels:
     name: Test wheels on ${{ matrix.python-version }}
     runs-on: [self-hosted, Linux]
-    needs: build-wheels
+    needs: [setup, build-wheels]
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' }}
 
     strategy:
