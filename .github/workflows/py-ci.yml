@@ -61,6 +61,9 @@ jobs:
           path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
+      - name: Apply formatting
+        run: uv run ruff format src tests
+
       - name: Format check
         run: uv run ruff format --check src tests
 
