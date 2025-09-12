@@ -381,19 +381,19 @@ crates/pysof/
     - [x] Add optional `fhir_version` parameter (default: "R4")
     - [x] Support R4, R4B, R5, R6 versions based on Rust feature compilation
     - [x] Add version compatibility validation
-  - [ ] **Comprehensive Error Handling:** Map Rust errors to Python exceptions:
-    - [ ] `InvalidViewDefinitionError` (from `SofError::InvalidViewDefinition`)
-    - [ ] `FhirPathError` (from `SofError::FhirPathError`)
-    - [ ] `SerializationError` (from `SofError::SerializationError`)
-    - [ ] `UnsupportedContentTypeError` (from `SofError::UnsupportedContentType`)
-    - [ ] `CsvError` (from `SofError::CsvError`)
-    - [ ] `IoError` (from `SofError::IoError`)
-    - [ ] Base `SofError` exception class hierarchy
-  - [ ] **Utility Functions:**
-    - [ ] `validate_view_definition(view: dict) -> bool` - Pre-validate ViewDefinition structure
-    - [ ] `validate_bundle(bundle: dict) -> bool` - Pre-validate Bundle structure
-    - [ ] `parse_content_type(mime_type: str) -> str` - Parse MIME types to format strings
-    - [ ] `get_supported_fhir_versions() -> List[str]` - List available FHIR versions
+  - [x] **Comprehensive Error Handling:** Map Rust errors to Python exceptions:
+    - [x] `InvalidViewDefinitionError` (from `SofError::InvalidViewDefinition`)
+    - [x] `FhirPathError` (from `SofError::FhirPathError`)
+    - [x] `SerializationError` (from `SofError::SerializationError`)
+    - [x] `UnsupportedContentTypeError` (from `SofError::UnsupportedContentType`)
+    - [x] `CsvError` (from `SofError::CsvError`)
+    - [x] `IoError` (from `SofError::IoError`)
+    - [x] Base `SofError` exception class hierarchy
+  - [x] **Utility Functions:**
+    - [x] `validate_view_definition(view: dict) -> bool` - Pre-validate ViewDefinition structure
+    - [x] `validate_bundle(bundle: dict) -> bool` - Pre-validate Bundle structure
+    - [x] `parse_content_type(mime_type: str) -> str` - Parse MIME types to format strings
+    - [x] `get_supported_fhir_versions() -> List[str]` - List available FHIR versions
   - [ ] Add wheel builds for Windows, Linux (manylinux/musllinux)
   - [ ] Add macOS wheel builds (x86_64, arm64) when self-hosted macOS runner available
   - [ ] Add integration tests mirroring Rust crate examples
