@@ -64,8 +64,10 @@ jobs:
       - name: Restore virtual environment
         uses: actions/cache@v4
         with:
-          path: .venv
+          path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
+          restore-keys: |
+            pysof-venv-${{ runner.os }}-
 
       - name: Install maturin
         run: uv pip install -q maturin
@@ -154,8 +156,10 @@ jobs:
       - name: Restore virtual environment
         uses: actions/cache@v4
         with:
-          path: .venv
+          path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
+          restore-keys: |
+            pysof-venv-${{ runner.os }}-
 
       - name: Install wheel and test dependencies
         run: |

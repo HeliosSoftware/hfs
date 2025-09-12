@@ -44,7 +44,7 @@ jobs:
       - name: Cache virtual environment
         uses: actions/cache@v4
         with:
-          path: .venv
+          path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
   lint:
@@ -58,7 +58,7 @@ jobs:
       - name: Restore virtual environment
         uses: actions/cache@v4
         with:
-          path: .venv
+          path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
       - name: Format check
@@ -81,7 +81,7 @@ jobs:
       - name: Restore virtual environment
         uses: actions/cache@v4
         with:
-          path: .venv
+          path: crates/pysof/.venv
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
       - name: Run tests with coverage
