@@ -3,7 +3,7 @@ name: py CD
 on:
   workflow_run:
     workflows: ['py CI']
-    branches: [main, epic/pysof]
+    branches: [main, epic/pysof, feat/deliver-wheel]
     types: [completed]
   workflow_dispatch:
     inputs:
