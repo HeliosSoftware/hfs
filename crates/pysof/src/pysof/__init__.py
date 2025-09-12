@@ -21,7 +21,7 @@ Exception hierarchy:
     IoError: File/IO related errors
 """
 
-from typing import Any
+from typing import Any, cast
 
 try:
     # Import the Rust extension module
@@ -69,7 +69,7 @@ try:
             CsvError: CSV generation failed
             IoError: I/O operation failed
         """
-        return py_run_view_definition(view, bundle, format, fhir_version)
+        return cast(bytes, py_run_view_definition(view, bundle, format, fhir_version))
 
     def run_view_definition_with_options(
         view: dict[str, Any],
@@ -103,14 +103,17 @@ try:
             CsvError: CSV generation failed
             IoError: I/O operation failed
         """
-        return py_run_view_definition_with_options(
-            view,
-            bundle,
-            format,
-            since=since,
-            limit=limit,
-            page=page,
-            fhir_version=fhir_version,
+        return cast(
+            bytes,
+            py_run_view_definition_with_options(
+                view,
+                bundle,
+                format,
+                since=since,
+                limit=limit,
+                page=page,
+                fhir_version=fhir_version,
+            ),
         )
 
     def validate_view_definition(
@@ -129,7 +132,7 @@ try:
             InvalidViewDefinitionError: ViewDefinition structure is invalid
             SerializationError: JSON parsing failed
         """
-        return py_validate_view_definition(view, fhir_version)
+        return cast(bool, py_validate_view_definition(view, fhir_version))
 
     def validate_bundle(bundle: dict[str, Any], *, fhir_version: str = "R4") -> bool:
         """Validate a Bundle structure without executing transformations.
@@ -144,7 +147,7 @@ try:
         Raises:
             SerializationError: JSON parsing failed
         """
-        return py_validate_bundle(bundle, fhir_version)
+        return cast(bool, py_validate_bundle(bundle, fhir_version))
 
     def parse_content_type(mime_type: str) -> str:
         """Parse MIME type string to format identifier.
@@ -158,7 +161,7 @@ try:
         Raises:
             UnsupportedContentTypeError: Unknown or unsupported MIME type
         """
-        return py_parse_content_type(mime_type)
+        return cast(str, py_parse_content_type(mime_type))
 
     def get_supported_fhir_versions() -> list[str]:
         """Get list of supported FHIR versions compiled into this build.
@@ -166,7 +169,7 @@ try:
         Returns:
             List of supported FHIR version strings
         """
-        return py_get_supported_fhir_versions()
+        return cast(list[str], py_get_supported_fhir_versions())
 
 except ImportError as e:
     # Fallback for when the Rust extension is not available
@@ -179,37 +182,37 @@ except ImportError as e:
     )
 
     # Define placeholder exception classes
-    class SofError(Exception):
+    class SofError(Exception):  # type: ignore[no-redef]
         """Base exception for all pysof errors"""
 
         pass
 
-    class InvalidViewDefinitionError(SofError):
+    class InvalidViewDefinitionError(SofError):  # type: ignore[no-redef]
         """ViewDefinition validation errors"""
 
         pass
 
-    class FhirPathError(SofError):
+    class FhirPathError(SofError):  # type: ignore[no-redef]
         """FHIRPath expression evaluation errors"""
 
         pass
 
-    class SerializationError(SofError):
+    class SerializationError(SofError):  # type: ignore[no-redef]
         """JSON/data serialization errors"""
 
         pass
 
-    class UnsupportedContentTypeError(SofError):
+    class UnsupportedContentTypeError(SofError):  # type: ignore[no-redef]
         """Unsupported output format errors"""
 
         pass
 
-    class CsvError(SofError):
+    class CsvError(SofError):  # type: ignore[no-redef]
         """CSV generation errors"""
 
         pass
 
-    class IoError(SofError):
+    class IoError(SofError):  # type: ignore[no-redef]
         """File/IO related errors"""
 
         pass
