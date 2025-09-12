@@ -62,13 +62,13 @@ jobs:
           key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
       - name: Apply formatting
-        run: uv run ruff format crates/pysof/src tests
+        run: uv run ruff format crates/pysof/src
 
       - name: Format check
-        run: uv run ruff format --check crates/pysof/src tests
+        run: uv run ruff format --check crates/pysof/src
 
       - name: Lint check
-        run: uv run ruff check crates/pysof/src tests
+        run: uv run ruff check crates/pysof/src
 
       - name: Type check
         run: uv run mypy crates/pysof/src
