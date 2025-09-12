@@ -15,7 +15,9 @@ classifiers = [
   "License :: OSI Approved",
   "Operating System :: OS Independent",
 ]
-dependencies = []
+dependencies = [
+    "maturin>=1.9.4",
+]
 
 [dependency-groups]
 dev = [
