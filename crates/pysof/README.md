@@ -28,6 +28,42 @@ uv run --with maturin maturin develop --release
 uv run python -c "import pysof; print(pysof.__version__); print(pysof.get_status()); print(pysof.get_supported_fhir_versions())"
 ```
 
+## Installation
+
+### From PyPI (Recommended)
+
+```bash
+pip install pysof
+```
+
+### From Source
+
+```bash
+# Install from source (requires Rust toolchain)
+pip install -e .
+
+# Or build wheel locally
+maturin build --release --out dist
+pip install dist/*.whl
+```
+
+### From GitHub Releases
+
+Download the appropriate wheel for your platform from the [releases page](https://github.com/helios/hfs/releases) and install:
+
+```bash
+pip install pysof-*.whl
+```
+
+### Supported Platforms
+
+- **Linux**: x86_64 (glibc and musl)
+- **Windows**: x86_64 (MSVC)
+- **macOS**: x86_64 and ARM64 (when available)
+- **Python**: 3.11 only
+
+For detailed information about wheel building and distribution, see [WHEEL_BUILDING.md](WHEEL_BUILDING.md).
+
 ## Testing
 
 Run the comprehensive test suite:
@@ -394,7 +430,7 @@ crates/pysof/
     - [x] `validate_bundle(bundle: dict) -> bool` - Pre-validate Bundle structure
     - [x] `parse_content_type(mime_type: str) -> str` - Parse MIME types to format strings
     - [x] `get_supported_fhir_versions() -> List[str]` - List available FHIR versions
-  - [ ] Add wheel builds for Windows, Linux (manylinux/musllinux)
+  - [x] Add wheel builds for Windows, Linux (manylinux/musllinux)
   - [ ] Add macOS wheel builds (x86_64, arm64) when self-hosted macOS runner available
   - [ ] Add integration tests mirroring Rust crate examples
   - [ ] Provide examples: in-memory, file-based, stdin/stdout-like workflows
