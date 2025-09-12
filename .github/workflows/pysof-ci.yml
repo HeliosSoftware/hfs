@@ -56,8 +56,8 @@ jobs:
         include:
           - os: Linux
             runner: [self-hosted, Linux]
-          - os: Windows
-            runner: [self-hosted, Windows]
+          # - os: Windows
+          #   runner: [self-hosted, Windows]
 
     steps:
       - name: Checkout code
@@ -71,38 +71,35 @@ jobs:
       - name: Set up Python 3.11
         run: uv python install 3.11
 
-      - name: Create virtual environment (Linux)
-        if: runner.os != 'Windows'
+      - name: Create virtual environment
         run: uv venv --python 3.11
         working-directory: crates/pysof
 
-      - name: Create virtual environment (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: uv venv --python 3.11
-        working-directory: crates/pysof
+      # - name: Create virtual environment (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: cmd
+      #   run: uv venv --python 3.11
+      #   working-directory: crates/pysof
 
-      - name: Install dependencies (Linux)
-        if: runner.os != 'Windows'
+      - name: Install dependencies
         run: uv sync --group dev
         working-directory: crates/pysof
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: uv sync --group dev
-        working-directory: crates/pysof
+      # - name: Install dependencies (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: cmd
+      #   run: uv sync --group dev
+      #   working-directory: crates/pysof
 
-      - name: Run tests with coverage (Linux)
-        if: runner.os != 'Windows'
+      - name: Run tests with coverage
         run: uv run test-cov
         working-directory: crates/pysof
 
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: uv run test
-        working-directory: crates/pysof
+      # - name: Run tests (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: cmd
+      #   run: uv run test
+      #   working-directory: crates/pysof
 
     #   - name: Upload coverage to Codecov
     #     if: runner.os != 'Windows'

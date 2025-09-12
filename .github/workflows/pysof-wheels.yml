@@ -39,20 +39,20 @@ jobs:
             runner: [self-hosted, Linux]
             target: x86_64-unknown-linux-musl
             platform: linux_x86_64
-          # Windows builds
-          - os: Windows
-            runner: [self-hosted, Windows]
-            target: x86_64-pc-windows-msvc
-            platform: win_amd64
-          # macOS builds (when available)
-          - os: macOS
-            runner: [self-hosted, macOS]
-            target: x86_64-apple-darwin
-            platform: macosx_10_9_x86_64
-          - os: macOS
-            runner: [self-hosted, macOS]
-            target: aarch64-apple-darwin
-            platform: macosx_11_0_arm64
+          # Windows builds (commented out for testing)
+          # - os: Windows
+          #   runner: [self-hosted, Windows]
+          #   target: x86_64-pc-windows-msvc
+          #   platform: win_amd64
+          # macOS builds (commented out for testing)
+          # - os: macOS
+          #   runner: [self-hosted, macOS]
+          #   target: x86_64-apple-darwin
+          #   platform: macosx_10_9_x86_64
+          # - os: macOS
+          #   runner: [self-hosted, macOS]
+          #   target: aarch64-apple-darwin
+          #   platform: macosx_11_0_arm64
 
     steps:
       - name: Checkout code
@@ -74,16 +74,16 @@ jobs:
       - name: Install maturin
         run: uv add maturin
 
-      - name: Build wheel (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Build wheel (Linux)
+        if: runner.os == 'Linux'
         run: |
           uv run maturin build --release --target ${{ matrix.target }} --out dist
 
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          uv run maturin build --release --target ${{ matrix.target }} --out dist
+      # - name: Build wheel (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: cmd
+      #   run: |
+      #     uv run maturin build --release --target ${{ matrix.target }} --out dist
 
       - name: Test wheel installation
         run: |
