@@ -1,6 +1,11 @@
 name: py CD
 
 on:
+  pull_request:
+    branches: [main, epic/pysof]
+    paths:
+      - 'crates/pysof/**'
+      - '.github/workflows/py-ci.yml'
   workflow_run:
     workflows: ['py CI']
     branches: [main, epic/pysof]
