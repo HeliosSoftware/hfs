@@ -61,7 +61,7 @@ crates/pysof/
   - [x] **Core API Functions:**
     - [x] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
     - [x] Expose `run_view_definition_with_options(view: dict, bundle: dict, format: str, *, since: str = None, limit: int = None, page: int = None) -> bytes`
-  - [ ] **Content Type Support:** Map content types: `csv`, `csv_with_header`, `json`, `ndjson`
+  - [x] **Content Type Support:** Map content types: `csv` (with headers), `json`, `ndjson` *(parquet planned but not yet implemented)*
   - [ ] **FHIR Version Support:**
     - [ ] Add optional `fhir_version` parameter (default: "R4")
     - [ ] Support R4, R4B, R5, R6 versions based on Rust feature compilation
