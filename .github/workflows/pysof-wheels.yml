@@ -3,7 +3,7 @@ name: Build and Publish pysof Wheels
 on:
   push:
     tags:
-      - 'pysof-v*'  # Trigger on pysof-specific tags
+      - 'pysof-v*' # Trigger on pysof-specific tags
     branches:
       - main
       - epic/pysof
@@ -63,59 +63,51 @@ jobs:
             platform: macosx_11_0_arm64
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        target: ${{ matrix.target }}
-        override: true
-        components: rustfmt, clippy
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        version: "latest"
+      - name: Set up Python 3.11
+        run: uv python install 3.11
 
-    - name: Set up Python 3.11
-      run: uv python install 3.11
+      - name: Create virtual environment
+        run: uv venv --python 3.11
 
-    - name: Create virtual environment
-      run: uv venv --python 3.11
+      - name: Install maturin
+        run: uv add maturin
 
-    - name: Install maturin
-      run: uv add maturin
+      - name: Build wheel (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          uv run maturin build --release --target ${{ matrix.target }} --out dist
 
-    - name: Build wheel (Linux/macOS)
-      if: runner.os != 'Windows'
-      run: |
-        uv run maturin build --release --target ${{ matrix.target }} --out dist
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          uv run maturin build --release --target ${{ matrix.target }} --out dist
 
-    - name: Build wheel (Windows)
-      if: runner.os == 'Windows'
-      shell: cmd
-      run: |
-        uv run maturin build --release --target ${{ matrix.target }} --out dist
+      - name: Test wheel installation
+        run: |
+          # Install the built wheel
+          uv pip install dist/*.whl --force-reinstall
 
-    - name: Test wheel installation
-      run: |
-        # Install the built wheel
-        uv pip install dist/*.whl --force-reinstall
-        
-        # Run basic import test
-        uv run python -c "import pysof; print(f'pysof version: {pysof.__version__}')"
-        
-        # Run a subset of tests to verify functionality
-        uv run python -m pytest tests/test_import.py tests/test_package_metadata.py -v
+          # Run basic import test
+          uv run python -c "import pysof; print(f'pysof version: {pysof.__version__}')"
 
-    - name: Upload wheel artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-${{ matrix.platform }}
-        path: crates/pysof/dist/*.whl
-        retention-days: 30
+          # Run a subset of tests to verify functionality
+          uv run python -m pytest tests/test_import.py tests/test_package_metadata.py -v
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: crates/pysof/dist/*.whl
+          retention-days: 30
 
   # Job to collect all wheels and create a release
   create-release:
@@ -123,54 +115,54 @@ jobs:
     runs-on: [self-hosted, Linux]
     needs: build-wheels
     if: startsWith(github.ref, 'refs/tags/pysof-v')
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Download all wheel artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: dist
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
 
-    - name: Create release archive
-      run: |
-        mkdir -p release
-        find dist -name "*.whl" -exec cp {} release/ \;
-        cd release
-        tar -czf ../pysof-wheels.tar.gz *.whl
-        cd ..
-        ls -la release/
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          find dist -name "*.whl" -exec cp {} release/ \;
+          cd release
+          tar -czf ../pysof-wheels.tar.gz *.whl
+          cd ..
+          ls -la release/
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ github.ref_name }}
-        name: pysof ${{ github.ref_name }}
-        body: |
-          Python wheels for pysof ${{ github.ref_name }}
-          
-          ## Installation
-          
-          Download the appropriate wheel for your platform and install with:
-          ```bash
-          pip install pysof-*.whl
-          ```
-          
-          ## Supported Platforms
-          - Linux x86_64 (glibc and musl)
-          - Windows x86_64
-          - macOS x86_64 and ARM64
-          
-          ## Python Version
-          - Python 3.11 only
-        files: |
-          release/*.whl
-          pysof-wheels.tar.gz
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: pysof ${{ github.ref_name }}
+          body: |
+            Python wheels for pysof ${{ github.ref_name }}
+
+            ## Installation
+
+            Download the appropriate wheel for your platform and install with:
+            ```bash
+            pip install pysof-*.whl
+            ```
+
+            ## Supported Platforms
+            - Linux x86_64 (glibc and musl)
+            - Windows x86_64
+            - macOS x86_64 and ARM64
+
+            ## Python Version
+            - Python 3.11 only
+          files: |
+            release/*.whl
+            pysof-wheels.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Job to publish to PyPI (only on tags and when explicitly requested)
   publish-pypi:
@@ -181,42 +173,42 @@ jobs:
       startsWith(github.ref, 'refs/tags/pysof-v') && 
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true' || 
        github.event_name == 'push')
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Download all wheel artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: dist
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        version: "latest"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
 
-    - name: Set up Python 3.11
-      run: uv python install 3.11
+      - name: Set up Python 3.11
+        run: uv python install 3.11
 
-    - name: Create virtual environment
-      run: uv venv --python 3.11
+      - name: Create virtual environment
+        run: uv venv --python 3.11
 
-    - name: Install build tools
-      run: |
-        uv add maturin
-        uv add twine
+      - name: Install build tools
+        run: |
+          uv add maturin
+          uv add twine
 
-    - name: Build source distribution
-      run: uv run maturin sdist --out dist
+      - name: Build source distribution
+        run: uv run maturin sdist --out dist
 
-    - name: Publish to PyPI
-      run: |
-        # Upload wheels and source distribution
-        uv run twine upload dist/*.whl dist/*.tar.gz
-      env:
-        TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      - name: Publish to PyPI
+        run: |
+          # Upload wheels and source distribution
+          uv run twine upload dist/*.whl dist/*.tar.gz
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
 
   # Job to test wheel builds on different Python versions (when available)
   test-wheels:
@@ -224,40 +216,40 @@ jobs:
     runs-on: [self-hosted, Linux]
     needs: build-wheels
     if: github.event_name == 'pull_request'
-    
+
     strategy:
       matrix:
-        python-version: ["3.11"]
+        python-version: ['3.11']
         # Add more Python versions as they become supported
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Download Linux wheel artifacts
-      uses: actions/download-artifact@v4
-      with:
-        name: wheel-linux_x86_64
-        path: dist
+      - name: Download Linux wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux_x86_64
+          path: dist
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v3
-      with:
-        version: "latest"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: 'latest'
 
-    - name: Set up Python ${{ matrix.python-version }}
-      run: uv python install ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
 
-    - name: Create virtual environment
-      run: uv venv --python ${{ matrix.python-version }}
+      - name: Create virtual environment
+        run: uv venv --python ${{ matrix.python-version }}
 
-    - name: Install wheel
-      run: uv pip install dist/*.whl --force-reinstall
+      - name: Install wheel
+        run: uv pip install dist/*.whl --force-reinstall
 
-    - name: Run comprehensive tests
-      run: |
-        # Install test dependencies
-        uv add pytest pytest-cov
-        
-        # Run all tests
-        uv run python -m pytest tests/ -v --tb=short
+      - name: Run comprehensive tests
+        run: |
+          # Install test dependencies
+          uv add pytest pytest-cov
+
+          # Run all tests
+          uv run python -m pytest tests/ -v --tb=short
