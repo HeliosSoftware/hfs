@@ -61,22 +61,14 @@ jobs:
         if: github.event_name != 'workflow_run'
         uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
+      - name: Restore virtual environment
+        uses: actions/cache@v4
         with:
-          version: 'latest'
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Create virtual environment
-        run: uv venv --python 3.11
+          path: .venv
+          key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
       - name: Install maturin
         run: uv pip install -q maturin
-
-      - name: Install test dependencies
-        run: uv pip install -q pytest
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
@@ -93,7 +85,6 @@ jobs:
         run: |
           uv pip install dist/*.whl --force-reinstall
           uv run python -c "import pysof; print(f'pysof version: {pysof.__version__}')"
-          uv run python -m pytest tests/test_import.py tests/test_package_metadata.py -v
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -142,12 +133,10 @@ jobs:
             crates/pysof/release/pysof-wheels.tar.gz
           retention-days: 30
 
-  smoke-test-wheels:
-    name: Smoke test wheels on ${{ matrix.python-version }}
+  test-wheels:
+    name: Test wheels on ${{ matrix.python-version }}
     runs-on: [self-hosted, Linux]
     needs: build-wheels
-    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' }}
-
     strategy:
       matrix:
         python-version: ['3.11']
@@ -162,24 +151,19 @@ jobs:
           name: wheel-linux_x86_64_gnu
           path: crates/pysof/dist
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
+      - name: Restore virtual environment
+        uses: actions/cache@v4
         with:
-          version: 'latest'
+          path: .venv
+          key: pysof-venv-${{ runner.os }}-${{ hashFiles('crates/pysof/pyproject.toml', 'crates/pysof/uv.lock') }}
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
-      - name: Create virtual environment
-        run: uv venv --python ${{ matrix.python-version }}
-
-      - name: Install wheel
-        run: uv pip install dist/*.whl --force-reinstall
+      - name: Install wheel and test dependencies
+        run: |
+          uv pip install dist/*.whl --force-reinstall
+          uv pip install -q pytest pytest-cov
 
       - name: Run comprehensive tests
-        run: |
-          uv pip install -q pytest pytest-cov
-          uv run python -m pytest tests/ -v --tb=short
+        run: uv run python -m pytest tests/ -v --tb=short
 
   publish-pypi:
     name: Publish to PyPI (manual on tag)
@@ -195,11 +179,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: crates/pysof/dist
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          version: 'latest'
 
       - name: Install twine
         run: uv pip install -q twine
