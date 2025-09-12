@@ -49,9 +49,10 @@ uv run pytest -v --tb=short
 ```
 
 Current test coverage:
-- **42 total tests** across 4 test files
+- **58 total tests** across 5 test files
 - Core API functions (19 tests)
 - Content type support (14 tests) 
+- FHIR version support (16 tests)
 - Package structure and imports (6 tests)
 - Package metadata (3 tests)
 
@@ -197,6 +198,143 @@ except pysof.SofError as e:
 
 Use `pysof.get_supported_fhir_versions()` to check what's available in your build.
 
+## Configuring FHIR Version Support
+
+By default, pysof is compiled with **R4 support only**. You can configure which FHIR versions are available by modifying the feature compilation settings.
+
+### Change Default FHIR Version
+
+To change from R4 to another version (e.g., R5):
+
+1. **Edit `crates/pysof/Cargo.toml`**:
+   ```toml
+   [features]
+   default = ["R5"]  # Changed from ["R4"]
+   R4 = ["helios-sof/R4", "helios-fhir/R4"]
+   R4B = ["helios-sof/R4B", "helios-fhir/R4B"]
+   R5 = ["helios-sof/R5", "helios-fhir/R5"]
+   R6 = ["helios-sof/R6", "helios-fhir/R6"]
+   ```
+
+2. **Rebuild the extension**:
+   ```bash
+   cd crates/pysof
+   uv run maturin develop --release
+   ```
+
+3. **Verify the change**:
+   ```bash
+   uv run python -c "
+   import pysof
+   versions = pysof.get_supported_fhir_versions()
+   print('Supported FHIR versions:', versions)
+   "
+   ```
+   This should now show `['R5']` instead of `['R4']`.
+
+### Enable Multiple FHIR Versions
+
+To support multiple FHIR versions simultaneously:
+
+1. **Edit `crates/pysof/Cargo.toml`**:
+   ```toml
+   [features]
+   default = ["R4", "R5"]  # Enable both R4 and R5
+   # Or enable all versions:
+   # default = ["R4", "R4B", "R5", "R6"]
+   ```
+
+2. **Rebuild and verify**:
+   ```bash
+   uv run maturin develop --release
+   uv run python -c "import pysof; print(pysof.get_supported_fhir_versions())"
+   ```
+   This should show `['R4', 'R5']` (or all enabled versions).
+
+3. **Use specific versions in code**:
+   ```python
+   import pysof
+   
+   # Use R4 explicitly
+   result_r4 = pysof.run_view_definition(view, bundle, "json", fhir_version="R4")
+   
+   # Use R5 explicitly  
+   result_r5 = pysof.run_view_definition(view, bundle, "json", fhir_version="R5")
+   ```
+
+### Build with Specific Features (Without Changing Default)
+
+To temporarily build with different features without modifying `Cargo.toml`:
+
+```bash
+# Build with only R5
+cargo build --features R5 --no-default-features
+
+# Build with R4 and R6
+cargo build --features R4,R6 --no-default-features
+
+# With maturin
+uv run --with maturin -- maturin develop --release --cargo-extra-args="--features R5 --no-default-features"
+```
+
+### Testing After Version Changes
+
+After changing FHIR version support, run the test suite to ensure compatibility:
+
+```bash
+# Run all tests
+uv run pytest
+
+# Run FHIR version-specific tests
+uv run pytest tests/test_fhir_versions.py -v
+
+# Test with your new default version
+uv run python -c "
+import pysof
+
+# Test with default version (should be your new default)
+view = {'resourceType': 'ViewDefinition', 'id': 'test', 'name': 'Test', 'status': 'active', 'resource': 'Patient', 'select': [{'column': [{'name': 'id', 'path': 'id'}]}]}
+bundle = {'resourceType': 'Bundle', 'type': 'collection', 'entry': [{'resource': {'resourceType': 'Patient', 'id': 'test'}}]}
+
+result = pysof.run_view_definition(view, bundle, 'json')
+print('Default version test successful:', len(result), 'bytes')
+"
+```
+
+### Important Considerations
+
+1. **Dependency Requirements**: Ensure the underlying `helios-sof` and `helios-fhir` crates support the features you want to enable
+2. **Binary Size**: Enabling multiple FHIR versions increases the compiled binary size significantly
+3. **Memory Usage**: Multiple versions require more memory at runtime
+4. **Testing**: Always run your test suite after changing version support
+5. **Documentation**: Update any project documentation that mentions specific FHIR versions
+6. **CI/CD**: Update build scripts and CI workflows if they depend on specific versions
+
+### Version Compatibility Matrix
+
+| FHIR Version | Feature Flag | Status | Notes |
+|--------------|--------------|---------|-------|
+| R4 | `R4` | ✅ Stable | Default, always recommended |
+| R4B | `R4B` | ✅ Stable | Minor updates to R4 |
+| R5 | `R5` | ✅ Stable | Current latest stable version |
+| R6 | `R6` | ⚠️ Preview | May have limited support |
+
+### Common Configuration Examples
+
+```toml
+# Production: Single version for minimal size
+default = ["R4"]
+
+# Development: Multiple versions for testing
+default = ["R4", "R5"]
+
+# Bleeding edge: Latest versions only
+default = ["R5", "R6"]
+
+# Maximum compatibility: All versions (not recommended for production)
+default = ["R4", "R4B", "R5", "R6"]
+```
+
 ## Project layout
 
 ```
@@ -207,9 +345,10 @@ crates/pysof/
 │  ├─ pysof/
 │  │  └─ __init__.py       # Python package root
 │  └─ lib.rs               # Rust PyO3 bindings
-├─ tests/                  # Test suite (42 tests)
+├─ tests/                  # Test suite (58 tests)
 │  ├─ test_core_functions.py
 │  ├─ test_content_types.py
+│  ├─ test_fhir_versions.py
 │  ├─ test_import.py
 │  └─ test_package_metadata.py
 └─ Cargo.toml              # Rust crate metadata
@@ -238,10 +377,10 @@ crates/pysof/
     - [x] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
     - [x] Expose `run_view_definition_with_options(view: dict, bundle: dict, format: str, *, since: str = None, limit: int = None, page: int = None) -> bytes`
   - [x] **Content Type Support:** Map content types: `csv` (with headers), `json`, `ndjson` *(parquet planned but not yet implemented)*
-  - [ ] **FHIR Version Support:**
-    - [ ] Add optional `fhir_version` parameter (default: "R4")
-    - [ ] Support R4, R4B, R5, R6 versions based on Rust feature compilation
-    - [ ] Add version compatibility validation
+  - [x] **FHIR Version Support:**
+    - [x] Add optional `fhir_version` parameter (default: "R4")
+    - [x] Support R4, R4B, R5, R6 versions based on Rust feature compilation
+    - [x] Add version compatibility validation
   - [ ] **Comprehensive Error Handling:** Map Rust errors to Python exceptions:
     - [ ] `InvalidViewDefinitionError` (from `SofError::InvalidViewDefinition`)
     - [ ] `FhirPathError` (from `SofError::FhirPathError`)
