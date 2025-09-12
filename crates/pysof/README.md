@@ -2,7 +2,7 @@
 
 Python wrapper for the Helios SOF (SQL on FHIR) toolkit.
 
-This is an initial scaffolding for the Python package. In a future iteration we will expose the Rust `sof` crate APIs to Python (likely via PyO3 + maturin). For now, this package provides a project layout and tooling configured for Python 3.11 with uv.
+This package provides Python bindings for the Rust `helios-sof` library via PyO3 and maturin. Use `uv` to manage the environment and run builds.
 
 ## Requirements
 
@@ -18,11 +18,14 @@ cd crates/pysof
 # Ensure Python 3.11 is available and create a venv
 uv venv --python 3.11
 
-# Install the project (no dependencies yet)
+# Install the project
 uv sync
 
-# Sanity check the package import
-uv run python -c "import pysof; print(pysof.__version__)"
+# Build and install the Rust extension into the venv
+uv run --with maturin maturin develop --release
+
+# Sanity checks
+uv run python -c "import pysof; print(pysof.__version__); print(pysof.get_status()); print(pysof.get_supported_fhir_versions())"
 ```
 
 ## Project layout
@@ -53,8 +56,8 @@ crates/pysof/
 
 - v1 (Rust bindings and wheels)
 
-  - [ ] Introduce PyO3 bindings to call Rust `helios-sof` library
-  - [ ] Switch build backend to `maturin` (PEP 621) for extension builds
+  - [x] Introduce PyO3 bindings to call Rust `helios-sof` library
+  - [x] Switch build backend to `maturin` (PEP 621) for extension builds
   - [ ] **Core API Functions:**
     - [ ] Expose `run_view_definition(view: dict, bundle: dict, format: str) -> bytes`
     - [ ] Expose `run_view_definition_with_options(view: dict, bundle: dict, format: str, *, since: str = None, limit: int = None, page: int = None) -> bytes`

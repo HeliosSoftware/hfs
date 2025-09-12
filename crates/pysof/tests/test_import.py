@@ -26,15 +26,30 @@ def test_get_status_function() -> None:
     """Test the get_status utility function."""
     status = pysof.get_status()
     assert isinstance(status, str)
-    assert "v0" in status
-    assert "scaffold" in status.lower()
+    assert "v1" in status
+    assert "rust" in status.lower()
 
 
 def test_all_exports() -> None:
     """Test that __all__ is properly defined."""
-    # In v0, __all__ should be empty since no public APIs are implemented yet
     assert isinstance(pysof.__all__, list)
-    assert len(pysof.__all__) == 0
+    # In v1, core APIs are exposed
+    for name in [
+        "run_view_definition",
+        "run_view_definition_with_options",
+        "validate_view_definition",
+        "validate_bundle",
+        "get_supported_fhir_versions",
+        "parse_content_type",
+        "SofError",
+        "InvalidViewDefinitionError",
+        "FhirPathError",
+        "SerializationError",
+        "UnsupportedContentTypeError",
+        "CsvError",
+        "IoError",
+    ]:
+        assert name in pysof.__all__
 
 
 def test_docstring() -> None:
