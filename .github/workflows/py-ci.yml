@@ -93,9 +93,6 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install maturin
-        run: uv pip install -q maturin
-
       - name: Build extension (dev)
         run: uv run maturin develop
 

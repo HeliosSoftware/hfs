@@ -69,8 +69,10 @@ jobs:
           restore-keys: |
             pysof-venv-${{ runner.os }}-
 
-      - name: Install maturin
-        run: uv pip install -q maturin
+      - name: Verify dependencies
+        run: |
+          # Verify that maturin is available from the cached venv
+          uv run maturin --version
 
       - name: Build wheel (Linux)
         if: runner.os == 'Linux'
