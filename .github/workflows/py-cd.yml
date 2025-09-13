@@ -24,6 +24,7 @@ env:
 jobs:
   build-wheels:
     name: Build wheels on ${{ matrix.os }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -32,10 +33,6 @@ jobs:
             runner: [self-hosted, Linux]
             target: x86_64-unknown-linux-gnu
             platform: linux_x86_64_gnu
-          - os: Linux
-            runner: [self-hosted, Linux]
-            target: x86_64-unknown-linux-musl
-            platform: linux_x86_64_musl
           # - os: Windows
           #   runner: [self-hosted, Windows]
           #   target: x86_64-pc-windows-msvc
@@ -48,7 +45,6 @@ jobs:
           #   runner: [self-hosted, macOS]
           #   target: aarch64-apple-darwin
           #   platform: macosx_11_0_arm64
-    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || github.event_name == 'workflow_dispatch' }}
 
     steps:
       - name: Checkout code (workflow_run)
