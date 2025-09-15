@@ -230,9 +230,9 @@ jobs:
       if: ${{ inputs.server == 'python-wheels' && runner.os == 'Linux' }}
       working-directory: crates/pysof
       run: |
-        # Activate venv and build with all FHIR features (R4, R4B, R5, R6)
+        # Activate venv and build with working FHIR features (R4, R4B, R5)
         source .venv/bin/activate
-        maturin build --release --all-features -i python --target x86_64-unknown-linux-gnu --out dist
+        maturin build --release --features R4,R4B,R5 -i python --target x86_64-unknown-linux-gnu --out dist
 
     - name: Create release archive (Python wheels)
       if: ${{ inputs.server == 'python-wheels' }}
