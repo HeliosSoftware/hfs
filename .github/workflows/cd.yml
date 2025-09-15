@@ -21,7 +21,11 @@ jobs:
   deploy:
     name: Deploy ${{ inputs.server }} to server
     runs-on: [self-hosted, Linux]
-    
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: 8388608
+      CARGO_BUILD_JOBS: 1
+
     steps:
     - name: Download release binary
       if: ${{ inputs.server != 'python-wheels' }}
@@ -171,6 +175,37 @@ jobs:
       with:
         ref: ${{ inputs.tag }}
 
+    - name: Install Rust toolchain (Python wheels)
+      if: ${{ inputs.server == 'python-wheels' }}
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: rustfmt, clippy
+        override: true
+
+    - name: Configure Rust to use LLD (Python wheels)
+      if: ${{ inputs.server == 'python-wheels' }}
+      shell: bash
+      run: |
+        mkdir -p ~/.cargo
+        if ! grep -q "link-arg=-fuse-ld=lld" ~/.cargo/config.toml 2>/dev/null; then
+          echo "[target.x86_64-unknown-linux-gnu]" >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
+        fi
+
+    - name: Cache cargo registry (Python wheels)
+      if: ${{ inputs.server == 'python-wheels' }}
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
     - name: Restore virtual environment (Python wheels)
       if: ${{ inputs.server == 'python-wheels' }}
       uses: actions/cache@v4
@@ -180,18 +215,24 @@ jobs:
         restore-keys: |
           pysof-venv-${{ runner.os }}-
 
-    - name: Verify dependencies (Python wheels)
+    - name: Setup and verify Python environment (Python wheels)
       if: ${{ inputs.server == 'python-wheels' }}
       working-directory: crates/pysof
       run: |
-        # Verify that maturin is available from the cached venv
-        uv run maturin --version
+        # Create/update the virtual environment and install dev deps (including maturin)
+        uv sync --all-groups
+        # Activate the venv so maturin can discover the python interpreter
+        source .venv/bin/activate
+        python --version
+        maturin --version
 
     - name: Build wheel (Linux)
       if: ${{ inputs.server == 'python-wheels' && runner.os == 'Linux' }}
       working-directory: crates/pysof
       run: |
-        uv run maturin build --release --target x86_64-unknown-linux-gnu --out dist
+        # Activate venv and build with all FHIR features (R4, R4B, R5, R6)
+        source .venv/bin/activate
+        maturin build --release --all-features -i python --target x86_64-unknown-linux-gnu --out dist
 
     - name: Create release archive (Python wheels)
       if: ${{ inputs.server == 'python-wheels' }}
