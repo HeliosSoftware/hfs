@@ -1424,8 +1424,8 @@ pub mod r4;
 pub mod r4b;
 #[cfg(feature = "R5")]
 pub mod r5;
-// #[cfg(feature = "R6")]
-// pub mod r6; // R6 has issues, keeping commented out for now
+#[cfg(feature = "R6")]
+pub mod r6;
 
 pub mod parameters;
 

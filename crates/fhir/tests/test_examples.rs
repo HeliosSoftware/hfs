@@ -204,6 +204,14 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
             "diagnosticreport-example-f201-brainct.json",
             "Contains null in conclusionCode array where struct TempCodeableReference expected",
         ),
+        (
+            "molecularsequence-example.json",
+            "R6 MolecularSequence contains incompatible data structure",
+        ),
+        (
+            "specimen-example-liver-biopsy.json",
+            "R6 Specimen example contains incompatible data structure",
+        ),
     ];
 
     for entry in fs::read_dir(dir).unwrap() {

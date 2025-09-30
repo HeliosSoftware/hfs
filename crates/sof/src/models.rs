@@ -42,6 +42,22 @@ pub struct RunQueryParams {
     /// Data source for transformation
     #[serde(rename = "source")]
     pub source: Option<String>,
+
+    /// Maximum file size for Parquet output (in MB)
+    #[serde(rename = "maxFileSize")]
+    pub max_file_size: Option<u32>,
+
+    /// Row group size for Parquet output (in MB)
+    #[serde(rename = "rowGroupSize")]
+    pub row_group_size: Option<u32>,
+
+    /// Page size for Parquet output (in KB)
+    #[serde(rename = "pageSize")]
+    pub page_size: Option<u32>,
+
+    /// Compression for Parquet output
+    #[serde(rename = "compression")]
+    pub compression: Option<String>,
 }
 
 /// Validated and parsed query parameters
@@ -68,6 +84,9 @@ pub struct ValidatedRunParams {
 
     /// Data source for transformation
     pub source: Option<String>,
+
+    /// Parquet-specific options
+    pub parquet_options: Option<helios_sof::ParquetOptions>,
 }
 
 /// Parameters for ViewDefinition/$run operation - now using proper FHIR Parameters
@@ -135,6 +154,67 @@ pub fn validate_query_params(
         None
     };
 
+    // Validate and build Parquet options if any Parquet parameters are provided
+    let parquet_options = if params.max_file_size.is_some()
+        || params.row_group_size.is_some()
+        || params.page_size.is_some()
+        || params.compression.is_some()
+    {
+        // Validate max_file_size
+        let max_file_size_mb = if let Some(size) = params.max_file_size {
+            if !(10..=10000).contains(&size) {
+                return Err("maxFileSize must be between 10 and 10000 MB".to_string());
+            }
+            Some(size)
+        } else {
+            None
+        };
+
+        // Validate row_group_size
+        let row_group_size_mb = if let Some(size) = params.row_group_size {
+            if !(64..=1024).contains(&size) {
+                return Err("rowGroupSize must be between 64 and 1024 MB".to_string());
+            }
+            size
+        } else {
+            256 // Default
+        };
+
+        // Validate page_size
+        let page_size_kb = if let Some(size) = params.page_size {
+            if !(64..=8192).contains(&size) {
+                return Err("pageSize must be between 64 and 8192 KB".to_string());
+            }
+            size
+        } else {
+            1024 // Default
+        };
+
+        // Validate compression
+        let compression = if let Some(comp) = &params.compression {
+            match comp.to_lowercase().as_str() {
+                "none" | "snappy" | "gzip" | "lz4" | "brotli" | "zstd" => comp.clone(),
+                _ => {
+                    return Err(format!(
+                        "Invalid compression type: {}. Must be one of: none, snappy, gzip, lz4, brotli, zstd",
+                        comp
+                    ));
+                }
+            }
+        } else {
+            "snappy".to_string() // Default
+        };
+
+        Some(helios_sof::ParquetOptions {
+            row_group_size_mb,
+            page_size_kb,
+            compression,
+            max_file_size_mb,
+        })
+    } else {
+        None
+    };
+
     Ok(ValidatedRunParams {
         format,
         limit,
@@ -143,6 +223,7 @@ pub fn validate_query_params(
         patient: params.patient.clone(),
         group: params.group.clone(),
         source: params.source.clone(),
+        parquet_options,
     })
 }
 
@@ -181,6 +262,10 @@ pub struct ExtractedParameters {
     pub source: Option<String>,
     pub limit: Option<u32>,
     pub since: Option<String>,
+    pub max_file_size: Option<u32>,
+    pub row_group_size: Option<u32>,
+    pub page_size: Option<u32>,
+    pub compression: Option<String>,
 }
 
 /// Helper function to process a single parameter in a version-independent way
@@ -352,6 +437,102 @@ fn process_parameter(
                 return Err(
                     "_limit parameter must use valueInteger or valuePositiveInt".to_string()
                 );
+            }
+        }
+        "maxFileSize" => {
+            if let Some(value_int) = param_json.get("valueInteger") {
+                if let Some(int_val) = value_int.as_i64() {
+                    if !(10..=10000).contains(&int_val) {
+                        return Err("maxFileSize must be between 10 and 10000 MB".to_string());
+                    }
+                    result.max_file_size = Some(int_val as u32);
+                }
+            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
+                if let Some(int_val) = value_pos_int.as_u64() {
+                    if !(10..=10000).contains(&int_val) {
+                        return Err("maxFileSize must be between 10 and 10000 MB".to_string());
+                    }
+                    result.max_file_size = Some(int_val as u32);
+                }
+            } else if has_any_value_field(&param_json) {
+                return Err(
+                    "maxFileSize parameter must use valueInteger or valuePositiveInt".to_string(),
+                );
+            }
+        }
+        "rowGroupSize" => {
+            if let Some(value_int) = param_json.get("valueInteger") {
+                if let Some(int_val) = value_int.as_i64() {
+                    if !(64..=1024).contains(&int_val) {
+                        return Err("rowGroupSize must be between 64 and 1024 MB".to_string());
+                    }
+                    result.row_group_size = Some(int_val as u32);
+                }
+            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
+                if let Some(int_val) = value_pos_int.as_u64() {
+                    if !(64..=1024).contains(&int_val) {
+                        return Err("rowGroupSize must be between 64 and 1024 MB".to_string());
+                    }
+                    result.row_group_size = Some(int_val as u32);
+                }
+            } else if has_any_value_field(&param_json) {
+                return Err(
+                    "rowGroupSize parameter must use valueInteger or valuePositiveInt".to_string(),
+                );
+            }
+        }
+        "pageSize" => {
+            if let Some(value_int) = param_json.get("valueInteger") {
+                if let Some(int_val) = value_int.as_i64() {
+                    if !(64..=8192).contains(&int_val) {
+                        return Err("pageSize must be between 64 and 8192 KB".to_string());
+                    }
+                    result.page_size = Some(int_val as u32);
+                }
+            } else if let Some(value_pos_int) = param_json.get("valuePositiveInt") {
+                if let Some(int_val) = value_pos_int.as_u64() {
+                    if !(64..=8192).contains(&int_val) {
+                        return Err("pageSize must be between 64 and 8192 KB".to_string());
+                    }
+                    result.page_size = Some(int_val as u32);
+                }
+            } else if has_any_value_field(&param_json) {
+                return Err(
+                    "pageSize parameter must use valueInteger or valuePositiveInt".to_string(),
+                );
+            }
+        }
+        "compression" => {
+            if let Some(value_code) = param_json.get("valueCode") {
+                if let Some(comp_str) = value_code.as_str() {
+                    match comp_str.to_lowercase().as_str() {
+                        "none" | "snappy" | "gzip" | "lz4" | "brotli" | "zstd" => {
+                            result.compression = Some(comp_str.to_string());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Invalid compression type: {}. Must be one of: none, snappy, gzip, lz4, brotli, zstd",
+                                comp_str
+                            ));
+                        }
+                    }
+                }
+            } else if let Some(value_str) = param_json.get("valueString") {
+                if let Some(comp_str) = value_str.as_str() {
+                    match comp_str.to_lowercase().as_str() {
+                        "none" | "snappy" | "gzip" | "lz4" | "brotli" | "zstd" => {
+                            result.compression = Some(comp_str.to_string());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Invalid compression type: {}. Must be one of: none, snappy, gzip, lz4, brotli, zstd",
+                                comp_str
+                            ));
+                        }
+                    }
+                }
+            } else if has_any_value_field(&param_json) {
+                return Err("compression parameter must use valueCode or valueString".to_string());
             }
         }
         "_since" => {
@@ -640,6 +821,10 @@ mod tests {
             patient: None,
             group: None,
             source: None,
+            max_file_size: None,
+            row_group_size: None,
+            page_size: None,
+            compression: None,
         };
 
         let result = validate_query_params(&params, None).unwrap();
@@ -659,6 +844,10 @@ mod tests {
             patient: None,
             group: None,
             source: None,
+            max_file_size: None,
+            row_group_size: None,
+            page_size: None,
+            compression: None,
         };
 
         let result = validate_query_params(&params, None);
@@ -681,6 +870,10 @@ mod tests {
             patient: None,
             group: None,
             source: None,
+            max_file_size: None,
+            row_group_size: None,
+            page_size: None,
+            compression: None,
         };
 
         let result = validate_query_params(&params, None);
@@ -705,6 +898,7 @@ mod tests {
             patient: None,
             group: None,
             source: None,
+            parquet_options: None,
         };
 
         let result = apply_csv_filtering(csv_data, &params).unwrap();
@@ -731,6 +925,7 @@ mod tests {
             patient: None,
             group: None,
             source: None,
+            parquet_options: None,
         };
 
         let result = apply_json_filtering(json_data, &params).unwrap();

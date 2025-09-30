@@ -1152,6 +1152,9 @@ fn generate_element_definition(
             "http://hl7.org/fhirpath/System.Time" => "std::string::String",
             "http://hl7.org/fhirpath/System.Quantity" => "std::string::String",
             "Element" | "BackboneElement" => &generate_type_name(&element.path),
+            // Fix for R6 TestPlan: replace Base with BackboneElement
+            // See https://github.com/HeliosSoftware/hfs/issues/11
+            "Base" if element.path.contains("TestPlan") => &generate_type_name(&element.path),
             _ => &capitalize_first_letter(&ty.code),
         };
 

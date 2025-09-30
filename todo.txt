@@ -1,27 +1,17 @@
-- Make repo public
-  - Add a CONTRIBUTING.md file
+- Merge the pysof work
 
-- R6 build recently is not building - it worked on Sat the 16th
+- Modify fhir_gen to add Rust docs to r4.rs, others.
 
 - FHIRPath
   - FHIRPath Lab Debugger support
 
 - SQL On FHIR
-  - source parameter - supporting both file path and AWS, and Google?
-  - group parameter
-  - parquet file(s)
-  - Chunked transfer encoding?
-  - Python Bindings
+  - Support the group parameter
   - Submit here:  https://github.com/FHIR/sql-on-fhir-v2?tab=readme-ov-file#registering-your-implementation
-
-- Process on a pile of JSON
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 
 - Test to see if invalid attributes in the FHIR JSON model are allowed/disallowed?
 
-- Modify fhir_gen to add Rust docs to r4.rs, others.
 
 - Manually added ViewDefinition Structure Definition to profiles-resources.json (deleting integer64) for generating r4.rs.  Need to also add it to the others except for r6 (anticipating a ViewDefinition resource to be added to r6) (and adding back in integer64)
-
-- Added fhirVersion to constant_types.json

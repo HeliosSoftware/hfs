@@ -4,11 +4,12 @@ use helios_fhir::{FhirResource, FhirVersion};
 use helios_fhirpath_support::{
     EvaluationError, EvaluationResult, IntoEvaluationResult, TypeInfoResult,
 };
+use parking_lot::Mutex;
 use regex::{Regex, RegexBuilder};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Evaluation context for FHIRPath expressions
 ///
@@ -72,8 +73,8 @@ pub struct EvaluationContext {
 
     /// Collects trace outputs during expression evaluation
     /// Each tuple contains (trace_name, traced_value)
-    /// Uses RefCell for interior mutability to allow collection during evaluation
-    pub trace_outputs: RefCell<Vec<(String, EvaluationResult)>>,
+    /// Uses Mutex for thread-safe interior mutability to allow collection during evaluation
+    pub trace_outputs: Arc<Mutex<Vec<(String, EvaluationResult)>>>,
 
     /// Parent context for variable scoping
     /// When looking up variables, if not found in current context, search parent chain
@@ -97,7 +98,7 @@ impl Clone for EvaluationContext {
             check_ordered_functions: self.check_ordered_functions,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index,
-            trace_outputs: RefCell::new(Vec::new()), // New trace outputs for clone
+            trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for clone
             parent_context: self.parent_context.clone(),
             terminology_server_url: self.terminology_server_url.clone(),
         }
@@ -160,7 +161,7 @@ impl EvaluationContext {
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
             current_index: None,            // Initialize current index
-            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
+            trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
         }
@@ -192,7 +193,7 @@ impl EvaluationContext {
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
             current_index: None,            // Initialize current index
-            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
+            trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
         }
@@ -221,7 +222,7 @@ impl EvaluationContext {
             check_ordered_functions: false, // Default to false
             current_aggregate_total: None,  // Initialize aggregate total
             current_index: None,            // Initialize current index
-            trace_outputs: RefCell::new(Vec::new()), // Initialize trace outputs
+            trace_outputs: Arc::new(Mutex::new(Vec::new())), // Initialize trace outputs
             parent_context: None,           // No parent context by default
             terminology_server_url: None,   // No terminology server by default
         }
@@ -267,14 +268,14 @@ impl EvaluationContext {
     /// This should be called at the start of each new evaluation to ensure
     /// trace outputs from previous evaluations don't persist.
     pub fn clear_trace_outputs(&self) {
-        self.trace_outputs.borrow_mut().clear();
+        self.trace_outputs.lock().clear();
     }
 
     /// Gets the collected trace outputs
     ///
     /// Returns a clone of all trace outputs collected during evaluation
     pub fn get_trace_outputs(&self) -> Vec<(String, EvaluationResult)> {
-        self.trace_outputs.borrow().clone()
+        self.trace_outputs.lock().clone()
     }
 
     /// Sets the strict mode for evaluation
@@ -437,7 +438,7 @@ impl EvaluationContext {
             check_ordered_functions: self.check_ordered_functions,
             current_aggregate_total: self.current_aggregate_total.clone(),
             current_index: self.current_index, // Inherit current index from parent
-            trace_outputs: RefCell::new(Vec::new()), // New trace outputs for child
+            trace_outputs: Arc::new(Mutex::new(Vec::new())), // New trace outputs for child
             parent_context: Some(Box::new(self.clone())), // Clone entire parent context
             terminology_server_url: self.terminology_server_url.clone(), // Inherit terminology server from parent
         }

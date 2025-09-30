@@ -11,9 +11,10 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use helios_sof::{
-    ContentType, SofBundle, SofViewDefinition,
+    ContentType, RunOptions, SofBundle, SofViewDefinition,
     data_source::{DataSource, UniversalDataSource},
-    get_fhir_version_string, get_newest_enabled_fhir_version, run_view_definition,
+    format_parquet_multi_file, get_fhir_version_string, get_newest_enabled_fhir_version,
+    process_view_definition, run_view_definition_with_options,
 };
 use tracing::{debug, info};
 
@@ -61,7 +62,7 @@ pub async fn capability_statement() -> ServerResult<impl IntoResponse> {
 /// | viewResource | ViewDefinition | in | type | 0 | * | ViewDefinition(s) to be used for data transformation. |
 /// | patient | Reference | in | type, instance | 0 | * | Filter resources by patient. |
 /// | group | Reference | in | type, instance | 0 | * | Filter resources by group. (not yet supported) |
-/// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. Supports file:// and http(s):// URLs. |
+/// | source | string | in | type, instance | 0 | 1 | If provided, the source of FHIR data to be transformed into a tabular projection. Supports file://, http(s)://, s3://, gs://, and azure:// URLs. |
 /// | _limit | integer | in | type, instance | 0 | 1 | Limits the number of results. (1-10000) |
 /// | _since | instant | in | type, instance | 0 | 1 | Return resources that have been modified after the supplied time. (RFC3339 format, validates format only) |
 /// | resource | Resource | in | type, instance | 0 | * | Collection of FHIR resources to be transformed into a tabular projection. |
@@ -186,6 +187,38 @@ pub async fn run_view_definition_handler(
         }
     }
 
+    // Merge Parquet options - body parameters take precedence over query parameters
+    if extracted_params.max_file_size.is_some()
+        || extracted_params.row_group_size.is_some()
+        || extracted_params.page_size.is_some()
+        || extracted_params.compression.is_some()
+    {
+        // Create or update Parquet options from body parameters
+        let mut parquet_opts = validated_params.parquet_options.clone().unwrap_or_else(|| {
+            helios_sof::ParquetOptions {
+                row_group_size_mb: 256,
+                page_size_kb: 1024,
+                compression: "snappy".to_string(),
+                max_file_size_mb: None,
+            }
+        });
+
+        if let Some(max_size) = extracted_params.max_file_size {
+            parquet_opts.max_file_size_mb = Some(max_size);
+        }
+        if let Some(row_group) = extracted_params.row_group_size {
+            parquet_opts.row_group_size_mb = row_group;
+        }
+        if let Some(page_size) = extracted_params.page_size {
+            parquet_opts.page_size_kb = page_size;
+        }
+        if let Some(compression) = extracted_params.compression {
+            parquet_opts.compression = compression;
+        }
+
+        validated_params.parquet_options = Some(parquet_opts);
+    }
+
     // Handle source parameter - load data from external source if provided
     let mut source_bundle = None;
     if let Some(source) = &source_param {
@@ -247,31 +280,96 @@ pub async fn run_view_definition_handler(
         create_bundle_from_resources(filtered_resources)?
     };
 
+    // Build RunOptions from validated parameters
+    let run_options = RunOptions {
+        since: validated_params.since,
+        limit: validated_params.limit,
+        page: None, // Pagination not supported via query params yet
+        parquet_options: validated_params.parquet_options.clone(),
+    };
+
     // Execute the ViewDefinition
     info!(
         "Executing ViewDefinition with output format: {:?}",
         validated_params.format
     );
-    let output = run_view_definition(view_definition, bundle, validated_params.format)?;
 
-    // Apply query parameter filtering
-    let filtered_output = apply_result_filtering(output, &validated_params)
-        .map_err(|e| ServerError::InternalError(format!("Failed to apply filtering: {}", e)))?;
+    // Check if we need to handle multi-file Parquet output
+    if validated_params.format == ContentType::Parquet
+        && validated_params
+            .parquet_options
+            .as_ref()
+            .and_then(|opts| opts.max_file_size_mb)
+            .is_some()
+    {
+        // Use multi-file Parquet generation
+        let processed_result = process_view_definition(view_definition, bundle)?;
 
-    // Determine the MIME type for the response
-    let mime_type = match validated_params.format {
-        ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
-        ContentType::Json => "application/json",
-        ContentType::NdJson => "application/ndjson",
-        ContentType::Parquet => "application/parquet",
-    };
+        // Get max file size in bytes
+        let max_file_size_bytes = validated_params
+            .parquet_options
+            .as_ref()
+            .and_then(|opts| opts.max_file_size_mb)
+            .map(|mb| mb as usize * 1024 * 1024)
+            .unwrap_or(usize::MAX);
 
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, mime_type)],
-        filtered_output,
-    )
-        .into_response())
+        let file_buffers = format_parquet_multi_file(
+            processed_result,
+            validated_params.parquet_options.as_ref(),
+            max_file_size_bytes,
+        )?;
+
+        // If multiple files, stream them as a ZIP archive
+        if file_buffers.len() > 1 {
+            info!(
+                "Generating ZIP archive with {} Parquet files",
+                file_buffers.len()
+            );
+            crate::streaming::stream_parquet_zip_response(file_buffers, "data")
+        } else {
+            // Single file - check if we should stream it
+            let file_size = file_buffers[0].len();
+            if crate::streaming::should_use_streaming(file_size) {
+                info!("Streaming single Parquet file ({} bytes)", file_size);
+                crate::streaming::stream_single_parquet_response(file_buffers[0].clone())
+            } else {
+                // Small file, return directly
+                Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/parquet")],
+                    file_buffers[0].clone(),
+                )
+                    .into_response())
+            }
+        }
+    } else {
+        // Standard processing
+        let output = run_view_definition_with_options(
+            view_definition,
+            bundle,
+            validated_params.format,
+            run_options,
+        )?;
+
+        // Apply any additional filtering (already applied in run_view_definition_with_options, but kept for compatibility)
+        let filtered_output = apply_result_filtering(output, &validated_params)
+            .map_err(|e| ServerError::InternalError(format!("Failed to apply filtering: {}", e)))?;
+
+        // Determine the MIME type for the response
+        let mime_type = match validated_params.format {
+            ContentType::Csv | ContentType::CsvWithHeader => "text/csv",
+            ContentType::Json => "application/json",
+            ContentType::NdJson => "application/ndjson",
+            ContentType::Parquet => "application/parquet",
+        };
+
+        Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime_type)],
+            filtered_output,
+        )
+            .into_response())
+    }
 }
 
 /// Create the server's CapabilityStatement

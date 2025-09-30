@@ -117,7 +117,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use helios_fhir::FhirVersion;
 use helios_sof::{
-    ContentType, RunOptions, SofBundle, SofViewDefinition,
+    ContentType, ParquetOptions, RunOptions, SofBundle, SofViewDefinition,
     data_source::{DataSource, UniversalDataSource},
     run_view_definition_with_options,
 };
@@ -137,11 +137,11 @@ struct Args {
     #[arg(long, short = 'b')]
     bundle: Option<PathBuf>,
 
-    /// URL or path to FHIR data source (file://, http://, https://)
+    /// URL or path to FHIR data source (file://, http://, https://, s3://, gs://, azure://)
     #[arg(
         long,
         short = 's',
-        help = "URL or path to FHIR data source. Supports file://, http://, and https:// protocols. Can be a Bundle, single resource, or array of resources."
+        help = "URL or path to FHIR data source. Supports:\n  - file:// for local files\n  - http(s):// for web resources\n  - s3:// for AWS S3 (e.g., s3://bucket/path/to/bundle.json)\n  - gs:// for Google Cloud Storage (e.g., gs://bucket/path/to/bundle.json)\n  - azure:// for Azure Blob Storage (e.g., azure://container/path/to/bundle.json)\nCan be a Bundle, single resource, or array of resources.\n\nCloud storage authentication:\n  - AWS S3: Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION\n  - GCS: Set GOOGLE_SERVICE_ACCOUNT or use Application Default Credentials\n  - Azure: Set AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_ACCESS_KEY or use managed identity"
     )]
     source: Option<String>,
 
@@ -173,6 +173,41 @@ struct Args {
     /// FHIR version to use for parsing resources
     #[arg(long, value_enum, default_value_t = FhirVersion::R4)]
     fhir_version: FhirVersion,
+
+    /// Parquet row group size in MB (default: 256MB, range: 64-1024MB)
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(64..=1024),
+        default_value = "256",
+        help = "Target row group size in MB for Parquet files. Larger values improve compression and columnar efficiency but require more memory."
+    )]
+    parquet_row_group_size: u32,
+
+    /// Parquet page size in KB (default: 1024KB, range: 64-8192KB)
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(64..=8192),
+        default_value = "1024",
+        help = "Target page size in KB for Parquet files. Smaller pages allow more fine-grained reading, larger pages have less overhead."
+    )]
+    parquet_page_size: u32,
+
+    /// Parquet compression algorithm
+    #[arg(
+        long,
+        default_value = "snappy",
+        value_parser = ["none", "snappy", "gzip", "lz4", "brotli", "zstd"],
+        help = "Compression algorithm for Parquet files. Options: none, snappy (default, fast), gzip (compatible), lz4 (fastest), brotli (best ratio), zstd (balanced)"
+    )]
+    parquet_compression: String,
+
+    /// Maximum file size for output files (in MB, only applies to Parquet format)
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(10..=10000),
+        help = "Maximum file size in MB for Parquet files. When exceeded, creates multiple numbered files (e.g., output_001.parquet, output_002.parquet). Range: 10-10000MB"
+    )]
+    max_file_size: Option<u32>,
 }
 
 /// Main entry point for the SQL-on-FHIR CLI application.
@@ -378,22 +413,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build run options
-    let options = RunOptions {
+    let mut options = RunOptions {
         since,
         limit,
-        page: None, // CLI doesn't support page parameter yet
+        page: None,            // CLI doesn't support page parameter yet
+        parquet_options: None, // Will be set if using parquet format
     };
 
-    // Run the transformation
-    let result = run_view_definition_with_options(view_definition, bundle, content_type, options)?;
+    // Configure parquet options if using parquet format
+    if content_type == ContentType::Parquet {
+        options.parquet_options = Some(ParquetOptions {
+            row_group_size_mb: args.parquet_row_group_size,
+            page_size_kb: args.parquet_page_size,
+            compression: args.parquet_compression.clone(),
+            max_file_size_mb: args.max_file_size,
+        });
+    }
 
-    // Output result
-    match args.output {
-        Some(path) => fs::write(path, result)?,
-        None => {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            io::Write::write_all(&mut handle, &result)?;
+    // For Parquet with max_file_size, we need special handling
+    if content_type == ContentType::Parquet && args.max_file_size.is_some() && args.output.is_some()
+    {
+        // Process and write Parquet files with splitting
+        write_parquet_with_splitting(view_definition, bundle, &args.output.unwrap(), options)?;
+    } else {
+        // Standard processing for all other cases
+        let result =
+            run_view_definition_with_options(view_definition, bundle, content_type, options)?;
+
+        // Output result
+        match args.output {
+            Some(path) => fs::write(path, result)?,
+            None => {
+                let stdout = io::stdout();
+                let mut handle = stdout.lock();
+                io::Write::write_all(&mut handle, &result)?;
+            }
         }
     }
 
@@ -547,4 +601,64 @@ fn merge_bundles(
             Ok(SofBundle::R6(bundle))
         }
     }
+}
+
+/// Write Parquet files with splitting when max_file_size is exceeded
+fn write_parquet_with_splitting(
+    view_definition: SofViewDefinition,
+    bundle: SofBundle,
+    output_path: &PathBuf,
+    options: RunOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use helios_sof::format_parquet_multi_file;
+
+    // Get the max file size in bytes
+    let max_file_size_bytes = options
+        .parquet_options
+        .as_ref()
+        .and_then(|opts| opts.max_file_size_mb)
+        .map(|mb| mb as usize * 1024 * 1024)
+        .unwrap_or(usize::MAX); // No limit if not specified
+
+    // Process the ViewDefinition to get the result
+    let processed_result = helios_sof::process_view_definition(view_definition, bundle)?;
+
+    // Generate Parquet files
+    let file_buffers = format_parquet_multi_file(
+        processed_result,
+        options.parquet_options.as_ref(),
+        max_file_size_bytes,
+    )?;
+
+    // Determine file naming pattern
+    let (base_path, extension) = if let Some(ext) = output_path.extension() {
+        let base = output_path.with_extension("");
+        (base, format!(".{}", ext.to_string_lossy()))
+    } else {
+        (output_path.clone(), ".parquet".to_string())
+    };
+
+    // Write files
+    if file_buffers.len() == 1 {
+        // Single file - use the original name
+        fs::write(output_path, &file_buffers[0])?;
+        println!("Wrote {} bytes to {:?}", file_buffers[0].len(), output_path);
+    } else {
+        // Multiple files - use numbered naming
+        for (i, buffer) in file_buffers.iter().enumerate() {
+            let file_path = if i == 0 {
+                // First file keeps the base name
+                PathBuf::from(format!("{}{}", base_path.display(), extension))
+            } else {
+                // Subsequent files get numbered
+                PathBuf::from(format!("{}_{:03}{}", base_path.display(), i + 1, extension))
+            };
+
+            fs::write(&file_path, buffer)?;
+            println!("Wrote {} bytes to {:?}", buffer.len(), file_path);
+        }
+        println!("Created {} Parquet files", file_buffers.len());
+    }
+
+    Ok(())
 }

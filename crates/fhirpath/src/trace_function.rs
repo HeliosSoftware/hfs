@@ -153,10 +153,10 @@ pub fn trace_function(
         invocation_base.clone()
     };
 
-    // Store the trace output in the context using RefCell
+    // Store the trace output in the context using Mutex
     context
         .trace_outputs
-        .borrow_mut()
+        .lock()
         .push((name.to_string(), trace_value));
 
     // Return the original input collection unchanged

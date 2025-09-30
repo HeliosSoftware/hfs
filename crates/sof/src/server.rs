@@ -16,6 +16,9 @@
 //! - **FHIR Version Support**: Handle requests for any supported FHIR version
 //! - **Error Handling**: Comprehensive HTTP error responses with FHIR OperationOutcome
 //! - **Configurable CORS**: Full control over CORS origins, methods, and headers
+//! - **Parquet Support**: Advanced Parquet configuration with automatic file splitting
+//! - **Streaming Response**: Chunked transfer encoding for large datasets
+//! - **ZIP Archive**: Automatic ZIP packaging when multiple Parquet files are generated
 //!
 //! ## API Endpoints
 //!
@@ -31,6 +34,10 @@
 //!     source: Data source (type: string) - Not yet supported
 //!     _limit: Limits the number of results (1-10000)
 //!     _since: Return resources modified after this time (RFC3339 format, validates format only)
+//!     maxFileSize: Maximum Parquet file size in MB (10-10000) - splits into multiple files if exceeded
+//!     rowGroupSize: Parquet row group size in MB (64-1024, default: 256)
+//!     pageSize: Parquet page size in KB (64-8192, default: 1024)
+//!     compression: Parquet compression (none, snappy, gzip, lz4, brotli, zstd, default: snappy)
 //!   Body Parameters (in FHIR Parameters resource):
 //!     _format: Output format (type: code or string)
 //!     header: CSV header control (type: boolean)
@@ -42,6 +49,10 @@
 //!     _limit: Result limit (type: integer)
 //!     _since: Modification time filter (type: instant)
 //!     resource: FHIR resources to transform (type: Resource)
+//!     maxFileSize: Maximum Parquet file size in MB (type: integer)
+//!     rowGroupSize: Parquet row group size in MB (type: integer)
+//!     pageSize: Parquet page size in KB (type: integer)
+//!     compression: Parquet compression algorithm (type: code or string)
 //!   Returns: Transformed data in requested format
 //!
 //! ```
@@ -96,6 +107,7 @@ use tracing::{info, warn};
 mod error;
 mod handlers;
 mod models;
+mod streaming;
 
 /// Server configuration options
 #[derive(Debug, Clone)]

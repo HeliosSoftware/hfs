@@ -2,7 +2,7 @@
   "resourceType" : "Bundle",
   "id" : "types",
   "meta" : {
-    "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+    "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
   },
   "type" : "collection",
   "entry" : [{
@@ -11,7 +11,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Element",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -34,7 +34,7 @@
       "name" : "Element",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -254,7 +254,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "BackboneElement",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -277,7 +277,7 @@
       "name" : "BackboneElement",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -501,7 +501,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "base64Binary",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -528,7 +528,7 @@
       "name" : "base64Binary",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -705,7 +705,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "boolean",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -728,7 +728,7 @@
       "name" : "boolean",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -903,7 +903,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "canonical",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -934,7 +934,7 @@
       "name" : "canonical",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -1111,7 +1111,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "code",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -1142,7 +1142,7 @@
       "name" : "code",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -1317,7 +1317,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "date",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -1348,7 +1348,7 @@
       "name" : "date",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -1523,7 +1523,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "dateTime",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -1558,7 +1558,7 @@
       "name" : "dateTime",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -1735,7 +1735,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "decimal",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -1770,7 +1770,7 @@
       "name" : "decimal",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -1947,7 +1947,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "id",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -1974,7 +1974,7 @@
       "name" : "id",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -2151,7 +2151,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "instant",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -2186,7 +2186,7 @@
       "name" : "instant",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -2363,7 +2363,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "integer",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -2394,7 +2394,7 @@
       "name" : "integer",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -2575,7 +2575,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "integer64",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -2606,7 +2606,7 @@
       "name" : "integer64",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -2787,7 +2787,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "markdown",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -2818,7 +2818,7 @@
       "name" : "markdown",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -2995,7 +2995,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "oid",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -3022,7 +3022,7 @@
       "name" : "oid",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -3199,7 +3199,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "positiveInt",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -3230,7 +3230,7 @@
       "name" : "positiveInt",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -3407,7 +3407,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "string",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -3442,7 +3442,7 @@
       "name" : "string",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -3621,7 +3621,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "time",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -3656,7 +3656,7 @@
       "name" : "time",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -3831,7 +3831,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "unsignedInt",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -3862,7 +3862,7 @@
       "name" : "unsignedInt",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -4039,7 +4039,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "uri",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -4070,7 +4070,7 @@
       "name" : "uri",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -4247,7 +4247,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "url",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -4278,7 +4278,7 @@
       "name" : "url",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -4453,7 +4453,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "uuid",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -4480,7 +4480,7 @@
       "name" : "uuid",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -4657,7 +4657,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "xhtml",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -4684,7 +4684,7 @@
       "name" : "xhtml",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 FHIR Standard",
       "contact" : [{
         "telecom" : [{
@@ -4856,7 +4856,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Address",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -4879,7 +4879,7 @@
       "name" : "Address",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -5864,7 +5864,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Age",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -5895,7 +5895,7 @@
       "name" : "Age",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -6334,7 +6334,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Annotation",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -6361,7 +6361,7 @@
       "name" : "Annotation",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -6719,7 +6719,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Attachment",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -6746,7 +6746,7 @@
       "name" : "Attachment",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -7735,7 +7735,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Availability",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -7754,7 +7754,7 @@
       "name" : "Availability",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -8422,7 +8422,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "BackboneType",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -8445,7 +8445,7 @@
       "name" : "BackboneType",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -8669,7 +8669,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Base",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -8692,7 +8692,7 @@
       "name" : "Base",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -8781,7 +8781,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "CodeableConcept",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -8812,7 +8812,7 @@
       "name" : "CodeableConcept",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -9151,7 +9151,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "CodeableReference",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -9182,7 +9182,7 @@
       "name" : "CodeableReference",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -9425,7 +9425,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Coding",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -9456,7 +9456,7 @@
       "name" : "Coding",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -10007,7 +10007,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ContactDetail",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -10030,7 +10030,7 @@
       "name" : "ContactDetail",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -10267,7 +10267,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ContactPoint",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -10290,7 +10290,7 @@
       "name" : "ContactPoint",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -10858,7 +10858,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Contributor",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -10877,7 +10877,7 @@
       "name" : "Contributor",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -11166,7 +11166,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Count",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -11189,7 +11189,7 @@
       "name" : "Count",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -11600,7 +11600,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "DataRequirement",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -11619,7 +11619,7 @@
       "name" : "DataRequirement",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -13047,7 +13047,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "DataType",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -13070,7 +13070,7 @@
       "name" : "DataType",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -13236,7 +13236,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Distance",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -13267,7 +13267,7 @@
       "name" : "Distance",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -13706,7 +13706,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Dosage",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -13725,7 +13725,7 @@
       "name" : "Dosage",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -15089,7 +15089,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Duration",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -15124,7 +15124,7 @@
       "name" : "Duration",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -15571,7 +15571,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ElementDefinition",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -15594,7 +15594,7 @@
       "name" : "ElementDefinition",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -22748,7 +22748,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Expression",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -22767,7 +22767,7 @@
       "name" : "Expression",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -23183,7 +23183,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ExtendedContactDetail",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -23202,7 +23202,7 @@
       "name" : "ExtendedContactDetail",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -23613,7 +23613,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Extension",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -23640,7 +23640,7 @@
       "name" : "Extension",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -24236,7 +24236,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "HumanName",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -24259,7 +24259,7 @@
       "name" : "HumanName",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -24913,7 +24913,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Identifier",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -24936,7 +24936,7 @@
       "name" : "Identifier",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -25588,7 +25588,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "MarketingStatus",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -25607,7 +25607,7 @@
       "name" : "MarketingStatus",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -25989,7 +25989,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Meta",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -26012,7 +26012,7 @@
       "name" : "Meta",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -26468,7 +26468,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "MonetaryComponent",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -26499,7 +26499,7 @@
       "name" : "MonetaryComponent",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -26849,7 +26849,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Money",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -26884,7 +26884,7 @@
       "name" : "Money",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -27183,7 +27183,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Narrative",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -27206,7 +27206,7 @@
       "name" : "Narrative",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -27502,7 +27502,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ParameterDefinition",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -27521,7 +27521,7 @@
       "name" : "ParameterDefinition",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -27997,7 +27997,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Period",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -28020,7 +28020,7 @@
       "name" : "Period",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -28329,7 +28329,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "PrimitiveType",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -28352,7 +28352,7 @@
       "name" : "PrimitiveType",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -28518,7 +28518,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "ProductShelfLife",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -28537,7 +28537,7 @@
       "name" : "ProductShelfLife",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -28853,7 +28853,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Quantity",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -28892,7 +28892,7 @@
       "name" : "Quantity",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -29451,7 +29451,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Range",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -29478,7 +29478,7 @@
       "name" : "Range",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -29790,7 +29790,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Ratio",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -29813,7 +29813,7 @@
       "name" : "Ratio",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -30103,7 +30103,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "RatioRange",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -30126,7 +30126,7 @@
       "name" : "RatioRange",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -30488,7 +30488,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Reference",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -30515,7 +30515,7 @@
       "name" : "Reference",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -30953,7 +30953,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "RelatedArtifact",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -30972,7 +30972,7 @@
       "name" : "RelatedArtifact",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -31587,7 +31587,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "RelativeTime",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -31606,7 +31606,7 @@
       "name" : "RelativeTime",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -32093,7 +32093,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "SampledData",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -32112,7 +32112,7 @@
       "name" : "SampledData",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -32785,7 +32785,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Signature",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -32808,7 +32808,7 @@
       "name" : "Signature",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -33365,7 +33365,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "Timing",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -33388,7 +33388,7 @@
       "name" : "Timing",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -34783,7 +34783,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "TriggerDefinition",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -34802,7 +34802,7 @@
       "name" : "TriggerDefinition",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -35324,7 +35324,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "UsageContext",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -35343,7 +35343,7 @@
       "name" : "UsageContext",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -35662,7 +35662,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "VirtualServiceDetail",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -35681,7 +35681,7 @@
       "name" : "VirtualServiceDetail",
       "status" : "draft",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -36065,7 +36065,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "MoneyQuantity",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -36104,7 +36104,7 @@
       "name" : "MoneyQuantity",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{
@@ -36492,7 +36492,7 @@
       "resourceType" : "StructureDefinition",
       "id" : "SimpleQuantity",
       "meta" : {
-        "lastUpdated" : "2025-09-02T16:02:33.010+00:00"
+        "lastUpdated" : "2025-09-23T00:56:40.963+00:00"
       },
       "text" : {
         "status" : "generated",
@@ -36531,7 +36531,7 @@
       "name" : "SimpleQuantity",
       "status" : "active",
       "experimental" : false,
-      "date" : "2025-09-02T16:02:33+00:00",
+      "date" : "2025-09-23T00:56:40+00:00",
       "publisher" : "HL7 International / FHIR Infrastructure",
       "contact" : [{
         "telecom" : [{

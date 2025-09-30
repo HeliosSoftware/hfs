@@ -49,21 +49,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # R6 is currently broken - issue with TestScript
-      #    - name: Build the FHIR model code generator for all versions (This will download the latest R6 from https://build.fhir.org/
-      #run: |
-      #echo "Build the FHIR model code generator for all versions..."
-      #cargo build -p helios-fhir-gen --all-features
+      - name: Build the FHIR model code generator for all versions (This will download the latest R6 from https://build.fhir.org/
+        run: |
+          echo "Build the FHIR model code generator for all versions..."
+          cargo build -p helios-fhir-gen --all-features
 
-      #- name: Generate all FHIR model code
-      #run: |
-      #echo "Generate all FHIR model code..."
-      #./target/debug/helios-fhir-gen --all
+      - name: Generate all FHIR model code
+        run: |
+          echo "Generate all FHIR model code..."
+          ./target/debug/helios-fhir-gen --all
 
       - name: Run tests with all features
         run: |
-          #cargo test --all-features 
-          cargo test --features R4,R4B,R5
+          cargo test --all-features 
 
   lint:
     name: Linting
@@ -100,7 +98,7 @@ jobs:
 
       - name: Run clippy
         run: |
-          cargo clippy --all-targets --features R4,R4B,R5 -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items
+          cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items
 
   security:
     name: Security Audit
@@ -152,10 +150,6 @@ jobs:
             echo 'linker = "clang"' >> ~/.cargo/config.toml
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
           fi
-
-      # Needed to pre-install this on the agent using: cargo install cargo-llvm-cov
-      #- name: Install cargo-llvm-cov
-      #  uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate code coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
@@ -475,12 +469,12 @@ jobs:
 
       - name: Build release (Linux/macOS)
         if: runner.os != 'Windows'
-        run: cargo build --features R4,R4B,R5 --release
+        run: cargo build --all-features --release
 
       - name: Build release (Windows)
         if: runner.os == 'Windows'
         shell: cmd
-        run: cargo build --features R4,R4B,R5 --release
+        run: cargo build --all-features --release
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4

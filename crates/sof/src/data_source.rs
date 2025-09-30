@@ -1,8 +1,13 @@
 use crate::{SofBundle, SofError};
 use async_trait::async_trait;
 use helios_fhir::Element;
+use object_store::{
+    ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    gcp::GoogleCloudStorageBuilder, path::Path as ObjectPath,
+};
 use reqwest;
 use serde_json;
+use std::sync::Arc;
 use tokio::fs;
 use url::Url;
 
@@ -46,8 +51,11 @@ impl DataSource for UniversalDataSource {
         match url.scheme() {
             "file" => load_from_file(&url).await,
             "http" | "https" => load_from_http(&self.client, &url).await,
+            "s3" => load_from_s3(&url).await,
+            "gs" => load_from_gcs(&url).await,
+            "azure" | "abfss" | "abfs" => load_from_azure(&url).await,
             scheme => Err(SofError::UnsupportedSourceProtocol(format!(
-                "Unsupported source protocol: {}",
+                "Unsupported source protocol: {}. Supported: file://, http(s)://, s3://, gs://, azure://",
                 scheme
             ))),
         }
@@ -107,6 +115,150 @@ async fn load_from_http(client: &reqwest::Client, url: &Url) -> Result<SofBundle
 
     // Parse and convert to bundle
     parse_fhir_content(&contents, url.as_str())
+}
+
+/// Load FHIR data from AWS S3
+async fn load_from_s3(url: &Url) -> Result<SofBundle, SofError> {
+    // Parse S3 URL: s3://bucket/path/to/object
+    let bucket = url.host_str().ok_or_else(|| {
+        SofError::InvalidSource(format!("Invalid S3 URL '{}': missing bucket name", url))
+    })?;
+
+    let path = url.path().trim_start_matches('/');
+    if path.is_empty() {
+        return Err(SofError::InvalidSource(format!(
+            "Invalid S3 URL '{}': missing object path",
+            url
+        )));
+    }
+
+    // Create S3 client using environment variables or default credentials
+    let store = AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .build()
+        .map_err(|e| {
+            SofError::SourceFetchError(format!(
+                "Failed to create S3 client for '{}': {}. Ensure AWS credentials are configured (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)",
+                url, e
+            ))
+        })?;
+
+    load_from_object_store(Arc::new(store), path, url.as_str()).await
+}
+
+/// Load FHIR data from Google Cloud Storage
+async fn load_from_gcs(url: &Url) -> Result<SofBundle, SofError> {
+    // Parse GCS URL: gs://bucket/path/to/object
+    let bucket = url.host_str().ok_or_else(|| {
+        SofError::InvalidSource(format!("Invalid GCS URL '{}': missing bucket name", url))
+    })?;
+
+    let path = url.path().trim_start_matches('/');
+    if path.is_empty() {
+        return Err(SofError::InvalidSource(format!(
+            "Invalid GCS URL '{}': missing object path",
+            url
+        )));
+    }
+
+    // Create GCS client using environment variables or default credentials
+    let store = GoogleCloudStorageBuilder::new()
+        .with_bucket_name(bucket)
+        .build()
+        .map_err(|e| {
+            SofError::SourceFetchError(format!(
+                "Failed to create GCS client for '{}': {}. Ensure GCP credentials are configured (GOOGLE_SERVICE_ACCOUNT or Application Default Credentials)",
+                url, e
+            ))
+        })?;
+
+    load_from_object_store(Arc::new(store), path, url.as_str()).await
+}
+
+/// Load FHIR data from Azure Blob Storage
+async fn load_from_azure(url: &Url) -> Result<SofBundle, SofError> {
+    // Parse Azure URL: azure://container/path/to/object or abfss://container@account.dfs.core.windows.net/path
+    let (container, path) = if url.scheme() == "azure" {
+        // Simple format: azure://container/path
+        let container = url.host_str().ok_or_else(|| {
+            SofError::InvalidSource(format!(
+                "Invalid Azure URL '{}': missing container name",
+                url
+            ))
+        })?;
+        let path = url.path().trim_start_matches('/');
+        (container.to_string(), path.to_string())
+    } else {
+        // ABFSS format: abfss://container@account.dfs.core.windows.net/path
+        let host = url.host_str().ok_or_else(|| {
+            SofError::InvalidSource(format!("Invalid Azure URL '{}': missing host", url))
+        })?;
+        let parts: Vec<&str> = host.split('@').collect();
+        if parts.len() != 2 {
+            return Err(SofError::InvalidSource(format!(
+                "Invalid Azure URL '{}': expected format abfss://container@account.dfs.core.windows.net/path",
+                url
+            )));
+        }
+        let container = parts[0];
+        let path = url.path().trim_start_matches('/');
+        (container.to_string(), path.to_string())
+    };
+
+    if path.is_empty() {
+        return Err(SofError::InvalidSource(format!(
+            "Invalid Azure URL '{}': missing blob path",
+            url
+        )));
+    }
+
+    // Create Azure client using environment variables or managed identity
+    let store = MicrosoftAzureBuilder::new()
+        .with_container_name(&container)
+        .build()
+        .map_err(|e| {
+            SofError::SourceFetchError(format!(
+                "Failed to create Azure client for '{}': {}. Ensure Azure credentials are configured (AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_ACCESS_KEY, or managed identity)",
+                url, e
+            ))
+        })?;
+
+    load_from_object_store(Arc::new(store), &path, url.as_str()).await
+}
+
+/// Common function to load from any object store
+async fn load_from_object_store(
+    store: Arc<dyn ObjectStore>,
+    path: &str,
+    source_name: &str,
+) -> Result<SofBundle, SofError> {
+    // Create object path
+    let object_path = ObjectPath::from(path);
+
+    // Download the object
+    let result = store.get(&object_path).await.map_err(|e| match e {
+        object_store::Error::NotFound { .. } => {
+            SofError::SourceNotFound(format!("Object not found at '{}'", source_name))
+        }
+        _ => SofError::SourceFetchError(format!("Failed to fetch from '{}': {}", source_name, e)),
+    })?;
+
+    // Read the bytes
+    let bytes = result
+        .bytes()
+        .await
+        .map_err(|e| SofError::SourceReadError(format!("Failed to read object data: {}", e)))?;
+
+    // Convert to string
+    let contents = String::from_utf8(bytes.to_vec()).map_err(|e| {
+        SofError::InvalidSourceContent(format!(
+            "Content from '{}' is not valid UTF-8: {}",
+            source_name, e
+        ))
+    })?;
+
+    // Parse and convert to bundle
+    parse_fhir_content(&contents, source_name)
 }
 
 /// Parse FHIR content and convert to SofBundle
@@ -456,5 +608,78 @@ mod tests {
         let invalid_json = r#"{"not": "fhir"}"#;
         let result = parse_fhir_content(invalid_json, "test");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_s3_url_parsing() {
+        let data_source = UniversalDataSource::new();
+
+        // Test invalid S3 URL without bucket
+        let result = data_source.load("s3:///path/to/file.json").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing bucket name"));
+        }
+
+        // Test invalid S3 URL without path
+        let result = data_source.load("s3://bucket/").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing object path"));
+        }
+
+        // Note: Actual S3 fetching would require valid credentials and a real bucket
+        // These tests verify URL parsing and error handling
+    }
+
+    #[tokio::test]
+    async fn test_gcs_url_parsing() {
+        let data_source = UniversalDataSource::new();
+
+        // Test invalid GCS URL without bucket
+        let result = data_source.load("gs:///path/to/file.json").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing bucket name"));
+        }
+
+        // Test invalid GCS URL without path
+        let result = data_source.load("gs://bucket/").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing object path"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_azure_url_parsing() {
+        let data_source = UniversalDataSource::new();
+
+        // Test invalid Azure URL without container
+        let result = data_source.load("azure:///path/to/file.json").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing container name"));
+        }
+
+        // Test invalid Azure URL without path
+        let result = data_source.load("azure://container/").await;
+        assert!(result.is_err());
+        if let Err(SofError::InvalidSource(msg)) = result {
+            assert!(msg.contains("missing blob path"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_protocol() {
+        let data_source = UniversalDataSource::new();
+
+        // Test unsupported protocol
+        let result = data_source.load("ftp://server/file.json").await;
+        assert!(result.is_err());
+        if let Err(SofError::UnsupportedSourceProtocol(msg)) = result {
+            assert!(msg.contains("Unsupported source protocol: ftp"));
+            assert!(msg.contains("Supported:"));
+        }
     }
 }

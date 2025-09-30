@@ -178,10 +178,12 @@
 //! - `R6`: FHIR 6.0.0 support
 
 pub mod data_source;
+pub mod parquet_schema;
 pub mod traits;
 
 use chrono::{DateTime, Utc};
 use helios_fhirpath::{EvaluationContext, EvaluationResult, evaluate_expression};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -546,6 +548,12 @@ pub enum SofError {
     /// This error occurs when the source URL uses an unsupported protocol.
     #[error("Unsupported source protocol: {0}")]
     UnsupportedSourceProtocol(String),
+
+    /// Parquet conversion error.
+    ///
+    /// This error occurs when converting data to Parquet format fails.
+    #[error("Parquet conversion error: {0}")]
+    ParquetConversionError(String),
 }
 
 /// Supported output content types for ViewDefinition transformations.
@@ -925,6 +933,30 @@ pub fn run_view_definition(
     run_view_definition_with_options(view_definition, bundle, content_type, RunOptions::default())
 }
 
+/// Configuration options for Parquet file generation.
+#[derive(Debug, Clone)]
+pub struct ParquetOptions {
+    /// Target row group size in MB (64-1024)
+    pub row_group_size_mb: u32,
+    /// Target page size in KB (64-8192)
+    pub page_size_kb: u32,
+    /// Compression algorithm (none, snappy, gzip, lz4, brotli, zstd)
+    pub compression: String,
+    /// Maximum file size in MB (splits output when exceeded)
+    pub max_file_size_mb: Option<u32>,
+}
+
+impl Default for ParquetOptions {
+    fn default() -> Self {
+        Self {
+            row_group_size_mb: 256,
+            page_size_kb: 1024,
+            compression: "snappy".to_string(),
+            max_file_size_mb: None,
+        }
+    }
+}
+
 /// Options for filtering and controlling ViewDefinition execution
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -934,6 +966,8 @@ pub struct RunOptions {
     pub limit: Option<usize>,
     /// Page number for pagination (1-based)
     pub page: Option<usize>,
+    /// Parquet-specific configuration options
+    pub parquet_options: Option<ParquetOptions>,
 }
 
 /// Execute a ViewDefinition transformation with additional filtering options.
@@ -977,10 +1011,14 @@ pub fn run_view_definition_with_options(
     };
 
     // Format the result according to the requested content type
-    format_output(processed_result, content_type)
+    format_output(
+        processed_result,
+        content_type,
+        options.parquet_options.as_ref(),
+    )
 }
 
-fn process_view_definition(
+pub fn process_view_definition(
     view_definition: SofViewDefinition,
     bundle: SofBundle,
 ) -> Result<ProcessedResult, SofError> {
@@ -1053,7 +1091,8 @@ fn process_view_definition_generic<VD, B>(
 where
     VD: ViewDefinitionTrait,
     B: BundleTrait,
-    B::Resource: ResourceTrait,
+    B::Resource: ResourceTrait + Sync,
+    VD::Select: Sync,
 {
     validate_view_definition(&view_definition)?;
 
@@ -1471,21 +1510,40 @@ fn generate_rows_from_selects<R, S>(
     variables: &HashMap<String, EvaluationResult>,
 ) -> Result<(Vec<String>, Vec<ProcessedRow>), SofError>
 where
-    R: ResourceTrait,
-    S: ViewDefinitionSelectTrait,
+    R: ResourceTrait + Sync,
+    S: ViewDefinitionSelectTrait + Sync,
     S::Select: ViewDefinitionSelectTrait,
 {
-    let mut all_columns = Vec::new();
+    // Process resources in parallel
+    let resource_results: Result<Vec<_>, _> = resources
+        .par_iter()
+        .map(|resource| {
+            // Each thread gets its own local column vector
+            let mut local_columns = Vec::new();
+            let resource_rows =
+                generate_rows_for_resource(*resource, selects, &mut local_columns, variables)?;
+            Ok::<(Vec<String>, Vec<ProcessedRow>), SofError>((local_columns, resource_rows))
+        })
+        .collect();
+
+    // Handle errors from parallel processing
+    let resource_results = resource_results?;
+
+    // Merge columns from all threads (maintaining order is important)
+    let mut final_columns = Vec::new();
     let mut all_rows = Vec::new();
 
-    // For each resource, generate all possible row combinations
-    for resource in resources {
-        let resource_rows =
-            generate_rows_for_resource(*resource, selects, &mut all_columns, variables)?;
+    for (local_columns, resource_rows) in resource_results {
+        // Merge columns, avoiding duplicates
+        for col in local_columns {
+            if !final_columns.contains(&col) {
+                final_columns.push(col);
+            }
+        }
         all_rows.extend(resource_rows);
     }
 
-    Ok((all_columns, all_rows))
+    Ok((final_columns, all_rows))
 }
 
 fn generate_rows_for_resource<R, S>(
@@ -2111,16 +2169,18 @@ fn apply_pagination_to_result(
     Ok(result)
 }
 
-fn format_output(result: ProcessedResult, content_type: ContentType) -> Result<Vec<u8>, SofError> {
+fn format_output(
+    result: ProcessedResult,
+    content_type: ContentType,
+    parquet_options: Option<&ParquetOptions>,
+) -> Result<Vec<u8>, SofError> {
     match content_type {
         ContentType::Csv | ContentType::CsvWithHeader => {
             format_csv(result, content_type == ContentType::CsvWithHeader)
         }
         ContentType::Json => format_json(result),
         ContentType::NdJson => format_ndjson(result),
-        ContentType::Parquet => Err(SofError::UnsupportedContentType(
-            "Parquet not yet implemented".to_string(),
-        )),
+        ContentType::Parquet => format_parquet(result, parquet_options),
     }
 }
 
@@ -2195,4 +2255,262 @@ fn format_ndjson(result: ProcessedResult) -> Result<Vec<u8>, SofError> {
     }
 
     Ok(output)
+}
+
+fn format_parquet(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+) -> Result<Vec<u8>, SofError> {
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use std::io::Cursor;
+
+    // Create Arrow schema from columns and sample data
+    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema_ref = std::sync::Arc::new(schema.clone());
+
+    // Get configuration from options or use defaults
+    let parquet_opts = options.cloned().unwrap_or_default();
+
+    // Calculate optimal batch size based on row count and estimated row size
+    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
+    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
+    const TARGET_ROWS_PER_BATCH: usize = 100_000; // Default batch size
+    const MAX_ROWS_PER_BATCH: usize = 500_000; // Maximum to prevent memory issues
+
+    // Estimate average row size from first 100 rows
+    let sample_size = std::cmp::min(100, result.rows.len());
+    let mut estimated_row_size = 100; // Default estimate in bytes
+
+    if sample_size > 0 {
+        let sample_json_size: usize = result.rows[..sample_size]
+            .iter()
+            .map(|row| {
+                row.values
+                    .iter()
+                    .filter_map(|v| v.as_ref())
+                    .map(|v| v.to_string().len())
+                    .sum::<usize>()
+            })
+            .sum();
+        estimated_row_size = (sample_json_size / sample_size).max(50);
+    }
+
+    // Calculate optimal batch size
+    let optimal_batch_size = (target_row_group_size_bytes / estimated_row_size)
+        .clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH);
+
+    // Parse compression algorithm
+    use parquet::basic::BrotliLevel;
+    use parquet::basic::GzipLevel;
+    use parquet::basic::ZstdLevel;
+
+    let compression = match parquet_opts.compression.as_str() {
+        "none" => Compression::UNCOMPRESSED,
+        "gzip" => Compression::GZIP(GzipLevel::default()),
+        "lz4" => Compression::LZ4,
+        "brotli" => Compression::BROTLI(BrotliLevel::default()),
+        "zstd" => Compression::ZSTD(ZstdLevel::default()),
+        _ => Compression::SNAPPY, // Default to snappy
+    };
+
+    // Set up writer properties with optimized settings
+    let props = WriterProperties::builder()
+        .set_compression(compression)
+        .set_max_row_group_size(target_row_group_size_bytes)
+        .set_data_page_row_count_limit(20_000) // Optimal for predicate pushdown
+        .set_data_page_size_limit(target_page_size_bytes)
+        .set_write_batch_size(8192) // Control write granularity
+        .build();
+
+    // Write to memory buffer
+    let mut buffer = Vec::new();
+    let mut cursor = Cursor::new(&mut buffer);
+    let mut writer =
+        ArrowWriter::try_new(&mut cursor, schema_ref.clone(), Some(props)).map_err(|e| {
+            SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
+        })?;
+
+    // Process data in batches to handle large datasets efficiently
+    let mut row_offset = 0;
+    while row_offset < result.rows.len() {
+        let batch_end = (row_offset + optimal_batch_size).min(result.rows.len());
+        let batch_rows = &result.rows[row_offset..batch_end];
+
+        // Convert batch to Arrow arrays
+        let batch_arrays =
+            parquet_schema::process_to_arrow_arrays(&schema, &result.columns, batch_rows)?;
+
+        // Create RecordBatch for this chunk
+        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
+            SofError::ParquetConversionError(format!(
+                "Failed to create RecordBatch for rows {}-{}: {}",
+                row_offset, batch_end, e
+            ))
+        })?;
+
+        // Write batch
+        writer.write(&batch).map_err(|e| {
+            SofError::ParquetConversionError(format!(
+                "Failed to write RecordBatch for rows {}-{}: {}",
+                row_offset, batch_end, e
+            ))
+        })?;
+
+        row_offset = batch_end;
+    }
+
+    writer.close().map_err(|e| {
+        SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
+    })?;
+
+    Ok(buffer)
+}
+
+/// Format Parquet data with automatic file splitting when size exceeds limit
+pub fn format_parquet_multi_file(
+    result: ProcessedResult,
+    options: Option<&ParquetOptions>,
+    max_file_size_bytes: usize,
+) -> Result<Vec<Vec<u8>>, SofError> {
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+    use std::io::Cursor;
+
+    // Create Arrow schema from columns and sample data
+    let schema = parquet_schema::create_arrow_schema(&result.columns, &result.rows)?;
+    let schema_ref = std::sync::Arc::new(schema.clone());
+
+    // Get configuration from options or use defaults
+    let parquet_opts = options.cloned().unwrap_or_default();
+
+    // Calculate optimal batch size
+    let target_row_group_size_bytes = (parquet_opts.row_group_size_mb as usize) * 1024 * 1024;
+    let target_page_size_bytes = (parquet_opts.page_size_kb as usize) * 1024;
+    const TARGET_ROWS_PER_BATCH: usize = 100_000;
+    const MAX_ROWS_PER_BATCH: usize = 500_000;
+
+    // Estimate average row size
+    let sample_size = std::cmp::min(100, result.rows.len());
+    let mut estimated_row_size = 100;
+
+    if sample_size > 0 {
+        let sample_json_size: usize = result.rows[..sample_size]
+            .iter()
+            .map(|row| {
+                row.values
+                    .iter()
+                    .filter_map(|v| v.as_ref())
+                    .map(|v| v.to_string().len())
+                    .sum::<usize>()
+            })
+            .sum();
+        estimated_row_size = (sample_json_size / sample_size).max(50);
+    }
+
+    let optimal_batch_size = (target_row_group_size_bytes / estimated_row_size)
+        .clamp(TARGET_ROWS_PER_BATCH, MAX_ROWS_PER_BATCH);
+
+    // Parse compression algorithm
+    use parquet::basic::BrotliLevel;
+    use parquet::basic::GzipLevel;
+    use parquet::basic::ZstdLevel;
+
+    let compression = match parquet_opts.compression.as_str() {
+        "none" => Compression::UNCOMPRESSED,
+        "gzip" => Compression::GZIP(GzipLevel::default()),
+        "lz4" => Compression::LZ4,
+        "brotli" => Compression::BROTLI(BrotliLevel::default()),
+        "zstd" => Compression::ZSTD(ZstdLevel::default()),
+        _ => Compression::SNAPPY,
+    };
+
+    // Set up writer properties
+    let props = WriterProperties::builder()
+        .set_compression(compression)
+        .set_max_row_group_size(target_row_group_size_bytes)
+        .set_data_page_row_count_limit(20_000)
+        .set_data_page_size_limit(target_page_size_bytes)
+        .set_write_batch_size(8192)
+        .build();
+
+    let mut file_buffers = Vec::new();
+    let mut current_buffer = Vec::new();
+    let mut current_cursor = Cursor::new(&mut current_buffer);
+    let mut current_writer =
+        ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
+            .map_err(|e| {
+                SofError::ParquetConversionError(format!("Failed to create Parquet writer: {}", e))
+            })?;
+
+    let mut row_offset = 0;
+    let mut _current_file_rows = 0;
+
+    while row_offset < result.rows.len() {
+        let batch_end = (row_offset + optimal_batch_size).min(result.rows.len());
+        let batch_rows = &result.rows[row_offset..batch_end];
+
+        // Convert batch to Arrow arrays
+        let batch_arrays =
+            parquet_schema::process_to_arrow_arrays(&schema, &result.columns, batch_rows)?;
+
+        // Create RecordBatch
+        let batch = RecordBatch::try_new(schema_ref.clone(), batch_arrays).map_err(|e| {
+            SofError::ParquetConversionError(format!(
+                "Failed to create RecordBatch for rows {}-{}: {}",
+                row_offset, batch_end, e
+            ))
+        })?;
+
+        // Write batch
+        current_writer.write(&batch).map_err(|e| {
+            SofError::ParquetConversionError(format!(
+                "Failed to write RecordBatch for rows {}-{}: {}",
+                row_offset, batch_end, e
+            ))
+        })?;
+
+        _current_file_rows += batch_end - row_offset;
+        row_offset = batch_end;
+
+        // Check if we should start a new file
+        // Get actual size of current buffer by flushing the writer
+        let current_size = current_writer.bytes_written();
+
+        if current_size >= max_file_size_bytes && row_offset < result.rows.len() {
+            // Close current file
+            current_writer.close().map_err(|e| {
+                SofError::ParquetConversionError(format!("Failed to close Parquet writer: {}", e))
+            })?;
+
+            // Save the buffer
+            file_buffers.push(current_buffer);
+
+            // Start new file
+            current_buffer = Vec::new();
+            current_cursor = Cursor::new(&mut current_buffer);
+            current_writer =
+                ArrowWriter::try_new(&mut current_cursor, schema_ref.clone(), Some(props.clone()))
+                    .map_err(|e| {
+                        SofError::ParquetConversionError(format!(
+                            "Failed to create new Parquet writer: {}",
+                            e
+                        ))
+                    })?;
+            _current_file_rows = 0;
+        }
+    }
+
+    // Close the final writer
+    current_writer.close().map_err(|e| {
+        SofError::ParquetConversionError(format!("Failed to close final Parquet writer: {}", e))
+    })?;
+
+    file_buffers.push(current_buffer);
+
+    Ok(file_buffers)
 }
