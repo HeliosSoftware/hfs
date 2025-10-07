@@ -227,7 +227,6 @@ jobs:
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld"]' >> ~/.cargo/config.toml
           fi
 
-
       - name: Install cargo-audit
         run: cargo install cargo-audit
 
@@ -613,7 +612,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: test_report.json 
+          name: test_report.json
           path: |
             crates/sof/
 
@@ -646,36 +645,17 @@ jobs:
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
           echo "path=$(pwd)/.venv" >> $GITHUB_OUTPUT
 
-      - name: Install pysof build dependencies (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
-        working-directory: crates/pysof
+      - name: Build pysof wheels
         run: |
-          uv sync --group dev
-          uv pip install patchelf
-
-      - name: Install pysof build dependencies (Unix)
-        if: matrix.os != 'Windows'
-        working-directory: crates/pysof
-        run: |
-          uv sync --group dev
-          uv pip install patchelf
-
-      - name: Build pysof wheel (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
-        working-directory: crates/pysof
-        run: uv run maturin build --release -o dist
-
-      - name: Build pysof wheel (Unix)
-        if: matrix.os != 'Windows'
-        working-directory: crates/pysof
-        run: uv run maturin build --release -o dist
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            uv run maturin build --release --sdist --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
+          else
+            uv run maturin build --release --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
+          fi
 
       - name: Upload pysof artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
 
   publish-pypi:
