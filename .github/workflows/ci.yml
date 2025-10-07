@@ -645,17 +645,48 @@ jobs:
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
           echo "path=$(pwd)/.venv" >> $GITHUB_OUTPUT
 
-      - name: Build pysof wheels
+      - name: Install pysof dev dependencies
+        working-directory: crates/pysof
+        run: uv sync --group dev
+
+      - name: Ensure maturin >=1.9.6 (Windows)
+        if: matrix.os == 'Windows'
+        shell: cmd
+        working-directory: crates/pysof
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            uv run maturin build --release --sdist --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
-          else
-            uv run maturin build --release --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
-          fi
+          source .venv\Scripts\activate
+          python -m pip install --upgrade "maturin>=1.9.6,<2.0"
+          maturin --version
+
+      - name: Ensure maturin >=1.9.6 (Unix)
+        if: matrix.os != 'Windows'
+        working-directory: crates/pysof
+        run: |
+          set -e
+          source .venv/bin/activate
+          python -m pip install --upgrade "maturin>=1.9.6,<2.0"
+          maturin --version
+
+      - name: Build pysof wheels and sdist (Windows)
+        if: matrix.os == 'Windows'
+        shell: cmd
+        run: |
+          source crates\pysof\.venv\Scripts\activate
+          maturin --version
+          maturin build --release --sdist --manifest-path crates\pysof\Cargo.toml -o crates\pysof\dist
+
+      - name: Build pysof wheels and sdist (Unix)
+        if: matrix.os != 'Windows'
+        run: |
+          set -e
+          source crates/pysof/.venv/bin/activate
+          maturin --version
+          maturin build --release --sdist --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
 
       - name: Upload pysof artifacts
         uses: actions/upload-artifact@v4
         with:
+          name: pysof-${{ matrix.target }}
           path: crates/pysof/dist/*
 
   publish-pypi:
@@ -710,6 +741,7 @@ jobs:
           mkdir -p releases/wheels
           # Copy all pysof wheels and sdist (if any)
           find artifacts -type f -name 'pysof-*whl' -exec cp {} releases/wheels/ \; || true
+          find artifacts -type f -name 'pysof-*.tar.gz' -exec cp {} releases/wheels/ \; || true
           ls -l releases/wheels || true
           # Copy test_report.json if it exists
           find artifacts -type f -name 'test_report.json' -exec cp {} releases/ \; || true
