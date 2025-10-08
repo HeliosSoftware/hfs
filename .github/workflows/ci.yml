@@ -92,7 +92,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          key: ${{ runner.os }}-uv-${{ hashFiles('crates/pysof/uv.lock') }}
           restore-keys: |
             ${{ runner.os }}-uv-
 
@@ -168,7 +168,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          key: ${{ runner.os }}-uv-${{ hashFiles('crates/pysof/uv.lock') }}
           restore-keys: |
             ${{ runner.os }}-uv-
 
@@ -578,7 +578,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-${{ hashFiles('uv.lock') }}
+          key: ${{ runner.os }}-uv-${{ hashFiles('crates/pysof/uv.lock') }}
           restore-keys: |
             ${{ runner.os }}-uv-
 
@@ -649,39 +649,17 @@ jobs:
         working-directory: crates/pysof
         run: uv sync --group dev
 
-      - name: Ensure maturin >=1.9.6 (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
+      - name: Ensure maturin >=1.9.6
         working-directory: crates/pysof
         run: |
-          source .venv\Scripts\activate
-          python -m pip install --upgrade "maturin>=1.9.6,<2.0"
-          maturin --version
+          uv run python -m pip install --upgrade "maturin>=1.9.6,<2.0"
+          uv run maturin --version
 
-      - name: Ensure maturin >=1.9.6 (Unix)
-        if: matrix.os != 'Windows'
+      - name: Build pysof wheels and sdist
         working-directory: crates/pysof
         run: |
-          set -e
-          source .venv/bin/activate
-          python -m pip install --upgrade "maturin>=1.9.6,<2.0"
-          maturin --version
-
-      - name: Build pysof wheels and sdist (Windows)
-        if: matrix.os == 'Windows'
-        shell: cmd
-        run: |
-          source crates\pysof\.venv\Scripts\activate
-          maturin --version
-          maturin build --release --sdist --manifest-path crates\pysof\Cargo.toml -o crates\pysof\dist
-
-      - name: Build pysof wheels and sdist (Unix)
-        if: matrix.os != 'Windows'
-        run: |
-          set -e
-          source crates/pysof/.venv/bin/activate
-          maturin --version
-          maturin build --release --sdist --manifest-path crates/pysof/Cargo.toml -o crates/pysof/dist
+          uv run maturin --version
+          uv run maturin build --release --sdist -o dist
 
       - name: Upload pysof artifacts
         uses: actions/upload-artifact@v4

@@ -1,8 +1,19 @@
 [workspace]
-members = ["crates/*"]
-# pysof is excluded because it requires Python to build (pyo3-build-config)
-# Users without Python can still build the rest of the workspace
-exclude = ["crates/pysof"]
+members = [
+	"crates/*",
+]
+# Build all Rust crates by default, but skip pysof unless explicitly requested.
+# This keeps `cargo build` working on machines without Python while still
+# making `crates/pysof` an actual workspace member for maturin.
+default-members = [
+	"crates/fhir",
+	"crates/fhir-gen",
+	"crates/fhir-macro",
+	"crates/fhirpath",
+	"crates/fhirpath-support",
+	"crates/hfs",
+	"crates/sof",
+]
 resolver = "2"
 
 [workspace.package]
