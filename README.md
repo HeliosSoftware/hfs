@@ -75,11 +75,17 @@ export CARGO_BUILD_JOBS=4
 git clone https://github.com/HeliosSoftware/hfs.git
 cd hfs
 
-# Build (R4 only by default)
+# Build (R4 only by default). Uses workspace default-members and skips the Python bindings crate (pysof).
 cargo build --release
 
 # Or build with all FHIR versions
 cargo build --release --features R4,R4B,R5,R6
+
+# Build all workspace members (including pysof)
+cargo build --workspace --release
+
+# Build everything except Python bindings explicitly (alternative)
+cargo build --workspace --exclude pysof --release
 ```
 
 ## Try It Out
@@ -168,7 +174,14 @@ result = pysof.run_view_definition(
 
 **Distribution:**
 - Cross-platform wheel distribution for Linux, Windows, and macOS
-- If building this project yourself, pysof is excluded from default workspace build (requires explicit `cargo build -p pysof`)
+- If building this project yourself, pysof is excluded from default workspace build via workspace default-members.
+  - Build only pysof (Rust-only): `cargo build -p pysof`
+  - Preferred (Python): use maturin to build and install into a venv:
+    - `cd crates/pysof`
+    - `uv venv --python 3.11`
+    - `uv sync`
+    - `uv run maturin develop --release`
+    - Build wheels/sdist: `uv run maturin build --release -o dist` and `uv run maturin sdist -o dist`
 
 ### 6. [`helios-fhir-macro`](crates/fhir-macro) - Procedural Macros
 Helper macros for code generation used by other components.
@@ -223,7 +236,7 @@ cargo doc --no-deps --open
 ## Building from Source
 ```bash
 # Build with default features (R4 only)
-# Note: pysof is excluded from default workspace build
+# Note: pysof (Python bindings) is excluded by workspace default-members
 cargo build
 
 # Build with all FHIR versions
@@ -233,9 +246,20 @@ cargo build --features R4,R4B,R5,R6
 cargo build -p helios-fhirpath
 
 # Build Python bindings (requires Python 3.11)
+# Option A: Rust-only build of the crate
 cargo build -p pysof
 
-# Build everything except Python bindings
+# Option B (recommended): build via maturin into a virtual env
+cd crates/pysof
+uv venv --python 3.11
+uv sync
+uv run maturin develop --release
+
+# Build distributable artifacts for pysof
+uv run maturin build --release -o dist   # wheels
+uv run maturin sdist -o dist             # source distribution
+
+# Build everything except Python bindings (alternative)
 cargo build --workspace --exclude pysof
 ```
 
