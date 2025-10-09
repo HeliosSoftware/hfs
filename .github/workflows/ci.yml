@@ -154,6 +154,16 @@ jobs:
         with:
           python-version-file: .python-version
           architecture: ${{ runner.os == 'macOS' && 'arm64' || 'x64' }}
+        continue-on-error: true
+
+      - name: Verify Python installation or install with uv
+        run: |
+          if ! command -v python${{ env.PYTHON_VERSION }} &> /dev/null; then
+            echo "Python not found, installing with uv..."
+            uv python install ${{ env.PYTHON_VERSION }}
+          else
+            echo "Python ${{ env.PYTHON_VERSION }} found"
+          fi
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
@@ -743,6 +753,16 @@ jobs:
         with:
           python-version-file: .python-version
           architecture: ${{ matrix.os == 'macOS' && 'arm64' || 'x64' }}
+        continue-on-error: true
+
+      - name: Verify Python installation or install with uv
+        run: |
+          if ! command -v python${{ env.PYTHON_VERSION }} &> /dev/null; then
+            echo "Python not found, installing with uv..."
+            uv python install ${{ env.PYTHON_VERSION }}
+          else
+            echo "Python ${{ env.PYTHON_VERSION }} found"
+          fi
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
