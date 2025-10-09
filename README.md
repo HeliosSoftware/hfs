@@ -49,20 +49,17 @@ Create or modify `~/.cargo/config.toml`:
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
 
-[target.x86_64-apple-darwin]
+[target.aarch64-apple-darwin]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]
 
 [target.x86_64-pc-windows-msvc]
 linker = "lld-link.exe"
+rustflags = ["-C", "link-arg=/STACK:8388608"]
 ```
 
-4. **Set stack size and parallel build count** (add to `~/.bashrc` or `~/.zshrc`):
-```bash
-export RUST_MIN_STACK=8388608
-```
 💡 **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs to 4 (or less):
 ```bash
 export CARGO_BUILD_JOBS=4
