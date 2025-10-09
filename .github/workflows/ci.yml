@@ -751,7 +751,7 @@ jobs:
 
       - name: Build pysof wheel
         working-directory: crates/pysof
-        run: uv run maturin build --release -o dist
+        run: uv run maturin build --release --sdist -o dist
 
       - name: Upload pysof artifacts
         uses: actions/upload-artifact@v4
