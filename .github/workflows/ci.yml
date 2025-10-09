@@ -149,10 +149,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python from .python-version
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version-file: .python-version
           architecture: ${{ runner.os == 'macOS' && 'arm64' || 'x64' }}
 
       - name: Create virtual environment for pysof
@@ -738,10 +738,10 @@ jobs:
           path: |
             crates/sof/
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python from .python-version
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version-file: .python-version
           architecture: ${{ matrix.os == 'macOS' && 'arm64' || 'x64' }}
 
       - name: Create virtual environment for pysof
