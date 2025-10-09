@@ -1,7 +1,7 @@
 //! Integration test for multithreading functionality
 
-use helios_sof::{RunOptions, ContentType};
 use chrono::Utc;
+use helios_sof::{ContentType, RunOptions};
 
 #[test]
 fn test_run_options_threading_support() {
@@ -22,7 +22,7 @@ fn test_content_type_parsing_for_multithreading() {
     // Test that ContentType parsing works for different output formats
     // that might be used in multithreaded scenarios
     let formats = ["json", "csv", "ndjson"];
-    
+
     for format in &formats {
         let content_type = ContentType::from_string(format);
         assert!(content_type.is_ok(), "Failed to parse format: {}", format);
@@ -33,7 +33,7 @@ fn test_content_type_parsing_for_multithreading() {
 fn test_default_run_options_compatibility() {
     // Test that Default::default() works
     let options = RunOptions::default();
-    
+
     assert!(options.since.is_none());
     assert!(options.limit.is_none());
     assert!(options.page.is_none());
@@ -48,9 +48,9 @@ fn test_run_options_cloning() {
         page: Some(2),
         ..Default::default()
     };
-    
+
     let cloned = original.clone();
-    
+
     assert_eq!(original.limit, cloned.limit);
     assert_eq!(original.page, cloned.page);
     assert_eq!(original.since, cloned.since);

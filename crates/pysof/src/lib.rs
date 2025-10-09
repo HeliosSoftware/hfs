@@ -52,12 +52,7 @@ pyo3::create_exception!(
     PySofError,
     "Invalid source parameter value"
 );
-pyo3::create_exception!(
-    pysof,
-    PySourceNotFoundError,
-    PySofError,
-    "Source not found"
-);
+pyo3::create_exception!(pysof, PySourceNotFoundError, PySofError, "Source not found");
 pyo3::create_exception!(
     pysof,
     PySourceFetchError,
