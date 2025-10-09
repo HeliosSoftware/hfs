@@ -150,28 +150,18 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
-        run: |
-          uv python install ${{ env.PYTHON_VERSION }}
-          if [ "$RUNNER_OS" == "macOS" ]; then
-            python_path=$(uv python find ${{ env.PYTHON_VERSION }})
-            echo "Python path: $python_path"
-            file "$python_path" || true
-          fi
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ runner.os == 'macOS' && 'arm64' || 'x64' }}
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
 
       - name: Install pysof build dependencies
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: |
           uv sync --group dev
 
@@ -183,8 +173,6 @@ jobs:
 
       - name: Build pysof wheel
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: uv run maturin develop
 
       - name: Run tests with coverage
@@ -233,9 +221,11 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
-      - name: Install Rust target (MacOS)
+      - name: Install Rust targets (MacOS)
         if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-darwin
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -320,9 +310,11 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
-      - name: Install Rust target (MacOS)
+      - name: Install Rust targets (MacOS)
         if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-darwin
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -373,9 +365,11 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
-      - name: Install Rust target (MacOS)
+      - name: Install Rust targets (MacOS)
         if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-darwin
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -745,35 +739,23 @@ jobs:
             crates/sof/
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
-        run: |
-          uv python install ${{ env.PYTHON_VERSION }}
-          if [ "$RUNNER_OS" == "macOS" ]; then
-            python_path=$(uv python find ${{ env.PYTHON_VERSION }})
-            echo "Python path: $python_path"
-            file "$python_path" || true
-          fi
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.os == 'macOS' && 'arm64' || 'x64' }}
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
 
       - name: Install pysof build dependencies
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: |
           uv sync --group dev
 
       - name: Build pysof wheel
         working-directory: crates/pysof
-        env:
-          ARCHFLAGS: "-arch arm64"
         run: uv run maturin build --release -o dist
 
       - name: Upload pysof artifacts
