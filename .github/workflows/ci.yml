@@ -151,15 +151,27 @@ jobs:
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         working-directory: crates/pysof
-        run: uv python install ${{ env.PYTHON_VERSION }}
+        env:
+          ARCHFLAGS: "-arch arm64"
+        run: |
+          uv python install ${{ env.PYTHON_VERSION }}
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            python_path=$(uv python find ${{ env.PYTHON_VERSION }})
+            echo "Python path: $python_path"
+            file "$python_path" || true
+          fi
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
 
       - name: Install pysof build dependencies
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: |
           uv sync --group dev
 
@@ -171,6 +183,8 @@ jobs:
 
       - name: Build pysof wheel
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: uv run maturin develop
 
       - name: Run tests with coverage
@@ -732,20 +746,34 @@ jobs:
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         working-directory: crates/pysof
-        run: uv python install ${{ env.PYTHON_VERSION }}
+        env:
+          ARCHFLAGS: "-arch arm64"
+        run: |
+          uv python install ${{ env.PYTHON_VERSION }}
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            python_path=$(uv python find ${{ env.PYTHON_VERSION }})
+            echo "Python path: $python_path"
+            file "$python_path" || true
+          fi
 
       - name: Create virtual environment for pysof
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }} .venv
 
       - name: Install pysof build dependencies
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: |
           uv sync --group dev
 
       - name: Build pysof wheel
         working-directory: crates/pysof
+        env:
+          ARCHFLAGS: "-arch arm64"
         run: uv run maturin build --release -o dist
 
       - name: Upload pysof artifacts
