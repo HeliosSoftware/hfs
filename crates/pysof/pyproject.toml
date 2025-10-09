@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = []
 authors = [
-    {name = "Helios Team", email = "team@helios.dev"},
+    {name = "Helios Team", email = "team@heliossoftware.com"},
 ]
 license = {text = "MIT"}
 project-urls = { Homepage = "https://github.com/helios/hfs", Repository = "https://github.com/helios/hfs", Documentation = "https://github.com/helios/hfs/tree/main/crates/pysof", "Bug Tracker" = "https://github.com/helios/hfs/issues" }

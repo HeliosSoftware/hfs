@@ -1,4 +1,6 @@
- 
+- Re-think skip-r6-download feature - it seems to be on all the time now.
+- Setup local cache for builds - need to move runners
+
 - FHIRPath
   - Add R6 support in fhirpath-lab.com
   - FHIRPath Lab Debugger support

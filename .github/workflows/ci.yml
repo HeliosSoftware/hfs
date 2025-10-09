@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 8388608
   CARGO_BUILD_JOBS: 1
   PYTHON_VERSION: "3.11"
 
@@ -240,11 +241,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -254,19 +250,24 @@ jobs:
 
       - name: Install dependencies
         working-directory: crates/pysof
-        run: uv sync --group dev --python ${{ env.PYTHON_VERSION }}
+        run: |
+          uv venv --python python${{ env.PYTHON_VERSION }} .venv
+          uv sync --group dev
 
       - name: Format check
         working-directory: crates/pysof
-        run: uv run ruff format --check src
+        run: |
+          uv run ruff format --check src
 
       - name: Lint check
         working-directory: crates/pysof
-        run: uv run ruff check src
+        run: |
+          uv run ruff check src
 
       - name: Type check
         working-directory: crates/pysof
-        run: uv run mypy src
+        run: |
+          uv run mypy src
 
   security:
     name: Security Audit

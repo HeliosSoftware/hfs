@@ -27,43 +27,53 @@ The Helios FHIR Server is an implementation of the [HL7® FHIR®](https://hl7.or
 ## Prerequisites
 
 1. **Install [Rust](https://www.rust-lang.org/tools/install)**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
 
 2. **Install [LLD](https://lld.llvm.org/)**
 
-Linux (Ubuntu/Debian):
-```bash
-sudo apt install clang lld
-```
+    Linux (Ubuntu/Debian):
+    ```bash
+    sudo apt install clang lld
+    ```
 
-macOS:
-```bash
-brew install lld
-```
+    macOS:
+    ```bash
+    brew install lld
+    ```
+
+    Windows:
+
+      Download a pre-build binary from [llvm-project's GitHub page](https://github.com/llvm/llvm-project/releases).
+
 
 3. **Configure Rust to use LLD**
 
-Create or modify `~/.cargo/config.toml`:
-```toml
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
+    Create or modify `~/.cargo/config.toml`:
+    ```toml
+    [target.x86_64-unknown-linux-gnu]
+    linker = "clang"
+    rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]
 
-[target.aarch64-apple-darwin]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]
+    [target.aarch64-apple-darwin]
+    linker = "clang"
+    rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]
 
-[target.x86_64-pc-windows-msvc]
-linker = "lld-link.exe"
-rustflags = ["-C", "link-arg=/STACK:8388608"]
-```
+    [target.x86_64-pc-windows-msvc]
+    linker = "lld-link.exe"
+    rustflags = ["-C", "link-arg=/STACK:8388608"]
+    ```
+
+4. **Set stack size and parallel build count** (add to `~/.bashrc` or `~/.zshrc`):
+    ```bash
+    export RUST_MIN_STACK=8388608
+    ```
 
 💡 **Tip**: If you run out of memory during compilation on Linux, especially on high CPU core count machines, limit parallel jobs to 4 (or less):
-```bash
-export CARGO_BUILD_JOBS=4
-```
+    ```bash
+    export CARGO_BUILD_JOBS=4
+    ```
 
 ## Installation
 
