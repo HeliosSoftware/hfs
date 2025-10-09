@@ -127,6 +127,10 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
+      - name: Install Rust target (MacOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin
+
       - name: Install the latest version of uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -215,6 +219,10 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
+      - name: Install Rust target (MacOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -298,6 +306,10 @@ jobs:
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
 
+      - name: Install Rust target (MacOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin
+
       - name: Install cargo-audit
         run: cargo install cargo-audit
 
@@ -346,6 +358,10 @@ jobs:
           echo "[target.aarch64-apple-darwin]" >> ~/.cargo/config.toml
           echo 'linker = "clang"' >> ~/.cargo/config.toml
           echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+
+      - name: Install Rust target (MacOS)
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin
 
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov
@@ -653,10 +669,14 @@ jobs:
         run: |
           mkdir -p ~/.cargo
           if ! grep -q "link-arg=-fuse-ld=lld" ~/.cargo/config.toml 2>/dev/null; then
-            echo "[target.x86_64-apple-darwin]" >> ~/.cargo/config.toml
+            echo "[target.aarch64-apple-darwin]" >> ~/.cargo/config.toml
             echo 'linker = "clang"' >> ~/.cargo/config.toml
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
           fi
+
+      - name: Install Rust target (MacOS)
+        if: matrix.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
