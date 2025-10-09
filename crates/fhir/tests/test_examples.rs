@@ -220,6 +220,14 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
             "composition-example.json",
             "R6 Composition.attester.mode structure incompatibility - expecting string but got CodeableConcept",
         ),
+        (
+            "devicealert-example.json",
+            "R6 DeviceAlert example contains incompatible data structure",
+        ),
+        (
+            "familymemberhistory-example.json",
+            "R6 FamilyMemberHistory example contains incompatible data structure",
+        ),
     ];
 
     for entry in fs::read_dir(dir).unwrap() {
@@ -269,12 +277,12 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
                                     // Skip other missing R6 resources (not yet implemented)
                                     let missing_r6_resources = [
                                         "MolecularSequence",
-                                        "SubstanceNucleicAcid", 
+                                        "SubstanceNucleicAcid",
                                         "SubstancePolymer",
                                         "SubstanceProtein",
-                                        "SubstanceReferenceInformation"
+                                        "SubstanceReferenceInformation",
                                     ];
-                                    
+
                                     if missing_r6_resources.contains(&resource_type_str) {
                                         println!("Skipping {} resource", resource_type_str);
                                         continue;

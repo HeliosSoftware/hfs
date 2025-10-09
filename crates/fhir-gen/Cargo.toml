@@ -16,11 +16,12 @@ R4 = ["helios-fhir/R4"]
 R4B = ["helios-fhir/R4B"]
 R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
+skip-r6-download = []
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-helios-fhir = { path = "../fhir", version = "0.1.17" }
+helios-fhir = { path = "../fhir", version = "0.1.20" }
 clap = { version = "4.4", features = ["derive"] }
 
 [build-dependencies]

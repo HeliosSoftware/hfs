@@ -17,8 +17,8 @@ R5 = ["helios-fhir/R5"]
 R6 = ["helios-fhir/R6"]
 
 [dependencies]
-helios-fhir = { path = "../fhir", version = "0.1.17" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.17" }
+helios-fhir = { path = "../fhir", version = "0.1.20" }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.20" }
 chumsky = "0.10"
 roxmltree = "0.20"
 chrono = { workspace = true } # For date/time parsing and functions
@@ -76,4 +76,8 @@ harness = false
 [[bench]]
 name = "server_benches"
 harness = false
+
+[package.metadata.docs.rs]
+features = ["R4", "R4B", "R5", "R6"]
+rustdoc-args = ["--cfg", "docsrs"]
 

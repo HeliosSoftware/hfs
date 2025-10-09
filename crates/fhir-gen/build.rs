@@ -3,13 +3,20 @@ use std::fs;
 use std::fs::File;
 use std::io::copy;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 use zip::ZipArchive;
 
 fn main() {
     // Check if R6 feature is enabled
     if !cfg!(feature = "R6") {
+        return;
+    }
+
+    // Skip R6 download if skip-r6-download feature is enabled or DOCS_RS env var is set
+    // This allows docs.rs builds to succeed using the checked-in R6 resources
+    if cfg!(feature = "skip-r6-download") || std::env::var("DOCS_RS").is_ok() {
+        println!("cargo:warning=Skipping R6 download (using checked-in resources)");
         return;
     }
 
@@ -34,10 +41,10 @@ fn main() {
     // Try downloading with retries
     const MAX_RETRIES: u32 = 3;
     let mut last_error = None;
-    
+
     for attempt in 1..=MAX_RETRIES {
         println!("Download attempt {} of {}", attempt, MAX_RETRIES);
-        
+
         match download_with_retry(&client, url, &output_path) {
             Ok(bytes) => {
                 println!("Downloaded {} bytes", bytes);
@@ -47,7 +54,7 @@ fn main() {
             Err(e) => {
                 println!("Attempt {} failed: {}", attempt, e);
                 last_error = Some(e);
-                
+
                 if attempt < MAX_RETRIES {
                     let wait_time = Duration::from_secs(5 * attempt as u64);
                     println!("Waiting {:?} before retry...", wait_time);
@@ -56,9 +63,12 @@ fn main() {
             }
         }
     }
-    
+
     if let Some(error) = last_error {
-        panic!("Failed to download file after {} attempts: {}", MAX_RETRIES, error);
+        panic!(
+            "Failed to download file after {} attempts: {}",
+            MAX_RETRIES, error
+        );
     }
 
     // Verify and extract the downloaded file
@@ -131,8 +141,8 @@ fn download_with_retry(
     let mut response = response;
 
     // Create the file
-    let mut downloaded_file = File::create(output_path)
-        .map_err(|e| format!("Failed to create the file: {}", e))?;
+    let mut downloaded_file =
+        File::create(output_path).map_err(|e| format!("Failed to create the file: {}", e))?;
 
     let bytes_copied = copy(&mut response, &mut downloaded_file)
         .map_err(|e| format!("Failed to copy the file: {}", e))?;

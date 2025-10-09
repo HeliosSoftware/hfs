@@ -16,13 +16,14 @@ R4 = []
 R4B = []
 R5 = []
 R6 = []
+skip-r6-download = []
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 clap = { version = "4.0", features = ["derive"] }
-helios-fhir-macro = { path = "../fhir-macro", version = "0.1.17" }
-helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.17" }
+helios-fhir-macro = { path = "../fhir-macro", version = "0.1.20" }
+helios-fhirpath-support = { path = "../fhirpath-support", version = "0.1.20" }
 time = "0.3"
 chrono = { workspace = true }
 # Re-add serde-with-arbitrary-precision, keep macros
@@ -36,7 +37,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 zip = "0.6"
 
 [package.metadata.docs.rs]
-all-features = true
+features = ["R4", "R4B", "R5", "R6", "skip-r6-download"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 

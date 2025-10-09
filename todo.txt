@@ -1,11 +1,13 @@
-- Merge the pysof work
-
+ 
 - FHIRPath
+  - Add R6 support in fhirpath-lab.com
   - FHIRPath Lab Debugger support
 
 - SQL On FHIR
-  - Support the group parameter
+  - Make test_results.json available 
   - Submit here:  https://github.com/FHIR/sql-on-fhir-v2?tab=readme-ov-file#registering-your-implementation
+  - Implement the new repeat feature
+  - Support the group parameter
 
 - My CapabilityStatement for $run needs help - name, and unsure about operation vs. resource
 

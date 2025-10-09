@@ -18,4 +18,4 @@ R6 = ["helios-fhir/R6"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
-helios-fhir = { path = "../fhir", version = "0.1.17" }
+helios-fhir = { path = "../fhir", version = "0.1.20" }
