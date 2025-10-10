@@ -86,7 +86,6 @@ cd hfs
 cargo build --release
 
 # Or build with all FHIR versions
-<<<<<<< HEAD
 cargo build --release --features R4,R4B,R5,R6
 
 # Build all workspace members (including pysof)
@@ -94,9 +93,6 @@ cargo build --workspace --release
 
 # Build everything except Python bindings explicitly (alternative)
 cargo build --workspace --exclude pysof --release
-=======
-cargo build --release --all-features
->>>>>>> eec3fd30ef9a95343f44b1b7a404b085cb5ce31d
 ```
 
 ## Try It Out
