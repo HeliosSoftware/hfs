@@ -1,0 +1,85 @@
+{
+  "resourceType": "ConceptMap",
+  "id": "103",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ConceptMap 103\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"103\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hc103\"\u003e \u003c/a\u003e\n      \u003cp\u003eMapping from \n        \u003ca href\u003d\"https://browser.ihtsdotools.org/\"\u003eAll Codes SCT ValueSet\u003c/a\u003e to (not specified)\n      \u003c/p\u003e\n      \u003cbr/\u003e\n      \u003cp\u003e\n        \u003cb\u003eGroup 1 \u003c/b\u003eMapping from \n        \u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-snomed-CT.html\"\u003eSNOMED CT International Edition\u003c/a\u003e to \n        \u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-icd10CM.html\"\u003eInternational Classification of Diseases, 10th Revision, Clinical Modification (ICD-10-CM)\u003c/a\u003e\n      \u003c/p\u003e\n      \u003ctable class\u003d\"grid\"\u003e\n        \u003ctr\u003e\n          \u003ctd\u003e\n            \u003cb\u003eSource Code\u003c/b\u003e\n          \u003c/td\u003e\n          \u003ctd\u003e\n            \u003cb\u003eRelationship\u003c/b\u003e\n          \u003c/td\u003e\n          \u003ctd\u003e\n            \u003cb\u003eTarget Code\u003c/b\u003e\n          \u003c/td\u003e\n          \u003ctd\u003e\n            \u003cb\u003eComment\u003c/b\u003e\n          \u003c/td\u003e\n        \u003c/tr\u003e\n        \u003ctr\u003e\n          \u003ctd\u003e263204007 (Fracture of shaft of ulna)\u003c/td\u003e\n          \u003ctd\u003e\n            \u003ca href\u003d\"codesystem-concept-map-relationship.html#source-is-broader-than-target\" title\u003d\"source-is-broader-than-target\"\u003eis broader than\u003c/a\u003e\n          \u003c/td\u003e\n          \u003ctd\u003eS52.209A (Unsp fracture of shaft of unsp ulna, init for clos fx)\u003c/td\u003e\n          \u003ctd\u003eThe target mapping to ICD-10-CM is \u0027source-is-broader-than-target\u0027, since additional patient data on the encounter (initial vs. subsequent) and fracture type is required for a valid ICD-10-CM mapping.\u003c/td\u003e\n        \u003c/tr\u003e\n        \u003ctr\u003e\n          \u003ctd\u003e263204007 (Fracture of shaft of ulna)\u003c/td\u003e\n          \u003ctd\u003e\n            \u003ca href\u003d\"codesystem-concept-map-relationship.html#source-is-broader-than-target\" title\u003d\"source-is-broader-than-target\"\u003eis broader than\u003c/a\u003e\n          \u003c/td\u003e\n          \u003ctd\u003eS52.209D (Unsp fx shaft of unsp ulna, subs for clos fx w routn heal)\u003c/td\u003e\n          \u003ctd\u003eThe target mapping to ICD-10-CM is \u0027source-is-broader-than-target\u0027, since additional patient data on the encounter (initial vs. subsequent), fracture type and healing (for subsequent encounter) is required for a valid ICD-10-CM mapping.\u003c/td\u003e\n        \u003c/tr\u003e\n      \u003c/table\u003e\n    \u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "vocab"
+    }
+  ],
+  "url": "http://hl7.org/fhir/ConceptMap/103",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.14.7"
+    },
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:uuid:53cd62ee-033e-414c-9f58-3ca97b5ffc3b"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "SNOMEDCTToICD10CMMappingsForFractureOfUlna",
+  "title": "SNOMED CT to ICD-10-CM mappings for fracture of ulna",
+  "status": "draft",
+  "experimental": true,
+  "date": "2012-06-13",
+  "publisher": "HL7 International / Terminology Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/Vocab"
+        }
+      ]
+    }
+  ],
+  "description": "Example rule-based mappings between SNOMED CT to ICD-10-CM for fracture of ulna",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "840",
+          "display": "United States of America (USA)"
+        }
+      ]
+    }
+  ],
+  "purpose": "Show example rule based mappings",
+  "copyright": "Creative Commons 0",
+  "sourceScopeCanonical": "http://snomed.info/sct?fhir_vs",
+  "group": [
+    {
+      "source": "http://snomed.info/sct",
+      "target": "http://hl7.org/fhir/sid/icd-10-cm",
+      "element": [
+        {
+          "code": "263204007",
+          "target": [
+            {
+              "code": "S52.209A",
+              "relationship": "source-is-broader-than-target",
+              "comment": "The target mapping to ICD-10-CM is \u0027source-is-broader-than-target\u0027, since additional patient data on the encounter (initial vs. subsequent) and fracture type is required for a valid ICD-10-CM mapping."
+            }
+          ]
+        },
+        {
+          "code": "263204007",
+          "target": [
+            {
+              "code": "S52.209D",
+              "relationship": "source-is-broader-than-target",
+              "comment": "The target mapping to ICD-10-CM is \u0027source-is-broader-than-target\u0027, since additional patient data on the encounter (initial vs. subsequent), fracture type and healing (for subsequent encounter) is required for a valid ICD-10-CM mapping."
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

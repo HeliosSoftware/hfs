@@ -1,0 +1,109 @@
+{
+  "resourceType": "TestPlan",
+  "id": "tx-example",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/TestPlan/testplan-tx-example",
+  "status": "draft",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "This is a subset of the full [terminology ecosystem tests](https://github.com/HL7/fhir-tx-ecosystem-ig/tree/main/tests)",
+  "scope": [
+    {
+      "reference": "http://hl7.org/fhir/uv/tx-ecosystem/ImplementationGuide/hl7.fhir.uv.tx-ecosystem"
+    }
+  ],
+  "runner": "https://github.com/hapifhir/org.hl7.fhir.core/blob/master/documentation/tx-runner.md",
+  "mode": [
+    {
+      "code": "general",
+      "description": "The tests a general purpose terminology server has to pass, but not codesystem specific terminology servers"
+    },
+    {
+      "code": "tx.fhir.org",
+      "description": "Tests that are only applicable for tx.fhir.org. Generally these are internal QA tests that haven\u0027t been made interopable (and don\u0027t need to be)"
+    }
+  ],
+  "suite": [
+    {
+      "name": "metadata",
+      "description": "These tests apply to all servers",
+      "test": [
+        {
+          "name": "metadata",
+          "description": "Check that the minimum expected things are found in the server CapabilityStatement",
+          "operation": "metadata",
+          "expected": [
+            {
+              "name": "response",
+              "file": "capstmt.json"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "simple-cases",
+      "description": "basic tests, setting up for the more complex API tests to come",
+      "mode": "general",
+      "input": [
+        {
+          "file": "simple/codesystem-simple.json"
+        },
+        {
+          "file": "simple/valueset-all.json"
+        }
+      ],
+      "test": [
+        {
+          "name": "simple-expand-all",
+          "description": "Expansion containing all the code system",
+          "operation": "expand",
+          "input": [
+            {
+              "name": "request",
+              "file": "simple/simple-expand-all-request-parameters.json"
+            }
+          ],
+          "expected": [
+            {
+              "name": "response",
+              "file": "simple/simple-expand-all-response-valueSet.json"
+            }
+          ]
+        },
+        {
+          "name": "simple-expand-isa-o2",
+          "description": "Expansion containing a filter on the code system using is-a relationship with paging (tx.fhir.org internal test)",
+          "operation": "expand",
+          "mode": "tx.fhir.org",
+          "input": [
+            {
+              "name": "request",
+              "file": "simple/simple-expand-isa-o2-request-parameters.json"
+            }
+          ],
+          "expected": [
+            {
+              "name": "response",
+              "file": "simple/simple-expand-isa-o2-response-valueSet.json"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

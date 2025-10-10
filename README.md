@@ -86,6 +86,7 @@ cd hfs
 cargo build --release
 
 # Or build with all FHIR versions
+<<<<<<< HEAD
 cargo build --release --features R4,R4B,R5,R6
 
 # Build all workspace members (including pysof)
@@ -93,6 +94,9 @@ cargo build --workspace --release
 
 # Build everything except Python bindings explicitly (alternative)
 cargo build --workspace --exclude pysof --release
+=======
+cargo build --release --all-features
+>>>>>>> eec3fd30ef9a95343f44b1b7a404b085cb5ce31d
 ```
 
 ## Try It Out
@@ -124,7 +128,7 @@ Generated from FHIR StructureDefinitions, type-safe Rust representations of all 
 - Supports FHIR R4, R4B, R5, and R6 via feature flags
 - JSON serialization/deserialization with full FHIR compliance
 - Precision decimal handling for clinical accuracy
-- Default: R4 (use `--features R4,R4B,R5,R6` for all versions)
+- Default: R4 (use `--all-features` for all versions)
 
 ### 2. [`helios-fhir-gen`](crates/fhir-gen) - Code Generator
 Generates the FHIR data models from official HL7 specifications.
@@ -247,7 +251,7 @@ cargo doc --no-deps --open
 cargo build
 
 # Build with all FHIR versions
-cargo build --features R4,R4B,R5,R6
+cargo build --all-features
 
 # Build specific component
 cargo build -p helios-fhirpath
@@ -276,7 +280,7 @@ cargo build --workspace --exclude pysof
 cargo test
 
 # Run tests for all FHIR versions
-cargo test --features R4,R4B,R5,R6
+cargo test --all-features
 
 # Run specific test
 cargo test test_name_pattern
@@ -289,9 +293,12 @@ cargo test -- --nocapture
 To regenerate FHIR models from HL7 specifications:
 ```bash
 # This will download the latest R6 (build) specifications from https://build.fhir.org/
-cargo build -p helios-fhir-gen --all-features
+# Note the lack of use of --all-features and the lack of skip-r6-download here.
+cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
 # This will generate all FHIR code models (r4.rs, r4b.rs, r5, and r6) 
 ./target/debug/helios-fhir-gen --all
+# Format the generated files accordingly
+cargo fmt --all 
 ```
 
 # Contributing

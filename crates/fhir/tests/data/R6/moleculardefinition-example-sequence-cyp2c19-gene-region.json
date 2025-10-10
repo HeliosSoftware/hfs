@@ -1,0 +1,48 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-cyp2c19-gene-region",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "extracted": {
+        "startingMolecule": {
+          "reference": "MolecularDefinition/example-sequence-cyp2c19-accession",
+          "type": "MolecularDefinition",
+          "display": "Homo sapiens cytochrome P450 family 2 subfamily C member 19 (CYP2C19), RefSeqGene (LRG_584) on chromosome 10"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30100-4",
+                  "display": "0-based interval counting"
+                }
+              ],
+              "text": "0-based interval counting"
+            }
+          }
+        },
+        "reverseComplement": false
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

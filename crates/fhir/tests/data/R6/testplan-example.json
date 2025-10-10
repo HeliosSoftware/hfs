@@ -1,0 +1,64 @@
+{
+  "resourceType": "TestPlan",
+  "id": "example",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/TestPlan/testplan-example",
+  "identifier": [
+    {
+      "system": "urn:oid:0.1.2.3.4.5.6.7",
+      "value": "1234"
+    }
+  ],
+  "status": "draft",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "This test plan describes a manual test that a given observation can be read from the server using POSTMan. The user is instructed in the documentation to perform a POSTMan get with the $id in the URL and the Accept header, and compare with the expected output.",
+  "scope": [
+    {
+      "reference": "http://hl7.org/fhir/StructureDefinition/Observation"
+    }
+  ],
+  "runner": "http://example.org/testing/my-manual-runner",
+  "suite": [
+    {
+      "name": "Basic Observation Handling",
+      "test": [
+        {
+          "name": "obs-read",
+          "description": "Read a JSON formatted Observation",
+          "operation": "postman/GET",
+          "parameter": [
+            {
+              "name": "$id",
+              "valueString": "123124"
+            },
+            {
+              "name": "Accept",
+              "valueString": "application/fhir+json"
+            }
+          ],
+          "expected": [
+            {
+              "name": "response",
+              "file": "response1.json"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

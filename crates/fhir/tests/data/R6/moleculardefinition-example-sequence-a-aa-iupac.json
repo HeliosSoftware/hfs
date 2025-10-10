@@ -1,0 +1,37 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-a-aa-iupac",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "aa",
+        "display": "AA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "literal": {
+        "encoding": {
+          "coding": [
+            {
+              "code": "aa-1-noamb-20common",
+              "display": "Amino acid, 1 letter, no ambiguity, 20 common"
+            }
+          ]
+        },
+        "value": "A"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

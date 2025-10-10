@@ -1,0 +1,82 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "detectedissue-management-code",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem detectedissue-management-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"detectedissue-management-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdetectedissue-management-code\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/detectedissue-management-code\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eintervention-required\u003ca name\u003d\"detectedissue-management-code-intervention-required\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProfessional Intervention Required\u003c/td\u003e\u003ctd\u003eIndicates the issue requires professional intervention.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ereview-suggested\u003ca name\u003d\"detectedissue-management-code-review-suggested\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProfessional Review Suggested\u003c/td\u003e\u003ctd\u003eIndicates professional review of the issue is suggested.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epotential-risk\u003ca name\u003d\"detectedissue-management-code-potential-risk\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePotential Risk\u003c/td\u003e\u003ctd\u003eIndicates the issue represents a potential risk.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/detectedissue-management-code",
+  "version": "6.0.0-ballot3",
+  "name": "DetectedIssueManagementCode",
+  "title": "Detected Issue Management Code",
+  "status": "active",
+  "experimental": true,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Example code system illustrating the type action (management) required.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/detectedissue-management-code",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "intervention-required",
+      "display": "Professional Intervention Required",
+      "definition": "Indicates the issue requires professional intervention."
+    },
+    {
+      "code": "review-suggested",
+      "display": "Professional Review Suggested",
+      "definition": "Indicates professional review of the issue is suggested."
+    },
+    {
+      "code": "potential-risk",
+      "display": "Potential Risk",
+      "definition": "Indicates the issue represents a potential risk."
+    }
+  ]
+}

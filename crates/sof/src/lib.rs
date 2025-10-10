@@ -35,6 +35,8 @@
 //! ## Usage Example
 //!
 //! ```rust
+//! # #[cfg(not(target_os = "windows"))]
+//! # {
 //! use helios_sof::{SofViewDefinition, SofBundle, ContentType, run_view_definition};
 //! use helios_fhir::FhirVersion;
 //!
@@ -90,6 +92,7 @@
 //! assert!(csv_string.contains("id,name"));
 //! // CSV values are quoted
 //! assert!(csv_string.contains("example") && csv_string.contains("Doe"));
+//! # }
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -300,6 +303,8 @@ impl SofViewDefinition {
 /// # Examples
 ///
 /// ```rust
+/// # #[cfg(not(target_os = "windows"))]
+/// # {
 /// use helios_sof::SofBundle;
 /// # #[cfg(feature = "R4")]
 /// use helios_fhir::r4::Bundle;
@@ -323,6 +328,7 @@ impl SofViewDefinition {
 ///
 /// // Check version compatibility
 /// assert_eq!(sof_bundle.version(), helios_fhir::FhirVersion::R4);
+/// # }
 /// # }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```

@@ -1,0 +1,88 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "eligibility",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem eligibility\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"eligibility\"\u003e \u003c/a\u003e\u003ca name\u003d\"hceligibility\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/eligibility\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eveterans\u003ca name\u003d\"eligibility-veterans\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eVeterans\u003c/td\u003e\u003ctd\u003eOnly Veterans are eligible to receive services associated with this code\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epediatric-patients\u003ca name\u003d\"eligibility-pediatric-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePediatric patients\u003c/td\u003e\u003ctd\u003ePediatric Patients\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eexisting-patients\u003ca name\u003d\"eligibility-existing-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExisting Patients\u003c/td\u003e\u003ctd\u003eExisting Patients\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enew-patients\u003ca name\u003d\"eligibility-new-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNew patients\u003c/td\u003e\u003ctd\u003eNew patients\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003elow-income-patients\u003ca name\u003d\"eligibility-low-income-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLow-income patients\u003c/td\u003e\u003ctd\u003eLow-income patients\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003euninsured-patients\u003ca name\u003d\"eligibility-uninsured-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUninsured patients\u003c/td\u003e\u003ctd\u003eUninsured patients\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erenal-patients\u003ca name\u003d\"eligibility-renal-patients\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRenal patients\u003c/td\u003e\u003ctd\u003eRenal patients (e.g., for dialysis services)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003especialist-referral-required\u003ca name\u003d\"eligibility-specialist-referral-required\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSpecialist referral required\u003c/td\u003e\u003ctd\u003eA specific specialist referral is required to receive services associated with this code\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eassessment-required\u003ca name\u003d\"eligibility-assessment-required\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAssessment required\u003c/td\u003e\u003ctd\u003eAn assessment is required to receive services associated with this code\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pa"
+    }
+  ],
+  "url": "http://hl7.org/fhir/eligibility",
+  "version": "6.0.0-ballot3",
+  "name": "Eligibility",
+  "title": "Eligibility Characteristics",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International",
+  "description": "Example set of HealthcareService eligibility codes",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "content": "complete",
+  "concept": [
+    {
+      "code": "veterans",
+      "display": "Veterans",
+      "definition": "Only Veterans are eligible to receive services associated with this code"
+    },
+    {
+      "code": "pediatric-patients",
+      "display": "Pediatric patients",
+      "definition": "Pediatric Patients"
+    },
+    {
+      "code": "existing-patients",
+      "display": "Existing Patients",
+      "definition": "Existing Patients"
+    },
+    {
+      "code": "new-patients",
+      "display": "New patients",
+      "definition": "New patients"
+    },
+    {
+      "code": "low-income-patients",
+      "display": "Low-income patients",
+      "definition": "Low-income patients"
+    },
+    {
+      "code": "uninsured-patients",
+      "display": "Uninsured patients",
+      "definition": "Uninsured patients"
+    },
+    {
+      "code": "renal-patients",
+      "display": "Renal patients",
+      "definition": "Renal patients (e.g., for dialysis services)"
+    },
+    {
+      "code": "specialist-referral-required",
+      "display": "Specialist referral required",
+      "definition": "A specific specialist referral is required to receive services associated with this code"
+    },
+    {
+      "code": "assessment-required",
+      "display": "Assessment required",
+      "definition": "An assessment is required to receive services associated with this code"
+    }
+  ]
+}

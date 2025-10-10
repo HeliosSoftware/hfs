@@ -25,7 +25,7 @@ authors = [
     {name = "Helios Team", email = "team@heliossoftware.com"},
 ]
 license = {text = "MIT"}
-project-urls = { Homepage = "https://github.com/helios/hfs", Repository = "https://github.com/helios/hfs", Documentation = "https://github.com/helios/hfs/tree/main/crates/pysof", "Bug Tracker" = "https://github.com/helios/hfs/issues" }
+project-urls = { Homepage = "https://github.com/HeliosSoftware/hfs", Repository = "https://github.com/HeliosSoftware/hfs", Documentation = "https://github.com/HeliosSoftware/hfs/tree/main/crates/pysof", "Bug Tracker" = "https://github.com/HeliosSoftware/hfs/issues" }
 
 [dependency-groups]
 dev = [

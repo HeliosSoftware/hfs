@@ -1,0 +1,458 @@
+{
+  "resourceType": "NutritionProduct",
+  "id": "example-apples",
+  "code": {
+    "coding": [
+      {
+        "system": "https://fdc.nal.usda.gov/",
+        "code": "1750340",
+        "display": "Apples, fuji, with skin, raw"
+      }
+    ],
+    "text": "Apples, fuji, with skin, raw"
+  },
+  "status": "active",
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "https://fdc.nal.usda.gov/",
+          "code": "0900",
+          "display": "Fruits and Fruit Juices"
+        }
+      ],
+      "text": "Fruits and Fruit Juices"
+    }
+  ],
+  "nutrient": [
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1051",
+              "display": "Water"
+            }
+          ],
+          "text": "Water"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "2047",
+              "display": "Energy (Atwater General Factors)"
+            }
+          ],
+          "text": "Energy (Atwater General Factors)"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "2048",
+              "display": "Energy (Atwater Specific Factors)"
+            }
+          ],
+          "text": "Energy (Atwater Specific Factors)"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1002",
+              "display": "Nitrogen"
+            }
+          ],
+          "text": "Nitrogen"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1003",
+              "display": "Protein"
+            }
+          ],
+          "text": "Protein"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1004",
+              "display": "Total lipid (fat)"
+            }
+          ],
+          "text": "Total lipid (fat)"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1007",
+              "display": "Ash"
+            }
+          ],
+          "text": "Ash"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1005",
+              "display": "Carbohydrate, by difference"
+            }
+          ],
+          "text": "Carbohydrate, by difference"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1050",
+              "display": "Carbohydrate, by summation"
+            }
+          ],
+          "text": "Carbohydrate, by summation"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1079",
+              "display": "Fiber, total dietary"
+            }
+          ],
+          "text": "Fiber, total dietary"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1063",
+              "display": "Sugars, Total"
+            }
+          ],
+          "text": "Sugars, Total"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "2000",
+              "display": "Sugars, total including NLEA"
+            }
+          ],
+          "text": "Sugars, total including NLEA"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1010",
+              "display": "Sucrose"
+            }
+          ],
+          "text": "Sucrose"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1011",
+              "display": "Glucose"
+            }
+          ],
+          "text": "Glucose"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1012",
+              "display": "Fructose"
+            }
+          ],
+          "text": "Fructose"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1013",
+              "display": "Lactose"
+            }
+          ],
+          "text": "Lactose"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1014",
+              "display": "Maltose"
+            }
+          ],
+          "text": "Maltose"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1087",
+              "display": "Calcium, Ca"
+            }
+          ],
+          "text": "Calcium, Ca"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1089",
+              "display": "Iron, Fe"
+            }
+          ],
+          "text": "Iron, Fe"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1090",
+              "display": "Magnesium, Mg"
+            }
+          ],
+          "text": "Magnesium, Mg"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1091",
+              "display": "Phosphorus, P"
+            }
+          ],
+          "text": "Phosphorus, P"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1092",
+              "display": "Potassium, K"
+            }
+          ],
+          "text": "Potassium, K"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1093",
+              "display": "Sodium, Na"
+            }
+          ],
+          "text": "Sodium, Na"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1095",
+              "display": "Zinc, Zn"
+            }
+          ],
+          "text": "Zinc, Zn"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1098",
+              "display": "Copper, Cu"
+            }
+          ],
+          "text": "Copper, Cu"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1101",
+              "display": "Manganese, Mn"
+            }
+          ],
+          "text": "Manganese, Mn"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1165",
+              "display": "Thiamin"
+            }
+          ],
+          "text": "Thiamin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1166",
+              "display": "Riboflavin"
+            }
+          ],
+          "text": "Riboflavin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1167",
+              "display": "Niacin"
+            }
+          ],
+          "text": "Niacin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1175",
+              "display": "Vitamin B-6"
+            }
+          ],
+          "text": "Vitamin B-6"
+        }
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

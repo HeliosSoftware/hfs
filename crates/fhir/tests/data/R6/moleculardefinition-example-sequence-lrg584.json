@@ -1,0 +1,29 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-lrg584",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "resolvable": {
+        "reference": "DocumentReference/example-genomicFile-ng0083843"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

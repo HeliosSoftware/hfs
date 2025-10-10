@@ -1,0 +1,94 @@
+{
+  "resourceType": "ValueSet",
+  "id": "care-plan-activity-performed",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet care-plan-activity-performed\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"care-plan-activity-performed\"\u003e \u003c/a\u003e\u003ca name\u003d\"hccare-plan-activity-performed\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://www.snomed.org/\"\u003e\u003ccode\u003ehttp://snomed.info/sct\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/238165008\"\u003e238165008\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eAbdominal wall hernia procedure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/11816003\"\u003e11816003\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eDiet education\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/967006\"\u003e967006\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eMedication education\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/6397004\"\u003e6397004\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eMuscular strength development exercise\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/367336001\"\u003e367336001\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eChemotherapy\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/1148817001\"\u003e1148817001\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eAssessment of barriers in housing insecurity care plan\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/185468001\"\u003e185468001\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003eHome visit for chronic condition (procedure)\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pc"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "draft"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/care-plan-activity-performed",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.3.3000"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "CarePlanActivityPerformed",
+  "title": "Care Plan Activity Performed",
+  "status": "draft",
+  "experimental": false,
+  "publisher": "HL7 International - Patient Care WG",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/patientcare/"
+        }
+      ]
+    }
+  ],
+  "description": "Example codes indicating the care plan activity that was performed. Note that these are in no way complete and might not even be appropriate for some uses.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "This resource includes content from SNOMED Clinical Terms® (SNOMED CT®) which is copyright of the International Health Terminology Standards Development Organisation (IHTSDO). Implementers of these specifications must have the appropriate SNOMED CT Affiliate license - for more information contact http://www.snomed.org/snomed-ct/get-snomed-ct or info@snomed.org",
+  "compose": {
+    "include": [
+      {
+        "system": "http://snomed.info/sct",
+        "concept": [
+          {
+            "code": "238165008"
+          },
+          {
+            "code": "11816003"
+          },
+          {
+            "code": "967006"
+          },
+          {
+            "code": "6397004"
+          },
+          {
+            "code": "367336001"
+          },
+          {
+            "code": "1148817001"
+          },
+          {
+            "code": "185468001"
+          }
+        ]
+      }
+    ]
+  }
+}

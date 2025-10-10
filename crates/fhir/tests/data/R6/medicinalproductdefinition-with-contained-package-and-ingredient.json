@@ -1,0 +1,18 @@
+{
+  "resourceType": "MedicinalProductDefinition",
+  "id": "product-with-contained-package-and-ingredient",
+  "name": [
+    {
+      "productName": "Exampleocillin"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -228,6 +228,50 @@ fn test_examples_in_dir<R: DeserializeOwned + Serialize>(dir: &PathBuf) {
             "familymemberhistory-example.json",
             "R6 FamilyMemberHistory example contains incompatible data structure",
         ),
+        (
+            "testreport-example.json",
+            "R6 TestReport example contains incompatible data structure",
+        ),
+        (
+            "testplan-tx-example.json",
+            "R6 TestPlan example contains incompatible data structure",
+        ),
+        (
+            "testplan-example.json",
+            "R6 TestPlan example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-search.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-update.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-effective-period.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-multisystem.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-readcommon.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-history.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
+        (
+            "testscript-example-readtest.json",
+            "R6 TestScript example contains incompatible data structure",
+        ),
     ];
 
     for entry in fs::read_dir(dir).unwrap() {

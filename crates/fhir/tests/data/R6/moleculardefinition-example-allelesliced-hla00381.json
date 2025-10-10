@@ -1,0 +1,76 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-allelesliced-hla00381",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "location": [
+    {
+      "sequenceLocation": {
+        "sequenceContext": {
+          "reference": "MolecularDefinition/example-sequence-af1961831-url",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: Homo sapiens MHC class I antigen (HLA-B) gene"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30102-0",
+                  "display": "1-based character counting"
+                }
+              ],
+              "text": "1-based character counting"
+            }
+          },
+          "startQuantity": {
+            "value": 1
+          },
+          "endQuantity": {
+            "value": 920
+          }
+        }
+      }
+    }
+  ],
+  "representation": [
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "allele-state",
+            "display": "Allele State"
+          }
+        ]
+      },
+      "code": [
+        {
+          "coding": [
+            {
+              "system": "https://www.ebi.ac.uk/ipd/imgt/hla/alleles/allele/",
+              "code": "HLA00381",
+              "display": "B*57:01:01:01"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

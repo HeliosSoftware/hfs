@@ -1,0 +1,48 @@
+{
+  "resourceType": "EventDefinition",
+  "id": "example",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    }
+  ],
+  "status": "draft",
+  "publisher": "HL7 International / Clinical Decision Support",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/dss"
+        }
+      ]
+    }
+  ],
+  "purpose": "Monitor all admissions to Emergency",
+  "trigger": [
+    {
+      "type": "named-event",
+      "name": "monitor-emergency-admissions",
+      "data": [
+        {
+          "type": "Encounter"
+        }
+      ],
+      "condition": {
+        "description": "Encounter Location \u003d emergency (active/completed encounters, current or previous)",
+        "language": "text/fhirpath",
+        "expression": "(%current | %previous).location.where(location \u003d \u0027Location/emergency\u0027 and status in {\u0027active\u0027, \u0027completed\u0027}).exists()"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

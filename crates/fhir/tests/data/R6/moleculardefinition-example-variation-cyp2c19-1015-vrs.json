@@ -1,0 +1,81 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-variation-cyp2c19-1015-vrs",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "location": [
+    {
+      "sequenceLocation": {
+        "sequenceContext": {
+          "reference": "MolecularDefinition/example-sequence-nm0007694-url",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: (CYP2C19), mRNA, NM_000769.4"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30100-4",
+                  "display": "0-based interval counting"
+                }
+              ],
+              "text": "0-based interval counting"
+            }
+          },
+          "startQuantity": {
+            "value": 1015
+          },
+          "endQuantity": {
+            "value": 1016
+          }
+        }
+      }
+    }
+  ],
+  "representation": [
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "reference-state",
+            "display": "Reference State"
+          }
+        ]
+      },
+      "literal": {
+        "value": "A"
+      }
+    },
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "alternative-state",
+            "display": "Alternative State"
+          }
+        ]
+      },
+      "literal": {
+        "value": "G"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

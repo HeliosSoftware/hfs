@@ -1,0 +1,148 @@
+{
+  "resourceType": "TestScript",
+  "id": "testscript-example-effective-period",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/artifact-effectivePeriod",
+      "valuePeriod": {
+        "start": "2019-10-30"
+      }
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/TestScript/testscript-example-effective-period",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.12.9"
+    }
+  ],
+  "version": "1.0",
+  "name": "TestScript Example Effective Period Test",
+  "status": "draft",
+  "experimental": true,
+  "date": "2025-07-29",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "TestScript example resource the demonstrates the use of the artifact-effectivePeriod extenstion. There is a single test for a Patient read operation. The effective period range represents the period of use for the FHIR R4 v4.0.1 specification starting from its release date on Oct 30, 2019 with no expiration.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "urn:iso:std:iso:3166",
+          "code": "US",
+          "display": "United States of America"
+        }
+      ]
+    }
+  ],
+  "purpose": "Demonstrate use of artifact-effectivePeriod extension",
+  "copyright": "© HL7.org 2011+",
+  "metadata": {
+    "link": [
+      {
+        "url": "http://hl7.org/fhir/patient.html",
+        "description": "Demographics and other administrative information about an individual or animal receiving care or other health-related services."
+      }
+    ],
+    "capability": [
+      {
+        "required": true,
+        "validated": false,
+        "description": "Patient Read Operation",
+        "link": [
+          "http://hl7.org/fhir/http.html#read"
+        ],
+        "capabilities": "http://hl7.org/fhir/CapabilityStatement/example"
+      }
+    ]
+  },
+  "scope": [
+    {
+      "artifact": "http://hl7.org/fhir/StructureDefinition/Patient",
+      "conformance": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/testscript-scope-conformance-codes",
+            "code": "optional"
+          }
+        ]
+      },
+      "phase": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/testscript-scope-phase-codes",
+            "code": "unit"
+          }
+        ]
+      }
+    }
+  ],
+  "profile": [
+    "http://hl7.org/fhir/StructureDefinition/Patient"
+  ],
+  "variable": [
+    {
+      "name": "KnownPatientResourceId",
+      "defaultValue": "example"
+    }
+  ],
+  "test": [
+    {
+      "id": "PatientRead",
+      "name": "Patient Read Test",
+      "description": "Read a known Patient and validate response.",
+      "action": [
+        {
+          "operation": {
+            "type": {
+              "system": "http://hl7.org/fhir/restful-interaction",
+              "code": "read"
+            },
+            "resource": "Patient",
+            "description": "Read the known Patient resource on the destination test system using the user defined dynamic variable ${KnownPatientResourceId}.",
+            "accept": "xml",
+            "encodeRequestUrl": true,
+            "params": "/${KnownPatientResourceId}"
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned HTTP status is 200(OK).",
+            "response": "okay",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned format is XML.",
+            "contentType": "xml",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned Patient conforms to the base FHIR specification.",
+            "stopTestOnFail": false,
+            "validateProfileId": "patient-profile",
+            "warningOnly": false
+          }
+        }
+      ]
+    }
+  ]
+}

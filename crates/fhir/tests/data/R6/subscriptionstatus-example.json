@@ -1,0 +1,25 @@
+{
+  "resourceType": "SubscriptionStatus",
+  "id": "example",
+  "status": "active",
+  "type": "event-notification",
+  "eventsSinceSubscriptionStart": "1000",
+  "notificationEvent": [
+    {
+      "eventNumber": "1000"
+    }
+  ],
+  "subscription": {
+    "reference": "http://example.org/FHIR/R5/Subscription/123"
+  },
+  "topic": "http://example.org/FHIR/R5/SubscriptionTopic/admission",
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

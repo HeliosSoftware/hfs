@@ -1,0 +1,79 @@
+{
+  "resourceType": "ValueSet",
+  "id": "observation-vitalsign-resprate",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet observation-vitalsign-resprate\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"observation-vitalsign-resprate\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcobservation-vitalsign-resprate\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude codes from\u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e where COMPONENT  in LP72199-0,LP309823-5, PROPERTY  \u003d LP6839-7 (NRat), TIME_ASPCT  \u003d LP6960-1 (Pt) and SCALE_TYP  \u003d LP7753-9 (Qn)\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/observation-vitalsign-resprate",
+  "version": "6.0.0-ballot3",
+  "name": "VitalSignsRespRate",
+  "title": "Vital Signs - Respiratory Rate",
+  "status": "active",
+  "experimental": false,
+  "publisher": "FHIR project team",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        }
+      ]
+    }
+  ],
+  "description": "This value set defines the set of LOINC codes considered to be appropriate for representing respiratory rate vital sign measurements in Observation.code.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "This content from LOINC® is copyright © 1995 Regenstrief Institute, Inc. and the LOINC Committee, and available at no cost under the license at http://loinc.org/terms-of-use",
+  "compose": {
+    "include": [
+      {
+        "system": "http://loinc.org",
+        "filter": [
+          {
+            "property": "COMPONENT",
+            "op": "in",
+            "value": "LP72199-0,LP309823-5"
+          },
+          {
+            "property": "PROPERTY",
+            "op": "\u003d",
+            "value": "LP6839-7"
+          },
+          {
+            "property": "TIME_ASPCT",
+            "op": "\u003d",
+            "value": "LP6960-1"
+          },
+          {
+            "property": "SCALE_TYP",
+            "op": "\u003d",
+            "value": "LP7753-9"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "resourceType": "SubstanceDefinition",
+  "id": "example",
+  "identifier": [
+    {
+      "system": "http://example.europa.eu/fhir/SMSId",
+      "value": "100000099270"
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Status",
+        "code": "200000005004",
+        "display": "Current"
+      }
+    ]
+  },
+  "classification": [
+    {
+      "coding": [
+        {
+          "system": "http://example.europa.eu/fhir/SubstanceType",
+          "code": "100000075670",
+          "display": "Chemical"
+        }
+      ]
+    }
+  ],
+  "domain": {
+    "coding": [
+      {
+        "system": "http://example.europa.eu/fhir/Domain",
+        "code": "100000000012",
+        "display": "Human use"
+      }
+    ]
+  },
+  "code": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Substance",
+            "code": "SUB99611MIG"
+          }
+        ]
+      }
+    }
+  ],
+  "name": [
+    {
+      "name": "PARACETAMOL",
+      "status": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Status",
+            "code": "200000005004",
+            "display": "Current"
+          }
+        ]
+      },
+      "preferred": true,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ПАРАЦЕТАМОЛ",
+      "status": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Status",
+            "code": "200000005004",
+            "display": "Current"
+          }
+        ]
+      },
+      "preferred": false,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "bg",
+              "display": "Bulgarian"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ACETAMINOPHEN",
+      "status": {
+        "coding": [
+          {
+            "system": "http://example.europa.eu/fhir/Status",
+            "code": "200000005004",
+            "display": "Current"
+          }
+        ]
+      },
+      "preferred": false,
+      "language": [
+        {
+          "coding": [
+            {
+              "system": "urn:ietf:bcp:47",
+              "code": "en",
+              "display": "English"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

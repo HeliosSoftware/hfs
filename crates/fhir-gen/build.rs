@@ -16,9 +16,10 @@ fn main() {
     // Skip R6 download if skip-r6-download feature is enabled or DOCS_RS env var is set
     // This allows docs.rs builds to succeed using the checked-in R6 resources
     if cfg!(feature = "skip-r6-download") || std::env::var("DOCS_RS").is_ok() {
-        println!("cargo:warning=Skipping R6 download (using checked-in resources)");
         return;
     }
+
+    println!("cargo:warning=Downloading R6 definitions from HL7 build server");
 
     let resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/R6");
 

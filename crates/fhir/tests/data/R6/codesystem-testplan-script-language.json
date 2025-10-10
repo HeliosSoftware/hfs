@@ -1,0 +1,82 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "testplan-script-language",
+  "meta": {
+    "lastUpdated": "2025-08-13T21:13:52.915+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem testplan-script-language\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"testplan-script-language\"\u003e \u003c/a\u003e\u003ca name\u003d\"hctestplan-script-language\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/testplan-script-language\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003egherkin\u003ca name\u003d\"testplan-script-language-gherkin\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGherkin\u003c/td\u003e\u003ctd\u003eThe Gherkin test script language.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epostman\u003ca name\u003d\"testplan-script-language-postman\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePostman\u003c/td\u003e\u003ctd\u003eThe Postman test script language.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003etestscript\u003ca name\u003d\"testplan-script-language-testscript\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFHIR TestScript\u003c/td\u003e\u003ctd\u003eThe FHIR TestScript resource.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/testplan-script-language",
+  "version": "6.0.0-ballot2",
+  "name": "TestPlanScriptLanguage",
+  "title": "TestPlanScriptLanguage",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-02-24T10:56:24+04:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The TestPlan test run script language.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/testplan-script-language",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "gherkin",
+      "display": "Gherkin",
+      "definition": "The Gherkin test script language."
+    },
+    {
+      "code": "postman",
+      "display": "Postman",
+      "definition": "The Postman test script language."
+    },
+    {
+      "code": "testscript",
+      "display": "FHIR TestScript",
+      "definition": "The FHIR TestScript resource."
+    }
+  ]
+}

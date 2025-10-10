@@ -1,0 +1,273 @@
+{
+  "resourceType": "CapabilityStatement",
+  "id": "example-terminology-server",
+  "text": {
+    "status": "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: CapabilityStatement example-terminology-server\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"example-terminology-server\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hcexample-terminology-server\"\u003e \u003c/a\u003e\n      \u003ch2 id\u003d\"title\"\u003eACME Terminology Service — Capability Statement\u003c/h2\u003e\n      \u003cul\u003e\n        \u003cli\u003eImplementation Guide Version: 6.0.0-ballot3 \u003c/li\u003e\n        \u003cli\u003eFHIR Version: 6.0.0-ballot3 \u003c/li\u003e\n        \u003cli\u003eSupported Formats: \n          \u003ccode\u003ejson\u003c/code\u003e, \n          \u003ccode\u003exml\u003c/code\u003e\n        \u003c/li\u003e\n        \u003cli\u003ePublished on: 2022-09-01 \u003c/li\u003e\n        \u003cli\u003ePublished by: HL7 International / FHIR Infrastructure \u003c/li\u003e\n      \u003c/ul\u003e\n      \u003cblockquote class\u003d\"impl-note\"\u003e\n        \u003cp\u003e\n          \u003cstrong\u003eNote to Implementers: FHIR Capabilities\u003c/strong\u003e\n        \u003c/p\u003e\n        \u003cp\u003eAny FHIR capability may be \u0027allowed\u0027 by the system unless explicitly marked as \u0027SHALL NOT\u0027. A few items are marked as MAY in the Implementation Guide to highlight their potential relevance to the use case.\u003c/p\u003e\n      \u003c/blockquote\u003e\n      \u003ch2 id\u003d\"rest\"\u003eFHIR RESTful Capabilities\u003c/h2\u003e\n      \u003cdiv class\u003d\"panel panel-default\"\u003e\n        \u003cdiv class\u003d\"panel-heading\"\u003e\n          \u003ch3 id\u003d\"mode1\" class\u003d\"panel-title\"\u003eMode: \n            \u003ccode\u003eserver\u003c/code\u003e\n          \u003c/h3\u003e\n        \u003c/div\u003e\n        \u003cdiv class\u003d\"panel-body\"/\u003e\n      \u003c/div\u003e\n      \u003ch3 id\u003d\"resourcesCap1\"\u003eCapabilities by Resource/Profile\u003c/h3\u003e\n      \u003ch4 id\u003d\"resourcesSummary1\"\u003eSummary\u003c/h4\u003e\n      \u003cp\u003eThe summary table lists the resources that are part of this configuration, and for each resource it lists:\u003c/p\u003e\n      \u003cul\u003e\n        \u003cli\u003eThe relevant profiles (if any)\u003c/li\u003e\n        \u003cli\u003eThe interactions supported by each resource (\n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eR\u003c/span\u003e\n          \u003c/b\u003eead, \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eS\u003c/span\u003e\n          \u003c/b\u003eearch, \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eU\u003c/span\u003e\n          \u003c/b\u003epdate, and \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eC\u003c/span\u003e\n          \u003c/b\u003ereate, are always shown, while \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eVR\u003c/span\u003e\n          \u003c/b\u003eead, \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eP\u003c/span\u003e\n          \u003c/b\u003eatch, \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eD\u003c/span\u003e\n          \u003c/b\u003eelete, \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eH\u003c/span\u003e\n          \u003c/b\u003eistory on \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eI\u003c/span\u003e\n          \u003c/b\u003enstance, or \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eH\u003c/span\u003e\n          \u003c/b\u003eistory on \n          \u003cb\u003e\n            \u003cspan class\u003d\"bg-info\"\u003eT\u003c/span\u003e\n          \u003c/b\u003eype are only present if at least one of the resources has support for them.\n        \u003c/li\u003e\n        \u003cli\u003e\n          \u003cspan\u003eThe required, recommended, and some optional search parameters (if any). \u003c/span\u003e\n        \u003c/li\u003e\n        \u003cli\u003eThe linked resources enabled for \n          \u003ccode\u003e_include\u003c/code\u003e\n        \u003c/li\u003e\n        \u003cli\u003eThe other resources enabled for \n          \u003ccode\u003e_revinclude\u003c/code\u003e\n        \u003c/li\u003e\n        \u003cli\u003eThe operations on the resource (if any)\u003c/li\u003e\n      \u003c/ul\u003e\n      \u003cdiv class\u003d\"table-responsive\"\u003e\n        \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n          \u003cthead\u003e\n            \u003ctr\u003e\n              \u003cth\u003e\n                \u003cb\u003eResource Type\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth\u003e\n                \u003cb\u003eProfile\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth class\u003d\"text-center\"\u003e\n                \u003cb title\u003d\"GET a resource (read interaction)\"\u003eR\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth class\u003d\"text-center\"\u003e\n                \u003cb title\u003d\"GET all set of resources of the type (search interaction)\"\u003eS\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth class\u003d\"text-center\"\u003e\n                \u003cb title\u003d\"PUT a new resource version (update interaction)\"\u003eU\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth class\u003d\"text-center\"\u003e\n                \u003cb title\u003d\"POST a new resource (create interaction)\"\u003eC\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth\u003e\n                \u003cb title\u003d\"Required and recommended search parameters\"\u003eSearches\u003c/b\u003e\n              \u003c/th\u003e\n              \u003cth\u003e\n                \u003ccode\u003e\n                  \u003cb\u003e_include\u003c/b\u003e\n                \u003c/code\u003e\n              \u003c/th\u003e\n              \u003cth\u003e\n                \u003ccode\u003e\n                  \u003cb\u003e_revinclude\u003c/b\u003e\n                \u003c/code\u003e\n              \u003c/th\u003e\n              \u003cth\u003e\n                \u003cb\u003eOperations\u003c/b\u003e\n              \u003c/th\u003e\n            \u003c/tr\u003e\n          \u003c/thead\u003e\n          \u003ctbody\u003e\n            \u003ctr\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"#CodeSystem1-1\"\u003eCodeSystem\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"codesystem.html\"\u003ehttp://hl7.org/fhir/StructureDefinition/CodeSystem\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd\u003eurl, version, name, title, status\u003c/td\u003e\n              \u003ctd/\u003e\n              \u003ctd/\u003e\n              \u003ctd\u003e\n                \u003ccode\u003e$expand\u003c/code\u003e, \n                \u003ccode\u003e$expand\u003c/code\u003e, \n                \u003ccode\u003e$expand\u003c/code\u003e\n              \u003c/td\u003e\n            \u003c/tr\u003e\n            \u003ctr\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"#ValueSet1-2\"\u003eValueSet\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"valueset.html\"\u003ehttp://hl7.org/fhir/StructureDefinition/ValueSet\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd\u003eurl, version, name, title, status\u003c/td\u003e\n              \u003ctd/\u003e\n              \u003ctd/\u003e\n              \u003ctd\u003e\n                \u003ccode\u003e$expand\u003c/code\u003e, \n                \u003ccode\u003e$expand\u003c/code\u003e\n              \u003c/td\u003e\n            \u003c/tr\u003e\n            \u003ctr\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"#ConceptMap1-3\"\u003eConceptMap\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003ca href\u003d\"conceptmap.html\"\u003ehttp://hl7.org/fhir/StructureDefinition/ConceptMap\u003c/a\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"\u003e\n                \u003cspan title\u003d\"SHALL\"\u003e\n                  \u003cb\u003eY\u003c/b\u003e\n                \u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd class\u003d\"text-center\"/\u003e\n              \u003ctd\u003eurl, version, name, title, status\u003c/td\u003e\n              \u003ctd/\u003e\n              \u003ctd/\u003e\n              \u003ctd\u003e\n                \u003ccode\u003e$expand\u003c/code\u003e\n              \u003c/td\u003e\n            \u003c/tr\u003e\n          \u003c/tbody\u003e\n        \u003c/table\u003e\n      \u003c/div\u003e\n      \u003chr/\u003e\n      \u003cdiv class\u003d\"panel panel-default\"\u003e\n        \u003cdiv class\u003d\"panel-heading\"\u003e\n          \u003ch4 id\u003d\"CodeSystem1-1\" class\u003d\"panel-title\"\u003e\n            \u003cspan style\u003d\"float: right;\"\u003eResource Conformance: SHALL \u003c/span\u003eCodeSystem\n          \u003c/h4\u003e\n        \u003c/div\u003e\n        \u003cdiv class\u003d\"panel-body\"\u003e\n          \u003cdiv class\u003d\"container\"\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eBase System Profile\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003ca href\u003d\"codesystem.html\"\u003eCodeSystem\u003c/a\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eProfile Conformance\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cb\u003eSHALL\u003c/b\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eReference Policy\u003c/span\u003e\n                \u003cbr/\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eInteraction summary\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cul\u003e\n                  \u003cli\u003e\n                    \u003cstrong\u003eSHALL\u003c/strong\u003e support \n                    \u003ccode\u003eread\u003c/code\u003e, \n                    \u003ccode\u003esearch-type\u003c/code\u003e.\n                  \u003c/li\u003e\n                \u003c/ul\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-7\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eSearch Parameters\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eParameter\u003c/th\u003e\n                      \u003cth\u003eType\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eurl\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003euri\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eversion\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003ename\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003etitle\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003estatus\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-5\"\u003e \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-12\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eExtended Operations\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eOperation\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ca href\u003d\"codesystem-operation-lookup.html\"\u003e$expand\u003c/a\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ca href\u003d\"codesystem-operation-validate-code.html\"\u003e$expand\u003c/a\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ca href\u003d\"codesystem-operation-subsumes.html\"\u003e$expand\u003c/a\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n          \u003c/div\u003e\n        \u003c/div\u003e\n      \u003c/div\u003e\n      \u003cdiv class\u003d\"panel panel-default\"\u003e\n        \u003cdiv class\u003d\"panel-heading\"\u003e\n          \u003ch4 id\u003d\"ValueSet1-2\" class\u003d\"panel-title\"\u003e\n            \u003cspan style\u003d\"float: right;\"\u003eResource Conformance: SHALL \u003c/span\u003eValueSet\n          \u003c/h4\u003e\n        \u003c/div\u003e\n        \u003cdiv class\u003d\"panel-body\"\u003e\n          \u003cdiv class\u003d\"container\"\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eBase System Profile\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003ca href\u003d\"valueset.html\"\u003eValueSet\u003c/a\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eProfile Conformance\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cb\u003eSHALL\u003c/b\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eReference Policy\u003c/span\u003e\n                \u003cbr/\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eInteraction summary\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cul\u003e\n                  \u003cli\u003e\n                    \u003cstrong\u003eSHALL\u003c/strong\u003e support \n                    \u003ccode\u003eread\u003c/code\u003e, \n                    \u003ccode\u003esearch-type\u003c/code\u003e.\n                  \u003c/li\u003e\n                \u003c/ul\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-7\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eSearch Parameters\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eParameter\u003c/th\u003e\n                      \u003cth\u003eType\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eurl\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003euri\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eversion\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003ename\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003etitle\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003estatus\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-5\"\u003e \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-12\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eExtended Operations\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eOperation\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ca href\u003d\"valueset-operation-expand.html\"\u003e$expand\u003c/a\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ca href\u003d\"valueset-operation-validate-code.html\"\u003e$expand\u003c/a\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n          \u003c/div\u003e\n        \u003c/div\u003e\n      \u003c/div\u003e\n      \u003cdiv class\u003d\"panel panel-default\"\u003e\n        \u003cdiv class\u003d\"panel-heading\"\u003e\n          \u003ch4 id\u003d\"ConceptMap1-3\" class\u003d\"panel-title\"\u003e\n            \u003cspan style\u003d\"float: right;\"\u003eResource Conformance: SHALL \u003c/span\u003eConceptMap\n          \u003c/h4\u003e\n        \u003c/div\u003e\n        \u003cdiv class\u003d\"panel-body\"\u003e\n          \u003cdiv class\u003d\"container\"\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eBase System Profile\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003ca href\u003d\"conceptmap.html\"\u003eConceptMap\u003c/a\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eProfile Conformance\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cb\u003eSHALL\u003c/b\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-3\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eReference Policy\u003c/span\u003e\n                \u003cbr/\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-6\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eInteraction summary\u003c/span\u003e\n                \u003cbr/\u003e\n                \u003cul\u003e\n                  \u003cli\u003e\n                    \u003cstrong\u003eSHALL\u003c/strong\u003e support \n                    \u003ccode\u003eread\u003c/code\u003e, \n                    \u003ccode\u003esearch-type\u003c/code\u003e.\n                  \u003c/li\u003e\n                \u003c/ul\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cp/\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-lg-7\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eSearch Parameters\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eParameter\u003c/th\u003e\n                      \u003cth\u003eType\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eurl\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003euri\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003eversion\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003ename\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003etitle\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003estring\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003estatus\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003ccode\u003etoken\u003c/code\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n              \u003cdiv class\u003d\"col-lg-5\"\u003e \u003c/div\u003e\n            \u003c/div\u003e\n            \u003cdiv class\u003d\"row\"\u003e\n              \u003cdiv class\u003d\"col-12\"\u003e\n                \u003cspan class\u003d\"lead\"\u003eExtended Operations\u003c/span\u003e\n                \u003ctable class\u003d\"table table-condensed table-hover\"\u003e\n                  \u003cthead\u003e\n                    \u003ctr\u003e\n                      \u003cth\u003eConformance\u003c/th\u003e\n                      \u003cth\u003eOperation\u003c/th\u003e\n                      \u003cth\u003eDocumentation\u003c/th\u003e\n                    \u003c/tr\u003e\n                  \u003c/thead\u003e\n                  \u003ctbody\u003e\n                    \u003ctr\u003e\n                      \u003ctd\u003e\n                        \u003cb\u003eSHALL\u003c/b\u003e\n                      \u003c/td\u003e\n                      \u003ctd\u003e$expand\u003c/td\u003e\n                      \u003ctd\u003e\n                        \u003cdiv/\u003e\n                      \u003c/td\u003e\n                    \u003c/tr\u003e\n                  \u003c/tbody\u003e\n                \u003c/table\u003e\n              \u003c/div\u003e\n            \u003c/div\u003e\n          \u003c/div\u003e\n        \u003c/div\u003e\n      \u003c/div\u003e\n    \u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/CapabilityStatement/terminology-server",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.34.6"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "ACMETerminologyServiceCapabilityStatement",
+  "title": "ACME Terminology Service — Capability Statement",
+  "status": "draft",
+  "date": "2022-09-01",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "Example capability statement for a Terminology Server. A server can support more fucntionality than defined here, but this is the minimum amount",
+  "kind": "instance",
+  "implementation": {
+    "description": "The ACME FHIR Terminology Server"
+  },
+  "fhirVersion": "6.0.0-ballot3",
+  "format": [
+    "json",
+    "xml"
+  ],
+  "rest": [
+    {
+      "mode": "server",
+      "resource": [
+        {
+          "type": "CodeSystem",
+          "profile": "http://hl7.org/fhir/StructureDefinition/CodeSystem",
+          "interaction": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "read"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "search-type"
+            }
+          ],
+          "searchParam": [
+            {
+              "name": "url",
+              "definition": "http://hl7.org/fhir/SearchParameter/CodeSystem-url",
+              "type": "uri"
+            },
+            {
+              "name": "version",
+              "definition": "http://hl7.org/fhir/SearchParameter/CodeSystem-version",
+              "type": "token"
+            },
+            {
+              "name": "name",
+              "definition": "http://hl7.org/fhir/SearchParameter/CodeSystem-name",
+              "type": "string"
+            },
+            {
+              "name": "title",
+              "definition": "http://hl7.org/fhir/SearchParameter/CodeSystem-title",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "definition": "http://hl7.org/fhir/SearchParameter/CodeSystem-status",
+              "type": "token"
+            }
+          ],
+          "operation": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-lookup"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-validate-code"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/CodeSystem-subsumes"
+            }
+          ]
+        },
+        {
+          "type": "ValueSet",
+          "profile": "http://hl7.org/fhir/StructureDefinition/ValueSet",
+          "interaction": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "read"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "search-type"
+            }
+          ],
+          "searchParam": [
+            {
+              "name": "url",
+              "definition": "http://hl7.org/fhir/SearchParameter/ValueSet-url",
+              "type": "uri"
+            },
+            {
+              "name": "version",
+              "definition": "http://hl7.org/fhir/SearchParameter/ValueSet-version",
+              "type": "token"
+            },
+            {
+              "name": "name",
+              "definition": "http://hl7.org/fhir/SearchParameter/ValueSet-name",
+              "type": "string"
+            },
+            {
+              "name": "title",
+              "definition": "http://hl7.org/fhir/SearchParameter/ValueSet-title",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "definition": "http://hl7.org/fhir/SearchParameter/ValueSet-status",
+              "type": "token"
+            }
+          ],
+          "operation": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-expand"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/ValueSet-validate-code"
+            }
+          ]
+        },
+        {
+          "type": "ConceptMap",
+          "profile": "http://hl7.org/fhir/StructureDefinition/ConceptMap",
+          "interaction": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "read"
+            },
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "code": "search-type"
+            }
+          ],
+          "searchParam": [
+            {
+              "name": "url",
+              "definition": "http://hl7.org/fhir/SearchParameter/ConceptMap-url",
+              "type": "uri"
+            },
+            {
+              "name": "version",
+              "definition": "http://hl7.org/fhir/SearchParameter/ConceptMap-version",
+              "type": "token"
+            },
+            {
+              "name": "name",
+              "definition": "http://hl7.org/fhir/SearchParameter/ConceptMap-name",
+              "type": "string"
+            },
+            {
+              "name": "title",
+              "definition": "http://hl7.org/fhir/SearchParameter/ConceptMap-title",
+              "type": "string"
+            },
+            {
+              "name": "status",
+              "definition": "http://hl7.org/fhir/SearchParameter/ConceptMap-status",
+              "type": "token"
+            }
+          ],
+          "operation": [
+            {
+              "extension": [
+                {
+                  "url": "http://hl7.org/fhir/StructureDefinition/capabilitystatement-expectation",
+                  "valueCode": "SHALL"
+                }
+              ],
+              "name": "expand",
+              "definition": "http://hl7.org/fhir/OperationDefinition/ConceptMap-translate"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

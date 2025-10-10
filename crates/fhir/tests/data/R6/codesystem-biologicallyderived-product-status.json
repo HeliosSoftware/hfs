@@ -1,0 +1,98 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "biologicallyderived-product-status",
+  "meta": {
+    "lastUpdated": "2025-10-10T05:25:56.447+11:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem biologicallyderived-product-status\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"biologicallyderived-product-status\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcbiologicallyderived-product-status\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2021-01-05T10:01:24.148+11:00\u003c/p\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/biologicallyderived-product-status\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eavailable\u003ca name\u003d\"biologicallyderived-product-status-available\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAvailable\u003c/td\u003e\u003ctd\u003eProduct is currently available for use.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eunavailable\u003ca name\u003d\"biologicallyderived-product-status-unavailable\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eUnavailable\u003c/td\u003e\u003ctd\u003eProduct is not currently available for use.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprocessed\u003ca name\u003d\"biologicallyderived-product-status-processed\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eProcessed\u003c/td\u003e\u003ctd\u003eThe biologically derived product has been further processed to one or more other products.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eapplied\u003ca name\u003d\"biologicallyderived-product-status-applied\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eApplied\u003c/td\u003e\u003ctd\u003eThe biologically derived product has been clinically applied.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ediscarded\u003ca name\u003d\"biologicallyderived-product-status-discarded\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDiscarded\u003c/td\u003e\u003ctd\u003eThe biologically derived product has been discarded.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "informative"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/biologicallyderived-product-status",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.1997"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "BiologicallyDerivedProductStatus",
+  "title": "Biologically Derived Product Status",
+  "status": "active",
+  "experimental": false,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Biologically Derived Product Status.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/biologicallyderived-product-status",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "available",
+      "display": "Available",
+      "definition": "Product is currently available for use."
+    },
+    {
+      "code": "unavailable",
+      "display": "Unavailable",
+      "definition": "Product is not currently available for use."
+    },
+    {
+      "code": "processed",
+      "display": "Processed",
+      "definition": "The biologically derived product has been further processed to one or more other products."
+    },
+    {
+      "code": "applied",
+      "display": "Applied",
+      "definition": "The biologically derived product has been clinically applied."
+    },
+    {
+      "code": "discarded",
+      "display": "Discarded",
+      "definition": "The biologically derived product has been discarded."
+    }
+  ]
+}

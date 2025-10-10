@@ -1,0 +1,63 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "device-property-type",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem device-property-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"device-property-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevice-property-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/device-property-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ematerial\u003ca name\u003d\"device-property-type-material\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMaterial\u003c/td\u003e\u003ctd\u003eDescribes the substance used in the construction of the device.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esize\u003ca name\u003d\"device-property-type-size\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSize\u003c/td\u003e\u003ctd\u003eDescribes the specific dimensions or the measurement of a device.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003estorage\u003ca name\u003d\"device-property-type-storage\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStorage Condition\u003c/td\u003e\u003ctd\u003eDescribes the specific environmental factors needed for the device.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecolor\u003ca name\u003d\"device-property-type-color\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eColor\u003c/td\u003e\u003ctd\u003eDescribes the range of colors that may be displayed or expressed on a device.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    }
+  ],
+  "url": "http://hl7.org/fhir/device-property-type",
+  "version": "6.0.0-ballot3",
+  "name": "DevicePropertyType",
+  "title": "Device Property Type (Example only)",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 Orders and Observations Workgroup",
+  "description": "The fixed characteristics or conditions of the device. These codes are for example purposes only.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "content": "complete",
+  "concept": [
+    {
+      "code": "material",
+      "display": "Material",
+      "definition": "Describes the substance used in the construction of the device."
+    },
+    {
+      "code": "size",
+      "display": "Size",
+      "definition": "Describes the specific dimensions or the measurement of a device."
+    },
+    {
+      "code": "storage",
+      "display": "Storage Condition",
+      "definition": "Describes the specific environmental factors needed for the device."
+    },
+    {
+      "code": "color",
+      "display": "Color",
+      "definition": "Describes the range of colors that may be displayed or expressed on a device."
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+{
+  "resourceType": "ImagingSelection",
+  "id": "example-3d-image-region-selection",
+  "identifier": [
+    {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.189914271934823329266024988586343.2.1"
+    }
+  ],
+  "status": "available",
+  "modality": {
+    "coding": [
+      {
+        "system": "http://dicom.nema.org/resources/ontology/DCM",
+        "code": "CT"
+      }
+    ]
+  },
+  "code": {
+    "text": "Region selected from multiframe CT volume"
+  },
+  "subject": {
+    "type": "Patient",
+    "identifier": {
+      "system": "https://fhirhospital.org",
+      "value": "PNWYPXNBXMPGMTWX"
+    }
+  },
+  "derivedFrom": {
+    "type": "ImagingStudy",
+    "identifier": {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.189914271956923329266024988586343"
+    }
+  },
+  "studyUid": "1.2.840.113747.20080222.189914271934870656966024988586343",
+  "seriesUid": "1.2.840.113747.20080222.189914271934870659266024988586343.1",
+  "seriesNumber": 1,
+  "frameOfReferenceUid": "1.2.840.113747.20080222.189914270656923329266024988586343.0",
+  "instance": [
+    {
+      "uid": "1.2.840.113747.20080222.189914271934870656923024988586343.1.0",
+      "sopClass": "urn:oid:1.2.840.10008.5.1.4.1.1.2.1"
+    }
+  ],
+  "imageRegion3D": [
+    {
+      "regionType": "ellipse",
+      "coordinate": [
+        -50.0,
+        -50.0,
+        -50.0,
+        50.0,
+        50.0,
+        50.0,
+        25.0,
+        -25.0,
+        0.0,
+        -25.0,
+        25.0,
+        0.0
+      ]
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

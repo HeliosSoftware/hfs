@@ -1,0 +1,92 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "task-reason",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem task-reason\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"task-reason\"\u003e \u003c/a\u003e\u003ca name\u003d\"hctask-reason\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/task-reason\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecancellation\u003ca name\u003d\"task-reason-cancellation\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCancellation\u003c/td\u003e\u003ctd\u003eThe task is requesting a cancellation.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efulfillment\u003ca name\u003d\"task-reason-fulfillment\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFulfillment\u003c/td\u003e\u003ctd\u003eThe task is requesting fulfullment.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emerging\u003ca name\u003d\"task-reason-merging\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMerging\u003c/td\u003e\u003ctd\u003eThe task is requesting a merge.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eadmittance\u003ca name\u003d\"task-reason-admittance\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAdmittance\u003c/td\u003e\u003ctd\u003eThe task is requesting a patient to be admitted.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eauthorization\u003ca name\u003d\"task-reason-authorization\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAuthorization\u003c/td\u003e\u003ctd\u003eThe task is representing an authorization of service.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/task-reason",
+  "version": "6.0.0-ballot3",
+  "name": "TaskReason",
+  "title": "Task Reason",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-03-12T10:00:00+08:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The reason for the task being performed.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/task-reason",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "cancellation",
+      "display": "Cancellation",
+      "definition": "The task is requesting a cancellation."
+    },
+    {
+      "code": "fulfillment",
+      "display": "Fulfillment",
+      "definition": "The task is requesting fulfullment."
+    },
+    {
+      "code": "merging",
+      "display": "Merging",
+      "definition": "The task is requesting a merge."
+    },
+    {
+      "code": "admittance",
+      "display": "Admittance",
+      "definition": "The task is requesting a patient to be admitted."
+    },
+    {
+      "code": "authorization",
+      "display": "Authorization",
+      "definition": "The task is representing an authorization of service."
+    }
+  ]
+}

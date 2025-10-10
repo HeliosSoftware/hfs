@@ -1,0 +1,62 @@
+{
+  "resourceType": "ImagingSelection",
+  "id": "example-dicom-sr-selection",
+  "identifier": [
+    {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.95946059916364657859950275.2.1"
+    }
+  ],
+  "status": "available",
+  "code": {
+    "text": "Observation within a DICOM SR"
+  },
+  "subject": {
+    "type": "Patient",
+    "identifier": {
+      "system": "https://fhirhospital.org",
+      "value": "RNKZPSBNZLNADAZV"
+    }
+  },
+  "issued": "2011-01-01T11:01:20+03:00",
+  "derivedFrom": {
+    "type": "ImagingStudy",
+    "identifier": {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.95946072916364657859950275"
+    }
+  },
+  "studyUid": "1.2.840.113747.20080222.95946058738694657859950275",
+  "seriesUid": "1.2.840.113747.20080222.95946058738664657859950275.1",
+  "frameOfReferenceUid": "1.2.840.113747.20080222.95946058736364657859950275.0",
+  "bodySite": [
+    {
+      "reference": {
+        "reference": "BodyStructure/tumor"
+      }
+    }
+  ],
+  "focus": [
+    {
+      "reference": "ImagingSelection/example-basic-image-selection"
+    }
+  ],
+  "instance": [
+    {
+      "uid": "1.2.840.113747.20080222.95946058738699434359950275.1.0",
+      "sopClass": "urn:oid:1.2.840.10008.5.1.4.1.1.88.22",
+      "subset": [
+        "1.2.840.113747.20080222.95946058738699434572916359950275.10.1"
+      ]
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

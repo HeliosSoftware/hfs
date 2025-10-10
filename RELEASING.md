@@ -24,6 +24,14 @@ HFS is a multi-crate Rust workspace where all crates share the same version numb
 
 ### 1. Prepare for Release
 
+- Consider downloading the latest FHIR Specification (R6) and test files, [generating](readme.md#code-generation), then running a [comprehensive test](readme.md#running-tests), and checking in the latest into GitHub. 
+```bash
+cargo build -p helios-fhir-gen --features R4,R4B,R5,R6
+./target/debug/helios-fhir-gen --all
+cargo fmt --all 
+cargo test --all-features
+```
+
 - Ensure that your build in GitHub Actions has succeeded fully.  These are found in [ci.yml](.github/workflows/ci.yml).
 
 

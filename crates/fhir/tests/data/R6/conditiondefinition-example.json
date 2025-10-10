@@ -1,0 +1,76 @@
+{
+  "resourceType": "ConditionDefinition",
+  "id": "example",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pc"
+    }
+  ],
+  "url": "http://hl7.org/fhir/ConditionDefinition/example",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.25.1"
+    }
+  ],
+  "name": "Hyperlipidemia",
+  "title": "Hyperlipidemia Status",
+  "status": "draft",
+  "date": "2019-05-26T10:44:00+10:00",
+  "publisher": "HL7 International / Patient Care",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/patientcare"
+        }
+      ]
+    }
+  ],
+  "description": "Hyperlipidemia Status",
+  "code": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "55822004",
+        "display": "Hyperlipidemia (disorder)"
+      }
+    ]
+  },
+  "hasSeverity": false,
+  "hasBodySite": false,
+  "hasStage": false,
+  "definition": [
+    "https://med.stanford.edu/content/dam/sm/cerc/documents/Hyperlipidemia%20Management%20Protocol.pdf"
+  ],
+  "observation": [
+    "http://example.org/fhir/ObservationDefinition/lipid-panel",
+    "http://example.org/fhir/ObservationDefinition/cholesterol",
+    "http://example.org/fhir/ObservationDefinition/triglyceride",
+    "http://example.org/fhir/ObservationDefinition/cholesterol-hdl",
+    "http://example.org/fhir/ObservationDefinition/cholesterol-ldl"
+  ],
+  "medication": [
+    {
+      "code": {
+        "coding": [
+          {
+            "system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+            "code": "203151",
+            "display": "fenoldopam mesylate"
+          }
+        ],
+        "text": "Gemfibrozil"
+      }
+    }
+  ],
+  "plan": [
+    {
+      "reference": {
+        "reference": "http://acme.com/fhir/PlanDefinition/fd0e32d8-2ebd-4211-9e50-8983efddc2c6"
+      }
+    }
+  ]
+}

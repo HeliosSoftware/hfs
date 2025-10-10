@@ -1,0 +1,162 @@
+{
+  "resourceType": "ChargeItemDefinition",
+  "id": "device",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pa"
+    }
+  ],
+  "url": "http://sap.org/ChargeItemDefinition/device-123",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.29.2"
+    }
+  ],
+  "name": "CustomDevice345675",
+  "title": "Financial details for custom made device (345675)",
+  "status": "active",
+  "date": "2023-02",
+  "publisher": "HL7 International / Patient Administration",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/pafm"
+        }
+      ]
+    }
+  ],
+  "description": "Financial details for custom made device",
+  "useContext": [
+    {
+      "code": {
+        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+        "code": "venue"
+      },
+      "valueCodeableConcept": {
+        "coding": [
+          {
+            "system": "http://snomed.info/sct",
+            "code": "440655000",
+            "display": "Outpatient environment"
+          }
+        ]
+      }
+    },
+    {
+      "code": {
+        "system": "http://terminology.hl7.org/CodeSystem/usage-context-type",
+        "code": "age"
+      },
+      "valueQuantity": {
+        "value": 18,
+        "comparator": "\u003e",
+        "unit": "yrs",
+        "system": "http://unitsofmeasure.org",
+        "code": "a"
+      }
+    }
+  ],
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "instance": [
+    {
+      "reference": "Device/example"
+    }
+  ],
+  "applicability": [
+    {
+      "condition": {
+        "description": "Verify ChargeItem pertains to Device 12345",
+        "language": "text/fhirpath",
+        "expression": "%context.service.suppliedItem.reference\u003d\u0027Device/12345\u0027"
+      }
+    }
+  ],
+  "propertyGroup": [
+    {
+      "priceComponent": [
+        {
+          "type": "base",
+          "code": {
+            "coding": [
+              {
+                "system": "http://fhir.de/CodeSystem/billing-attributes",
+                "code": "VK",
+                "display": "Verkaufspreis (netto)"
+              }
+            ]
+          },
+          "amount": {
+            "value": 67.44,
+            "currency": "EUR"
+          }
+        }
+      ]
+    },
+    {
+      "applicability": [
+        {
+          "condition": {
+            "description": "Gültigkeit Steuersatz",
+            "language": "text/fhirpath",
+            "expression": "%context.occurenceDateTime \u003e \u00272018-04-01\u0027"
+          }
+        }
+      ],
+      "priceComponent": [
+        {
+          "type": "tax",
+          "code": {
+            "coding": [
+              {
+                "system": "http://fhir.de/CodeSystem/billing-attributes",
+                "code": "MWST",
+                "display": "Mehrwersteuersatz"
+              }
+            ]
+          },
+          "factor": 1.19
+        }
+      ]
+    },
+    {
+      "applicability": [
+        {
+          "condition": {
+            "description": "Gültigkeit Steuersatz",
+            "language": "text/fhirpath",
+            "expression": "%context.occurenceDateTime \u003c\u003d \u00272018-04-01\u0027"
+          }
+        }
+      ],
+      "priceComponent": [
+        {
+          "type": "tax",
+          "code": {
+            "coding": [
+              {
+                "system": "http://fhir.de/CodeSystem/billing-attributes",
+                "code": "MWST",
+                "display": "Mehrwersteuersatz"
+              }
+            ]
+          },
+          "factor": 1.07
+        }
+      ]
+    }
+  ]
+}

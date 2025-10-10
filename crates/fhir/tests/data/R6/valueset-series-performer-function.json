@@ -1,0 +1,99 @@
+{
+  "resourceType": "ValueSet",
+  "id": "series-performer-function",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet series-performer-function\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"series-performer-function\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcseries-performer-function\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html\"\u003e\u003ccode\u003ehttp://terminology.hl7.org/CodeSystem/v3-ParticipationType\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-CON\"\u003eCON\u003c/a\u003e\u003c/td\u003e\u003ctd\u003econsultant\u003c/td\u003e\u003ctd\u003eAn advisor participating in the service by performing evaluations and making recommendations.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-VRF\"\u003eVRF\u003c/a\u003e\u003c/td\u003e\u003ctd\u003everifier\u003c/td\u003e\u003ctd\u003eA person who verifies the correctness and appropriateness of the service (plan, order, event, etc.) and hence takes on accountability.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-PRF\"\u003ePRF\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eperformer\u003c/td\u003e\u003ctd\u003e**Definition:** A person, non-person living subject, organization or device that who actually and principally carries out the action. Device should only be assigned as a performer in circumstances where the device is performing independent of human intervention. Need not be the principal responsible actor.\u003cbr/\u003e\u003cbr/\u003e**Exampe:** A surgery resident operating under supervision of attending surgeon, a search and rescue dog locating survivors, an electronic laboratory analyzer or the laboratory discipline requested to perform a laboratory test. The performer may also be the patient in self-care, e.g. fingerstick blood sugar. The traditional order filler is a performer. This information should accompany every service event.\u003cbr/\u003e\u003cbr/\u003e**Note:** that existing HL7 designs assign an organization as the playing entity of the Role that is the performer. These designs should be revised in subsequent releases to make this the scooping entity for the role involved.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-SPRF\"\u003eSPRF\u003c/a\u003e\u003c/td\u003e\u003ctd\u003esecondary performer\u003c/td\u003e\u003ctd\u003eA person assisting in an act through his substantial presence and involvement This includes: assistants, technicians, associates, or whatever the job titles may be.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-REF\"\u003eREF\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ereferrer\u003c/td\u003e\u003ctd\u003eA person having referred the subject of the service to the performer (referring physician). Typically, a referring physician will receive a report.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-DEV\"\u003eDEV\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003edevice\u003c/td\u003e\u003ctd\u003eParticipant used in performing the act without being substantially affected by the act (i.e. durable or inert with respect to that particular service).\u003cbr/\u003e\u003cbr/\u003e*Examples:* monitoring equipment, tools, but also access/drainage lines, prostheses, pace maker, etc.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://terminology.hl7.org/6.5.0/CodeSystem-v3-ParticipationType.html#v3-ParticipationType-LOC\"\u003eLOC\u003c/a\u003e\u003c/td\u003e\u003ctd style\u003d\"color: #cccccc\"\u003elocation\u003c/td\u003e\u003ctd\u003eThe facility where the service is done. May be a static building (or room therein) or a moving location (e.g., ambulance, helicopter, aircraft, train, truck, ship, etc.)\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "ii"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 4
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/series-performer-function",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.3.989"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "ImagingStudySeriesPerformerFunction",
+  "title": "ImagingStudy series performer function",
+  "status": "active",
+  "experimental": false,
+  "date": "2024-12-30",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        }
+      ]
+    }
+  ],
+  "description": "Performer function of an agent in an imaging study series",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "compose": {
+    "include": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+        "concept": [
+          {
+            "code": "CON",
+            "display": "consultant"
+          },
+          {
+            "code": "VRF",
+            "display": "verifier"
+          },
+          {
+            "code": "PRF",
+            "display": "performer"
+          },
+          {
+            "code": "SPRF",
+            "display": "secondary performer"
+          },
+          {
+            "code": "REF",
+            "display": "referrer"
+          },
+          {
+            "code": "DEV"
+          },
+          {
+            "code": "LOC"
+          }
+        ]
+      }
+    ]
+  }
+}

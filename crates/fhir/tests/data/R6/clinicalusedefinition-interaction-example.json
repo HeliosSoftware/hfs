@@ -1,0 +1,65 @@
+{
+  "resourceType": "ClinicalUseDefinition",
+  "id": "example-interaction",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    }
+  ],
+  "type": "interaction",
+  "subject": [
+    {}
+  ],
+  "interaction": {
+    "interactant": [
+      {
+        "itemCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://ema.europa.eu/example/interactant",
+              "code": "alphaconazole"
+            }
+          ]
+        }
+      },
+      {
+        "itemCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://ema.europa.eu/example/interactant",
+              "code": "betaconazole"
+            }
+          ]
+        }
+      }
+    ],
+    "type": {
+      "coding": [
+        {
+          "system": "http://ema.europa.eu/example/interactionsType",
+          "code": "Inhibitor"
+        }
+      ]
+    },
+    "effect": {
+      "concept": {
+        "text": "Increased plasma concentration"
+      }
+    },
+    "management": [
+      {
+        "text": "Careful monitoring of dose"
+      }
+    ]
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

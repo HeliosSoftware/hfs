@@ -1,0 +1,117 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "group-code",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem group-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"group-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgroup-code\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/group-code\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epatient-list\u003ca name\u003d\"group-code-patient-list\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePatient-List\u003c/td\u003e\u003ctd\u003eA list of patients for the purpose of some kind of clinical treatment.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efamily\u003ca name\u003d\"group-code-family\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFamily\u003c/td\u003e\u003ctd\u003eA group of persons and/or animals that constitute a family. The definition of family is not precisely fixed and subject to much variableness in interpretation.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehousehold\u003ca name\u003d\"group-code-household\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHousehold\u003c/td\u003e\u003ctd\u003eA group of persons and/or animals that reside in a singe house. Both the definitions of \u0027reside\u0027 and \u0027house\u0027 are not precisely fixed.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eworkplace\u003ca name\u003d\"group-code-workplace\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eWorkplace\u003c/td\u003e\u003ctd\u003eA group of persons who work together in a single place.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eevent-attendee\u003ca name\u003d\"group-code-event-attendee\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eEvent Attendee\u003c/td\u003e\u003ctd\u003eGroup contains a set of persons and/or animals who were at the same place at the same time. This is typically used for an infection event\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eexposure-group\u003ca name\u003d\"group-code-exposure-group\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExposure Group\u003c/td\u003e\u003ctd\u003eGroup contains a set of persons and/or animals who were exposed to some antigen or infectious agent.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eherd\u003ca name\u003d\"group-code-herd\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHerd\u003c/td\u003e\u003ctd\u003eGroup contains a set of animals that are treated as a coherent group.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003elocality\u003ca name\u003d\"group-code-locality\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLocality\u003c/td\u003e\u003ctd\u003eGroup contains HealthcareService resources that are found in a single geographical location.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eorganization\u003ca name\u003d\"group-code-organization\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOrganization\u003c/td\u003e\u003ctd\u003eA collection of healthcare services.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecollection\u003ca name\u003d\"group-code-collection\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCollection\u003c/td\u003e\u003ctd\u003eA collection of entities for an arbitrary reason.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/group-code",
+  "version": "6.0.0-ballot3",
+  "name": "GroupType",
+  "title": "Group Type",
+  "status": "active",
+  "experimental": false,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "A code that describes the use of the group. The use of the group usually dictates what kind of entities can be members of the group.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/group-code",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "patient-list",
+      "display": "Patient-List",
+      "definition": "A list of patients for the purpose of some kind of clinical treatment."
+    },
+    {
+      "code": "family",
+      "display": "Family",
+      "definition": "A group of persons and/or animals that constitute a family. The definition of family is not precisely fixed and subject to much variableness in interpretation."
+    },
+    {
+      "code": "household",
+      "display": "Household",
+      "definition": "A group of persons and/or animals that reside in a singe house. Both the definitions of \u0027reside\u0027 and \u0027house\u0027 are not precisely fixed."
+    },
+    {
+      "code": "workplace",
+      "display": "Workplace",
+      "definition": "A group of persons who work together in a single place."
+    },
+    {
+      "code": "event-attendee",
+      "display": "Event Attendee",
+      "definition": "Group contains a set of persons and/or animals who were at the same place at the same time. This is typically used for an infection event"
+    },
+    {
+      "code": "exposure-group",
+      "display": "Exposure Group",
+      "definition": "Group contains a set of persons and/or animals who were exposed to some antigen or infectious agent."
+    },
+    {
+      "code": "herd",
+      "display": "Herd",
+      "definition": "Group contains a set of animals that are treated as a coherent group."
+    },
+    {
+      "code": "locality",
+      "display": "Locality",
+      "definition": "Group contains HealthcareService resources that are found in a single geographical location."
+    },
+    {
+      "code": "organization",
+      "display": "Organization",
+      "definition": "A collection of healthcare services."
+    },
+    {
+      "code": "collection",
+      "display": "Collection",
+      "definition": "A collection of entities for an arbitrary reason."
+    }
+  ]
+}

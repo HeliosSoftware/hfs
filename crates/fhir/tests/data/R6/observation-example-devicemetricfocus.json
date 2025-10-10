@@ -1,0 +1,128 @@
+{
+  "resourceType": "Bundle",
+  "id": "example-observation-device-flowratemetric",
+  "type": "collection",
+  "entry": [
+    {
+      "fullUrl": "http://hl7.org/fhir/Observation/example-observation-device-flowratemetric",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "example-observation-device-flowratemetric",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation example-observation-device-flowratemetric\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-observation-device-flowratemetric\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-observation-device-flowratemetric\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttp://goodcare.org/observation/id\u003c/code\u003e/1191144-10\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 8977-1}\"\u003eFluid intake intravascular 8 hour\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003efocus\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDeviceMetric/example-iv-pump-flowratemetric\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2024-12-05T09:30:10+01:00\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: 150 milliliter per 8 hour\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codemL/(8.h) \u003d \u0027mL/(8.h)\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003edevice\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "http://goodcare.org/observation/id",
+            "value": "1191144-10"
+          }
+        ],
+        "status": "final",
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "8977-1",
+              "display": "Fluid intake intravascular 8 hour"
+            }
+          ]
+        },
+        "subject": {
+          "reference": "Device/example-IV-pump"
+        },
+        "focus": [
+          {
+            "reference": "DeviceMetric/example-iv-pump-flowratemetric"
+          }
+        ],
+        "effectiveDateTime": "2024-12-05T09:30:10+01:00",
+        "valueQuantity": {
+          "value": 150,
+          "unit": "milliliter per 8 hour",
+          "system": "http://unitsofmeasure.org",
+          "code": "mL/(8.h)"
+        },
+        "device": {
+          "reference": "Device/example-IV-pump"
+        }
+      }
+    },
+    {
+      "fullUrl": "http://hl7.org/fhir/DeviceAssociation/example-device-patient-association",
+      "resource": {
+        "resourceType": "DeviceAssociation",
+        "id": "example-device-patient-association",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DeviceAssociation example-device-patient-association\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-device-patient-association\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-device-patient-association\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003edevice\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://hl7.org/fhir/deviceassociation-status attached}\"\u003eAttached\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example-a.html\"\u003eDonald Duck\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "device": {
+          "reference": "Device/example-IV-pump"
+        },
+        "status": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/deviceassociation-status",
+              "code": "attached"
+            }
+          ]
+        },
+        "subject": {
+          "reference": "Patient/pat1",
+          "display": "Donald Duck"
+        }
+      }
+    },
+    {
+      "fullUrl": "http://hl7.org/fhir/DeviceMetric/example-iv-pump-flowratemetric",
+      "resource": {
+        "resourceType": "DeviceMetric",
+        "id": "example-iv-pump-flowratemetric",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DeviceMetric example-iv-pump-flowratemetric\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-iv-pump-flowratemetric\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-iv-pump-flowratemetric\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003etype\u003c/b\u003e: \u003cspan title\u003d\"Codes:{urn:iso:std:iso:11073:10101 157784}\"\u003eMDC_FLOW_FLUID_PUMP\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eunit\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://unitsofmeasure.org mL/(8.h)}\"\u003emL/(8.h)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003edevice\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eDevice/example-IV-pump\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://hl7.org/fhir/metric-category measurement}\"\u003eMeasurement\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "urn:iso:std:iso:11073:10101",
+              "code": "157784",
+              "display": "MDC_FLOW_FLUID_PUMP"
+            }
+          ]
+        },
+        "unit": {
+          "coding": [
+            {
+              "system": "http://unitsofmeasure.org",
+              "code": "mL/(8.h)",
+              "display": "mL/(8.h)"
+            }
+          ]
+        },
+        "device": {
+          "reference": "Device/example-IV-pump"
+        },
+        "category": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/metric-category",
+              "code": "measurement",
+              "display": "Measurement"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -1,0 +1,147 @@
+{
+  "resourceType": "Permission",
+  "id": "ex-permission-directory-admin",
+  "meta": {
+    "security": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST"
+      }
+    ],
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  },
+  "status": "active",
+  "asserter": {
+    "reference": "Organization/example"
+  },
+  "date": [
+    "2023-11-22"
+  ],
+  "combining": "deny-unless-permit",
+  "rule": [
+    {
+      "type": "permit",
+      "activity": [
+        {
+          "action": [
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "C"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "R"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "U"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "D"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "E"
+                }
+              ]
+            }
+          ],
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HDIRECT"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "permit",
+      "activity": [
+        {
+          "action": [
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "C"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "R"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "U"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "D"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "E"
+                }
+              ]
+            }
+          ],
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HSYSADMIN"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

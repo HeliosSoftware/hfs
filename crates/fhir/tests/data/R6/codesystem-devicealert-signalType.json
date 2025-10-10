@@ -1,0 +1,82 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "devicealert-signalType",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem devicealert-signalType\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"devicealert-signalType\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevicealert-signalType\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/devicealert-signalType\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003estrobe-white\u003ca name\u003d\"devicealert-signalType-strobe-white\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eWhite Strobe\u003c/td\u003e\u003ctd\u003eWhite flashing light\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003etext-2m\u003ca name\u003d\"devicealert-signalType-text-2m\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eText (2 m)\u003c/td\u003e\u003ctd\u003eText readable at a distance of 2 meters\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efast-pulse\u003ca name\u003d\"devicealert-signalType-fast-pulse\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIntermittent Vibration (Rapid)\u003c/td\u003e\u003ctd\u003eA rapid intermittent (alternating) vibration\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "dev"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "draft"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/devicealert-signalType",
+  "version": "6.0.0-ballot3",
+  "name": "DeviceAlertSignalType",
+  "title": "Device Alert Signal Type",
+  "status": "active",
+  "experimental": false,
+  "date": "2023-12-10T10:01:24+11:00",
+  "publisher": "HL7 International / Health Care Devices",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/healthcaredevices"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Describes the annunciator of a device alert.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/devicealert-signalType",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "strobe-white",
+      "display": "White Strobe",
+      "definition": "White flashing light"
+    },
+    {
+      "code": "text-2m",
+      "display": "Text (2 m)",
+      "definition": "Text readable at a distance of 2 meters"
+    },
+    {
+      "code": "fast-pulse",
+      "display": "Intermittent Vibration (Rapid)",
+      "definition": "A rapid intermittent (alternating) vibration"
+    }
+  ]
+}

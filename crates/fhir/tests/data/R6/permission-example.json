@@ -1,0 +1,68 @@
+{
+  "resourceType": "Permission",
+  "id": "example",
+  "status": "active",
+  "asserter": {
+    "reference": "Organization/example"
+  },
+  "date": [
+    "2022-06-13"
+  ],
+  "combining": "deny-unless-permit",
+  "rule": [
+    {
+      "type": "permit",
+      "data": [
+        {
+          "resource": [
+            {
+              "meaning": "authoredby",
+              "reference": {
+                "reference": "Practitioner/example"
+              }
+            }
+          ]
+        }
+      ],
+      "activity": [
+        {
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "TREAT"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HPAYMT"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HOPERAT"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

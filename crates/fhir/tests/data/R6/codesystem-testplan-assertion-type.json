@@ -1,0 +1,82 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "testplan-assertion-type",
+  "meta": {
+    "lastUpdated": "2025-08-13T21:13:52.915+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem testplan-assertion-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"testplan-assertion-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hctestplan-assertion-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/testplan-assertion-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einformative\u003ca name\u003d\"testplan-assertion-type-informative\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInformative\u003c/td\u003e\u003ctd\u003eThe assertion defines informational outcomes that do not contribute to the overall success of the test case.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eoptional\u003ca name\u003d\"testplan-assertion-type-optional\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOptional\u003c/td\u003e\u003ctd\u003eThe assertion defines optional outcomes that produce warning only outcomes for failure conditions of the test case.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erequired\u003ca name\u003d\"testplan-assertion-type-required\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRequired\u003c/td\u003e\u003ctd\u003eThis assertion defines required outcomes that produce failed outcomes for failure conditions of the test case.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/testplan-assertion-type",
+  "version": "6.0.0-ballot2",
+  "name": "TestPlanAssertionType",
+  "title": "TestPlanAssertionType",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-02-24T10:56:24+04:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The TestPlan test case assertion type.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/testplan-assertion-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "informative",
+      "display": "Informative",
+      "definition": "The assertion defines informational outcomes that do not contribute to the overall success of the test case."
+    },
+    {
+      "code": "optional",
+      "display": "Optional",
+      "definition": "The assertion defines optional outcomes that produce warning only outcomes for failure conditions of the test case."
+    },
+    {
+      "code": "required",
+      "display": "Required",
+      "definition": "This assertion defines required outcomes that produce failed outcomes for failure conditions of the test case."
+    }
+  ]
+}

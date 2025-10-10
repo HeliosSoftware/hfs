@@ -1,0 +1,37 @@
+{
+  "resourceType": "ClinicalUseDefinition",
+  "id": "example-warning",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    }
+  ],
+  "type": "warning",
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/clinical-use-definition-category",
+          "code": "DriveAndMachines",
+          "display": "Effects on Ability to Drive and Use Machines"
+        }
+      ]
+    }
+  ],
+  "subject": [
+    {}
+  ],
+  "warning": {
+    "description": "May cause drowsiness. Avoid driving or operating heavy machinery."
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

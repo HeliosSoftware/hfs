@@ -37,7 +37,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 zip = "0.6"
 
 [package.metadata.docs.rs]
-features = ["R4", "R4B", "R5", "R6", "skip-r6-download"]
+all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 

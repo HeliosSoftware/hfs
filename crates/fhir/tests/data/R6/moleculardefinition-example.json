@@ -1,0 +1,117 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "literal": {
+        "value": "ATGAACAGACAAGTAAAAGACATGACAGYGATACTTTCCCAGAGCTGAAGTTAACAAATGCACCTGGTTC TTTTACTAAGTGTTCAAATACCAGTGAACTTAAAGAATTTGTCAATCCTAGCCTTCCAAGAGAAGAAAAA GAAGAGAAACTAGAAACAGTTAAAGTGTCTAATAATGCTGAAGACCCCAAAGATCTCATGTTAAGTGGAG AAAGGGTTTTGCAAACTGAAAGATCTGTAGAGAGTAGCAGTATTTCAYTGGTACCTGGTACTGATTATGG CACTCAGGAAAGTATCTCGTTACTGGAAGTTAGCACTCTAGGGAAGGCAAAAACAGAACCAAATAAATGT GTGAGTCAGTGTGCAGCATTTGAAAACCCCAAGGGACTAATTCATGGTTGTTCCAAAGATAATAGAAATG ACACAGAAGGCTTTAAGTATCCATTGGGACATGAAGTTAACCACAGTCGGGAAACAAGCATAGAAATGGA AGAAAGTGAACTTGATGCTCAGTATTTGCAGAATACATTCAAGGTTTCAAAGCGCCAGTCATTTGCTCYG TTTTCAAATCCAGGAAATGCAGAAGAGGAATGTGCAACATTCTCTGCCCACTCTGGGTCCTTAAAGAAAC AAAGTCCAAAAGTCACTTTTGAATGTGAACAAAAGGAAGAAAATCAAGGAAAGAATGAGTCTAATATCAA GCCTGTACAGACAGTTAATATCACTGCAGGCTTTCCTGTGGTTGGTCAGAAAGA"
+      },
+      "resolvable": {
+        "reference": "DocumentReference/example-genomicFile-mw7162561"
+      },
+      "extracted": {
+        "startingMolecule": {
+          "reference": "MolecularDefinition/example-starting-sequence-2b-extracted",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30100-4",
+                  "display": "0-based interval counting"
+                }
+              ],
+              "text": "0-based interval counting"
+            }
+          }
+        },
+        "reverseComplement": false
+      },
+      "concatenated": {
+        "sequenceElement": [
+          {
+            "sequence": {
+              "reference": "MolecularDefinition/example-sequence0-2b-concatenated",
+              "type": "MolecularDefinition",
+              "display": "Sequence-of index 0-Resource for concatenated sequence example"
+            },
+            "ordinalIndex": 0
+          },
+          {
+            "sequence": {
+              "reference": "MolecularDefinition/example-sequence1-2b-concatenated",
+              "type": "MolecularDefinition",
+              "display": "Sequence-of index 1-Resource for concatenated sequence example"
+            },
+            "ordinalIndex": 1
+          },
+          {
+            "sequence": {
+              "reference": "MolecularDefinition/example-sequence2-2b-concatenated",
+              "type": "MolecularDefinition",
+              "display": "Sequence-of index 2-Resource for concatenated sequence example"
+            },
+            "ordinalIndex": 2
+          }
+        ]
+      },
+      "relative": {
+        "startingMolecule": {
+          "reference": "MolecularDefinition/example-starting-sequence-2b-relative",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource"
+        },
+        "edit": [
+          {
+            "coordinateInterval": {
+              "coordinateSystem": {
+                "system": {
+                  "coding": [
+                    {
+                      "system": "http://loinc.org",
+                      "code": "LA30100-4",
+                      "display": "0-based interval counting"
+                    }
+                  ],
+                  "text": "0-based interval counting"
+                }
+              }
+            },
+            "replacementMolecule": {
+              "reference": "MolecularDefinition/example-replacement-sequence",
+              "type": "MolecularDefinition",
+              "display": "Replacement Sequence Resource"
+            },
+            "replacedMolecule": {
+              "reference": "MolecularDefinition/example-replaced-sequence",
+              "type": "MolecularDefinition",
+              "display": "Replaced Sequence Resource"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

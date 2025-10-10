@@ -1,0 +1,473 @@
+{
+  "resourceType": "Citation",
+  "id": "example-dataset-citation",
+  "meta": {
+    "versionId": "5",
+    "lastUpdated": "2023-12-02T22:30:09.159Z",
+    "profile": [
+      "http://hl7.org/fhir/uv/ebm/StructureDefinition/dataset-citation"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n\t\t\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: Citation 179559\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"179559\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"hc179559\"\u003e \u003c/a\u003e\n      \u003ca name\u003d\"179559-en-US\"\u003e \u003c/a\u003e\n      \u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\n        \u003cp style\u003d\"margin-bottom: 0px\"\u003eversion: 5; Last updated: 2023-12-02 22:30:09+0000\u003c/p\u003e\n        \u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \n          \u003ca href\u003d\"StructureDefinition-dataset-citation.html\"\u003eDatasetCitation\u003c/a\u003e\n        \u003c/p\u003e\n      \u003c/div\u003e\n      \u003cp\u003e\n        \u003cb\u003eurl\u003c/b\u003e: \n        \u003ca href\u003d\"Citation-179559.html\"\u003eCitation DatasetCitation: Extrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes\u003c/a\u003e\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003eidentifier\u003c/b\u003e: FEvIR Object Identifier/179559\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003eversion\u003c/b\u003e: 1.0.0-ballot2\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003etitle\u003c/b\u003e: DatasetCitation: Extrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003estatus\u003c/b\u003e: Active\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003edate\u003c/b\u003e: 2025-02-24 19:37:10+0000\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003epublisher\u003c/b\u003e: HL7 International / Clinical Decision Support\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003econtact\u003c/b\u003e: HL7 International / Clinical Decision Support: \n        \u003ca href\u003d\"http://www.hl7.org/Special/committees/dss\"\u003ehttp://www.hl7.org/Special/committees/dss\u003c/a\u003e\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003edescription\u003c/b\u003e: \n      \u003c/p\u003e\n      \u003cdiv\u003e\n        \u003cp\u003eThis Citation Resource is referenced in an example for the EBMonFHIR Implementation Guide.\u003c/p\u003e\n\t\t\n      \u003c/div\u003e\n      \u003cp\u003e\n        \u003cb\u003ejurisdiction\u003c/b\u003e: \n        \u003cspan title\u003d\"Codes:{http://unstats.un.org/unsd/methods/m49/m49.htm 001}\"\u003eWorld\u003c/span\u003e\n      \u003c/p\u003e\n      \u003cp\u003e\n        \u003cb\u003ecopyright\u003c/b\u003e: \n      \u003c/p\u003e\n      \u003cdiv\u003e\n        \u003cp\u003ehttps://creativecommons.org/licenses/by-nc-sa/4.0/\u003c/p\u003e\n\t\t\n      \u003c/div\u003e\n      \u003cp\u003e\n        \u003cb\u003eauthor\u003c/b\u003e: Brian S. Alper: \n      \u003c/p\u003e\n      \u003ch3\u003eSummaries\u003c/h3\u003e\n      \u003ctable class\u003d\"grid\"\u003e\n        \u003ctr\u003e\n          \u003ctd style\u003d\"display: none\"\u003e-\u003c/td\u003e\n          \u003ctd\u003e\n            \u003cb\u003eStyle\u003c/b\u003e\n          \u003c/td\u003e\n          \u003ctd\u003e\n            \u003cb\u003eText\u003c/b\u003e\n          \u003c/td\u003e\n        \u003c/tr\u003e\n        \u003ctr\u003e\n          \u003ctd style\u003d\"display: none\"\u003e*\u003c/td\u003e\n          \u003ctd\u003e\n            \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/citation-summary-style comppub}\"\u003eComputable Publishing\u003c/span\u003e\n          \u003c/td\u003e\n          \u003ctd\u003e\n            \u003cdiv\u003e\n              \u003cp\u003eExtrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes [Dataset]. Contributors:  Anish Thomas,  Lorinc S. Pongor,  Rajesh Kumar,  Parth Desai [Authors]. In: database of Genotypes and Phenotypes, Accession Number phs003190.v1.p1. Published October 16, 2023. Available at: https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id\u003dphs003190.v1.p1.\u003c/p\u003e\n\t\t\n            \u003c/div\u003e\n          \u003c/td\u003e\n        \u003c/tr\u003e\n      \u003c/table\u003e\n      \u003cblockquote\u003e\n        \u003cp\u003e\n          \u003cb\u003ecitedArtifact\u003c/b\u003e\n        \u003c/p\u003e\n        \u003cp\u003e\n          \u003cb\u003eidentifier\u003c/b\u003e: dbGaP Study Accession/phs003190.v1.p1\n        \u003c/p\u003e\n        \u003ch3\u003eTitles\u003c/h3\u003e\n        \u003ctable class\u003d\"grid\"\u003e\n          \u003ctr\u003e\n            \u003ctd style\u003d\"display: none\"\u003e-\u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eType\u003c/b\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eLanguage\u003c/b\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eText\u003c/b\u003e\n            \u003c/td\u003e\n          \u003c/tr\u003e\n          \u003ctr\u003e\n            \u003ctd style\u003d\"display: none\"\u003e*\u003c/td\u003e\n            \u003ctd\u003e\n              \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/title-type primary}\"\u003ePrimary title\u003c/span\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cspan title\u003d\"Codes:{urn:ietf:bcp:47 en}\"\u003eEnglish\u003c/span\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cdiv\u003e\n                \u003cp\u003eExtrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes\u003c/p\u003e\n\t\t\n              \u003c/div\u003e\n            \u003c/td\u003e\n          \u003c/tr\u003e\n        \u003c/table\u003e\n        \u003ch3\u003eAbstracts\u003c/h3\u003e\n        \u003ctable class\u003d\"grid\"\u003e\n          \u003ctr\u003e\n            \u003ctd style\u003d\"display: none\"\u003e-\u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eType\u003c/b\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eLanguage\u003c/b\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cb\u003eText\u003c/b\u003e\n            \u003c/td\u003e\n          \u003c/tr\u003e\n          \u003ctr\u003e\n            \u003ctd style\u003d\"display: none\"\u003e*\u003c/td\u003e\n            \u003ctd\u003e\n              \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 description}\"\u003eStudy Description\u003c/span\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cspan title\u003d\"Codes:{urn:ietf:bcp:47 en}\"\u003eEnglish\u003c/span\u003e\n            \u003c/td\u003e\n            \u003ctd\u003e\n              \u003cdiv\u003e\n                \u003cp\u003eSmall-cell lung cancer (SCLC) is a very aggressive neuroendocrine lung cancer often associated with oncogenic MYC amplifications, which are known to drive SCLC heterogeneity marked by neuroendocrine (NE) and non-neuroendocrine (non-NE) cell states. The genetic mechanisms of MYC amplification and phenotypic plasticity between cell states is not known. Using data from cell-lines and a few patient-derived samples along with integrated whole-genome sequencing, long-range optical mapping, single-cell DNA sequencing, and fluorescence in situ hybridization, we have attempted to successfully characterize extrachromosomal DNA (ecDNA) as the primary source of MYC amplifications and driver fusions in SCLC.\u003c/p\u003e\n\t\t\n                \u003cp\u003eStudy Design:\n\t\tCross-Sectional\n\t\tStudy Type:\n\t\tObservational\n\t\tTotal number of consented subjects: 5\u003c/p\u003e\n\t\t\n              \u003c/div\u003e\n            \u003c/td\u003e\n          \u003c/tr\u003e\n        \u003c/table\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003epublicationForm\u003c/b\u003e\n          \u003c/p\u003e\n          \u003ch3\u003ePublishedIns\u003c/h3\u003e\n          \u003ctable class\u003d\"grid\"\u003e\n            \u003ctr\u003e\n              \u003ctd style\u003d\"display: none\"\u003e-\u003c/td\u003e\n              \u003ctd\u003e\n                \u003cb\u003eType\u003c/b\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003cb\u003eIdentifier\u003c/b\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003cb\u003eTitle\u003c/b\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003cb\u003ePublisher\u003c/b\u003e\n              \u003c/td\u003e\n              \u003ctd\u003e\n                \u003cb\u003ePublisherLocation\u003c/b\u003e\n              \u003c/td\u003e\n            \u003c/tr\u003e\n            \u003ctr\u003e\n              \u003ctd style\u003d\"display: none\"\u003e*\u003c/td\u003e\n              \u003ctd\u003e\n                \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/published-in-type D019991}\"\u003eDatabase\u003c/span\u003e\n              \u003c/td\u003e\n              \u003ctd\u003eAbbreviation/dbGaP\u003c/td\u003e\n              \u003ctd\u003edatabase of Genotypes and Phenotypes\u003c/td\u003e\n              \u003ctd\u003eNLM\u003c/td\u003e\n              \u003ctd\u003eBethesda, MD, USA\u003c/td\u003e\n            \u003c/tr\u003e\n          \u003c/table\u003e\n          \u003cp\u003e\n            \u003cb\u003ecitedMedium\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/cited-medium internet}\"\u003eInternet\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003earticleDate\u003c/b\u003e: 2023-10-16\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eaccessionNumber\u003c/b\u003e: phs003190.v1.p1\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003epageCount\u003c/b\u003e: Total number of consented subjects: 5\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003ecopyright\u003c/b\u003e: \n          \u003c/p\u003e\n          \u003cdiv\u003e\n            \u003cp\u003eData access provided by: dbGaP Authorized Access. For publicly available data (public ftp), Connect to the public download site. The site contains release notes and manifests. The site also contains data dictionaries, variable summaries, documents, and truncated analyses, whenever available.\u003c/p\u003e\n\t\t\n          \u003c/div\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003ewebLocation\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassifier\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/artifact-url-classifier webpage}\"\u003eWebpage\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eurl\u003c/b\u003e: \n            \u003ca href\u003d\"https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id\u003dphs003190.v1.p1\"\u003ehttps://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id\u003dphs003190.v1.p1\u003c/a\u003e\n          \u003c/p\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003ewebLocation\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassifier\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 defined-in-text}\"\u003epublic download site\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eurl\u003c/b\u003e: \n            \u003ca href\u003d\"https://ftp.ncbi.nlm.nih.gov/dbgap/studies/phs003190/phs003190.v1.p1\"\u003ehttps://ftp.ncbi.nlm.nih.gov/dbgap/studies/phs003190/phs003190.v1.p1\u003c/a\u003e\n          \u003c/p\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassification\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003etype\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type knowledge-artifact-type}\"\u003eKnowledge Artifact Type\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassifier\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/citation-artifact-classifier D064886}\"\u003eDataset\u003c/span\u003e\n          \u003c/p\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassification\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003etype\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 study-design}\"\u003eStudy Design\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassifier\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/181513 SEVCO:01027}\"\u003eCross-Sectional\u003c/span\u003e, \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/181513 SEVCO:01002}\"\u003eObservational Research\u003c/span\u003e\n          \u003c/p\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassification\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003etype\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 defined-in-text}\"\u003ePrimary Phenotype\u003c/span\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003eclassifier\u003c/b\u003e: \n            \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 defined-in-text}\"\u003eSmall Cell Lung Carcinoma\u003c/span\u003e\n          \u003c/p\u003e\n        \u003c/blockquote\u003e\n        \u003cblockquote\u003e\n          \u003cp\u003e\n            \u003cb\u003econtributorship\u003c/b\u003e\n          \u003c/p\u003e\n          \u003cp\u003e\n            \u003cb\u003ecomplete\u003c/b\u003e: true\n          \u003c/p\u003e\n          \u003cblockquote\u003e\n            \u003cp\u003e\n              \u003cb\u003eentry\u003c/b\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributor\u003c/b\u003e: \n              \u003ca href\u003d\"#hc179559/contributor0\"\u003ePractitioner Anish Thomas \u003c/a\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003eaffiliation\u003c/b\u003e: Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributionType\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 principal-investigator}\"\u003ePrincipal Investigator\u003c/span\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003erole\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/contributor-role author}\"\u003eAuthor/Creator\u003c/span\u003e\n            \u003c/p\u003e\n          \u003c/blockquote\u003e\n          \u003cblockquote\u003e\n            \u003cp\u003e\n              \u003cb\u003eentry\u003c/b\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributor\u003c/b\u003e: \n              \u003ca href\u003d\"#hc179559/contributor1\"\u003ePractitioner Lorinc S. Pongor \u003c/a\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003eaffiliation\u003c/b\u003e: Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributionType\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 co-investigator}\"\u003eCo-Investigator\u003c/span\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003erole\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/contributor-role author}\"\u003eAuthor/Creator\u003c/span\u003e\n            \u003c/p\u003e\n          \u003c/blockquote\u003e\n          \u003cblockquote\u003e\n            \u003cp\u003e\n              \u003cb\u003eentry\u003c/b\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributor\u003c/b\u003e: \n              \u003ca href\u003d\"#hc179559/contributor2\"\u003ePractitioner Rajesh Kumar \u003c/a\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003eaffiliation\u003c/b\u003e: Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributionType\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 co-investigator}\"\u003eCo-Investigator\u003c/span\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003erole\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/contributor-role author}\"\u003eAuthor/Creator\u003c/span\u003e\n            \u003c/p\u003e\n          \u003c/blockquote\u003e\n          \u003cblockquote\u003e\n            \u003cp\u003e\n              \u003cb\u003eentry\u003c/b\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributor\u003c/b\u003e: \n              \u003ca href\u003d\"#hc179559/contributor3\"\u003ePractitioner Parth Desai \u003c/a\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003eaffiliation\u003c/b\u003e: Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003econtributionType\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{https://fevir.net/resources/CodeSystem/179423 co-investigator}\"\u003eCo-Investigator\u003c/span\u003e\n            \u003c/p\u003e\n            \u003cp\u003e\n              \u003cb\u003erole\u003c/b\u003e: \n              \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/contributor-role author}\"\u003eAuthor/Creator\u003c/span\u003e\n            \u003c/p\u003e\n          \u003c/blockquote\u003e\n        \u003c/blockquote\u003e\n      \u003c/blockquote\u003e\n      \u003chr/\u003e\n      \u003cblockquote\u003e\n        \u003cp class\u003d\"res-header-id\"\u003e\n          \u003cb\u003eGenerated Narrative: Practitioner #contributor0\u003c/b\u003e\n        \u003c/p\u003e\n        \u003ca name\u003d\"179559/contributor0\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"hc179559/contributor0\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"179559/contributor0-en-US\"\u003e \u003c/a\u003e\n        \u003cp\u003e\n          \u003cb\u003ename\u003c/b\u003e: Anish Thomas \n        \u003c/p\u003e\n      \u003c/blockquote\u003e\n      \u003chr/\u003e\n      \u003cblockquote\u003e\n        \u003cp class\u003d\"res-header-id\"\u003e\n          \u003cb\u003eGenerated Narrative: Practitioner #contributor1\u003c/b\u003e\n        \u003c/p\u003e\n        \u003ca name\u003d\"179559/contributor1\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"hc179559/contributor1\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"179559/contributor1-en-US\"\u003e \u003c/a\u003e\n        \u003cp\u003e\n          \u003cb\u003ename\u003c/b\u003e: Lorinc S. Pongor \n        \u003c/p\u003e\n      \u003c/blockquote\u003e\n      \u003chr/\u003e\n      \u003cblockquote\u003e\n        \u003cp class\u003d\"res-header-id\"\u003e\n          \u003cb\u003eGenerated Narrative: Practitioner #contributor2\u003c/b\u003e\n        \u003c/p\u003e\n        \u003ca name\u003d\"179559/contributor2\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"hc179559/contributor2\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"179559/contributor2-en-US\"\u003e \u003c/a\u003e\n        \u003cp\u003e\n          \u003cb\u003ename\u003c/b\u003e: Rajesh Kumar \n        \u003c/p\u003e\n      \u003c/blockquote\u003e\n      \u003chr/\u003e\n      \u003cblockquote\u003e\n        \u003cp class\u003d\"res-header-id\"\u003e\n          \u003cb\u003eGenerated Narrative: Practitioner #contributor3\u003c/b\u003e\n        \u003c/p\u003e\n        \u003ca name\u003d\"179559/contributor3\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"hc179559/contributor3\"\u003e \u003c/a\u003e\n        \u003ca name\u003d\"179559/contributor3-en-US\"\u003e \u003c/a\u003e\n        \u003cp\u003e\n          \u003cb\u003ename\u003c/b\u003e: Parth Desai \n        \u003c/p\u003e\n      \u003c/blockquote\u003e\n\t\n    \u003c/div\u003e"
+  },
+  "contained": [
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor0",
+      "name": [
+        {
+          "family": "Thomas",
+          "given": [
+            "Anish"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor1",
+      "name": [
+        {
+          "family": "Pongor",
+          "given": [
+            "Lorinc S."
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor2",
+      "name": [
+        {
+          "family": "Kumar",
+          "given": [
+            "Rajesh"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor3",
+      "name": [
+        {
+          "family": "Desai",
+          "given": [
+            "Parth"
+          ]
+        }
+      ]
+    }
+  ],
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    }
+  ],
+  "url": "http://hl7.org/fhir/Citation/example-dataset-citation",
+  "identifier": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+            "code": "ACSN",
+            "display": "Accession ID"
+          }
+        ],
+        "text": "FEvIR Object Identifier"
+      },
+      "system": "https://fevir.net",
+      "value": "179559",
+      "assigner": {
+        "display": "Computable Publishing LLC"
+      }
+    }
+  ],
+  "version": "1.0.0-ballot2",
+  "title": "DatasetCitation: Extrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes",
+  "status": "active",
+  "date": "2025-02-24T19:37:10+00:00",
+  "author": [
+    {
+      "name": "Brian S. Alper"
+    }
+  ],
+  "publisher": "HL7 International / Clinical Decision Support",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/dss"
+        }
+      ]
+    }
+  ],
+  "description": "This Citation Resource is referenced in an example for the EBMonFHIR Implementation Guide.",
+  "copyright": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+  "summary": [
+    {
+      "style": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/citation-summary-style",
+            "code": "comppub",
+            "display": "Computable Publishing"
+          }
+        ]
+      },
+      "text": "Extrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes [Dataset]. Contributors:  Anish Thomas,  Lorinc S. Pongor,  Rajesh Kumar,  Parth Desai [Authors]. In: database of Genotypes and Phenotypes, Accession Number phs003190.v1.p1. Published October 16, 2023. Available at: https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id\u003dphs003190.v1.p1."
+    }
+  ],
+  "citedArtifact": {
+    "identifier": [
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+              "code": "ACSN",
+              "display": "Accession ID"
+            }
+          ],
+          "text": "dbGaP Study Accession"
+        },
+        "value": "phs003190.v1.p1"
+      }
+    ],
+    "title": [
+      {
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/title-type",
+                "code": "primary",
+                "display": "Primary title"
+              }
+            ]
+          }
+        ],
+        "language": "en",
+        "text": "Extrachromosomal DNA Amplification Contributes to Small Cell Lung Cancer Heterogeneity and is Associated with Worse Outcomes"
+      }
+    ],
+    "abstract": [
+      {
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "https://fevir.net/resources/CodeSystem/179423",
+                "code": "description",
+                "display": "Description"
+              }
+            ],
+            "text": "Study Description"
+          }
+        ],
+        "language": "en",
+        "text": "Small-cell lung cancer (SCLC) is a very aggressive neuroendocrine lung cancer often associated with oncogenic MYC amplifications, which are known to drive SCLC heterogeneity marked by neuroendocrine (NE) and non-neuroendocrine (non-NE) cell states. The genetic mechanisms of MYC amplification and phenotypic plasticity between cell states is not known. Using data from cell-lines and a few patient-derived samples along with integrated whole-genome sequencing, long-range optical mapping, single-cell DNA sequencing, and fluorescence in situ hybridization, we have attempted to successfully characterize extrachromosomal DNA (ecDNA) as the primary source of MYC amplifications and driver fusions in SCLC.\n\nStudy Design:\nCross-Sectional\nStudy Type:\nObservational\nTotal number of consented subjects: 5"
+      }
+    ],
+    "publicationForm": [
+      {
+        "publishedIn": {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/published-in-type",
+                "code": "D019991",
+                "display": "Database"
+              }
+            ]
+          },
+          "identifier": [
+            {
+              "type": {
+                "coding": [
+                  {
+                    "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                    "code": "XX",
+                    "display": "Organization identifier"
+                  }
+                ],
+                "text": "Abbreviation"
+              },
+              "value": "dbGaP"
+            }
+          ],
+          "title": "database of Genotypes and Phenotypes",
+          "publisher": {
+            "display": "NLM"
+          },
+          "publisherLocation": "Bethesda, MD, USA"
+        },
+        "citedMedium": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-medium",
+              "code": "internet",
+              "display": "Internet"
+            }
+          ]
+        },
+        "articleDate": "2023-10-16",
+        "accessionNumber": "phs003190.v1.p1",
+        "pageCount": "Total number of consented subjects: 5",
+        "copyright": "Data access provided by: dbGaP Authorized Access. For publicly available data (public ftp), Connect to the public download site. The site contains release notes and manifests. The site also contains data dictionaries, variable summaries, documents, and truncated analyses, whenever available."
+      }
+    ],
+    "webLocation": [
+      {
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/artifact-url-classifier",
+                "code": "webpage",
+                "display": "Webpage"
+              }
+            ]
+          }
+        ],
+        "url": "https://www.ncbi.nlm.nih.gov/projects/gap/cgi-bin/study.cgi?study_id\u003dphs003190.v1.p1"
+      },
+      {
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://fevir.net/resources/CodeSystem/179423",
+                "code": "defined-in-text",
+                "display": "Defined in text"
+              }
+            ],
+            "text": "public download site"
+          }
+        ],
+        "url": "https://ftp.ncbi.nlm.nih.gov/dbgap/studies/phs003190/phs003190.v1.p1"
+      }
+    ],
+    "classification": [
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "knowledge-artifact-type",
+              "display": "Knowledge Artifact Type"
+            }
+          ]
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D064886",
+                "display": "Dataset"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "https://fevir.net/resources/CodeSystem/179423",
+              "code": "study-design",
+              "display": "Study Design"
+            }
+          ],
+          "text": "Study Design"
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://fevir.net/resources/CodeSystem/181513",
+                "code": "SEVCO:01027",
+                "display": "Cross sectional data collection"
+              }
+            ],
+            "text": "Cross-Sectional"
+          },
+          {
+            "coding": [
+              {
+                "system": "https://fevir.net/resources/CodeSystem/181513",
+                "code": "SEVCO:01002",
+                "display": "observational research"
+              }
+            ],
+            "text": "Observational Research"
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "https://fevir.net/resources/CodeSystem/179423",
+              "code": "defined-in-text",
+              "display": "Defined in text"
+            }
+          ],
+          "text": "Primary Phenotype"
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://fevir.net/resources/CodeSystem/179423",
+                "code": "defined-in-text",
+                "display": "Defined in text"
+              }
+            ],
+            "text": "Small Cell Lung Carcinoma"
+          }
+        ]
+      }
+    ],
+    "contributorship": {
+      "complete": true,
+      "entry": [
+        {
+          "contributor": {
+            "reference": "#contributor0",
+            "type": "Practitioner"
+          },
+          "affiliation": [
+            {
+              "display": "Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA"
+            }
+          ],
+          "contributionType": [
+            {
+              "coding": [
+                {
+                  "system": "https://fevir.net/resources/CodeSystem/179423",
+                  "code": "principal-investigator",
+                  "display": "Principal Investigator"
+                }
+              ],
+              "text": "Principal Investigator"
+            }
+          ],
+          "role": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/contributor-role",
+                "code": "author",
+                "display": "Author/Creator"
+              }
+            ]
+          }
+        },
+        {
+          "contributor": {
+            "reference": "#contributor1",
+            "type": "Practitioner"
+          },
+          "affiliation": [
+            {
+              "display": "Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA"
+            }
+          ],
+          "contributionType": [
+            {
+              "coding": [
+                {
+                  "system": "https://fevir.net/resources/CodeSystem/179423",
+                  "code": "co-investigator",
+                  "display": "Co-Investigator"
+                }
+              ],
+              "text": "Co-Investigator"
+            }
+          ],
+          "role": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/contributor-role",
+                "code": "author",
+                "display": "Author/Creator"
+              }
+            ]
+          }
+        },
+        {
+          "contributor": {
+            "reference": "#contributor2",
+            "type": "Practitioner"
+          },
+          "affiliation": [
+            {
+              "display": "Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA"
+            }
+          ],
+          "contributionType": [
+            {
+              "coding": [
+                {
+                  "system": "https://fevir.net/resources/CodeSystem/179423",
+                  "code": "co-investigator",
+                  "display": "Co-Investigator"
+                }
+              ],
+              "text": "Co-Investigator"
+            }
+          ],
+          "role": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/contributor-role",
+                "code": "author",
+                "display": "Author/Creator"
+              }
+            ]
+          }
+        },
+        {
+          "contributor": {
+            "reference": "#contributor3",
+            "type": "Practitioner"
+          },
+          "affiliation": [
+            {
+              "display": "Developmental Therapeutics Branch, Center for Cancer Research, National Cancer Institute, Bethesda, MD, USA"
+            }
+          ],
+          "contributionType": [
+            {
+              "coding": [
+                {
+                  "system": "https://fevir.net/resources/CodeSystem/179423",
+                  "code": "co-investigator",
+                  "display": "Co-Investigator"
+                }
+              ],
+              "text": "Co-Investigator"
+            }
+          ],
+          "role": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/contributor-role",
+                "code": "author",
+                "display": "Author/Creator"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "resourceType": "ObservationDefinition",
+  "id": "example",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    }
+  ],
+  "status": "active",
+  "publisher": "HL7 International / Orders and Observations",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/orders"
+        }
+      ]
+    }
+  ],
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+          "code": "laboratory"
+        }
+      ]
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://loinc.org",
+        "code": "13980-8",
+        "display": "Albumin/Protein.total in Serum or Plasma by Electrophoresis"
+      }
+    ]
+  },
+  "permittedDataType": [
+    "Quantity"
+  ],
+  "multipleResultsAllowed": false,
+  "method": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "115341008",
+        "display": "Total measurement"
+      }
+    ]
+  },
+  "preferredReportName": "Serum albumin/​Protein total",
+  "permittedUnit": [
+    {
+      "system": "http://unitsofmeasure.org",
+      "code": "%",
+      "display": "%"
+    }
+  ],
+  "qualifiedValue": [
+    {
+      "context": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+            "code": "normal",
+            "display": "Normal Range"
+          }
+        ]
+      },
+      "rangeCategory": "reference",
+      "range": {
+        "low": {
+          "value": 50
+        }
+      }
+    },
+    {
+      "context": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/referencerange-meaning",
+            "code": "normal",
+            "display": "Normal Range"
+          }
+        ]
+      },
+      "rangeCategory": "critical",
+      "range": {
+        "high": {
+          "value": 40
+        }
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "deviceassociation-relationship",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem deviceassociation-relationship\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"deviceassociation-relationship\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdeviceassociation-relationship\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/deviceassociation-relationship\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eowner\u003ca name\u003d\"deviceassociation-relationship-owner\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOwner\u003c/td\u003e\u003ctd\u003eOwner of the device.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecustodian\u003ca name\u003d\"deviceassociation-relationship-custodian\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCustodian\u003c/td\u003e\u003ctd\u003eThe individual or organization who has responsibility for taking care of the device.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emaintainer\u003ca name\u003d\"deviceassociation-relationship-maintainer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMaintainer\u003c/td\u003e\u003ctd\u003eThe individual or organization that keeps the device in an appropriate condition.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epatient\u003ca name\u003d\"deviceassociation-relationship-patient\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePatient\u003c/td\u003e\u003ctd\u003eThe patient in which the device is implanted, or to which the device is associated.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eoperator\u003ca name\u003d\"deviceassociation-relationship-operator\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOperator\u003c/td\u003e\u003ctd\u003eThe person operating the device.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    }
+  ],
+  "url": "http://hl7.org/fhir/deviceassociation-relationship",
+  "version": "6.0.0-ballot3",
+  "name": "DeviceAssociation",
+  "title": "DeviceAssociation Relationship Codes",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International",
+  "description": "DeviceAssociation Relationship Codes",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/deviceassociation-relationship",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "owner",
+      "display": "Owner",
+      "definition": "Owner of the device."
+    },
+    {
+      "code": "custodian",
+      "display": "Custodian",
+      "definition": "The individual or organization who has responsibility for taking care of the device."
+    },
+    {
+      "code": "maintainer",
+      "display": "Maintainer",
+      "definition": "The individual or organization that keeps the device in an appropriate condition."
+    },
+    {
+      "code": "patient",
+      "display": "Patient",
+      "definition": "The patient in which the device is implanted, or to which the device is associated."
+    },
+    {
+      "code": "operator",
+      "display": "Operator",
+      "definition": "The person operating the device."
+    }
+  ]
+}

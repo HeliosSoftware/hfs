@@ -17,7 +17,7 @@ env:
 jobs:
   test-rust:
     name: Test Rust
-    runs-on: [self-hosted, Windows]
+    runs-on: [self-hosted]
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +41,7 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -72,122 +72,12 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build the FHIR model code generator for all versions (This will download the latest R6 from https://build.fhir.org/
-        run: |
-          echo "Build the FHIR model code generator for all versions..."
-          cargo build -p helios-fhir-gen --all-features
-
-      - name: Generate all FHIR model code
-        run: |
-          echo "Generate all FHIR model code..."
-          cargo run -p helios-fhir-gen --all-features -- --all
-
       - name: Run tests with all features
         run: |
           cargo test --all-features
 
   test-python:
     name: Test Python
-    runs-on: [self-hosted]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (Linux/macOS)
-        if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-
-      - name: Configure Rust to use LLD (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
-          set "configPath=%USERPROFILE%\.cargo\config.toml"
-          if exist "%configPath%" del "%configPath%"
-          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
-          echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
-
-      - name: Configure Rust to use LLD (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo "[target.x86_64-unknown-linux-gnu]" >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
-
-      - name: Configure Rust to use LLD (MacOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p ~/.cargo
-          rm -f ~/.cargo/config.toml
-          echo "[target.aarch64-apple-darwin]" >> ~/.cargo/config.toml
-          echo 'linker = "clang"' >> ~/.cargo/config.toml
-          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
-
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Set up Python from .python-version
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: .python-version
-          architecture: ${{ runner.os == 'macOS' && 'arm64' || 'x64' }}
-        continue-on-error: true
-
-      - name: Verify Python installation or install with uv
-        run: |
-          if ! command -v python${{ env.PYTHON_VERSION }} &> /dev/null; then
-            echo "Python not found, installing with uv..."
-            uv python install ${{ env.PYTHON_VERSION }}
-          else
-            echo "Python ${{ env.PYTHON_VERSION }} found"
-          fi
-
-      - name: Create virtual environment for pysof
-        working-directory: crates/pysof
-        run: |
-          uv venv --python ${{ env.PYTHON_VERSION }} .venv
-
-      - name: Install pysof build dependencies
-        working-directory: crates/pysof
-        run: |
-          uv sync --group dev
-
-      - name: Install patchelf (Linux)
-        if: runner.os == 'Linux'
-        working-directory: crates/pysof
-        run: |
-          uv pip install patchelf
-
-      - name: Build pysof wheel
-        working-directory: crates/pysof
-        run: uv run maturin develop
-
-      - name: Run tests with coverage
-        working-directory: crates/pysof
-        run: uv run python -m pytest python-tests/ -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
-
-  lint:
-    name: Linting
     runs-on: [self-hosted, macOS]
     steps:
       - name: Checkout code
@@ -208,7 +98,70 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
+
+      - name: Configure Rust to use LLD (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo "[target.x86_64-unknown-linux-gnu]" >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-zstack-size=8388608"]' >> ~/.cargo/config.toml
+
+      - name: Configure Rust to use LLD (MacOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p ~/.cargo
+          rm -f ~/.cargo/config.toml
+          echo "[target.aarch64-apple-darwin]" >> ~/.cargo/config.toml
+          echo 'linker = "clang"' >> ~/.cargo/config.toml
+          echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build pysof wheel
+        working-directory: crates/pysof
+        run: uv run maturin develop
+
+      - name: Run tests with coverage
+        working-directory: crates/pysof
+        run: uv run python -m pytest python-tests/ -v --cov=src --cov-report=xml:coverage.xml --cov-report=term-missing
+
+  lint:
+    name: Linting
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Configure Rust to use LLD (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not exist "%USERPROFILE%\.cargo" mkdir "%USERPROFILE%\.cargo"
+          set "configPath=%USERPROFILE%\.cargo\config.toml"
+          if exist "%configPath%" del "%configPath%"
+          echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
+          echo linker = "lld-link.exe" >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -248,12 +201,6 @@ jobs:
         run: |
           cargo clippy --all-targets --all-features -- -D warnings -A clippy::items_after_test_module -A clippy::large_enum_variant -A clippy::question_mark -A clippy::collapsible_match -A clippy::collapsible_if -A clippy::field_reassign_with_default -A clippy::doc-overindented-list-items -A clippy::doc-lazy-continuation
 
-      - name: Install dependencies
-        working-directory: crates/pysof
-        run: |
-          uv venv --python python${{ env.PYTHON_VERSION }} .venv
-          uv sync --group dev
-
       - name: Format check
         working-directory: crates/pysof
         run: |
@@ -291,7 +238,7 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -340,7 +287,7 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: runner.os == 'Linux'
@@ -507,7 +454,7 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Build fhirpath-server (R5)
         shell: cmd
@@ -649,7 +596,7 @@ jobs:
           if exist "%configPath%" del "%configPath%"
           echo [target.x86_64-pc-windows-msvc] >> "%configPath%"
           echo linker = "lld-link.exe" >> "%configPath%"
-          echo rustflags = ["-C", "link-arg=/STACK:8388608"] >> "%configPath%"
+          echo rustflags = ["-C", "link-arg=/STACK:16777216"] >> "%configPath%"
 
       - name: Configure Rust to use LLD (Linux)
         if: matrix.os == 'Linux'
@@ -666,7 +613,7 @@ jobs:
         run: |
           mkdir -p ~/.cargo
           if ! grep -q "link-arg=-fuse-ld=lld" ~/.cargo/config.toml 2>/dev/null; then
-            echo "[target.aarch64-apple-darwin]" >> ~/.cargo/config.toml
+            echo "[target.x86_64-apple-darwin]" >> ~/.cargo/config.toml
             echo 'linker = "clang"' >> ~/.cargo/config.toml
             echo 'rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=-Wl,-stack_size,0x800000"]' >> ~/.cargo/config.toml
           fi
@@ -683,11 +630,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
 
       - name: Build Release (Windows)
         if: matrix.os == 'Windows'
@@ -719,39 +661,13 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: test_report.json
+          name: test_report.json 
           path: |
             crates/sof/
 
-      - name: Set up Python from .python-version
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: .python-version
-          architecture: ${{ matrix.os == 'macOS' && 'arm64' || 'x64' }}
-        continue-on-error: true
-
-      - name: Verify Python installation or install with uv
-        run: |
-          if ! command -v python${{ env.PYTHON_VERSION }} &> /dev/null; then
-            echo "Python not found, installing with uv..."
-            uv python install ${{ env.PYTHON_VERSION }}
-          else
-            echo "Python ${{ env.PYTHON_VERSION }} found"
-          fi
-
-      - name: Create virtual environment for pysof
-        working-directory: crates/pysof
-        run: |
-          uv venv --python ${{ env.PYTHON_VERSION }} .venv
-
-      - name: Install pysof build dependencies
-        working-directory: crates/pysof
-        run: |
-          uv sync --group dev
-
       - name: Build pysof wheel
         working-directory: crates/pysof
-        run: uv run maturin build --release --sdist -o dist
+        run: uv run maturin build --release -o dist
 
       - name: Upload pysof artifacts
         uses: actions/upload-artifact@v4
@@ -771,14 +687,6 @@ jobs:
           pattern: pysof-*
           path: ./pysof-dist
           merge-multiple: true
-
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
-
-      - name: Set up Python for publishing
-        run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install twine
         run: uv pip install --system twine
@@ -816,7 +724,6 @@ jobs:
           mkdir -p releases/wheels
           # Copy all pysof wheels and sdist (if any)
           find artifacts -type f -name 'pysof-*whl' -exec cp {} releases/wheels/ \; || true
-          find artifacts -type f -name 'pysof-*.tar.gz' -exec cp {} releases/wheels/ \; || true
           ls -l releases/wheels || true
           # Copy test_report.json if it exists
           find artifacts -type f -name 'test_report.json' -exec cp {} releases/ \; || true

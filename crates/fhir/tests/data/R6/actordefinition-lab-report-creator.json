@@ -1,0 +1,44 @@
+{
+  "resourceType": "ActorDefinition",
+  "id": "lab-report-creator",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      \u003cp class\u003d\"res-header-id\"\u003e\n        \u003cb\u003eGenerated Narrative: ActorDefinition lab-report-creator\u003c/b\u003e\n      \u003c/p\u003e\n      \u003ca name\u003d\"lab-report-creator\"/\u003e\n      \u003ctable class\u003d\"grid\"\u003e\n        \u003ctr\u003e\n          \u003ctd\u003e\n            \u003cb\u003eActor: LabReportCreator \u003c/b\u003e\n          \u003c/td\u003e\n          \u003ctd/\u003e\n          \u003ctd\u003eType: system \u003c/td\u003e\n        \u003c/tr\u003e\n        \u003ctr\u003e\n          \u003ctd colspan\u003d\"3\"\u003e\n            \u003cdiv\u003e\n              \u003cp\u003eThis actor represents the Laboratory Report creators. That is the actor creating the report that can be send to a consumer or to a repository for report storage and sharing.\u003c/p\u003e\n            \u003c/div\u003e\n          \u003c/td\u003e\n        \u003c/tr\u003e\n      \u003c/table\u003e\n    \u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/ActorDefinition/lab-report-creator",
+  "version": "0.2.0-ci",
+  "name": "LabReportCreator",
+  "status": "active",
+  "date": "2024-12-14T06:50:57+00:00",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "150",
+          "display": "Europe"
+        }
+      ]
+    }
+  ],
+  "copyright": "Used by permission of HL7 Europe, all rights reserved Creative Commons License",
+  "type": "system",
+  "documentation": "This actor represents the Laboratory Report creators. That is the actor creating the report that can be send to a consumer or to a repository for report storage and sharing."
+}

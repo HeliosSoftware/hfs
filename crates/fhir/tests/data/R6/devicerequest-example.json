@@ -1,0 +1,23 @@
+{
+  "resourceType": "DeviceRequest",
+  "id": "example",
+  "status": "completed",
+  "intent": "original-order",
+  "code": {
+    "reference": {
+      "reference": "Device/example"
+    }
+  },
+  "subject": {
+    "reference": "Patient/example"
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

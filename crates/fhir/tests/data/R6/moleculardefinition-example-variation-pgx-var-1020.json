@@ -1,0 +1,81 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-variation-pgx-var-1020",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "location": [
+    {
+      "sequenceLocation": {
+        "sequenceContext": {
+          "reference": "MolecularDefinition/example-sequence-nc00001010-url",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: Homo sapiens chromosome 10, GRCh37.p13 Primary Assembly, NC_000010.10"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30102-0",
+                  "display": "1-based character counting"
+                }
+              ],
+              "text": "1-based character counting"
+            }
+          },
+          "startQuantity": {
+            "value": 96702047
+          },
+          "endQuantity": {
+            "value": 96702047
+          }
+        }
+      }
+    }
+  ],
+  "representation": [
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "reference-state",
+            "display": "Reference State"
+          }
+        ]
+      },
+      "literal": {
+        "value": "C"
+      }
+    },
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "alternative-state",
+            "display": "Alternative State"
+          }
+        ]
+      },
+      "literal": {
+        "value": "C"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

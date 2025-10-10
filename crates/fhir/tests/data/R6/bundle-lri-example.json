@@ -1,0 +1,1631 @@
+{
+  "resourceType": "Bundle",
+  "id": "lri-example",
+  "meta": {
+    "versionId": "1",
+    "lastUpdated": "2017-06-27T00:52:51Z",
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  },
+  "type": "collection",
+  "entry": [
+    {
+      "fullUrl": "http://test.fhir.org/r5/DiagnosticReport/lri-example",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "lri-example",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: DiagnosticReport lri-example\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-example\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-example\"\u003e \u003c/a\u003e\u003ch2\u003e\u003cspan title\u003d\"Codes:{http://loinc.org 624-7}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e (\u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v2-0074 LAB}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eLaboratory\u003c/span\u003e) \u003c/h2\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003eSubject\u003c/td\u003e\u003ctd\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eWhen For\u003c/td\u003e\u003ctd\u003e2016-08-15\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eReported\u003c/td\u003e\u003ctd\u003e2016-08-18T18:14:35Z\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003ePerformer\u003c/td\u003e\u003ctd\u003e \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eIdentifiers\u003c/td\u003e\u003ctd\u003e Placer Identifier/RP723234 Filler Identifier/250401 Group/RFP 123456\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eReport Details\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eValue\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd colspan\u003d\"2\"\u003e\u003ci\u003eObservation\u003c/i\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                  "code": "PLAC",
+                  "display": "Placer Identifier"
+                }
+              ]
+            },
+            "system": "https://acme.org/identifiers",
+            "value": "RP723234"
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+                  "code": "FILL",
+                  "display": "Filler Identifier"
+                }
+              ]
+            },
+            "system": "https://acme.org/identifiers",
+            "value": "250401"
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "https://acme.org/identifiers",
+                  "code": "GRP",
+                  "display": "Group"
+                }
+              ]
+            },
+            "system": "https://acme.org/identifiers",
+            "value": "RFP 123456"
+          }
+        ],
+        "basedOn": [
+          {
+            "reference": "ServiceRequest/example"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "LAB",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-15",
+        "issued": "2016-08-18T18:14:35Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "specimen": [
+          {
+            "reference": "Specimen/101"
+          }
+        ],
+        "result": [
+          {
+            "reference": "Observation/lri-organism1",
+            "display": "Normal Flora"
+          },
+          {
+            "reference": "Observation/lri-organism2",
+            "display": "Klebsiella pneumoniaee"
+          },
+          {
+            "reference": "Observation/lri-organism3",
+            "display": "Staphylococcus aureus"
+          },
+          {
+            "reference": "Observation/lri-gramstain1",
+            "display": "Many WBCs"
+          },
+          {
+            "reference": "Observation/lri-gramstain2",
+            "display": "Moderate Gram Positive Rods"
+          },
+          {
+            "reference": "Observation/lri-gramstain3",
+            "display": "Moderate Gram Positive Cocci in Chains"
+          },
+          {
+            "reference": "Observation/lri-gramstain4",
+            "display": "Many Gram Negative Rods"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-gramstain1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-gramstain1",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-gramstain1\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-gramstain1\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-gramstain1\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/gramstain1\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}, {https://acme.org/codes GMST}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes MNY}\"\u003eMany\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes WBCS}\"\u003eWBCS\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "gramstain1"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "664-3",
+              "display": "Gram Stn Spec"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GMST",
+              "display": "Gram Stain"
+            }
+          ],
+          "text": "Gram Stain"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "MNY",
+                  "display": "Many"
+                }
+              ],
+              "text": "Many"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "WBCS",
+                  "display": "WBCS"
+                }
+              ],
+              "text": "WBCS"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-gramstain2",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-gramstain2",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-gramstain2\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-gramstain2\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-gramstain2\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/gramstain2\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}, {https://acme.org/codes GMST}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes MOD}\"\u003eModerate\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes GPR}\"\u003eGram Positive Rods\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "gramstain2"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "664-3",
+              "display": "Gram Stn Spec"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GMST",
+              "display": "Gram Stain"
+            }
+          ],
+          "text": "Gram Stain"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "MOD",
+                  "display": "Moderate"
+                }
+              ],
+              "text": "Moderate"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "GPR",
+                  "display": "Moderate"
+                }
+              ],
+              "text": "Gram Positive Rods"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-gramstain3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-gramstain3",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-gramstain3\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-gramstain3\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-gramstain3\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/gramstain3\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}, {https://acme.org/codes GMST}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes MOD}\"\u003eModerate\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes GPCCH}\"\u003eGram Positive Cocci in Chains\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "gramstain3"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "664-3",
+              "display": "Gram Stn Spec"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GMST",
+              "display": "Gram Stain"
+            }
+          ],
+          "text": "Gram Stain"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "MOD",
+                  "display": "Moderate"
+                }
+              ],
+              "text": "Moderate"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "GPCCH",
+                  "display": "Gram Positive Cocci in Chains"
+                }
+              ],
+              "text": "Gram Positive Cocci in Chains"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-gramstain4",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-gramstain4",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-gramstain4\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-gramstain4\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-gramstain4\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/gramstain4\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}, {https://acme.org/codes GMST}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes MNY}\"\u003eMany\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ecomponent\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 664-3}\"\u003eGram Stain\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{https://acme.org/codes GNR}\"\u003eGram Negative Rods\u003c/span\u003e\u003c/p\u003e\u003c/blockquote\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "gramstain4"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "664-3",
+              "display": "Gram Stn Spec"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GMST",
+              "display": "Gram Stain"
+            }
+          ],
+          "text": "Gram Stain"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "component": [
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "MNY",
+                  "display": "Many"
+                }
+              ],
+              "text": "Many"
+            }
+          },
+          {
+            "code": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "664-3",
+                  "display": "Gram Stn Spec"
+                }
+              ],
+              "text": "Gram Stain"
+            },
+            "valueCodeableConcept": {
+              "coding": [
+                {
+                  "system": "https://acme.org/codes",
+                  "code": "GNR",
+                  "display": "Gram Negative Rods"
+                }
+              ],
+              "text": "Gram Negative Rods"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-growth1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-growth1",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-growth1\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-growth1\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-growth1\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/growth1\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes GROWTH}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 263812008}\"\u003eModerate Growth\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "growth1"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GROWTH",
+              "display": "Growth"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "263812008",
+              "display": "Moderate Growth"
+            }
+          ],
+          "text": "Moderate Growth"
+        }
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-growth2",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-growth2",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-growth2\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-growth2\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-growth2\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/growth2\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes GROWTH}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 263776006}\"\u003eHeavy growth\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "growth2"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GROWTH",
+              "display": "Growth"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "263776006",
+              "display": "Heavy growth"
+            }
+          ],
+          "text": "Heavy growth"
+        }
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-growth3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-growth3",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-growth3\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-growth3\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-growth3\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/growth3\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes GROWTH}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 263776006}\"\u003eHeavy growth\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "growth3"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "GROWTH",
+              "display": "Growth"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "263776006",
+              "display": "Heavy growth"
+            }
+          ],
+          "text": "Heavy growth"
+        }
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org2-amp",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org2-amp",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org2-amp\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org2-amp\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org2-amp\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org2-amp\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 28-1}, {https://acme.org/codes AMPMIC}\"\u003eAmpicilin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.06 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org2-amp"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "28-1",
+              "display": "Ampicillin Islt MIC"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "AMPMIC",
+              "display": "Ampicilin MIC"
+            }
+          ],
+          "text": "Ampicilin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.06,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org2-cip",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org2-cip",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org2-cip\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org2-cip\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org2-cip\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org2-cip\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 185-9}, {https://acme.org/codes CIPMIC}\"\u003eCiprofloxacin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.05 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org2-cip"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "185-9",
+              "display": "Ciprofloxacin Islt MIC"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CIPMIC",
+              "display": "Ciprofloxacin MIC"
+            }
+          ],
+          "text": "Ciprofloxacin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.05,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org2-gent",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org2-gent",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org2-gent\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org2-gent\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org2-gent\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org2-gent\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 267-5}, {https://acme.org/codes CIPMIC}\"\u003eGentamicin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.05 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org2-gent"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "267-5",
+              "display": "Gentamicin Islt MIC"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CIPMIC",
+              "display": "Gentamicin MIC"
+            }
+          ],
+          "text": "Gentamicin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.05,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org3-amp",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org3-amp",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org3-amp\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org3-amp\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org3-amp\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org3-amp\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 28-1}, {https://acme.org/codes AMPMIC}\"\u003eAmpicilin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.06 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org3-amp"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "28-1",
+              "display": "Ampicillin Islt MIC"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "AMPMIC",
+              "display": "Ampicilin MIC"
+            }
+          ],
+          "text": "Ampicilin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.06,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org3-cip",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org3-cip",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org3-cip\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org3-cip\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org3-cip\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org3-cip\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 185-9}, {https://acme.org/codes CIPMIC}\"\u003eCiprofloxacin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.05 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org3-cip"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "185-9",
+              "display": "Ciprofloxacin Islt MIC"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CIPMIC",
+              "display": "Ciprofloxacin MIC"
+            }
+          ],
+          "text": "Ciprofloxacin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.05,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-org3-gent",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-org3-gent",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-org3-gent\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-org3-gent\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-org3-gent\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/org3-gent\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 267-5}\"\u003eGentamicin MIC\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u0026lt;0.05 ug/ml\u003cspan style\u003d\"background: LightGoldenRodYellow\"\u003e (Details: UCUM  codeug/mL \u003d \u0027ug/mL\u0027)\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003einterpretation\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation S}\"\u003eSusceptible\u003c/span\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "org3-gent"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "267-5",
+              "display": "Gentamicin Islt MIC"
+            }
+          ],
+          "text": "Gentamicin MIC"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueQuantity": {
+          "value": 0.05,
+          "comparator": "\u003c",
+          "unit": "ug/ml",
+          "system": "http://unitsofmeasure.org",
+          "code": "ug/mL"
+        },
+        "interpretation": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v3-ObservationInterpretation",
+                "code": "S",
+                "display": "Susceptible"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-organism1",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-organism1",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-organism1\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-organism1\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-organism1\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/organism1\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes CULTID}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 23506009}\"\u003eNormal flora\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ehasMember\u003c/b\u003e: \u003ca href\u003d\"broken-link.html\"\u003eModerate growth\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "organism1"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CULTID",
+              "display": "Culture ID"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "23506009",
+              "display": "Normal flora"
+            }
+          ],
+          "text": "Normal flora"
+        },
+        "hasMember": [
+          {
+            "reference": "Observation/lri-growth1",
+            "display": "Moderate growth"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-organism2",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-organism2",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-organism2\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-organism2\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-organism2\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/organism2\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes CULTID}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 56415008}\"\u003eKlebsiella pneumoniae\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ehasMember\u003c/b\u003e: \u003c/p\u003e\u003cul\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eHeavy growth\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eAmpicillin MIC - Susceptible\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eCiprofloxacin MIC - Susceptible\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eGentamicin MIC  - Susceptible\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "organism2"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CULTID",
+              "display": "Culture ID"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "56415008",
+              "display": "Klebsiella pneumoniae"
+            }
+          ],
+          "text": "Klebsiella pneumoniae"
+        },
+        "hasMember": [
+          {
+            "reference": "Observation/lri-growth2",
+            "display": "Heavy growth"
+          },
+          {
+            "reference": "Observation/lri-org2-amp",
+            "display": "Ampicillin MIC - Susceptible"
+          },
+          {
+            "reference": "Observation/lri-org2-cip",
+            "display": "Ciprofloxacin MIC - Susceptible"
+          },
+          {
+            "reference": "Observation/lri-org2-gent",
+            "display": "Gentamicin MIC  - Susceptible"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "http://test.fhir.org/r5/Observation/lri-organism3",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "lri-organism3",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Observation lri-organism3\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"lri-organism3\"\u003e \u003c/a\u003e\u003ca name\u003d\"hclri-organism3\"\u003e \u003c/a\u003e\u003cp\u003e\u003cb\u003eidentifier\u003c/b\u003e: \u003ccode\u003ehttps://acme.org/identifiers\u003c/code\u003e/organism3\u003c/p\u003e\u003cp\u003e\u003cb\u003estatus\u003c/b\u003e: Final\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/observation-category laboratory}, {http://terminology.hl7.org/CodeSystem/v2-0074 MB}\"\u003eMicro\u003c/span\u003e, \u003cspan title\u003d\"Codes:{urn:oid:2.16.840.1.113883.9.195.4.61 RSLT}\"\u003eResult\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://loinc.org 624-7}, {https://acme.org/codes CULTID}\"\u003eAerobic Respiratory Culture, Sputum\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003esubject\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eeffective\u003c/b\u003e: 2016-08-18\u003c/p\u003e\u003cp\u003e\u003cb\u003eissued\u003c/b\u003e: 2016-08-18T23:06:32Z\u003c/p\u003e\u003cp\u003e\u003cb\u003eperformer\u003c/b\u003e: \u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003evalue\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 3092008}\"\u003eStaphylococcus aureus\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ehasMember\u003c/b\u003e: \u003c/p\u003e\u003cul\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eHeavy growth\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eAmpicillin MIC - Susceptible\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eCiprofloxacin MIC - Susceptible\u003c/a\u003e\u003c/li\u003e\u003cli\u003e\u003ca href\u003d\"broken-link.html\"\u003eGentamicin MIC  - Susceptible\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+        },
+        "identifier": [
+          {
+            "system": "https://acme.org/identifiers",
+            "value": "organism3"
+          }
+        ],
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "laboratory",
+                "display": "Laboratory"
+              },
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "MB",
+                "display": "microbiology"
+              }
+            ],
+            "text": "Micro"
+          },
+          {
+            "coding": [
+              {
+                "system": "urn:oid:2.16.840.1.113883.9.195.4.61",
+                "code": "RSLT",
+                "display": "Result"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "624-7",
+              "display": "Bacteria Spt Resp Cult"
+            },
+            {
+              "system": "https://acme.org/codes",
+              "code": "CULTID",
+              "display": "Culture ID"
+            }
+          ],
+          "text": "Aerobic Respiratory Culture, Sputum"
+        },
+        "subject": {
+          "reference": "Patient/example"
+        },
+        "effectiveDateTime": "2016-08-18",
+        "issued": "2016-08-18T23:06:32Z",
+        "performer": [
+          {
+            "reference": "Organization/example"
+          }
+        ],
+        "valueCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "3092008",
+              "display": "Staphylococcus aureus"
+            }
+          ],
+          "text": "Staphylococcus aureus"
+        },
+        "hasMember": [
+          {
+            "reference": "Observation/lri-growth3",
+            "display": "Heavy growth"
+          },
+          {
+            "reference": "Observation/lri-org3-amp",
+            "display": "Ampicillin MIC - Susceptible"
+          },
+          {
+            "reference": "Observation/lri-org3-cip",
+            "display": "Ciprofloxacin MIC - Susceptible"
+          },
+          {
+            "reference": "Observation/lri-org3-gent",
+            "display": "Gentamicin MIC  - Susceptible"
+          }
+        ]
+      }
+    }
+  ]
+}

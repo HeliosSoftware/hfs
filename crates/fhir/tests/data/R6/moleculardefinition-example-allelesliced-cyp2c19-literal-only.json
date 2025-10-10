@@ -1,0 +1,80 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-allelesliced-cyp2c19-literal-only",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "rna",
+        "display": "RNA Sequence"
+      }
+    ]
+  },
+  "location": [
+    {
+      "sequenceLocation": {
+        "sequenceContext": {
+          "reference": "MolecularDefinition/example-sequence-nm0007694-url",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: (CYP2C19), mRNA, NM_000769.4"
+        },
+        "coordinateInterval": {
+          "coordinateSystem": {
+            "system": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "LA30100-4",
+                  "display": "0-based interval counting"
+                }
+              ],
+              "text": "0-based interval counting"
+            }
+          },
+          "startQuantity": {
+            "value": 1015
+          },
+          "endQuantity": {
+            "value": 1016
+          }
+        }
+      }
+    }
+  ],
+  "representation": [
+    {
+      "focus": {
+        "coding": [
+          {
+            "code": "allele-state",
+            "display": "Allele State"
+          }
+        ]
+      },
+      "code": [
+        {
+          "coding": [
+            {
+              "system": "https://www.pharmvar.org",
+              "version": "6.2",
+              "code": "PV00076",
+              "display": "CYP2C19*1.002"
+            }
+          ]
+        }
+      ],
+      "literal": {
+        "value": "G"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

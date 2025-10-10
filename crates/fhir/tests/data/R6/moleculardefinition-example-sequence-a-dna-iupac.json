@@ -1,0 +1,37 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-a-dna-iupac",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "literal": {
+        "encoding": {
+          "coding": [
+            {
+              "code": "nuc-dna-1-noamb",
+              "display": "Nucleotide, DNA, 1 letter, no ambiguity"
+            }
+          ]
+        },
+        "value": "A"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

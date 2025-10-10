@@ -1,0 +1,173 @@
+{
+  "resourceType": "ValueSet",
+  "id": "example-characteristic-codes",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet example-characteristic-codes\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"example-characteristic-codes\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcexample-characteristic-codes\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/76691-5/\"\u003e76691-5\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGender identity\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/76689-9/\"\u003e76689-9\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSex assigned at birth\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/21112-8/\"\u003e21112-8\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBirth date\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/46463-6/\"\u003e46463-6\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRace or ethnicity\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/45402-5/\"\u003e45402-5\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrimary language\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/71802-3/\"\u003e71802-3\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHousing status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/8302-2/\"\u003e8302-2\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBody height\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/29463-7/\"\u003e29463-7\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBody weight\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/39156-5/\"\u003e39156-5\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBMI (Body Mass Index)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/8480-6/\"\u003e8480-6\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSystolic blood pressure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/8462-4/\"\u003e8462-4\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDiastolic blood pressure\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/15074-8/\"\u003e15074-8\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGlucose [Moles/volume] in Blood\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/2085-9/\"\u003e2085-9\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHDL Cholesterol\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/4548-4/\"\u003e4548-4\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHemoglobin A1c/Hemoglobin.total in Blood\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/75323-6/\"\u003e75323-6\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCondition status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/55758-7/\"\u003e55758-7\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDiabetes status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/45701-0/\"\u003e45701-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSmoking status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/68518-0/\"\u003e68518-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePregnancy status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/74468-0/\"\u003e74468-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eVaccination status\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/38208-5/\"\u003e38208-5\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRisk assessment cardiovascular disease\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/79423-0/\"\u003e79423-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCardiovascular disease risk score\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/75640-3/\"\u003e75640-3\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFall risk assessment\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/10160-0/\"\u003e10160-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMedication use\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/45260-7/\"\u003e45260-7\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMedication compliance\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/68358-1/\"\u003e68358-1\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDate chronic dialysis began\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/77301-0/\"\u003e77301-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActivities of daily living assessment\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/77160-0/\"\u003e77160-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFunctional outcome score GOSE\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/72133-2/\"\u003e72133-2\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMontreal Cognitive Assessment [MoCA]\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/95023-8/\"\u003e95023-8\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFASI v1.0 - Mobility [CMS Assessment]\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "draft"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/example-characteristic-codes",
+  "version": "6.0.0-ballot3",
+  "name": "ExampleCharacteristicCodes",
+  "title": "Example Characterist ic Codes",
+  "status": "draft",
+  "experimental": false,
+  "date": "2025-03-03",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "This value set contains an example set of LOINC codes that might be used to define common characteristics for grouping individuals in FHIR Group resources.",
+  "copyright": "This content from LOINCÂ® is copyright Â© 1995 Regenstrief Institute, Inc. and the LOINC Committee, and available at no cost under the license at http://loinc.org/terms-of-use.",
+  "compose": {
+    "include": [
+      {
+        "system": "http://loinc.org",
+        "concept": [
+          {
+            "code": "76691-5",
+            "display": "Gender identity"
+          },
+          {
+            "code": "76689-9",
+            "display": "Sex assigned at birth"
+          },
+          {
+            "code": "21112-8",
+            "display": "Birth date"
+          },
+          {
+            "code": "46463-6",
+            "display": "Race or ethnicity"
+          },
+          {
+            "code": "45402-5",
+            "display": "Primary language"
+          },
+          {
+            "code": "71802-3",
+            "display": "Housing status"
+          },
+          {
+            "code": "8302-2",
+            "display": "Body height"
+          },
+          {
+            "code": "29463-7",
+            "display": "Body weight"
+          },
+          {
+            "code": "39156-5",
+            "display": "BMI (Body Mass Index)"
+          },
+          {
+            "code": "8480-6",
+            "display": "Systolic blood pressure"
+          },
+          {
+            "code": "8462-4",
+            "display": "Diastolic blood pressure"
+          },
+          {
+            "code": "15074-8",
+            "display": "Glucose [Moles/volume] in Blood"
+          },
+          {
+            "code": "2085-9",
+            "display": "HDL Cholesterol"
+          },
+          {
+            "code": "4548-4",
+            "display": "Hemoglobin A1c/Hemoglobin.total in Blood"
+          },
+          {
+            "code": "75323-6",
+            "display": "Condition status"
+          },
+          {
+            "code": "55758-7",
+            "display": "Diabetes status"
+          },
+          {
+            "code": "45701-0",
+            "display": "Smoking status"
+          },
+          {
+            "code": "68518-0",
+            "display": "Pregnancy status"
+          },
+          {
+            "code": "74468-0",
+            "display": "Vaccination status"
+          },
+          {
+            "code": "38208-5",
+            "display": "Risk assessment cardiovascular disease"
+          },
+          {
+            "code": "79423-0",
+            "display": "Cardiovascular disease risk score"
+          },
+          {
+            "code": "75640-3",
+            "display": "Fall risk assessment"
+          },
+          {
+            "code": "10160-0",
+            "display": "Medication use"
+          },
+          {
+            "code": "45260-7",
+            "display": "Medication compliance"
+          },
+          {
+            "code": "68358-1",
+            "display": "Date chronic dialysis began"
+          },
+          {
+            "code": "77301-0",
+            "display": "Activities of daily living assessment"
+          },
+          {
+            "code": "77160-0",
+            "display": "Functional outcome score GOSE"
+          },
+          {
+            "code": "72133-2",
+            "display": "Montreal Cognitive Assessment [MoCA]"
+          },
+          {
+            "code": "95023-8",
+            "display": "FASI v1.0 - Mobility [CMS Assessment]"
+          }
+        ]
+      }
+    ]
+  }
+}

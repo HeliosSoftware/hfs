@@ -1,0 +1,211 @@
+{
+  "resourceType": "Permission",
+  "id": "example-exclude",
+  "meta": {
+    "security": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST"
+      }
+    ],
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  },
+  "status": "active",
+  "asserter": {
+    "reference": "Organization/example"
+  },
+  "date": [
+    "2023-11-22"
+  ],
+  "combining": "deny-unless-permit",
+  "rule": [
+    {
+      "type": "permit",
+      "activity": [
+        {
+          "action": [
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "C"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "R"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "U"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "D"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "E"
+                }
+              ]
+            }
+          ],
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HDIRECT"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HSYSADMIN"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "permit",
+      "activity": [
+        {
+          "action": [
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "R"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "E"
+                }
+              ]
+            }
+          ],
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "TREAT"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HPAYMT"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "HOPERAT"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "limit": [
+        {
+          "tag": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+              "code": "LOCIS"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "permit",
+      "data": [
+        {
+          "expression": {
+            "description": "select all Practitioner resources where the Practitioner has a PractitionerRole with code of doctor",
+            "language": "application/x-fhir-query",
+            "expression": "Practitioner?_has:PractitionerRole:practitioner:role\u003dhttp://terminology.hl7.org/CodeSystem/practitioner-role|doctor"
+          }
+        }
+      ],
+      "activity": [
+        {
+          "action": [
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "R"
+                }
+              ]
+            },
+            {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/audit-event-action",
+                  "code": "E"
+                }
+              ]
+            }
+          ],
+          "purpose": [
+            {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+                  "code": "PATRQT"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "limit": [
+        {
+          "tag": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+              "code": "LOCIS"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "resourceType": "Flag",
+  "id": "protocol",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003eSpecial guidance: Ensure patients meet all inclusion criteria before starting Zika Virus Infection Management Process\u003c/div\u003e"
+  },
+  "identifier": [
+    {
+      "value": "guidance-2024-abc"
+    }
+  ],
+  "status": "active",
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/flag-category",
+          "code": "safety",
+          "display": "Safety"
+        }
+      ],
+      "text": "Safety"
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://example.org/local",
+        "code": "special-guidance",
+        "display": "Special Guidance"
+      }
+    ],
+    "text": "Ensure patients meet all inclusion criteria before starting Zika Virus Infection Management Process"
+  },
+  "subject": {
+    "reference": "PlanDefinition/zika-virus-intervention",
+    "display": "Zika Virus Infection Management Process"
+  },
+  "period": {
+    "start": "2024-09-01"
+  },
+  "author": {
+    "reference": "Organization/example",
+    "display": "ACME Health"
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -1,0 +1,213 @@
+{
+  "resourceType": "MedicinalProductDefinition",
+  "id": "drug-and-device-complete",
+  "contained": [
+    {
+      "resourceType": "PackagedProductDefinition",
+      "id": "package",
+      "packageFor": [
+        {
+          "reference": "#"
+        }
+      ],
+      "packaging": {
+        "packaging": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "code": "cardboard box (outer)"
+                }
+              ]
+            },
+            "packaging": [
+              {
+                "type": {
+                  "coding": [
+                    {
+                      "code": "cardboard box (inner)"
+                    }
+                  ]
+                },
+                "packaging": [
+                  {
+                    "type": {
+                      "coding": [
+                        {
+                          "code": "sachet"
+                        }
+                      ]
+                    },
+                    "containedItem": [
+                      {
+                        "item": {
+                          "reference": {
+                            "reference": "#powderItem"
+                          }
+                        },
+                        "amount": {
+                          "value": 5,
+                          "unit": "g",
+                          "system": "http://unitsofmeasure.org",
+                          "code": "g"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": {
+                      "coding": [
+                        {
+                          "code": "bottle"
+                        }
+                      ]
+                    },
+                    "containedItem": [
+                      {
+                        "item": {
+                          "reference": {
+                            "reference": "#solventItem"
+                          }
+                        },
+                        "amount": {
+                          "value": 20,
+                          "unit": "ml",
+                          "system": "http://unitsofmeasure.org",
+                          "code": "mL"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "type": {
+                  "coding": [
+                    {
+                      "code": "foil bag"
+                    }
+                  ]
+                },
+                "containedItem": [
+                  {
+                    "item": {
+                      "reference": {
+                        "reference": "#syringeDevice"
+                      }
+                    },
+                    "amount": {
+                      "value": 1
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "resourceType": "ManufacturedItemDefinition",
+      "id": "solventItem",
+      "status": "active",
+      "manufacturedDoseForm": {
+        "coding": [
+          {
+            "system": "http://example.org.uk/fhir/doseform",
+            "code": "solvent for powder for injection"
+          }
+        ]
+      }
+    },
+    {
+      "resourceType": "ManufacturedItemDefinition",
+      "id": "powderItem",
+      "status": "active",
+      "manufacturedDoseForm": {
+        "coding": [
+          {
+            "system": "http://example.org.uk/fhir/doseform",
+            "code": "powder for solution for injection"
+          }
+        ]
+      }
+    },
+    {
+      "resourceType": "DeviceDefinition",
+      "id": "syringeDevice",
+      "status": "active",
+      "classification": [
+        {
+          "type": {
+            "text": "syringe"
+          }
+        }
+      ]
+    },
+    {
+      "resourceType": "AdministrableProductDefinition",
+      "id": "administrable-form",
+      "status": "active",
+      "formOf": [
+        {
+          "reference": "#"
+        }
+      ],
+      "administrableDoseForm": {
+        "coding": [
+          {
+            "code": "solution for injection"
+          }
+        ]
+      },
+      "producedFrom": [
+        {
+          "reference": "#powderItem"
+        },
+        {
+          "reference": "#solventItem"
+        }
+      ],
+      "routeOfAdministration": [
+        {
+          "code": {
+            "coding": [
+              {
+                "system": "http://example.org.uk/fhir/route",
+                "code": "intramuscular"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "identifier": [
+    {
+      "system": "http://example.org.uk/fhir/product",
+      "value": "Wonderdrug+"
+    }
+  ],
+  "combinedPharmaceuticalDoseForm": {
+    "coding": [
+      {
+        "system": "http://example.org.uk/fhir/doseform",
+        "code": "Powder and solution for injection with itegral syringe"
+      }
+    ]
+  },
+  "name": [
+    {
+      "productName": "Wonderdrug liquid 20ml (integral syringe)"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

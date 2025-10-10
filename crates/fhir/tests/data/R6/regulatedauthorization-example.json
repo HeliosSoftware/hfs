@@ -1,0 +1,98 @@
+{
+  "resourceType": "RegulatedAuthorization",
+  "id": "example",
+  "identifier": [
+    {
+      "system": "http://ema.europa.eu/example/marketingAuthorizationNumber",
+      "value": "EU/1/11/999/001"
+    }
+  ],
+  "region": [
+    {
+      "coding": [
+        {
+          "system": "http://ema.europa.eu/example/country",
+          "code": "EU"
+        }
+      ]
+    }
+  ],
+  "status": {
+    "coding": [
+      {
+        "system": "http://ema.europa.eu/example/authorizationstatus",
+        "code": "active"
+      }
+    ]
+  },
+  "statusDate": "2015-01-14",
+  "validityPeriod": {
+    "start": "2014-09-03",
+    "end": "2020-05-20"
+  },
+  "holder": {
+    "reference": "Organization/example"
+  },
+  "regulator": {
+    "reference": "Organization/example"
+  },
+  "case": {
+    "identifier": {
+      "system": "http://ema.europa.eu/example/procedureidentifier-number",
+      "value": "EMEA/H/C/009999/IA/0099/G"
+    },
+    "type": {
+      "coding": [
+        {
+          "system": "http://ema.europa.eu/example/marketingAuthorizationProcedureType",
+          "code": "VariationTypeIA"
+        }
+      ]
+    },
+    "datePeriod": {
+      "start": "2014-09-02",
+      "end": "2015-08-21"
+    },
+    "application": [
+      {
+        "identifier": {
+          "system": "http://ema.europa.eu/example/applicationidentifier-number",
+          "value": "IA38G"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "http://ema.europa.eu/example/marketingAuthorizationApplicationType",
+              "code": "GroupTypeIAVariationNotification"
+            }
+          ]
+        },
+        "dateDateTime": "2015-08-01"
+      },
+      {
+        "identifier": {
+          "system": "http://ema.europa.eu/example/applicationidentifier-number",
+          "value": "IA38F"
+        },
+        "type": {
+          "coding": [
+            {
+              "system": "http://ema.europa.eu/example/marketingAuthorizationApplicationType",
+              "code": "GroupTypeIAVariationNotification"
+            }
+          ]
+        },
+        "dateDateTime": "2014-09-01"
+      }
+    ]
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

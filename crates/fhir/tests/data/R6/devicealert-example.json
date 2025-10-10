@@ -1,0 +1,101 @@
+{
+  "resourceType": "DeviceAlert",
+  "id": "example",
+  "identifier": [
+    {
+      "use": "official",
+      "type": {
+        "text": "Alarm Unique Id"
+      },
+      "value": "0600dcFFFF750001^^^EUI-64_d1130a75-316c-4401-88c4-9c71704cdf6b_d629bc41-0310-4fec-b1a4-41356b66a7eb"
+    }
+  ],
+  "status": "in-progress",
+  "code": {
+    "coding": [
+      {
+        "system": "urn:iso:std:iso:11073:10101",
+        "code": "196670",
+        "display": "MDC_EVT_LO"
+      }
+    ]
+  },
+  "subject": {
+    "reference": "Patient/pat1"
+  },
+  "presence": true,
+  "device": {
+    "reference": "Device/example"
+  },
+  "derivedFrom": [
+    {
+      "observation": {
+        "reference": "Observation/f0f9274d-8ada-402b-afa9-b9468ca50510",
+        "type": "Observation"
+      },
+      "limit": {
+        "low": {
+          "value": 87,
+          "unit": "MDC_DIM_PERCENT",
+          "system": "urn:iso:std:iso:11073:10101",
+          "code": "262688"
+        },
+        "high": {
+          "value": 98,
+          "unit": "MDC_DIM_PERCENT",
+          "system": "urn:iso:std:iso:11073:10101",
+          "code": "262688"
+        }
+      }
+    }
+  ],
+  "acknowledged": false,
+  "label": "**SpO2   86  \u003c87  ",
+  "signal": [
+    {
+      "activationState": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/devicealert-activationState",
+            "code": "on",
+            "display": "On"
+          }
+        ]
+      },
+      "presence": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/devicealert-presence",
+            "code": "on",
+            "display": "On"
+          }
+        ]
+      },
+      "annunciator": {
+        "reference": {
+          "reference": "Device/example",
+          "type": "Device"
+        }
+      },
+      "manifestation": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/devicealert-manifestation",
+            "code": "visual",
+            "display": "Visual"
+          }
+        ],
+        "text": "visual alert"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

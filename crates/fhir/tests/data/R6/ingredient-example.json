@@ -1,0 +1,101 @@
+{
+  "resourceType": "Ingredient",
+  "id": "example",
+  "status": "active",
+  "role": {
+    "coding": [
+      {
+        "system": "http://ema.europa.eu/example/ingredientRole",
+        "code": "ActiveBase"
+      }
+    ]
+  },
+  "manufacturer": [
+    {
+      "manufacturer": {
+        "reference": "Organization/example"
+      }
+    }
+  ],
+  "substance": {
+    "code": {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://ema.europa.eu/example/substance",
+            "code": "EQUIXABAN"
+          }
+        ]
+      }
+    },
+    "strength": [
+      {
+        "presentationRatio": {
+          "numerator": {
+            "value": 50,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg"
+          },
+          "denominator": {
+            "value": 1,
+            "unit": "tablet",
+            "system": "http://unitsofmeasure.org",
+            "code": "{tablet}"
+          }
+        },
+        "concentrationRatio": {
+          "numerator": {
+            "value": 5,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg"
+          },
+          "denominator": {
+            "value": 1,
+            "unit": "mg",
+            "system": "http://unitsofmeasure.org",
+            "code": "mg"
+          }
+        },
+        "referenceStrength": [
+          {
+            "substance": {
+              "concept": {
+                "coding": [
+                  {
+                    "system": "http://ema.europa.eu/example/substance",
+                    "code": "EQUIXABAN-SULPHATE"
+                  }
+                ]
+              }
+            },
+            "strengthRatio": {
+              "numerator": {
+                "value": 5.03,
+                "unit": "mg",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg"
+              },
+              "denominator": {
+                "value": 1,
+                "unit": "mg",
+                "system": "http://unitsofmeasure.org",
+                "code": "mg"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

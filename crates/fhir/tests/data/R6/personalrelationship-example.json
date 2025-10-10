@@ -1,0 +1,32 @@
+{
+  "resourceType": "PersonalRelationship",
+  "id": "example",
+  "source": {
+    "reference": "Patient/example"
+  },
+  "relationshipType": {
+    "coding": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+        "code": "WIFE"
+      }
+    ]
+  },
+  "target": {
+    "reference": "Patient/example"
+  },
+  "period": [
+    {
+      "start": "2022-05-19"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

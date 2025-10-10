@@ -1,0 +1,87 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "devicealert-priority",
+  "meta": {
+    "lastUpdated": "2025-07-03T16:22:16.509+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem devicealert-priority\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"devicealert-priority\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcdevicealert-priority\"\u003e \u003c/a\u003e\u003ca name\u003d\"devicealert-priority-en-US\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/devicealert-priority\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ehigh\u003ca name\u003d\"devicealert-priority-high\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHigh Priority\u003c/td\u003e\u003ctd\u003eThe alert is about a potentially life-threatening condition that should be addressed immediately.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003emedium\u003ca name\u003d\"devicealert-priority-medium\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eMedium Priority\u003c/td\u003e\u003ctd\u003eThe alert is about a significant condition that should be addressed promptly.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003elow\u003ca name\u003d\"devicealert-priority-low\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLow Priority\u003c/td\u003e\u003ctd\u003eThe alert is about a condition that should be addressed.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einfo\u003ca name\u003d\"devicealert-priority-info\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInformation Only\u003c/td\u003e\u003ctd\u003eThe alert is about a condition that does not need addressing.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "dev"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "draft"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 2
+    }
+  ],
+  "url": "http://hl7.org/fhir/devicealert-priority",
+  "version": "6.0.0-ballot2",
+  "name": "DeviceAlertPriority",
+  "title": "Device Alert Priority",
+  "status": "active",
+  "experimental": false,
+  "date": "2023-12-10T10:01:24+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Describes the priority of a DeviceAlert.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/devicealert-priority",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "high",
+      "display": "High Priority",
+      "definition": "The alert is about a potentially life-threatening condition that should be addressed immediately."
+    },
+    {
+      "code": "medium",
+      "display": "Medium Priority",
+      "definition": "The alert is about a significant condition that should be addressed promptly."
+    },
+    {
+      "code": "low",
+      "display": "Low Priority",
+      "definition": "The alert is about a condition that should be addressed."
+    },
+    {
+      "code": "info",
+      "display": "Information Only",
+      "definition": "The alert is about a condition that does not need addressing."
+    }
+  ]
+}

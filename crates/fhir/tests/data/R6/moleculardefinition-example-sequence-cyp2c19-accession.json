@@ -1,0 +1,29 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-cyp2c19-accession",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "resolvable": {
+        "reference": "DocumentReference/example-genomicFile-cyp2c19-accession"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

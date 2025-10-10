@@ -2,10 +2,6 @@
 /target
 /node_modules
 yarn.lock
-.aider*
-crates/fhir_gen/resources/R6/*
-!crates/fhir_gen/resources/R6/view-definition-bundle-entry.json
-crates/fhir/tests/data/R6
 crates/sof/test_report.json
 crates/sof/output.csv
 .idea

@@ -1,0 +1,20 @@
+{
+  "resourceType": "Device",
+  "id": "f001",
+  "identifier": [
+    {
+      "system": "http:/goodhealthhospital/identifier/devices",
+      "value": "12345"
+    }
+  ],
+  "status": "active",
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "task-inputoutput-parameter-type",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem task-inputoutput-parameter-type\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"task-inputoutput-parameter-type\"\u003e \u003c/a\u003e\u003ca name\u003d\"hctask-inputoutput-parameter-type\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/task-inputoutput-parameter-type\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecollected-specimen\u003ca name\u003d\"task-inputoutput-parameter-type-collected-specimen\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCollected Specimen\u003c/td\u003e\u003ctd\u003eA specimen that has been collected.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ereference-results\u003ca name\u003d\"task-inputoutput-parameter-type-reference-results\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eReference Results\u003c/td\u003e\u003ctd\u003eReference results to compare against.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprior-results\u003ca name\u003d\"task-inputoutput-parameter-type-prior-results\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrior Results\u003c/td\u003e\u003ctd\u003eResults from a previous order.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003econcomitant-medications\u003ca name\u003d\"task-inputoutput-parameter-type-concomitant-medications\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eConcomitant Medications\u003c/td\u003e\u003ctd\u003eMedications, supplements or drugs the patient consumes at the same time as something else.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efiller-order\u003ca name\u003d\"task-inputoutput-parameter-type-filler-order\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFiller Order\u003c/td\u003e\u003ctd\u003eThe order number associated with the filler.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edata-query\u003ca name\u003d\"task-inputoutput-parameter-type-data-query\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003edata query input\u003c/td\u003e\u003ctd\u003eIndicates the parameters of a FHIR RESTful search to be executed whose results are requested by a data-request Task. The content will be the portion of the query URL following the \u0027base\u0027. E.g.  `Observation?code\u003dfoo`.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edata-code\u003ca name\u003d\"task-inputoutput-parameter-type-data-code\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003edata code input\u003c/td\u003e\u003ctd\u003eA code describing the information requested by a data-request Task - often a code for a type of document\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003edata-value\u003ca name\u003d\"task-inputoutput-parameter-type-data-value\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003edata values output\u003c/td\u003e\u003ctd\u003eA FHIR resource, typically a search-set Bundle, containing the requested information in response to a data-request Task\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/task-inputoutput-parameter-type",
+  "version": "6.0.0-ballot3",
+  "name": "TaskInputOutputParameterType",
+  "title": "Task Input/Output Parameter Type",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-03-12T10:00:00+08:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The input and output types for the task.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/task-inputoutput-parameter-type",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "collected-specimen",
+      "display": "Collected Specimen",
+      "definition": "A specimen that has been collected."
+    },
+    {
+      "code": "reference-results",
+      "display": "Reference Results",
+      "definition": "Reference results to compare against."
+    },
+    {
+      "code": "prior-results",
+      "display": "Prior Results",
+      "definition": "Results from a previous order."
+    },
+    {
+      "code": "concomitant-medications",
+      "display": "Concomitant Medications",
+      "definition": "Medications, supplements or drugs the patient consumes at the same time as something else."
+    },
+    {
+      "code": "filler-order",
+      "display": "Filler Order",
+      "definition": "The order number associated with the filler."
+    },
+    {
+      "code": "data-query",
+      "display": "data query input",
+      "definition": "Indicates the parameters of a FHIR RESTful search to be executed whose results are requested by a data-request Task. The content will be the portion of the query URL following the \u0027base\u0027. E.g.  `Observation?code\u003dfoo`."
+    },
+    {
+      "code": "data-code",
+      "display": "data code input",
+      "definition": "A code describing the information requested by a data-request Task - often a code for a type of document"
+    },
+    {
+      "code": "data-value",
+      "display": "data values output",
+      "definition": "A FHIR resource, typically a search-set Bundle, containing the requested information in response to a data-request Task"
+    }
+  ]
+}

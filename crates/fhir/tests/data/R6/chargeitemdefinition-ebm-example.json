@@ -1,0 +1,99 @@
+{
+  "resourceType": "ChargeItemDefinition",
+  "id": "ebm",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pa"
+    }
+  ],
+  "url": "http://fhir.de/ChargeItemDefinition/kbv/ebm-30110",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.29.1"
+    }
+  ],
+  "version": "2-2018",
+  "status": "active",
+  "publisher": "HL7 International / Patient Administration",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/pafm"
+        }
+      ]
+    }
+  ],
+  "description": "Allergologisch-diagnostischer Komplex zur Diagnostik und/oder zum Ausschluss einer (Kontakt-)Allergie vom Spättyp (Typ IV), einschl. Kosten",
+  "code": {
+    "coding": [
+      {
+        "system": "http://fhir.de/CodingSystem/kbv/ebm",
+        "code": "30110",
+        "display": "Allergologiediagnostik I"
+      }
+    ]
+  },
+  "applicability": [
+    {
+      "condition": {
+        "description": "Excludes billing code 13250 for same Encounter",
+        "language": "text/cql",
+        "expression": "[some CQL expression]"
+      },
+      "effectivePeriod": {
+        "start": "2018-04-01",
+        "end": "2018-06-30"
+      }
+    },
+    {
+      "condition": {
+        "description": "Applies only once per Encounter",
+        "language": "text/CQL",
+        "expression": "[some CQL expression]"
+      },
+      "effectivePeriod": {
+        "start": "2018-04-01",
+        "end": "2018-06-30"
+      }
+    }
+  ],
+  "propertyGroup": [
+    {
+      "priceComponent": [
+        {
+          "type": "base",
+          "code": {
+            "coding": [
+              {
+                "system": "http://fhir.de/CodeSystem/kbv/ebm-attribute",
+                "code": "gesamt-euro",
+                "display": "Gesamt (Euro)"
+              }
+            ]
+          },
+          "amount": {
+            "value": 67.44,
+            "currency": "EUR"
+          }
+        },
+        {
+          "type": "informational",
+          "code": {
+            "coding": [
+              {
+                "system": "http://fhir.de/CodeSystem/kbv/ebm-attribute",
+                "code": "gesamt-punkte",
+                "display": "Gesamt (Punkte)"
+              }
+            ]
+          },
+          "factor": 633
+        }
+      ]
+    }
+  ]
+}

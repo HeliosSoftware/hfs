@@ -1,0 +1,40 @@
+{
+  "resourceType": "NutritionProduct",
+  "id": "adult-formula-supplement",
+  "code": {
+    "coding": [
+      {
+        "system": "http://snomed.info/sct",
+        "code": "442651000124102",
+        "display": "Adult Formula (product)"
+      }
+    ]
+  },
+  "status": "active",
+  "manufacturer": [
+    {
+      "display": "Nestle"
+    }
+  ],
+  "energy": {
+    "value": 1.7,
+    "unit": "kcal/ml",
+    "system": "http://unitsofmeasure.org",
+    "code": "kcal/ml"
+  },
+  "instance": [
+    {
+      "name": "Boost Pudding",
+      "expiry": "2026-08-23"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

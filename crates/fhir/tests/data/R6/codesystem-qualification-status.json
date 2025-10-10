@@ -1,0 +1,93 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "qualification-status",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem qualification-status\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"qualification-status\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcqualification-status\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/qualification-status\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eactive\u003ca name\u003d\"qualification-status-active\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eActive\u003c/td\u003e\u003ctd\u003eThe qualification is available to use - The qualification period may be included to indicate a time interval if required.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003einactive\u003ca name\u003d\"qualification-status-inactive\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eInactive\u003c/td\u003e\u003ctd\u003eThis qualification is not available to use. This can be used without a period, and the expectation will not resume use.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ein-progress\u003ca name\u003d\"qualification-status-in-progress\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIn-progress\u003c/td\u003e\u003ctd\u003eThe practitioner is in the process of aquiring for this qualification/certification \u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epending\u003ca name\u003d\"qualification-status-pending\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePending\u003c/td\u003e\u003ctd\u003eThe qualification is complete, however final issue/award is pending \u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003etemporary\u003ca name\u003d\"qualification-status-temporary\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTemporary\u003c/td\u003e\u003ctd\u003eThis qualification has been allocated to the practitioner on a temporary basis, the period may indicate a time interval. This could cover cases such as the recognition of an external qualificiaiton that is still being verified, but can be used during the process.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003econditional\u003ca name\u003d\"qualification-status-conditional\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eConditional\u003c/td\u003e\u003ctd\u003eThis qualification may be used, however there are conditions that may apply\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esuspended\u003ca name\u003d\"qualification-status-suspended\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSuspended\u003c/td\u003e\u003ctd\u003eThis qualification should not be used, but may resume use in the future - the period, if included, may indicate when this started (via the end date, start date indicates when the qualification was available from).\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003erevoked\u003ca name\u003d\"qualification-status-revoked\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eRevoked\u003c/td\u003e\u003ctd\u003eThis qualification should not be used, and is not expected to resume in the future\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pa"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    }
+  ],
+  "url": "http://hl7.org/fhir/qualification-status",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.2137"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "QualificationStatus",
+  "title": "Qualification Status",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International",
+  "description": "Set of statuses that apply to qualifications of practitioners and organizations",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "content": "complete",
+  "concept": [
+    {
+      "code": "active",
+      "display": "Active",
+      "definition": "The qualification is available to use - The qualification period may be included to indicate a time interval if required."
+    },
+    {
+      "code": "inactive",
+      "display": "Inactive",
+      "definition": "This qualification is not available to use. This can be used without a period, and the expectation will not resume use."
+    },
+    {
+      "code": "in-progress",
+      "display": "In-progress",
+      "definition": "The practitioner is in the process of aquiring for this qualification/certification "
+    },
+    {
+      "code": "pending",
+      "display": "Pending",
+      "definition": "The qualification is complete, however final issue/award is pending "
+    },
+    {
+      "code": "temporary",
+      "display": "Temporary",
+      "definition": "This qualification has been allocated to the practitioner on a temporary basis, the period may indicate a time interval. This could cover cases such as the recognition of an external qualificiaiton that is still being verified, but can be used during the process."
+    },
+    {
+      "code": "conditional",
+      "display": "Conditional",
+      "definition": "This qualification may be used, however there are conditions that may apply"
+    },
+    {
+      "code": "suspended",
+      "display": "Suspended",
+      "definition": "This qualification should not be used, but may resume use in the future - the period, if included, may indicate when this started (via the end date, start date indicates when the qualification was available from)."
+    },
+    {
+      "code": "revoked",
+      "display": "Revoked",
+      "definition": "This qualification should not be used, and is not expected to resume in the future"
+    }
+  ]
+}

@@ -1,0 +1,150 @@
+{
+  "resourceType": "Bundle",
+  "id": "example-bundle-allergyintolerance",
+  "type": "searchset",
+  "total": 1,
+  "link": [
+    {
+      "relation": "self",
+      "url": "http://example.org/fhir/AllergyIntolerance?_id\u003d79613\u0026_revinclude\u003dProvenance:target"
+    }
+  ],
+  "entry": [
+    {
+      "fullUrl": "http://example.org/fhir/AllergyIntolerance/79613",
+      "resource": {
+        "resourceType": "AllergyIntolerance",
+        "id": "79613",
+        "meta": {
+          "versionId": "1",
+          "lastUpdated": "2019-07-09T15:26:23.217+00:00"
+        },
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: AllergyIntolerance 79613\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"79613\"\u003e \u003c/a\u003e\u003ca name\u003d\"hc79613\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eversion: 1; Last updated: 2019-07-09T15:26:23.217Z\u003c/p\u003e\u003c/div\u003e\u003cp\u003e\u003cb\u003eclinicalStatus\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical active}\"\u003eActive\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003everificationStatus\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/allergyintolerance-verification confirmed}\"\u003eConfirmed\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003ecategory\u003c/b\u003e: Medication\u003c/p\u003e\u003cp\u003e\u003cb\u003ecriticality\u003c/b\u003e: High Risk\u003c/p\u003e\u003cp\u003e\u003cb\u003ecode\u003c/b\u003e: \u003cspan title\u003d\"Codes:{http://snomed.info/sct 762952008}\"\u003ePeanuts\u003c/span\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003epatient\u003c/b\u003e: \u003ca href\u003d\"patient-example.html\"\u003eJim  Male, DoB: 1974-12-25 ( Medical record number (use: usual, period: 2001-05-06 --\u0026gt; (ongoing)))\u003c/a\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eonset\u003c/b\u003e: 2017-06-09\u003c/p\u003e\u003cblockquote\u003e\u003cp\u003e\u003cb\u003ereaction\u003c/b\u003e\u003c/p\u003e\u003ch3\u003eManifestations\u003c/h3\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd style\u003d\"display: none\"\u003e-\u003c/td\u003e\u003ctd\u003e\u003cb\u003eConcept\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"display: none\"\u003e*\u003c/td\u003e\u003ctd\u003e\u003cspan title\u003d\"Codes:{http://snomed.info/sct 247472004}\"\u003eHives\u003c/span\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eonset\u003c/b\u003e: 2017-06-09\u003c/p\u003e\u003c/blockquote\u003e\u003c/div\u003e"
+        },
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+              "code": "active",
+              "display": "Active"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "category": [
+          "medication"
+        ],
+        "criticality": "high",
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "version": "http://snomed.info/sct/731000124108",
+              "code": "762952008",
+              "display": "Peanuts"
+            }
+          ],
+          "text": "Peanuts"
+        },
+        "patient": {
+          "reference": "Patient/example"
+        },
+        "onsetDateTime": "2017-06-09",
+        "reaction": [
+          {
+            "manifestation": [
+              {
+                "concept": {
+                  "coding": [
+                    {
+                      "system": "http://snomed.info/sct",
+                      "version": "http://snomed.info/sct/731000124108",
+                      "code": "247472004",
+                      "display": "Hives"
+                    }
+                  ]
+                }
+              }
+            ],
+            "onset": "2017-06-09"
+          }
+        ]
+      },
+      "search": {
+        "mode": "match"
+      }
+    },
+    {
+      "fullUrl": "http://example.org/fhir/Provenance/79614",
+      "resource": {
+        "resourceType": "Provenance",
+        "id": "79614",
+        "text": {
+          "status": "generated",
+          "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: Provenance 79614\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"79614\"\u003e \u003c/a\u003e\u003ca name\u003d\"hc79614\"\u003e \u003c/a\u003e\u003cp\u003eProvenance for \u003ca href\u003d\"broken-link.html\"\u003eAllergyIntolerance/79613\u003c/a\u003e\u003c/p\u003e\u003cp\u003eSummary\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003eRecorded\u003c/td\u003e\u003ctd\u003e2019-07-09T15:26:23.217Z\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eAgents\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eType\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003ewho\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eOn Behalf Of\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/provenance-participant-type custodian}\"\u003eCustodian\u003c/span\u003e\u003c/td\u003e\u003ctd\u003e\u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/td\u003e\u003ctd/\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003cspan title\u003d\"Codes:{http://terminology.hl7.org/CodeSystem/provenance-participant-type author}\"\u003eAuthor\u003c/span\u003e\u003c/td\u003e\u003ctd\u003e\u003ca href\u003d\"practitioner-example-f004-rb.html\"\u003ePractitioner Ronald Briet (official)\u003c/a\u003e\u003c/td\u003e\u003ctd\u003e\u003ca href\u003d\"organization-example.html\"\u003eOrganization ACME Health\u003c/a\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+        },
+        "target": [
+          {
+            "reference": "AllergyIntolerance/79613/_history/1"
+          }
+        ],
+        "recorded": "2019-07-09T15:26:23.217+00:00",
+        "agent": [
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "custodian",
+                  "display": "Custodian"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Organization/example"
+            }
+          },
+          {
+            "type": {
+              "coding": [
+                {
+                  "system": "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+                  "code": "author",
+                  "display": "Author"
+                }
+              ]
+            },
+            "who": {
+              "reference": "Practitioner/f004"
+            },
+            "onBehalfOf": {
+              "reference": "Organization/example"
+            }
+          }
+        ]
+      },
+      "search": {
+        "mode": "include"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

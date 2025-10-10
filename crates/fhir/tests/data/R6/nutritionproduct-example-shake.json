@@ -1,0 +1,537 @@
+{
+  "resourceType": "NutritionProduct",
+  "id": "example-shake",
+  "code": {
+    "coding": [
+      {
+        "system": "https://fdc.nal.usda.gov/",
+        "code": "1838384",
+        "display": "FRENCH VANILLA MAX PROTEIN NUTRITION SHAKE, FRENCH VANILLA"
+      }
+    ],
+    "text": "FRENCH VANILLA MAX PROTEIN NUTRITION SHAKE, FRENCH VANILLA"
+  },
+  "status": "active",
+  "category": [
+    {
+      "text": "Energy, Protein \u0026 Muscle Recovery Drinks"
+    }
+  ],
+  "nutrient": [
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1005",
+              "display": "Carbohydrate, by difference"
+            }
+          ],
+          "text": "Carbohydrate, by difference"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1003",
+              "display": "Protein"
+            }
+          ],
+          "text": "Protein"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1100",
+              "display": "Iodine, I"
+            }
+          ],
+          "text": "Iodine, I"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1165",
+              "display": "Thiamin"
+            }
+          ],
+          "text": "Thiamin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1166",
+              "display": "Riboflavin"
+            }
+          ],
+          "text": "Riboflavin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1175",
+              "display": "Vitamin B-6"
+            }
+          ],
+          "text": "Vitamin B-6"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1170",
+              "display": "Pantothenic acid"
+            }
+          ],
+          "text": "Pantothenic acid"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1253",
+              "display": "Cholesterol"
+            }
+          ],
+          "text": "Cholesterol"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1104",
+              "display": "Vitamin A, IU"
+            }
+          ],
+          "text": "Vitamin A, IU"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1258",
+              "display": "Fatty acids, total saturated"
+            }
+          ],
+          "text": "Fatty acids, total saturated"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1090",
+              "display": "Magnesium, Mg"
+            }
+          ],
+          "text": "Magnesium, Mg"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1101",
+              "display": "Manganese, Mn"
+            }
+          ],
+          "text": "Manganese, Mn"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1092",
+              "display": "Potassium, K"
+            }
+          ],
+          "text": "Potassium, K"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1093",
+              "display": "Sodium, Na"
+            }
+          ],
+          "text": "Sodium, Na"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1079",
+              "display": "Fiber, total dietary"
+            }
+          ],
+          "text": "Fiber, total dietary"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1167",
+              "display": "Niacin"
+            }
+          ],
+          "text": "Niacin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1257",
+              "display": "Fatty acids, total trans"
+            }
+          ],
+          "text": "Fatty acids, total trans"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1103",
+              "display": "Selenium, Se"
+            }
+          ],
+          "text": "Selenium, Se"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1162",
+              "display": "Vitamin C, total ascorbic acid"
+            }
+          ],
+          "text": "Vitamin C, total ascorbic acid"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1091",
+              "display": "Phosphorus, P"
+            }
+          ],
+          "text": "Phosphorus, P"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1098",
+              "display": "Copper, Cu"
+            }
+          ],
+          "text": "Copper, Cu"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1095",
+              "display": "Zinc, Zn"
+            }
+          ],
+          "text": "Zinc, Zn"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1178",
+              "display": "Vitamin B-12"
+            }
+          ],
+          "text": "Vitamin B-12"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1004",
+              "display": "Total lipid (fat)"
+            }
+          ],
+          "text": "Total lipid (fat)"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "2000",
+              "display": "Sugars, total including NLEA"
+            }
+          ],
+          "text": "Sugars, total including NLEA"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1087",
+              "display": "Calcium, Ca"
+            }
+          ],
+          "text": "Calcium, Ca"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1177",
+              "display": "Folate, total"
+            }
+          ],
+          "text": "Folate, total"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1185",
+              "display": "Vitamin K (phylloquinone)"
+            }
+          ],
+          "text": "Vitamin K (phylloquinone)"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1089",
+              "display": "Iron, Fe"
+            }
+          ],
+          "text": "Iron, Fe"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1008",
+              "display": "Energy"
+            }
+          ],
+          "text": "Energy"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://fdc.nal.usda.gov/",
+              "code": "1186",
+              "display": "Folic acid"
+            }
+          ],
+          "text": "Folic acid"
+        }
+      }
+    }
+  ],
+  "ingredient": [
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://uts.nlm.nih.gov/uts/",
+              "code": "C0301465",
+              "display": "calcium caseinate"
+            }
+          ],
+          "text": "calcium caseinate"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://uts.nlm.nih.gov/uts/",
+              "code": "C0021936",
+              "display": "inulin"
+            }
+          ],
+          "text": "inulin"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://uts.nlm.nih.gov/uts/",
+              "code": "C0026138",
+              "display": "milk protein"
+            }
+          ],
+          "text": "milk protein"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://uts.nlm.nih.gov/uts/",
+              "code": "C0043047",
+              "display": "water"
+            }
+          ],
+          "text": "water"
+        }
+      }
+    },
+    {
+      "item": {
+        "concept": {
+          "coding": [
+            {
+              "system": "https://uts.nlm.nih.gov/uts/",
+              "code": "C0012173",
+              "display": "fiber"
+            }
+          ],
+          "text": "fiber"
+        }
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

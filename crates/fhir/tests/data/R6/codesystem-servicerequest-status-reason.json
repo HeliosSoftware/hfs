@@ -1,0 +1,79 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "servicerequest-status-reason",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem servicerequest-status-reason\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"servicerequest-status-reason\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcservicerequest-status-reason\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/CodeSystem/servicerequest-status-reason\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eno-longer-clinically-necessary\u003ca name\u003d\"servicerequest-status-reason-no-longer-clinically-necessary\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNo longer clinically necessary\u003c/td\u003e\u003ctd\u003eThe service is no longer clinically necessary or relevant for the patient\u0027s care.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epre-approval-denied\u003ca name\u003d\"servicerequest-status-reason-pre-approval-denied\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePre-approval denied\u003c/td\u003e\u003ctd\u003ePre-authorization or approval for the service was denied by the payer or authorization entity.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "draft"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/CodeSystem/servicerequest-status-reason",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.3325"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "ServiceRequestStatusReasonCodes",
+  "title": "Service Request Status Reason Codes",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International - Orders and Observations",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/orders/index.cfm"
+        }
+      ]
+    }
+  ],
+  "description": "Codes indicating the reason why a service request is in its current status.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "Copyright HL7. Licensed under creative commons public domain",
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/servicerequest-status-reason",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "no-longer-clinically-necessary",
+      "display": "No longer clinically necessary",
+      "definition": "The service is no longer clinically necessary or relevant for the patient\u0027s care."
+    },
+    {
+      "code": "pre-approval-denied",
+      "display": "Pre-approval denied",
+      "definition": "Pre-authorization or approval for the service was denied by the payer or authorization entity."
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "global-langpack-support",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem global-langpack-support\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"global-langpack-support\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcglobal-langpack-support\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/global-langpack-support\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003enot-supported\u003ca name\u003d\"global-langpack-support-not-supported\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eNot Supported\u003c/td\u003e\u003ctd\u003eLanguage Packs are not supported at all\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eexplicit\u003ca name\u003d\"global-langpack-support-explicit\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLanguage Packs Supported by request\u003c/td\u003e\u003ctd\u003eThe server supports language packs, but only when the value set asks for them, or they are requested explicity by parameter.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eimplicit\u003ca name\u003d\"global-langpack-support-implicit\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eGlobal Language Packs Supported\u003c/td\u003e\u003ctd\u003eLanguage Packs marked as \u0027global language packs\u0027 are automatically in scope when the relevant language is requested.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "vocab"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/global-langpack-support",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.2128"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "GlobalLangPackSupportVS",
+  "title": "Global LangPack Support VS",
+  "status": "active",
+  "experimental": false,
+  "date": "2022-08-31T10:21:22+10:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "How a server supports global language packs",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/global-langpack-support",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "not-supported",
+      "display": "Not Supported",
+      "definition": "Language Packs are not supported at all"
+    },
+    {
+      "code": "explicit",
+      "display": "Language Packs Supported by request",
+      "definition": "The server supports language packs, but only when the value set asks for them, or they are requested explicity by parameter."
+    },
+    {
+      "code": "implicit",
+      "display": "Global Language Packs Supported",
+      "definition": "Language Packs marked as \u0027global language packs\u0027 are automatically in scope when the relevant language is requested."
+    }
+  ]
+}

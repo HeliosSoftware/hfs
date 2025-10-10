@@ -1,0 +1,51 @@
+{
+  "resourceType": "ClinicalUseDefinition",
+  "id": "example-undesirable",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    }
+  ],
+  "type": "undesirable-effect",
+  "subject": [
+    {}
+  ],
+  "undesirableEffect": {
+    "symptomConditionEffect": {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://ema.europa.eu/example/undesirableeffectassymptom-condition-effect",
+            "code": "Anaemia"
+          }
+        ]
+      }
+    },
+    "classification": {
+      "coding": [
+        {
+          "system": "http://ema.europa.eu/example/symptom-condition-effectclassification",
+          "code": "Blood-and-lymphatic-system-disorders"
+        }
+      ]
+    },
+    "frequencyOfOccurrence": {
+      "coding": [
+        {
+          "system": "http://ema.europa.eu/example/frequencyofoccurrence",
+          "code": "Common"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

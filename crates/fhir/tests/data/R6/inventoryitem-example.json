@@ -1,0 +1,14 @@
+{
+  "resourceType": "InventoryItem",
+  "id": "example",
+  "status": "active",
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

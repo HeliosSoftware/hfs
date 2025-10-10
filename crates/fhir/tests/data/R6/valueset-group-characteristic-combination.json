@@ -1,0 +1,98 @@
+{
+  "resourceType": "ValueSet",
+  "id": "group-characteristic-combination",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "extensions",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet group-characteristic-combination\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"group-characteristic-combination\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgroup-characteristic-combination\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"codesystem-group-characteristic-combination.html\"\u003e\u003ccode\u003ehttp://hl7.org/fhir/group-characteristic-combination\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"codesystem-group-characteristic-combination.html#group-characteristic-combination-all-of\"\u003eall-of\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAll of\u003c/td\u003e\u003ctd\u003eCombine characteristics with AND.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"codesystem-group-characteristic-combination.html#group-characteristic-combination-any-of\"\u003eany-of\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAny of\u003c/td\u003e\u003ctd\u003eCombine characteristics with OR.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"codesystem-group-characteristic-combination.html#group-characteristic-combination-at-least\"\u003eat-least\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAt least\u003c/td\u003e\u003ctd\u003eMeet at least the threshold number of characteristics for definition.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"codesystem-group-characteristic-combination.html#group-characteristic-combination-at-most\"\u003eat-most\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAt most\u003c/td\u003e\u003ctd\u003eMeet at most the threshold number of characteristics for definition.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"codesystem-group-characteristic-combination.html#group-characteristic-combination-except-subset\"\u003eexcept-subset\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExcept subset\u003c/td\u003e\u003ctd\u003eMeet the inclusion criteria under the condition that the basis does not match the exclusion criteria.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 3
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/group-characteristic-combination",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.3.1344"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "GroupCharacteristicCombination",
+  "title": "Group Characteristic Combination",
+  "status": "draft",
+  "experimental": false,
+  "date": "2023-10-02T17:55:11+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Logical grouping of characteristics for the Group Resource.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "immutable": true,
+  "compose": {
+    "include": [
+      {
+        "system": "http://hl7.org/fhir/group-characteristic-combination",
+        "concept": [
+          {
+            "code": "all-of",
+            "display": "All of"
+          },
+          {
+            "code": "any-of",
+            "display": "Any of"
+          },
+          {
+            "code": "at-least",
+            "display": "At least"
+          },
+          {
+            "code": "at-most",
+            "display": "At most"
+          },
+          {
+            "code": "except-subset",
+            "display": "Except subset"
+          }
+        ]
+      }
+    ]
+  }
+}

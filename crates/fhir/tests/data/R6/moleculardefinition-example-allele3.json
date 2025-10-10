@@ -1,0 +1,72 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-allele3",
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "location": [
+    {
+      "sequenceLocation": {
+        "sequenceContext": {
+          "reference": "MolecularDefinition/example-sequence-hla000011",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: HLA00001"
+        }
+      }
+    }
+  ],
+  "representation": [
+    {
+      "relative": {
+        "startingMolecule": {
+          "reference": "MolecularDefinition/example-sequence-hla000011",
+          "type": "MolecularDefinition",
+          "display": "Starting Sequence Resource: HLA00001"
+        },
+        "edit": [
+          {
+            "coordinateInterval": {
+              "coordinateSystem": {
+                "system": {
+                  "coding": [
+                    {
+                      "system": "http://loinc.org",
+                      "code": "LA30100-4",
+                      "display": "0-based interval counting"
+                    }
+                  ],
+                  "text": "0-based interval counting"
+                }
+              }
+            },
+            "replacementMolecule": {
+              "reference": "MolecularDefinition/example-sequence-c",
+              "type": "MolecularDefinition",
+              "display": "Replacement Sequence Resource: C"
+            },
+            "replacedMolecule": {
+              "reference": "MolecularDefinition/example-sequence-t",
+              "type": "MolecularDefinition",
+              "display": "Replaced Sequence Resource: T"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

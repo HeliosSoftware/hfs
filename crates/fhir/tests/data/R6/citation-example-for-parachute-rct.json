@@ -1,0 +1,1650 @@
+{
+  "resourceType": "Citation",
+  "id": "example-for-parachute-rct",
+  "meta": {
+    "versionId": "2",
+    "lastUpdated": "2025-02-06T18:03:52.258Z",
+    "profile": [
+      "http://hl7.org/fhir/uv/ebm/StructureDefinition/journal-article-citation"
+    ]
+  },
+  "contained": [
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor0",
+      "name": [
+        {
+          "family": "Yeh",
+          "given": [
+            "Robert W"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor1",
+      "name": [
+        {
+          "family": "Valsdottir",
+          "given": [
+            "Linda R"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor2",
+      "name": [
+        {
+          "family": "Yeh",
+          "given": [
+            "Michael W"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor3",
+      "name": [
+        {
+          "family": "Shen",
+          "given": [
+            "Changyu"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor4",
+      "name": [
+        {
+          "family": "Kramer",
+          "given": [
+            "Daniel B"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor5",
+      "name": [
+        {
+          "family": "Strom",
+          "given": [
+            "Jordan B"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor6",
+      "name": [
+        {
+          "family": "Secemsky",
+          "given": [
+            "Eric A"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor7",
+      "name": [
+        {
+          "family": "Healy",
+          "given": [
+            "Joanne L"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor8",
+      "name": [
+        {
+          "family": "Domeier",
+          "given": [
+            "Robert M"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor9",
+      "name": [
+        {
+          "family": "Kazi",
+          "given": [
+            "Dhruv S"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Practitioner",
+      "id": "contributor10",
+      "name": [
+        {
+          "family": "Nallamothu",
+          "given": [
+            "Brahmajee K"
+          ]
+        }
+      ]
+    },
+    {
+      "resourceType": "Organization",
+      "id": "contributor11",
+      "name": "PARACHUTE Investigators"
+    },
+    {
+      "resourceType": "ArtifactAssessment",
+      "id": "meshHeading0",
+      "artifactReference": {
+        "reference": "#",
+        "type": "Citation"
+      },
+      "content": [
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D000060",
+                  "display": "Accidents, Aviation",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            },
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "coding": [
+                    {
+                      "system": "https://meshb.nlm.nih.gov/",
+                      "code": "Q000517",
+                      "display": "prevention \u0026 control"
+                    }
+                  ]
+                }
+              ],
+              "component": [
+                {
+                  "type": {
+                    "text": "is Major topic"
+                  },
+                  "classifier": [
+                    {
+                      "coding": [
+                        {
+                          "code": "N"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D000328",
+                  "display": "Adult",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D000337",
+                  "display": "Aerospace Medicine",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            },
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "coding": [
+                    {
+                      "system": "https://meshb.nlm.nih.gov/",
+                      "code": "Q000379",
+                      "display": "methods"
+                    }
+                  ]
+                }
+              ],
+              "component": [
+                {
+                  "type": {
+                    "text": "is Major topic"
+                  },
+                  "classifier": [
+                    {
+                      "coding": [
+                        {
+                          "code": "Y"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D000401",
+                  "display": "Aircraft",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D003645",
+                  "display": "Death, Sudden",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            },
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "coding": [
+                    {
+                      "system": "https://meshb.nlm.nih.gov/",
+                      "code": "Q000517",
+                      "display": "prevention \u0026 control"
+                    }
+                  ]
+                }
+              ],
+              "component": [
+                {
+                  "type": {
+                    "text": "is Major topic"
+                  },
+                  "classifier": [
+                    {
+                      "coding": [
+                        {
+                          "code": "Y"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D005260",
+                  "display": "Female",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D006801",
+                  "display": "Humans",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D015601",
+                  "display": "Injury Severity Score",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D008297",
+                  "display": "Male",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D008875",
+                  "display": "Middle Aged",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D011482",
+                  "display": "Protective Devices",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is Major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D014925",
+                  "display": "Wit and Humor as Topic",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+                "code": "mesh-heading",
+                "display": "MeSH heading"
+              }
+            ],
+            "text": "components (if present) include qualifier codings"
+          },
+          "classifier": [
+            {
+              "coding": [
+                {
+                  "system": "https://meshb.nlm.nih.gov/",
+                  "code": "D014947",
+                  "display": "Wounds and Injuries",
+                  "userSelected": false
+                }
+              ]
+            }
+          ],
+          "freeToShare": true,
+          "component": [
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "text": "is not a major topic"
+                }
+              ]
+            },
+            {
+              "type": {
+                "text": "qualifier"
+              },
+              "classifier": [
+                {
+                  "coding": [
+                    {
+                      "system": "https://meshb.nlm.nih.gov/",
+                      "code": "Q000517",
+                      "display": "prevention \u0026 control"
+                    }
+                  ]
+                }
+              ],
+              "component": [
+                {
+                  "type": {
+                    "text": "is Major topic"
+                  },
+                  "classifier": [
+                    {
+                      "coding": [
+                        {
+                          "code": "Y"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    }
+  ],
+  "url": "http://hl7.org/fhir/Citation/example-for-parachute-rct",
+  "identifier": [
+    {
+      "type": {
+        "text": "FEvIR Object Identifier"
+      },
+      "system": "urn:ietf:rfc:3986",
+      "value": "https://fevir.net/FOI/306957",
+      "assigner": {
+        "display": "Computable Publishing LLC"
+      }
+    },
+    {
+      "system": "https://pubmed.ncbi.nlm.nih.gov",
+      "value": "30545967"
+    }
+  ],
+  "title": "30545967 Parachute use to prevent death and major trauma when jumping from aircraft: randomized controlled trial.",
+  "status": "active",
+  "author": [
+    {
+      "name": "Computable Publishing®: MEDLINE-to-FEvIR Converter"
+    }
+  ],
+  "publisher": "HL7 International / Clinical Decision Support",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/dss"
+        }
+      ]
+    }
+  ],
+  "useContext": [
+    {
+      "code": {
+        "system": "http://terminology.hl7.org/CodeSystem/citation-classification-type",
+        "code": "fevir-platform-use",
+        "display": "FEvIR Platform Use"
+      },
+      "valueCodeableConcept": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+            "code": "medline-base",
+            "display": "Medline Base",
+            "userSelected": false
+          }
+        ]
+      }
+    }
+  ],
+  "copyright": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+  "approvalDate": "2019-04-09",
+  "lastReviewDate": "2020-02-25",
+  "classification": [
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/citation-classification-type",
+            "code": "citation-source",
+            "display": "Citation Source"
+          }
+        ]
+      },
+      "classifier": [
+        {
+          "text": "MEDLINE"
+        }
+      ]
+    },
+    {
+      "type": {
+        "coding": [
+          {
+            "system": "http://terminology.hl7.org/CodeSystem/citation-classification-type",
+            "code": "medline-owner",
+            "display": "MEDLINE Citation Owner"
+          }
+        ]
+      },
+      "classifier": [
+        {
+          "coding": [
+            {
+              "system": "https://www.nlm.nih.gov/bsd/licensee/elements_descriptions.html#owner_value",
+              "code": "NLM",
+              "display": "National Library of Medicine, Index Section",
+              "userSelected": false
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "currentState": [
+    {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/citation-status-type",
+          "code": "medline-medline",
+          "display": "Medline Citation Status of Medline"
+        }
+      ]
+    },
+    {
+      "coding": [
+        {
+          "system": "http://hl7.org/fhir/citation-status-type",
+          "code": "pubmed-publication-status-epublish",
+          "display": "PubMed PublicationStatus of epublish"
+        }
+      ]
+    }
+  ],
+  "statusDate": [
+    {
+      "activity": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/citation-status-type",
+            "code": "pubmed-pubstatus-entrez",
+            "display": "PubMed Pubstatus of Entrez"
+          }
+        ]
+      },
+      "period": {
+        "end": "2018-12-15T06:00:00.000Z"
+      }
+    },
+    {
+      "activity": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/citation-status-type",
+            "code": "pubmed-pubstatus-pubmed",
+            "display": "PubMed Pubstatus of Pubmed"
+          }
+        ]
+      },
+      "period": {
+        "end": "2018-12-14T06:00:00.000Z"
+      }
+    },
+    {
+      "activity": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/citation-status-type",
+            "code": "pubmed-pubstatus-medline",
+            "display": "PubMed Pubstatus of Medline"
+          }
+        ]
+      },
+      "period": {
+        "end": "2019-04-10T06:00:00.000Z"
+      }
+    },
+    {
+      "activity": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/citation-status-type",
+            "code": "pubmed-pubstatus-pmc-release",
+            "display": "PubMed Pubstatus of PMC release"
+          }
+        ]
+      },
+      "period": {
+        "end": "2018-01-01"
+      }
+    }
+  ],
+  "citedArtifact": {
+    "identifier": [
+      {
+        "system": "https://pubmed.ncbi.nlm.nih.gov",
+        "value": "30545967"
+      },
+      {
+        "system": "https://www.ncbi.nlm.nih.gov/pmc/",
+        "value": "PMC6298200"
+      },
+      {
+        "system": "https://doi.org",
+        "value": "10.1136/bmj.k5094"
+      }
+    ],
+    "title": [
+      {
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/title-type",
+                "code": "primary",
+                "display": "Primary title"
+              }
+            ]
+          }
+        ],
+        "language": "en",
+        "text": "PARACHUTE Trial Citation Parachute use to prevent death and major trauma when jumping from aircraft: randomized controlled trial."
+      }
+    ],
+    "abstract": [
+      {
+        "text": "\u003cAbstractText Label\u003d\"OBJECTIVE\" NlmCategory\u003d\"OBJECTIVE\"\u003eTo determine if using a parachute prevents death or major traumatic injury when jumping from an aircraft.\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"DESIGN\" NlmCategory\u003d\"METHODS\"\u003eRandomized controlled trial.\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"SETTING\" NlmCategory\u003d\"METHODS\"\u003ePrivate or commercial aircraft between September 2017 and August 2018.\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"PARTICIPANTS\" NlmCategory\u003d\"METHODS\"\u003e92 aircraft passengers aged 18 and over were screened for participation. 23 agreed to be enrolled and were randomized.\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"INTERVENTION\" NlmCategory\u003d\"METHODS\"\u003eJumping from an aircraft (airplane or helicopter) with a parachute versus an empty backpack (unblinded).\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"MAIN OUTCOME MEASURES\" NlmCategory\u003d\"METHODS\"\u003eComposite of death or major traumatic injury (defined by an Injury Severity Score over 15) upon impact with the ground measured immediately after landing.\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"RESULTS\" NlmCategory\u003d\"RESULTS\"\u003eParachute use did not significantly reduce death or major injury (0% for parachute \u003ci\u003ev\u003c/i\u003e 0% for control; P\u003e0.9). This finding was consistent across multiple subgroups. Compared with individuals screened but not enrolled, participants included in the study were on aircraft at significantly lower altitude (mean of 0.6 m for participants \u003ci\u003ev\u003c/i\u003e mean of 9146 m for non-participants; P\u003c0.001) and lower velocity (mean of 0 km/h \u003ci\u003ev\u003c/i\u003e mean of 800 km/h; P\u003c0.001).\u003c/AbstractText\u003e\u003cAbstractText Label\u003d\"CONCLUSIONS\" NlmCategory\u003d\"CONCLUSIONS\"\u003eParachute use did not reduce death or major traumatic injury when jumping from aircraft in the first randomized evaluation of this intervention. However, the trial was only able to enroll participants on small stationary aircraft on the ground, suggesting cautious extrapolation to high altitude jumps. When beliefs regarding the effectiveness of an intervention exist in the community, randomized trials might selectively enroll individuals with a lower perceived likelihood of benefit, thus diminishing the applicability of the results to clinical practice.\u003c/AbstractText\u003e",
+        "copyright": "Published by the BMJ Publishing Group Limited. For permission to use (where not already granted under a licence) please go to http://group.bmj.com/group/rights-licensing/permissions."
+      }
+    ],
+    "relatesTo": [
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Smith GC, Pell JP. Parachute use to prevent death and major trauma related to gravitational challenge: systematic review of randomised controlled trials. BMJ 2003;327:1459-61. 10.1136/bmj.327.7429.1459 "
+      },
+      {
+        "type": "cites",
+        "citation": "United States Parachute Association. Skydiver\u0027s Information Manual, 2018. https://uspa.org/Portals/0/files/Man_SIM_2018.pdf"
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Knapik J, Steelman R. Risk factors for injuries during military static-line airborne operations: a systematic review and meta-analysis. J Athl Train 2016;51:962-80. 10.4085/1062-6050-51.9.10 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Ellitsgaard N. Parachuting injuries: a study of 110,000 sports jumps. Br J Sports Med 1987;21:13-7. 10.1136/bjsm.21.1.13 "
+      },
+      {
+        "type": "cites",
+        "citation": "ICD-10-CM Code V97.2. Parachutist Accident. https://icd.codes/icd10cm/V972"
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Echt DS, Liebson PR, Mitchell LB, et al. Mortality and morbidity in patients receiving encainide, flecainide, or placebo. The Cardiac Arrhythmia Suppression Trial. N Engl J Med 1991;324:781-8. 10.1056/NEJM199103213241201 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Rossouw JE, Anderson GL, Prentice RL, et al. Writing Group for the Women’s Health Initiative Investigators Risks and benefits of estrogen plus progestin in healthy postmenopausal women: principal results From the Women’s Health Initiative randomized controlled trial. JAMA 2002;288:321-33. 10.1001/jama.288.3.321 "
+      },
+      {
+        "type": "cites",
+        "citation": "QuickTapSurvey [program]: TabbleDabble Inc., Toronto, Canada. https://www.quicktapsurvey.com"
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Baker SP, O’Neill B, Haddon W, Jr, Long WB. The injury severity score: a method for describing patients with multiple injuries and evaluating emergency care. J Trauma 1974;14:187-96. 10.1097/00005373-197403000-00001 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Ware J, Jr, Kosinski M, Keller SD. A 12-Item Short-Form Health Survey: construction of scales and preliminary tests of reliability and validity. Med Care 1996;34:220-33. 10.1097/00005650-199603000-00003 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Schwartz AL, Landon BE, Elshaug AG, Chernew ME, McWilliams JM. Measuring low-value care in Medicare. JAMA Intern Med 2014;174:1067-76. 10.1001/jamainternmed.2014.1541 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Kunz R, Oxman AD. The unpredictability paradox: review of empirical comparisons of randomised and non--randomised clinical trials. BMJ 1998;317:1185-90. 10.1136/bmj.317.7167.1185 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Nallamothu BK, Hayward RA, Bates ER. Beyond the randomized clinical trial: the role of effectiveness studies in evaluating cardiovascular therapies. Circulation 2008;118:1294-303. 10.1161/CIRCULATIONAHA.107.703579 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Kennedy-Martin T, Curtis S, Faries D, Robinson S, Johnston J. A literature review on the representativeness of randomized controlled trial samples and implications for the external validity of trial results. Trials 2015;16:495. 10.1186/s13063-015-1023-4 "
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Hayes MJ, Kaestner V, Mailankody S, Prasad V. Most medical practices are not parachutes: a citation analysis of practices felt by biomedical authors to be analogous to parachutes. CMAJ Open 2018;6:E31-8. 10.9778/cmajo.20170088 "
+      },
+      {
+        "type": "cites",
+        "citation": "Newton SI. Law of Universal Gravitation. Philosophiæ Naturalis Principia Mathematica, 1687."
+      },
+      {
+        "type": "cites",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article"
+              }
+            ]
+          }
+        ],
+        "citation": "Al-Lamee R, Thompson D, Dehbi H-M, et al. ORBITA investigators Percutaneous coronary intervention in stable angina (ORBITA): a double-blind, randomised controlled trial. Lancet 2018;391:31-40. 10.1016/S0140-6736(17)32714-9 "
+      },
+      {
+        "type": "correction-in",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://meshb.nlm.nih.gov/",
+                "code": "D016425",
+                "display": "Published Erratum",
+                "userSelected": false
+              }
+            ]
+          }
+        ],
+        "citation": "BMJ. 2018 Dec 18;363:k5343. doi: 10.1136/bmj.k5343"
+      },
+      {
+        "type": "comment-in",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://meshb.nlm.nih.gov/",
+                "code": "D016420",
+                "display": "Comment",
+                "userSelected": false
+              }
+            ]
+          }
+        ],
+        "citation": "Catheter Cardiovasc Interv. 2019 Apr 1;93(5):944-945. doi: 10.1002/ccd.28151"
+      },
+      {
+        "type": "comment-in",
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://meshb.nlm.nih.gov/",
+                "code": "D016420",
+                "display": "Comment",
+                "userSelected": false
+              }
+            ]
+          }
+        ],
+        "citation": "MMW Fortschr Med. 2019 Feb;161(3):26. doi: 10.1007/s15006-019-0173-9"
+      }
+    ],
+    "publicationForm": [
+      {
+        "publishedIn": {
+          "type": {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/published-in-type",
+                "code": "D020492",
+                "display": "Periodical"
+              }
+            ]
+          },
+          "identifier": [
+            {
+              "type": {
+                "coding": [
+                  {
+                    "system": "https://www.nlm.nih.gov/bsd/licensee/elements_descriptions.html#issn",
+                    "code": "Electronic",
+                    "display": "Electronic"
+                  }
+                ],
+                "text": "Electronic ISSN Type"
+              },
+              "system": "https://portal.issn.org",
+              "value": "1756-1833"
+            },
+            {
+              "type": {
+                "text": "ISOAbbreviation"
+              },
+              "system": "https://www.issn.org/services/online-services/access-to-the-ltwa/",
+              "value": "BMJ"
+            },
+            {
+              "type": {
+                "text": "ISSN Linking"
+              },
+              "system": "https://www.issn.org/understanding-the-issn/assignment-rules/the-issn-l-for-publications-on-multiple-media/",
+              "value": "0959-8138"
+            },
+            {
+              "type": {
+                "text": "Medline Title Abbreviation"
+              },
+              "system": "https://www.nlm.nih.gov/tsd/cataloging/contructitleabbre.html",
+              "value": "BMJ"
+            },
+            {
+              "type": {
+                "text": "NLM Unique ID"
+              },
+              "system": "https://locatorplus.gov/cgi-bin/Pwebrecon.cgi?DB\u003dlocal",
+              "value": "8900488"
+            }
+          ],
+          "title": "BMJ (Clinical research ed.)",
+          "publisherLocation": "England"
+        },
+        "citedMedium": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-medium",
+              "code": "internet",
+              "display": "Internet"
+            }
+          ]
+        },
+        "volume": "363",
+        "articleDate": "2018-12-13",
+        "pageString": "k5094"
+      },
+      {
+        "citedMedium": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-medium",
+              "code": "internet-without-issue",
+              "display": "Internet without issue"
+            }
+          ]
+        },
+        "articleDate": "2018-12-13"
+      }
+    ],
+    "webLocation": [
+      {
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/artifact-url-classifier",
+                "code": "abstract",
+                "display": "Abstract"
+              }
+            ]
+          }
+        ],
+        "url": "https://pubmed.ncbi.nlm.nih.gov/30545967/"
+      },
+      {
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/artifact-url-classifier",
+                "code": "doi-based",
+                "display": "DOI Based"
+              }
+            ]
+          }
+        ],
+        "url": "https://doi.org/10.1136/bmj.k5094"
+      }
+    ],
+    "classification": [
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "publishing-model",
+              "display": "Publishing Model",
+              "userSelected": false
+            }
+          ]
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "Electronic",
+                "display": "Electronic",
+                "userSelected": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "mesh-heading",
+              "display": "MeSH heading"
+            }
+          ]
+        },
+        "artifactAssessment": [
+          {
+            "reference": "#meshHeading0",
+            "type": "ArtifactAssessment"
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "publication-type",
+              "display": "Publication type"
+            }
+          ]
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://meshb.nlm.nih.gov/",
+                "code": "D016428",
+                "display": "Journal Article",
+                "userSelected": false
+              }
+            ]
+          },
+          {
+            "coding": [
+              {
+                "system": "https://meshb.nlm.nih.gov/",
+                "code": "D016449",
+                "display": "Randomized Controlled Trial",
+                "userSelected": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "knowledge-artifact-type",
+              "display": "Knowledge Artifact Type",
+              "userSelected": false
+            }
+          ]
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/citation-artifact-classifier",
+                "code": "D016428",
+                "display": "Journal Article",
+                "userSelected": false
+              }
+            ]
+          }
+        ],
+        "artifactAssessment": [
+          {
+            "display": "Classifier added by Computable Publishing LLC"
+          }
+        ]
+      },
+      {
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/cited-artifact-classification-type",
+              "code": "citation-subset",
+              "display": "Citation subset",
+              "userSelected": false
+            }
+          ]
+        },
+        "classifier": [
+          {
+            "coding": [
+              {
+                "system": "https://www.nlm.nih.gov/bsd/licensee/elements_descriptions.html#citationsubset",
+                "code": "IM",
+                "display": "IM",
+                "userSelected": false
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "contributorship": {
+      "complete": true,
+      "entry": [
+        {
+          "contributor": {
+            "reference": "#contributor0",
+            "type": "Practitioner",
+            "display": "Yeh RW"
+          },
+          "forenameInitials": "RW",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA ryeh@bidmc.harvard.edu."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor1",
+            "type": "Practitioner",
+            "display": "Valsdottir LR"
+          },
+          "forenameInitials": "LR",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor2",
+            "type": "Practitioner",
+            "display": "Yeh MW"
+          },
+          "forenameInitials": "MW",
+          "affiliation": [
+            {
+              "display": "David Geffen School of Medicine, University of California, Los Angeles, CA, USA ryeh@bidmc.harvard.edu."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor3",
+            "type": "Practitioner",
+            "display": "Shen C"
+          },
+          "forenameInitials": "C",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor4",
+            "type": "Practitioner",
+            "display": "Kramer DB"
+          },
+          "forenameInitials": "DB",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor5",
+            "type": "Practitioner",
+            "display": "Strom JB"
+          },
+          "forenameInitials": "JB",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor6",
+            "type": "Practitioner",
+            "display": "Secemsky EA"
+          },
+          "forenameInitials": "EA",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor7",
+            "type": "Practitioner",
+            "display": "Healy JL"
+          },
+          "forenameInitials": "JL",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor8",
+            "type": "Practitioner",
+            "display": "Domeier RM"
+          },
+          "forenameInitials": "RM",
+          "affiliation": [
+            {
+              "display": "Department of Emergency Medicine, University of Michigan and Saint Joseph Hospital, Ann Arbor, MI, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor9",
+            "type": "Practitioner",
+            "display": "Kazi DS"
+          },
+          "forenameInitials": "DS",
+          "affiliation": [
+            {
+              "display": "Richard A and Susan F Smith Center for Outcomes Research in Cardiology, Beth Israel Deaconess Medical Center, Harvard Medical School, 375 Longwood Avenue, Boston, MA 02215, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor10",
+            "type": "Practitioner",
+            "display": "Nallamothu BK"
+          },
+          "forenameInitials": "BK",
+          "affiliation": [
+            {
+              "display": "Michigan Integrated Center for Health Analytics and Medical Prediction, Department of Internal Medicine and Institute for Healthcare Policy and Innovation, University of Michigan, Ann Arbor, MI, USA."
+            }
+          ]
+        },
+        {
+          "contributor": {
+            "reference": "#contributor11",
+            "type": "Organization",
+            "display": "PARACHUTE Investigators"
+          }
+        }
+      ]
+    }
+  }
+}

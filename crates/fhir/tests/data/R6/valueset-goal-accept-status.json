@@ -1,0 +1,64 @@
+{
+  "resourceType": "ValueSet",
+  "id": "goal-accept-status",
+  "meta": {
+    "lastUpdated": "2025-10-10T05:25:56.447+11:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet goal-accept-status\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"goal-accept-status\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgoal-accept-status\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eLast updated: 2023-01-31T07:07:38.434+11:00\u003c/p\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude all codes defined in \u003ca href\u003d\"codesystem-goal-accept-status.html\"\u003e\u003ccode\u003ehttp://hl7.org/fhir/goal-accept-status\u003c/code\u003e\u003c/a\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pc"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 3
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/goal-accept-status",
+  "version": "6.0.0-ballot3",
+  "name": "GoalAcceptStatus",
+  "title": "Goal acceptance status value set",
+  "status": "active",
+  "experimental": false,
+  "publisher": "HL7 International / Patient Care",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/patientcare"
+        }
+      ]
+    }
+  ],
+  "description": "Codes that identify whether the goal has been accepted or not.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "compose": {
+    "include": [
+      {
+        "system": "http://hl7.org/fhir/goal-accept-status"
+      }
+    ]
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "variable-role",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem variable-role\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"variable-role\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcvariable-role\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/variable-role\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epopulation\u003ca name\u003d\"variable-role-population\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePopulation\u003c/td\u003e\u003ctd\u003eThe group from which the observations were obtained.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eexposure\u003ca name\u003d\"variable-role-exposure\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eExposure\u003c/td\u003e\u003ctd\u003eAn independant variable of primary interest.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eoutcome\u003ca name\u003d\"variable-role-outcome\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOutcome\u003c/td\u003e\u003ctd\u003eA dependent variable.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecovariate\u003ca name\u003d\"variable-role-covariate\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCovariate\u003c/td\u003e\u003ctd\u003eA variable that influences the exposure or outcome.\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/variable-role",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.4.2136"
+    }
+  ],
+  "version": "6.0.0-ballot3",
+  "name": "Variable Role",
+  "title": "VariableRole",
+  "status": "active",
+  "experimental": false,
+  "date": "2023-11-08T16:55:11+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The role that the variable plays.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/variable-role",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "population",
+      "display": "Population",
+      "definition": "The group from which the observations were obtained."
+    },
+    {
+      "code": "exposure",
+      "display": "Exposure",
+      "definition": "An independant variable of primary interest."
+    },
+    {
+      "code": "outcome",
+      "display": "Outcome",
+      "definition": "A dependent variable."
+    },
+    {
+      "code": "covariate",
+      "display": "Covariate",
+      "definition": "A variable that influences the exposure or outcome."
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "resourceType": "ClinicalUseDefinition",
+  "id": "example-indication",
+  "contained": [
+    {
+      "resourceType": "Group",
+      "id": "group",
+      "type": "person",
+      "membership": "definitional",
+      "characteristic": [
+        {
+          "code": {
+            "coding": [
+              {
+                "system": "http://ema.europa.eu/example/characteristic",
+                "code": "age-range"
+              }
+            ]
+          },
+          "valueRange": {
+            "low": {
+              "value": 18,
+              "unit": "a"
+            }
+          },
+          "exclude": false
+        }
+      ]
+    }
+  ],
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "brr"
+    }
+  ],
+  "type": "indication",
+  "subject": [
+    {}
+  ],
+  "indication": {
+    "diseaseSymptomProcedure": {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://ema.europa.eu/example/indicationasdisease-symptom-procedure",
+            "code": "Pulmonary-embolism-and-thrombosis-example-code"
+          }
+        ],
+        "text": "Prevention of venous thromboembolic events (VTE) in adult patients who have undergone elective hip or knee replacement surgery. Prevention of stroke and systemic embolism in adult patients with non-valvular atrial fibrillation (NVAF), with one or more risk factors, such as prior stroke or transient ischaemic attack (TIA); age ≥ 75 years; hypertension; diabetes mellitus; symptomatic heart failure (NYHA Class ≥ II). Treatment of deep vein thrombosis (DVT) and pulmonary embolism (PE), and prevention of recurrent DVT and PE in adults."
+      }
+    },
+    "diseaseStatus": {
+      "concept": {
+        "coding": [
+          {
+            "system": "http://ema.europa.eu/example/diseasestatus",
+            "code": "Recurrent"
+          }
+        ]
+      }
+    },
+    "intendedEffect": [
+      {
+        "concept": {
+          "coding": [
+            {
+              "system": "http://ema.europa.eu/example/intendedeffect",
+              "code": "PRYLX"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "population": [
+    {
+      "reference": "#group"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

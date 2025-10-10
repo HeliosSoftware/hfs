@@ -1,0 +1,246 @@
+{
+  "resourceType": "TestScript",
+  "id": "testscript-example-multisystem",
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    }
+  ],
+  "url": "http://hl7.org/fhir/TestScript/testscript-example-multisystem",
+  "identifier": [
+    {
+      "system": "urn:ietf:rfc:3986",
+      "value": "urn:oid:2.16.840.1.113883.4.642.12.6"
+    }
+  ],
+  "version": "1.0",
+  "name": "Testscriptexamplemultisystem",
+  "title": "Multisystem Test Script",
+  "status": "draft",
+  "experimental": true,
+  "date": "2017-01-18",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "TestScript example resource showing use of origin and destination for multisystem support. The single origin will execute a Patient read against the two destination systems using user defined dynamic variables. The test engine will wait at each operation action with a defined origin and destination for the origin test system to send the expected FHIR operation to the destination test system. Once the expected request and response is observed, the test engine will continue with the test execution.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "urn:iso:std:iso:3166",
+          "code": "US",
+          "display": "United States of America"
+        }
+      ]
+    }
+  ],
+  "purpose": "Patient Read Operation",
+  "copyright": "© HL7.org 2011+",
+  "testSystem": [
+    {
+      "index": 1,
+      "title": "FHIR Client",
+      "description": "The FHIR Client system under test."
+    },
+    {
+      "index": 1,
+      "title": "FHIR Server",
+      "description": "The FHIR Server system under test.",
+      "url": "http://acme.com/fhir/test"
+    }
+  ],
+  "metadata": {
+    "link": [
+      {
+        "url": "http://hl7.org/fhir/patient.html",
+        "description": "Demographics and other administrative information about an individual or animal receiving care or other health-related services."
+      }
+    ],
+    "capability": [
+      {
+        "required": true,
+        "validated": false,
+        "description": "Patient Read Operation",
+        "origin": [
+          1
+        ],
+        "destination": 1,
+        "link": [
+          "http://hl7.org/fhir/http.html#read"
+        ],
+        "capabilities": "http://hl7.org/fhir/CapabilityStatement/example"
+      },
+      {
+        "required": true,
+        "validated": false,
+        "description": "Patient Read Operation",
+        "origin": [
+          1
+        ],
+        "destination": 2,
+        "link": [
+          "http://hl7.org/fhir/http.html#read"
+        ],
+        "capabilities": "http://hl7.org/fhir/CapabilityStatement/example"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "name": "Dest1PatientResourceId",
+      "defaultValue": "example"
+    },
+    {
+      "name": "Dest2PatientResourceId",
+      "defaultValue": "example"
+    }
+  ],
+  "test": [
+    {
+      "id": "01-ReadPatient-Destination1",
+      "name": "ReadPatient-Destination1",
+      "description": "Read a Patient from the first destination test system using the user defined dynamic variable ${Dest1PatientResourceId}. Perform basic validation.",
+      "action": [
+        {
+          "operation": {
+            "type": {
+              "system": "http://hl7.org/fhir/restful-interaction",
+              "code": "read"
+            },
+            "resource": "Patient",
+            "description": "Read a Patient from the first destination test system and perform basic validation.",
+            "accept": "xml",
+            "contentType": "xml",
+            "destination": 1,
+            "encodeRequestUrl": true,
+            "origin": 1,
+            "params": "/${Dest1PatientResourceId}",
+            "requestId": "request-read-patient-01"
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the request method GET was sent by the client system under test.",
+            "requestMethod": "get",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the client requested an Accept of xml.",
+            "direction": "request",
+            "headerField": "Accept",
+            "operator": "contains",
+            "stopTestOnFail": false,
+            "value": "xml",
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned HTTP status is 200(OK).",
+            "direction": "response",
+            "response": "okay",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned format is XML.",
+            "direction": "response",
+            "contentType": "xml",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned resource type is Patient.",
+            "direction": "response",
+            "resource": "Patient",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "02-ReadPatient-Destination2",
+      "name": "ReadPatient-Destination2",
+      "description": "Read a Patient from the second destination test system using the user defined dynamic variable ${Dest2PatientResourceId}. Perform basic validation.",
+      "action": [
+        {
+          "operation": {
+            "type": {
+              "system": "http://hl7.org/fhir/restful-interaction",
+              "code": "read"
+            },
+            "resource": "Patient",
+            "description": "Read a Patient from the second destination test system and perform basic validation.",
+            "accept": "xml",
+            "contentType": "xml",
+            "destination": 2,
+            "encodeRequestUrl": true,
+            "origin": 1,
+            "params": "/${Dest2PatientResourceId}",
+            "requestHeader": [
+              {
+                "field": "Accept-Charset",
+                "value": "utf-8"
+              }
+            ]
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the client requested an Accept of xml.",
+            "direction": "request",
+            "headerField": "Accept",
+            "operator": "contains",
+            "stopTestOnFail": false,
+            "value": "xml",
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned HTTP status is 200(OK).",
+            "direction": "response",
+            "response": "okay",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned format is XML.",
+            "direction": "response",
+            "contentType": "xml",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        },
+        {
+          "assert": {
+            "description": "Confirm that the returned resource type is Patient.",
+            "direction": "response",
+            "resource": "Patient",
+            "stopTestOnFail": false,
+            "warningOnly": false
+          }
+        }
+      ]
+    }
+  ]
+}

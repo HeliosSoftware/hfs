@@ -1,0 +1,47 @@
+{
+  "resourceType": "ImagingSelection",
+  "id": "example-presentation-state-selection",
+  "identifier": [
+    {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.104120739293836151163903631439818.2.1"
+    }
+  ],
+  "status": "available",
+  "code": {
+    "text": "Referenced DICOM Grayscale Softcopy Presentation State"
+  },
+  "subject": {
+    "reference": "Patient/example"
+  },
+  "derivedFrom": {
+    "type": "ImagingStudy",
+    "identifier": {
+      "system": "urn:dicom:uid",
+      "value": "urn:oid:1.2.840.113747.20080222.104120739291289003163903631439818"
+    }
+  },
+  "studyUid": "1.2.840.113747.20080222.104120739293836153163903631439818",
+  "seriesUid": "1.2.840.113747.20080222.104120739293836151283903631439818.1",
+  "frameOfReferenceUid": "1.2.840.113747.20080222.104120739293289003163903631439818.0",
+  "focus": [
+    {
+      "reference": "ImagingSelection/example-basic-image-selection"
+    }
+  ],
+  "instance": [
+    {
+      "uid": "1.2.840.113747.20080222.104120739293836151289903631439818.1.0",
+      "sopClass": "urn:oid:1.2.840.10008.5.1.4.1.1.11.1"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

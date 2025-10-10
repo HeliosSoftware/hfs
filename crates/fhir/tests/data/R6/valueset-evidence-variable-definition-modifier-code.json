@@ -1,0 +1,96 @@
+{
+  "resourceType": "ValueSet",
+  "id": "evidence-variable-definition-modifier-code",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet evidence-variable-definition-modifier-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"evidence-variable-definition-modifier-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcevidence-variable-definition-modifier-code\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://www.snomed.org/\"\u003e\u003ccode\u003ehttp://snomed.info/sct\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/303105007\"\u003e303105007\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eDisease phases (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/272103003\"\u003e272103003\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eTime patterns (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/397669002\"\u003e397669002\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eAge (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/1157245009\"\u003e1157245009\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFixed dose (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/261829003\"\u003e261829003\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eHigh dose (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"http://snomed.info/id/262459003\"\u003e262459003\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eLow dose (qualifier value)\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/evidence-variable-definition-modifier-code",
+  "version": "6.0.0-ballot3",
+  "name": "EvidenceVariableDefinitionModifierCode",
+  "title": "Evidence Variable Definition Modifier Code",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-02-19T12:55:11+11:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "Examples of terms that represent an evidence variable definition modifier code.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "This resource includes content from SNOMED Clinical Terms® (SNOMED CT®) which is copyright of the International Health Terminology Standards Development Organisation (IHTSDO). Implementers of these specifications must have the appropriate SNOMED CT Affiliate license - for more information contact http://www.snomed.org/snomed-ct/get-snomed-ct or info@snomed.org",
+  "compose": {
+    "include": [
+      {
+        "system": "http://snomed.info/sct",
+        "concept": [
+          {
+            "code": "303105007",
+            "display": "Disease phases (qualifier value)"
+          },
+          {
+            "code": "272103003",
+            "display": "Time patterns (qualifier value)"
+          },
+          {
+            "code": "397669002",
+            "display": "Age (qualifier value)"
+          },
+          {
+            "code": "1157245009",
+            "display": "Fixed dose (qualifier value)"
+          },
+          {
+            "code": "261829003",
+            "display": "High dose (qualifier value)"
+          },
+          {
+            "code": "262459003",
+            "display": "Low dose (qualifier value)"
+          }
+        ]
+      }
+    ]
+  }
+}

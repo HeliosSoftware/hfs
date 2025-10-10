@@ -1,0 +1,55 @@
+{
+  "resourceType": "Flag",
+  "id": "medication",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003eWarning: Usage of Oxycodone in the formulary requires special approval before prescription\u003c/div\u003e"
+  },
+  "identifier": [
+    {
+      "value": "warning-2024-drug-Oxycodone"
+    }
+  ],
+  "status": "active",
+  "category": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/flag-category",
+          "code": "admin",
+          "display": "Administrative"
+        }
+      ],
+      "text": "Administrative"
+    }
+  ],
+  "code": {
+    "coding": [
+      {
+        "system": "http://example.org/local",
+        "code": "special-approval-required",
+        "display": "Special Approval Required"
+      }
+    ],
+    "text": "Usage of Oxycodone requires special approval before prescription."
+  },
+  "subject": {
+    "reference": "Medication/med0310",
+    "display": "Oxycodone"
+  },
+  "period": {
+    "start": "2024-09-01"
+  },
+  "author": {
+    "display": "Pharmacy and Therapeutics Co"
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

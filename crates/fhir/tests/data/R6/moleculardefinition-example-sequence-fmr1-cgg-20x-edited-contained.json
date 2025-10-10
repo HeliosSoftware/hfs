@@ -1,0 +1,103 @@
+{
+  "resourceType": "MolecularDefinition",
+  "id": "example-sequence-fmr1-cgg-20x-edited-contained",
+  "contained": [
+    {
+      "resourceType": "MolecularDefinition",
+      "id": "replacement",
+      "moleculeType": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/sequence-type",
+            "code": "dna",
+            "display": "DNA Sequence"
+          }
+        ]
+      },
+      "representation": [
+        {
+          "literal": {
+            "value": "A"
+          }
+        }
+      ]
+    },
+    {
+      "resourceType": "MolecularDefinition",
+      "id": "replaced",
+      "moleculeType": {
+        "coding": [
+          {
+            "system": "http://hl7.org/fhir/sequence-type",
+            "code": "dna",
+            "display": "DNA Sequence"
+          }
+        ]
+      },
+      "representation": [
+        {
+          "literal": {
+            "value": "C"
+          }
+        }
+      ]
+    }
+  ],
+  "moleculeType": {
+    "coding": [
+      {
+        "system": "http://hl7.org/fhir/sequence-type",
+        "code": "dna",
+        "display": "DNA Sequence"
+      }
+    ]
+  },
+  "representation": [
+    {
+      "relative": {
+        "startingMolecule": {
+          "reference": "MolecularDefinition/example-sequence-fmr1-cgg-20x-repeat",
+          "type": "MolecularDefinition",
+          "display": "CGG 20X"
+        },
+        "edit": [
+          {
+            "coordinateInterval": {
+              "coordinateSystem": {
+                "system": {
+                  "coding": [
+                    {
+                      "system": "http://loinc.org",
+                      "code": "LA30102-0",
+                      "display": "1-based character counting"
+                    }
+                  ],
+                  "text": "1-based character counting"
+                }
+              }
+            },
+            "replacementMolecule": {
+              "reference": "#replacement",
+              "type": "MolecularDefinition",
+              "display": "A"
+            },
+            "replacedMolecule": {
+              "reference": "#replaced",
+              "type": "MolecularDefinition",
+              "display": "C"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

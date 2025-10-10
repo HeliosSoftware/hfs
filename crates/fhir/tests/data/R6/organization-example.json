@@ -1,0 +1,26 @@
+{
+  "resourceType": "Organization",
+  "id": "example",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n      ACME Health - generic example\n    \u003c/div\u003e"
+  },
+  "name": "ACME Health",
+  "alias": [
+    "Example Health Org"
+  ],
+  "endpoint": [
+    {
+      "reference": "Endpoint/example"
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

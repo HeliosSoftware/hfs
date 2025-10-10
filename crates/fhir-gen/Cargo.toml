@@ -28,3 +28,7 @@ clap = { version = "4.4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["blocking"] }
 zip = "0.6"
 serde_json = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

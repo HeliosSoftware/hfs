@@ -1,0 +1,240 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "group-involvement",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem group-involvement\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"group-involvement\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcgroup-involvement\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003e\u003cb\u003eProperties\u003c/b\u003e\u003c/p\u003e\u003cp\u003e\u003cb\u003eThis code system defines the following properties for its concepts\u003c/b\u003e\u003c/p\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eName\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eURI\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eType\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDescription\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003egroup-type\u003c/td\u003e\u003ctd\u003egroup-type\u003c/td\u003e\u003ctd\u003ehttp://hl7.org/fhir/group-involvement#group-type\u003c/td\u003e\u003ctd\u003ecode\u003c/td\u003e\u003ctd\u003eWhich group code this relationship is considered appropriate to use with\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003cp\u003e\u003cb\u003eConcepts\u003c/b\u003e\u003c/p\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/group-involvement\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003egroup-type\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eindex-case\u003ca name\u003d\"group-involvement-index-case\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eIndex Case\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eThe first case that is the reason for creating the group. Usually the first known infection, but other kinds of first are known.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003epatient-list\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprimary-exposure\u003ca name\u003d\"group-involvement-primary-exposure\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrimary Exposure\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003ePatient is included in the list on the grounds of being a primary exposure case (sometimes, but not neceessarily, direct exposure to the index case, or a known infected person).\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003epatient-list\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003esecondary-exposure\u003ca name\u003d\"group-involvement-secondary-exposure\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eSecondary Exposure\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003ePatient is included in the list on the grounds of being a secondary exposure case - that is, exposed to a potentially infected patient or person of interest.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003epatient-list\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eprimary-contact\u003ca name\u003d\"group-involvement-primary-contact\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePrimary Contact\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003ePatient is included in the list on the grounds of being the primary contact point for a family, household, workplace, etc.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003efamily, household, workplace\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efamily-member\u003ca name\u003d\"group-involvement-family-member\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFamily Member\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003ePatient is included in the list on the grounds of being a family member in a family group. See \u003ca href\u003d\"group.html#relationships\"\u003eRelationships inside the group\u003c/a\u003e for more detailed family relationships.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003ehousehold\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eowner\u003ca name\u003d\"group-involvement-owner\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eOwner\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eHousehold member is a legally / officially registered owner of the dwelling that contains the household. Or at least, considers themselves the rightful owner.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003ehousehold\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eresident\u003ca name\u003d\"group-involvement-resident\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eResident\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eHousehold member is a resident - that is, they consistently reside in the dwelling.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003ehousehold\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003evisitor\u003ca name\u003d\"group-involvement-visitor\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eVisitor\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eHousehold member is transiently visiting the dwelling during (part of) the period of interest, or, for a workplace, a person who was/is in the workplace but not an employee\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003ehousehold, workplace\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003estaff\u003ca name\u003d\"group-involvement-staff\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eStaff\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eHousehold member is a member of the staff working in the dwelling (and by implication, not a resident).\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003ehousehold\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epet\u003ca name\u003d\"group-involvement-pet\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePet\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eGroup member is animal kept as a pet by the family/household.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003efamkily, household\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003efull-time\u003ca name\u003d\"group-involvement-full-time\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eFull-Time Employee\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eThis is the group member\u0027s primary workplace on a consistent basis.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003eworkplace\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003epart-time\u003ca name\u003d\"group-involvement-part-time\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePart Time\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eThe group member works in the workplace, but on an occasional basis.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003eworkplace\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ecasual\u003ca name\u003d\"group-involvement-casual\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eCasual\u003c/td\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eThe group member was working in the workplace, but is not consistently present.\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003ctd\u003eworkplace\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "fhir"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 0
+    }
+  ],
+  "url": "http://hl7.org/fhir/group-involvement",
+  "version": "6.0.0-ballot3",
+  "name": "GroupInvolvement",
+  "title": "Group Involvement",
+  "status": "draft",
+  "experimental": false,
+  "date": "2021-01-05T10:01:24+11:00",
+  "publisher": "HL7 International / FHIR Infrastructure",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url"
+        },
+        {
+          "system": "email"
+        }
+      ]
+    },
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/fiwg"
+        }
+      ]
+    }
+  ],
+  "description": "A code that describes how a member of the group participates in the group.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/group-involvement",
+  "content": "complete",
+  "property": [
+    {
+      "code": "group-type",
+      "uri": "http://hl7.org/fhir/group-involvement#group-type",
+      "description": "Which group code this relationship is considered appropriate to use with",
+      "type": "code"
+    }
+  ],
+  "concept": [
+    {
+      "code": "index-case",
+      "display": "Index Case",
+      "definition": "The first case that is the reason for creating the group. Usually the first known infection, but other kinds of first are known.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "patient-list"
+        }
+      ]
+    },
+    {
+      "code": "primary-exposure",
+      "display": "Primary Exposure",
+      "definition": "Patient is included in the list on the grounds of being a primary exposure case (sometimes, but not neceessarily, direct exposure to the index case, or a known infected person).",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "patient-list"
+        }
+      ]
+    },
+    {
+      "code": "secondary-exposure",
+      "display": "Secondary Exposure",
+      "definition": "Patient is included in the list on the grounds of being a secondary exposure case - that is, exposed to a potentially infected patient or person of interest.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "patient-list"
+        }
+      ]
+    },
+    {
+      "code": "primary-contact",
+      "display": "Primary Contact",
+      "definition": "Patient is included in the list on the grounds of being the primary contact point for a family, household, workplace, etc.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "family"
+        },
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        },
+        {
+          "code": "group-type",
+          "valueCode": "workplace"
+        }
+      ]
+    },
+    {
+      "code": "family-member",
+      "display": "Family Member",
+      "definition": "Patient is included in the list on the grounds of being a family member in a family group. See [Relationships inside the group](group.html#relationships) for more detailed family relationships.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        }
+      ]
+    },
+    {
+      "code": "owner",
+      "display": "Owner",
+      "definition": "Household member is a legally / officially registered owner of the dwelling that contains the household. Or at least, considers themselves the rightful owner.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        }
+      ]
+    },
+    {
+      "code": "resident",
+      "display": "Resident",
+      "definition": "Household member is a resident - that is, they consistently reside in the dwelling.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        }
+      ]
+    },
+    {
+      "code": "visitor",
+      "display": "Visitor",
+      "definition": "Household member is transiently visiting the dwelling during (part of) the period of interest, or, for a workplace, a person who was/is in the workplace but not an employee",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        },
+        {
+          "code": "group-type",
+          "valueCode": "workplace"
+        }
+      ]
+    },
+    {
+      "code": "staff",
+      "display": "Staff",
+      "definition": "Household member is a member of the staff working in the dwelling (and by implication, not a resident).",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        }
+      ]
+    },
+    {
+      "code": "pet",
+      "display": "Pet",
+      "definition": "Group member is animal kept as a pet by the family/household.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "famkily"
+        },
+        {
+          "code": "group-type",
+          "valueCode": "household"
+        }
+      ]
+    },
+    {
+      "code": "full-time",
+      "display": "Full-Time Employee",
+      "definition": "This is the group member\u0027s primary workplace on a consistent basis.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "workplace"
+        }
+      ]
+    },
+    {
+      "code": "part-time",
+      "display": "Part Time",
+      "definition": "The group member works in the workplace, but on an occasional basis.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "workplace"
+        }
+      ]
+    },
+    {
+      "code": "casual",
+      "display": "Casual",
+      "definition": "The group member was working in the workplace, but is not consistently present.",
+      "property": [
+        {
+          "code": "group-type",
+          "valueCode": "workplace"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "resourceType": "OperationDefinition",
+  "id": "Patient-purge",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: OperationDefinition Patient-purge\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"Patient-purge\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcPatient-purge\"\u003e \u003c/a\u003e\u003cp\u003eURL: [base]/Patient/[id]/$purge\u003c/p\u003e\u003ch3\u003eParameters\u003c/h3\u003e\u003ctable class\u003d\"grid\"\u003e\u003ctr\u003e\u003ctd\u003e\u003cb\u003eUse\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eName\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eScope\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eCardinality\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eType\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eBinding\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDocumentation\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003eOUT\u003c/td\u003e\u003ctd\u003ereturn\u003c/td\u003e\u003ctd/\u003e\u003ctd\u003e0..1\u003c/td\u003e\u003ctd\u003e\u003ca href\u003d\"operationoutcome.html\"\u003eOperationOutcome\u003c/a\u003e\u003c/td\u003e\u003ctd/\u003e\u003ctd\u003e\u003cdiv\u003e\u003cp\u003eStatus and/or results of the purge request\u003c/p\u003e\n\u003c/div\u003e\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 2
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "pa"
+    }
+  ],
+  "url": "http://hl7.org/fhir/OperationDefinition/Patient-purge",
+  "version": "6.0.0-ballot3",
+  "name": "Purge",
+  "title": "Purge Patient Record",
+  "status": "draft",
+  "kind": "operation",
+  "experimental": false,
+  "date": "2025-10-09T18:25:56+00:00",
+  "publisher": "HL7 International / Patient Administration",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    },
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/pafm"
+        }
+      ]
+    }
+  ],
+  "description": "This operation is used to request the removal of all current and historical versions for all resources in a patient compartment.  The result will be an OperationOutcome with results and/or details about execution.\n\nFollowing are some common `issue-type` values:\n- `success` the request has been completed to the server\u0027s satisfaction - the patient and associated resources are no longer accessible\n- `incomplete` the request is partially complete, but additional processing will continue (e.g., the server is continuing to clean out resources)\n\nWhen supported, it is recommended (though not required) to support an [Asynchronous Request Pattern](async.html).\n\nNote that the deletion of resources typically involves many policy decisions.  Implementers are expected to use this operation in conjunction with their policies for such a request - e.g., soft vs. hard delete, audibility/traceability, evaluation of referential integrity, etc.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "affectsState": false,
+  "code": "purge",
+  "resource": [
+    "Patient"
+  ],
+  "system": false,
+  "type": false,
+  "instance": true,
+  "parameter": [
+    {
+      "name": "return",
+      "use": "out",
+      "min": 0,
+      "max": "1",
+      "documentation": "Status and/or results of the purge request",
+      "type": "OperationOutcome"
+    }
+  ]
+}

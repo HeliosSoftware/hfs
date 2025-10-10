@@ -1,0 +1,41 @@
+{
+  "resourceType": "Transport",
+  "id": "simpledelivery",
+  "identifier": [
+    {
+      "value": "Transport1234"
+    }
+  ],
+  "basedOn": [
+    {
+      "reference": "SupplyRequest/simpleorder"
+    }
+  ],
+  "partOf": [
+    {
+      "display": "Central Supply Restock"
+    }
+  ],
+  "status": "completed",
+  "period": {
+    "start": "2025-08-10T09:00:00Z",
+    "end": "2025-08-10T11:00:00Z"
+  },
+  "to": {
+    "reference": "Location/location-hospitalLab",
+    "display": "Requested location for item at City Hospital Lab"
+  },
+  "from": {
+    "reference": "Location/location-labA",
+    "display": "Current location for item at Lab A"
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "task-performer-function-code",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablecodesystem"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: CodeSystem task-performer-function-code\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"task-performer-function-code\"\u003e \u003c/a\u003e\u003ca name\u003d\"hctask-performer-function-code\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablecodesystem.html\"\u003eShareable CodeSystem\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cp\u003eThis case-sensitive code system \u003ccode\u003ehttp://hl7.org/fhir/task-performer-function-code\u003c/code\u003e defines the following codes:\u003c/p\u003e\u003ctable class\u003d\"codes\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDefinition\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003eperformer\u003ca name\u003d\"task-performer-function-code-performer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003ePerformer\u003c/td\u003e\u003ctd\u003eA person, non-person living subject, organization or device that who actually and principally carries out the Task action.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003everifier\u003ca name\u003d\"task-performer-function-code-verifier\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eVerifier\u003c/td\u003e\u003ctd\u003eA person who verifies the correctness and appropriateness of the Task action (plan, order, event, etc.) and hence takes on accountability.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ewitness\u003ca name\u003d\"task-performer-function-code-witness\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eWitness\u003c/td\u003e\u003ctd\u003eA person witnessing the action happening without doing anything. A witness is not necessarily aware, much less approves of anything stated in the service event.\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003ereferrer\u003ca name\u003d\"task-performer-function-code-referrer\"\u003e \u003c/a\u003e\u003c/td\u003e\u003ctd\u003eReferrer\u003c/td\u003e\u003ctd\u003eA person having referred the action of the Task to the performer (referring physician).\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-standards-status",
+      "valueCode": "trial-use"
+    },
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-fmm",
+      "valueInteger": 1
+    }
+  ],
+  "url": "http://hl7.org/fhir/task-performer-function-code",
+  "version": "6.0.0-ballot3",
+  "name": "TaskPerformerFunctionCode",
+  "title": "Task Performer Function Code",
+  "status": "active",
+  "experimental": false,
+  "date": "2025-03-12T10:00:00+08:00",
+  "publisher": "HL7 (FHIR Project)",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        },
+        {
+          "system": "email",
+          "value": "fhir@lists.hl7.org"
+        }
+      ]
+    }
+  ],
+  "description": "The performer of the task.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "caseSensitive": true,
+  "valueSet": "http://hl7.org/fhir/ValueSet/task-performer-function-code",
+  "content": "complete",
+  "concept": [
+    {
+      "code": "performer",
+      "display": "Performer",
+      "definition": "A person, non-person living subject, organization or device that who actually and principally carries out the Task action."
+    },
+    {
+      "code": "verifier",
+      "display": "Verifier",
+      "definition": "A person who verifies the correctness and appropriateness of the Task action (plan, order, event, etc.) and hence takes on accountability."
+    },
+    {
+      "code": "witness",
+      "display": "Witness",
+      "definition": "A person witnessing the action happening without doing anything. A witness is not necessarily aware, much less approves of anything stated in the service event."
+    },
+    {
+      "code": "referrer",
+      "display": "Referrer",
+      "definition": "A person having referred the action of the Task to the performer (referring physician)."
+    }
+  ]
+}

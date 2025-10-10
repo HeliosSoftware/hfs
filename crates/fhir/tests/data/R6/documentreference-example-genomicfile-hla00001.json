@@ -1,0 +1,42 @@
+{
+  "resourceType": "DocumentReference",
+  "id": "example-genomicfile-hla00001",
+  "identifier": [
+    {
+      "system": "http://www.somesystemabc.net/identifiers/files",
+      "value": "11111"
+    }
+  ],
+  "status": "current",
+  "docStatus": "preliminary",
+  "description": "A sample Document Reference instance representing HLA00001.",
+  "securityLabel": [
+    {
+      "coding": [
+        {
+          "system": "http://terminology.hl7.org/CodeSystem/v3-Confidentiality",
+          "code": "R",
+          "display": "Restricted"
+        }
+      ]
+    }
+  ],
+  "content": [
+    {
+      "attachment": {
+        "contentType": "text/html",
+        "url": "https://www.ebi.ac.uk/Tools/dbfetch/dbfetch?db\u003dimgthla;id\u003dHLA00001;format\u003dfasta;style\u003draw",
+        "title": "HLA00001"
+      }
+    }
+  ],
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}

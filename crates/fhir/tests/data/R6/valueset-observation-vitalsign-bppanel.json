@@ -1,0 +1,71 @@
+{
+  "resourceType": "ValueSet",
+  "id": "observation-vitalsign-bppanel",
+  "meta": {
+    "lastUpdated": "2025-10-09T18:25:56.447+00:00",
+    "profile": [
+      "http://hl7.org/fhir/StructureDefinition/shareablevalueset"
+    ]
+  },
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\u003cp class\u003d\"res-header-id\"\u003e\u003cb\u003eGenerated Narrative: ValueSet observation-vitalsign-bppanel\u003c/b\u003e\u003c/p\u003e\u003ca name\u003d\"observation-vitalsign-bppanel\"\u003e \u003c/a\u003e\u003ca name\u003d\"hcobservation-vitalsign-bppanel\"\u003e \u003c/a\u003e\u003cdiv style\u003d\"display: inline-block; background-color: #d9e0e7; padding: 6px; margin: 4px; border: 1px solid #8da1b4; border-radius: 5px; line-height: 60%\"\u003e\u003cp style\u003d\"margin-bottom: 0px\"/\u003e\u003cp style\u003d\"margin-bottom: 0px\"\u003eProfile: \u003ca href\u003d\"shareablevalueset.html\"\u003eShareable ValueSet\u003c/a\u003e\u003c/p\u003e\u003c/div\u003e\u003cul\u003e\u003cli\u003eInclude these codes as defined in \u003ca href\u003d\"http://loinc.org\"\u003e\u003ccode\u003ehttp://loinc.org\u003c/code\u003e\u003c/a\u003e\u003ctable class\u003d\"none\"\u003e\u003ctr\u003e\u003ctd style\u003d\"white-space:nowrap\"\u003e\u003cb\u003eCode\u003c/b\u003e\u003c/td\u003e\u003ctd\u003e\u003cb\u003eDisplay\u003c/b\u003e\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/35094-2/\"\u003e35094-2\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBlood pressure panel\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/55417-0/\"\u003e55417-0\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eShort blood pressure panel\u003c/td\u003e\u003c/tr\u003e\u003ctr\u003e\u003ctd\u003e\u003ca href\u003d\"https://loinc.org/85354-9/\"\u003e85354-9\u003c/a\u003e\u003c/td\u003e\u003ctd\u003eBlood pressure panel with all children optional\u003c/td\u003e\u003c/tr\u003e\u003c/table\u003e\u003c/li\u003e\u003c/ul\u003e\u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "oo"
+    }
+  ],
+  "url": "http://hl7.org/fhir/ValueSet/observation-vitalsign-bppanel",
+  "version": "6.0.0-ballot3",
+  "name": "VitalSignsBPPanel",
+  "title": "Vital Signs - BP Panel",
+  "status": "active",
+  "experimental": false,
+  "publisher": "FHIR project team",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://hl7.org/fhir"
+        }
+      ]
+    }
+  ],
+  "description": "This value set defines the set of LOINC codes considered to be appropriate for representing an arterial szstolic and diastolic BP panel of vital signs measurements in Observation.component.code.",
+  "jurisdiction": [
+    {
+      "coding": [
+        {
+          "system": "http://unstats.un.org/unsd/methods/m49/m49.htm",
+          "code": "001",
+          "display": "World"
+        }
+      ]
+    }
+  ],
+  "copyright": "This content from LOINC® is copyright © 1995 Regenstrief Institute, Inc. and the LOINC Committee, and available at no cost under the license at http://loinc.org/terms-of-use",
+  "compose": {
+    "include": [
+      {
+        "system": "http://loinc.org",
+        "concept": [
+          {
+            "code": "35094-2",
+            "display": "Blood pressure panel"
+          },
+          {
+            "code": "55417-0",
+            "display": "Short blood pressure panel"
+          },
+          {
+            "code": "85354-9",
+            "display": "Blood pressure panel with all children optional"
+          }
+        ]
+      }
+    ]
+  }
+}

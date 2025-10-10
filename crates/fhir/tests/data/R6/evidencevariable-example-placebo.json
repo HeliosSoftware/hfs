@@ -1,0 +1,50 @@
+{
+  "resourceType": "EvidenceVariable",
+  "id": "example-placebo",
+  "text": {
+    "status": "generated",
+    "div": "\u003cdiv xmlns\u003d\"http://www.w3.org/1999/xhtml\"\u003e\n\t\t\n      \u003cp\u003e\n\t\t\tIn a study of response rates if placebo is given, \u0026quot;placcebo given\u0026quot; may be the variable for the exposure of interest.\n      \u003c/p\u003e\n\t\n    \u003c/div\u003e"
+  },
+  "extension": [
+    {
+      "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-wg",
+      "valueCode": "cds"
+    }
+  ],
+  "name": "Placebo",
+  "title": "Placebo",
+  "status": "draft",
+  "publisher": "HL7 International / Clinical Decision Support",
+  "contact": [
+    {
+      "telecom": [
+        {
+          "system": "url",
+          "value": "http://www.hl7.org/Special/committees/dss"
+        }
+      ]
+    }
+  ],
+  "description": "Placebo",
+  "actual": true,
+  "definition": {
+    "concept": {
+      "coding": [
+        {
+          "system": "http://snomed.info/sct",
+          "code": "182886004",
+          "display": "Placebo given (situation)"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
+    ]
+  }
+}
