@@ -1412,12 +1412,30 @@ version = "0.1.29"
 dependencies = [
  "chrono",
  "clap",
- "helios-fhir-macro",
- "helios-fhirpath-support",
+ "helios-fhir-macro 0.1.29",
+ "helios-fhirpath-support 0.1.29",
  "helios-serde",
  "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "time",
+ "zip 0.6.6",
+]
+
+[[package]]
+name = "helios-fhir"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04b7a38af06472eeed648436836ad0846a1587dd7c8d90b061b1efde0147f9cb"
+dependencies = [
+ "chrono",
+ "clap",
+ "helios-fhir-macro 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
+ "helios-fhirpath-support 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
+ "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "time",
@@ -1430,7 +1448,7 @@ version = "0.1.29"
 dependencies = [
  "chrono",
  "clap",
- "helios-fhir",
+ "helios-fhir 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
  "reqwest",
  "serde",
  "serde_json",
@@ -1442,7 +1460,22 @@ name = "helios-fhir-macro"
 version = "0.1.29"
 dependencies = [
  "heck",
- "helios-fhirpath-support",
+ "helios-fhirpath-support 0.1.29",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.106",
+]
+
+[[package]]
+name = "helios-fhir-macro"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddfdd94c010045bac7b717474f2c3fedf631f88b9452cc2d9c4fc182bc0a8c54"
+dependencies = [
+ "heck",
+ "helios-fhirpath-support 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
  "proc-macro2",
  "quote",
  "serde",
@@ -1463,8 +1496,8 @@ dependencies = [
  "clap",
  "criterion",
  "futures",
- "helios-fhir",
- "helios-fhirpath-support",
+ "helios-fhir 0.1.29",
+ "helios-fhirpath-support 0.1.29",
  "helios-serde",
  "hex",
  "http",
@@ -1496,11 +1529,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-fhirpath-support"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86d30ff8273350d9f80d42eb8c73b66ff5fe909934604e0f74e0497a8e0ef55b"
+dependencies = [
+ "rust_decimal",
+]
+
+[[package]]
 name = "helios-hfs"
 version = "0.1.29"
 dependencies = [
  "clap",
- "helios-fhir",
+ "helios-fhir 0.1.29",
 ]
 
 [[package]]
@@ -1527,9 +1569,9 @@ dependencies = [
  "criterion",
  "csv",
  "futures",
- "helios-fhir",
+ "helios-fhir 0.1.29",
  "helios-fhirpath",
- "helios-fhirpath-support",
+ "helios-fhirpath-support 0.1.29",
  "helios-serde",
  "http",
  "mime",
@@ -2745,7 +2787,7 @@ version = "0.1.29"
 dependencies = [
  "chrono",
  "csv",
- "helios-fhir",
+ "helios-fhir 0.1.29",
  "helios-serde",
  "helios-sof",
  "pyo3",

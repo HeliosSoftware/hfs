@@ -165,8 +165,9 @@ fn generate_version_header(version: &FhirVersion) -> String {
 //! # {{
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {{
 //! use helios_fhir::{}::Patient;
+//! use helios_serde::json;
 //!
-//! let json = r#\"{{
+//! let json_str = r#\"{{
 //!     \"resourceType\": \"Patient\",
 //!     \"id\": \"example\",
 //!     \"name\": [{{
@@ -175,7 +176,7 @@ fn generate_version_header(version: &FhirVersion) -> String {
 //!     }}]
 //! }}\"#;
 //!
-//! let patient: Patient = serde_json::from_str(json)?;
+//! let patient: Patient = json::from_str(json_str)?;
 //! assert_eq!(patient.id.as_ref().unwrap().value.as_ref().unwrap(), \"example\");
 //! # Ok(())
 //! # }}
@@ -189,6 +190,7 @@ fn generate_version_header(version: &FhirVersion) -> String {
 //! # {{
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {{
 //! use helios_fhir::{}::{{Patient, HumanName}};
+//! use helios_serde::json;
 //!
 //! let patient = Patient {{
 //!     id: None,
@@ -199,7 +201,7 @@ fn generate_version_header(version: &FhirVersion) -> String {
 //!     ..Default::default()
 //! }};
 //!
-//! let json = serde_json::to_string_pretty(&patient)?;
+//! let json_str = json::to_string_pretty(&patient)?;
 //! # Ok(())
 //! # }}
 //! # }}
