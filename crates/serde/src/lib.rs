@@ -109,12 +109,6 @@ impl<V, F> DeserializationContext<V, F> {
     }
 }
 
-impl<V, F> Default for DeserializationContext<V, F> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<V> DeserializationContext<V, Json> {
     /// Create a JSON deserialization context for the given type.
     pub fn json() -> Self {
