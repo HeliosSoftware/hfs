@@ -9,7 +9,7 @@ fn test_datetime_constant_debug() {
         "resourceType": "DetectedIssue",
         "id": "di2",
         "status": "final",
-        "identified": "2016-11-12"
+        "identifiedDateTime": "2016-11-12"
     }"#,
     )
     .unwrap();
