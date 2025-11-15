@@ -49,7 +49,7 @@ use helios_serde::{
 use rust_decimal::Decimal;
 use serde::{
     Deserialize, Serialize,
-    de::{self, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Visitor},
+    de::{self, DeserializeSeed, Deserializer, MapAccess, Visitor},
     ser::{SerializeStruct, Serializer},
 };
 use std::cmp::Ordering;
@@ -2095,6 +2095,28 @@ where
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
+                        helios_serde::json::SERDE_NUMBER_SENTINEL => {
+                            let raw_number: String = map.next_value::<String>().map_err(|e| {
+                                de::Error::custom(format!(
+                                    "Failed to deserialize serde_json sentinel number: {}",
+                                    e
+                                ))
+                            })?;
+                            let ctx = DeserializationContext::<V, Json>::json();
+                            let value = ctx
+                                .deserialize(raw_number.into_deserializer())
+                                .map_err(|e: serde::de::value::Error| {
+                                    de::Error::custom(format!(
+                                        "Failed to deserialize sentinel number into Element value: {}",
+                                        e
+                                    ))
+                                })?;
+                            return Ok(Element {
+                                id: None,
+                                extension: None,
+                                value: Some(value),
+                            });
+                        }
                         "id" => {
                             let ctx = DeserializationContext::<Option<String>, Json>::json();
                             id = map.next_value_seed(ctx).map_err(|e| {
@@ -2633,13 +2655,15 @@ mod tests {
         // Test deserializing a string "2" into Element<i64, ()>
         type TestElement = Element<i64, TestExtension>;
 
-        // Test case 1: String containing integer (should fail)
+        // Test case 1: String containing integer (should succeed)
         let json_str = r#""2""#;
         let result: Result<TestElement, _> = json::from_str(json_str);
         assert!(
-            result.is_err(),
-            "String '2' should not deserialize directly into an integer element"
+            result.is_ok(),
+            "String '2' should deserialize directly into an integer element: {:?}",
+            result.err()
         );
+        assert_eq!(result.unwrap().value, Some(2i64));
 
         // Test case 2: Number
         let json_num = r#"2"#;
@@ -2658,15 +2682,58 @@ mod tests {
     fn test_i32_string_deserialization() {
         type TestElement = Element<i32, TestExtension>;
 
-        // String inputs should fail for integer elements
+        // String inputs should now succeed for integer elements
         let json_str = r#""123""#;
         let result: Result<TestElement, _> = json::from_str(json_str);
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "String integers should be accepted: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap().value, Some(123i32));
 
         // Numeric inputs should succeed
         let json_num = r#"123"#;
         let element: TestElement = json::from_str(json_num).expect("number should deserialize");
         assert_eq!(element.value, Some(123i32));
+    }
+
+    #[test]
+    fn test_f32_string_deserialization() {
+        type TestElement = Element<f32, TestExtension>;
+
+        let json_str = r#""3.14""#;
+        let result: Result<TestElement, _> = json::from_str(json_str);
+        assert!(
+            result.is_ok(),
+            "String floats should be accepted for f32 elements: {:?}",
+            result
+        );
+        let element = result.unwrap();
+        assert_eq!(element.value, Some(3.14f32));
+
+        let json_num = r#"3.14"#;
+        let element: TestElement = json::from_str(json_num).expect("number should deserialize");
+        assert_eq!(element.value, Some(3.14f32));
+    }
+
+    #[test]
+    fn test_f64_string_deserialization() {
+        type TestElement = Element<f64, TestExtension>;
+
+        let json_str = r#""42.001""#;
+        let result: Result<TestElement, _> = json::from_str(json_str);
+        assert!(
+            result.is_ok(),
+            "String floats should be accepted for f64 elements: {:?}",
+            result
+        );
+        let element = result.unwrap();
+        assert_eq!(element.value, Some(42.001f64));
+
+        let json_num = r#"42.001"#;
+        let element: TestElement = json::from_str(json_num).expect("number should deserialize");
+        assert_eq!(element.value, Some(42.001f64));
     }
 
     #[test]

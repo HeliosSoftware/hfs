@@ -32,6 +32,8 @@
 
 use serde::de::{DeserializeSeed, Deserializer};
 use serde::ser::{Serialize, Serializer};
+use std::convert::TryFrom;
+use std::fmt;
 use std::marker::PhantomData;
 
 pub mod json;
@@ -246,9 +248,287 @@ macro_rules! impl_fhir_serde_for_primitive {
 }
 
 // Implement for common primitive and standard library types
-impl_fhir_serde_for_primitive!(
-    String, bool, i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, f32, f64, char
-);
+impl_fhir_serde_for_primitive!(String, bool, char);
+
+macro_rules! impl_fhir_float {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl FhirSerialize<Json> for $t {
+                fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    Serialize::serialize(self, serializer)
+                }
+            }
+
+            impl FhirDeserialize<Json> for $t {
+                fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    struct FloatVisitor;
+
+                    impl FloatVisitor {
+                        fn parse_from_str<E>(value: &str) -> Result<$t, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            let trimmed = value.trim();
+                            if trimmed.is_empty() {
+                                return Err(E::invalid_value(
+                                    serde::de::Unexpected::Str(value),
+                                    &concat!(
+                                        "a valid ",
+                                        stringify!($t),
+                                        " or stringified floating point number"
+                                    ),
+                                ));
+                            }
+
+                            trimmed.parse::<$t>().map_err(|_| {
+                                E::invalid_value(
+                                    serde::de::Unexpected::Str(value),
+                                    &concat!(
+                                        "a valid ",
+                                        stringify!($t),
+                                        " or stringified floating point number"
+                                    ),
+                                )
+                            })
+                        }
+                    }
+
+                    impl<'de> serde::de::Visitor<'de> for FloatVisitor {
+                        type Value = $t;
+
+                        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                            formatter.write_str(concat!(
+                                "a floating point number or string containing a ",
+                                stringify!($t)
+                            ))
+                        }
+
+                        fn visit_f32<E>(self, v: f32) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Ok(v as Self::Value)
+                        }
+
+                        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Self::parse_from_str(v)
+                        }
+
+                        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            self.visit_str(&v)
+                        }
+
+                        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                        where
+                            A: serde::de::MapAccess<'de>,
+                        {
+                            use serde::de::Error;
+
+                            while let Some(key) = map.next_key::<String>()? {
+                                if key == crate::json::SERDE_NUMBER_SENTINEL {
+                                    let serialized_number: String = map.next_value()?;
+                                    return Self::parse_from_str::<A::Error>(&serialized_number);
+                                } else {
+                                    let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                                }
+                            }
+
+                            Err(Error::invalid_type(
+                                serde::de::Unexpected::Map,
+                                &concat!(
+                                    "a valid ",
+                                    stringify!($t),
+                                    ", stringified float, or serde_json arbitrary precision map"
+                                ),
+                            ))
+                        }
+                    }
+
+                    deserializer.deserialize_any(FloatVisitor)
+                }
+            }
+        )*
+    };
+}
+
+impl_fhir_float!(f32, f64);
+
+macro_rules! impl_fhir_integer {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl FhirSerialize<Json> for $t {
+                fn fhir_serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    Serialize::serialize(self, serializer)
+                }
+            }
+
+            impl FhirDeserialize<Json> for $t {
+                fn fhir_deserialize<'de, D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    struct IntegerVisitor;
+
+                    impl<'de> serde::de::Visitor<'de> for IntegerVisitor {
+                        type Value = $t;
+
+                        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                            formatter.write_str(concat!(
+                                "an integer or string containing an integer representable as ",
+                                stringify!($t)
+                            ))
+                        }
+
+                        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Self::Value::try_from(v).map_err(|err| {
+                                E::custom(format!(
+                                    "value {} is out of range for {}: {}",
+                                    v,
+                                    stringify!($t),
+                                    err
+                                ))
+                            })
+                        }
+
+                        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Self::Value::try_from(v).map_err(|err| {
+                                E::custom(format!(
+                                    "value {} is out of range for {}: {}",
+                                    v,
+                                    stringify!($t),
+                                    err
+                                ))
+                            })
+                        }
+
+                        fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Self::Value::try_from(v).map_err(|err| {
+                                E::custom(format!(
+                                    "value {} is out of range for {}: {}",
+                                    v,
+                                    stringify!($t),
+                                    err
+                                ))
+                            })
+                        }
+
+                        fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            Self::Value::try_from(v).map_err(|err| {
+                                E::custom(format!(
+                                    "value {} is out of range for {}: {}",
+                                    v,
+                                    stringify!($t),
+                                    err
+                                ))
+                            })
+                        }
+
+                        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            let trimmed = v.trim();
+                            if trimmed.is_empty() {
+                                return Err(E::invalid_value(
+                                    serde::de::Unexpected::Str(v),
+                                    &concat!(
+                                        "a valid ",
+                                        stringify!($t),
+                                        " or stringified integer"
+                                    ),
+                                ));
+                            }
+
+                            trimmed.parse::<Self::Value>().map_err(|_| {
+                                E::invalid_value(
+                                    serde::de::Unexpected::Str(v),
+                                    &concat!(
+                                        "a valid ",
+                                        stringify!($t),
+                                        " or stringified integer"
+                                    ),
+                                )
+                            })
+                        }
+
+                        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            self.visit_str(&v)
+                        }
+                    }
+
+                    deserializer.deserialize_any(IntegerVisitor)
+                }
+            }
+        )*
+    };
+}
+
+impl_fhir_integer!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
 
 // FhirSerialize/Deserialize for serde_json::Value (used in element primitives)
 impl FhirSerialize<Json> for serde_json::Value {

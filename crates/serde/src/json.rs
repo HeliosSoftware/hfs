@@ -31,6 +31,18 @@ use crate::{DeserializationContext, Json, SerializationContext};
 use serde::de::{DeserializeSeed, IntoDeserializer};
 use serde::Serialize;
 
+/// Sentinel key used by `serde_json` when the `arbitrary_precision` feature is enabled.
+///
+/// When `serde_json` encounters a number that cannot be represented as a native integer or
+/// floating point value without losing information, it wraps the number in a map containing
+/// this key and the original string representation. Handling this sentinel allows us to
+/// support environments where `serde_json` is built with `arbitrary_precision`.
+///
+/// This string is undeniably “magic”, but serde_json has kept it stable for years and
+/// many downstream libraries rely on it in the same way:
+/// <https://github.com/search?q=%24serde_json%3A%3Aprivate%3A%3ANumber&type=code>
+pub const SERDE_NUMBER_SENTINEL: &str = "$serde_json::private::Number";
+
 /// Serialize a FHIR resource to a JSON string.
 ///
 /// # Arguments
